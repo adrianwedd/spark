@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Launch the wake-word listener daemon.
+# Usage: bin/run-wake [--wake-word "hey robot"] [--dry-run] [--help]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+MODEL_DIR="${PX_WAKE_MODEL:-$PROJECT_ROOT/models/vosk-model-small-en-us-0.15}"
+WAKE_WORD="${PX_WAKE_WORD:-hey robot}"
+APLAY_DEV="${PX_VOICE_DEVICE:-}"
+
+exec "$SCRIPT_DIR/px-wake-listen" \
+    --model-dir "$MODEL_DIR" \
+    --wake-word "$WAKE_WORD" \
+    ${APLAY_DEV:+--aplay-device "$APLAY_DEV"} \
+    "$@"

@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+/usr/bin/python3 - "$@" <<'PY'
+"""Wake-word listener: detects wake phrase via Vosk, captures utterance, pipes to voice loop.
+
+Flow:
+  1. Grammar recognizer listens continuously for the wake word (low CPU).
+  2. On detection: play ack chime + enable speaker, switch to full recognizer.
+  3. Record until 1.5 s silence or 8 s max.
+  4. Transcribe with Vosk, pipe text to run-voice-loop-claude --max-turns 1.
+  5. Return to step 1.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import audioop
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+import wave
+from pathlib import Path
+
+LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
+LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
+PID_FILE = Path(os.environ.get("PX_WAKE_PID", LOG_DIR / "px-wake-listen.pid"))
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
+
+# Audio constants
+MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
+VOSK_RATE   = 16000  # Vosk model input rate
+CHUNK       = 2048   # frames per buffer at 44100 Hz (~46 ms)
+CHANNELS    = 1
+SILENCE_S   = 1.5    # silence after speech → end of utterance
+MAX_RECORD_S = 8.0   # hard cap on recording length
+RMS_SILENCE = 300    # RMS threshold below which is "silence"
+
+DEFAULT_MODEL = str(PROJECT_ROOT / "models" / "vosk-model-small-en-us-0.15")
+DEFAULT_WAKE  = "hey robot"
+DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-claude")
+
+
+def log(msg: str) -> None:
+    ts = dt.datetime.now().isoformat(timespec="seconds")
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{ts} [wake] {msg}"
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def rms(data: bytes) -> float:
+    """Compute RMS amplitude of 16-bit PCM chunk."""
+    count = len(data) // 2
+    if count == 0:
+        return 0.0
+    shorts = struct.unpack(f"{count}h", data)
+    return (sum(s * s for s in shorts) / count) ** 0.5
+
+
+def find_input_device(pa, preferred_name: str = "") -> int:
+    """Return PyAudio device index for the best available input."""
+    best = None
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info["maxInputChannels"] < 1:
+            continue
+        if preferred_name and preferred_name.lower() in info["name"].lower():
+            return i
+        if best is None:
+            best = i
+    if best is None:
+        raise RuntimeError("No input audio device found")
+    return best
+
+
+def play_chime(device: str = "") -> None:
+    """Play a short 440 Hz beep via aplay to signal wake detection."""
+    try:
+        from robot_hat import enable_speaker
+        enable_speaker()
+    except Exception:
+        pass
+    try:
+        # Generate a short beep: 0.25 s 440 Hz sine, 16-bit 44100 Hz mono WAV
+        import math, wave as wv, tempfile
+        beep_f = 440
+        dur    = 0.25
+        n      = int(MIC_RATE * dur)
+        samples = bytes(struct.pack(f"{n}h", *[
+            int(28000 * math.sin(2 * math.pi * beep_f * t / MIC_RATE))
+            for t in range(n)
+        ]))
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            with wv.open(tf.name, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(MIC_RATE)
+                wf.writeframes(samples)
+            tmp = tf.name
+        cmd = ["aplay", "-q"]
+        if device:
+            cmd += ["-D", device]
+        cmd.append(tmp)
+        subprocess.run(cmd, check=False, capture_output=True)
+        os.unlink(tmp)
+    except Exception as exc:
+        log(f"chime error: {exc}")
+
+
+def resample(data: bytes, state=None):
+    """Downsample 44100 Hz 16-bit mono PCM to 16000 Hz. Returns (resampled_bytes, new_state)."""
+    resampled, new_state = audioop.ratecv(data, 2, 1, MIC_RATE, VOSK_RATE, state)
+    return resampled, new_state
+
+
+def transcribe(model, audio_bytes: bytes) -> str:
+    """Full Vosk transcription of 44100 Hz captured audio (resampled to 16kHz internally)."""
+    import vosk
+    rec = vosk.KaldiRecognizer(model, VOSK_RATE)
+    chunk_size = MIC_RATE * 2  # 1 s of 44100 Hz 16-bit
+    state = None
+    for i in range(0, len(audio_bytes), chunk_size):
+        chunk = audio_bytes[i:i + chunk_size]
+        resampled, state = resample(chunk, state)
+        rec.AcceptWaveform(resampled)
+    result = json.loads(rec.FinalResult())
+    return result.get("text", "").strip()
+
+
+def run_voice_turn(text: str, voice_cmd: str, dry: bool) -> None:
+    """Send transcribed text to the voice loop (single turn)."""
+    log(f"utterance: {text!r}")
+    if not text:
+        log("empty transcript — skipping")
+        return
+    if dry:
+        log(f"dry_run: would pipe {text!r} to voice loop")
+        return
+    env = os.environ.copy()
+    env["PX_DRY"] = "0"  # real mode inside the voice turn
+    result = subprocess.run(
+        [voice_cmd, "--max-turns", "1"],
+        input=text,
+        text=True,
+        capture_output=False,
+        env=env,
+        check=False,
+    )
+    log(f"voice loop exited rc={result.returncode}")
+
+
+def listen_loop(pa, model, args) -> None:
+    """Main listen loop: wake-word detect → record → transcribe → respond."""
+    import vosk
+    import pyaudio
+
+    device_idx = find_input_device(pa, args.mic)
+    log(f"using mic device idx={device_idx} ({pa.get_device_info_by_index(device_idx)['name']})")
+
+    # Grammar recognizer for wake word (fast, low-CPU)
+    wake_phrase = args.wake_word.lower().strip()
+    grammar = json.dumps([wake_phrase, "[unk]"])
+    wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
+    resample_state = None  # audioop.ratecv state for wake recognizer
+
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=CHANNELS,
+        rate=MIC_RATE,
+        input=True,
+        input_device_index=device_idx,
+        frames_per_buffer=CHUNK,
+    )
+    stream.start_stream()
+    log(f"listening for wake word: '{wake_phrase}'")
+
+    try:
+        while True:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            resampled_data, resample_state = resample(data, resample_state)
+
+            if wake_rec.AcceptWaveform(resampled_data):
+                result = json.loads(wake_rec.Result())
+                text = result.get("text", "")
+                if wake_phrase in text:
+                    log(f"wake word detected: {text!r}")
+                    threading.Thread(
+                        target=play_chime,
+                        args=(args.aplay_device,),
+                        daemon=True,
+                    ).start()
+
+                    # --- Capture utterance ---
+                    captured = []
+                    silence_frames = 0
+                    silence_limit = int(SILENCE_S * MIC_RATE / CHUNK)
+                    max_frames = int(MAX_RECORD_S * MIC_RATE / CHUNK)
+                    log("recording...")
+
+                    for _ in range(max_frames):
+                        chunk = stream.read(CHUNK, exception_on_overflow=False)
+                        captured.append(chunk)
+                        if rms(chunk) < RMS_SILENCE:
+                            silence_frames += 1
+                            if silence_frames >= silence_limit:
+                                break
+                        else:
+                            silence_frames = 0
+
+                    log(f"captured {len(captured)} chunks ({len(captured)*CHUNK/RATE:.1f}s)")
+                    audio_bytes = b"".join(captured)
+                    text_out = transcribe(model, audio_bytes)
+
+                    threading.Thread(
+                        target=run_voice_turn,
+                        args=(text_out, args.voice_cmd, args.dry_run),
+                        daemon=True,
+                    ).start()
+
+                    # Reset wake recognizer
+                    wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
+                    resample_state = None
+                    log(f"listening for wake word: '{wake_phrase}'")
+
+    finally:
+        stream.stop_stream()
+        stream.close()
+
+
+def main(argv) -> int:
+    parser = argparse.ArgumentParser(description="Wake-word listener daemon")
+    parser.add_argument("--wake-word",     default=DEFAULT_WAKE,
+                        help="Wake phrase to listen for (default: 'hey robot')")
+    parser.add_argument("--model-dir",     default=DEFAULT_MODEL,
+                        help="Path to Vosk model directory")
+    parser.add_argument("--mic",           default="USB",
+                        help="Substring to match in mic device name (default: USB)")
+    parser.add_argument("--aplay-device",  default="",
+                        help="ALSA device for chime output (default: system default)")
+    parser.add_argument("--voice-cmd",     default=DEFAULT_VOICE_CMD,
+                        help="Voice loop command to pipe utterances to")
+    parser.add_argument("--dry-run",       action="store_true",
+                        help="Detect and transcribe but do not run voice loop")
+    args = parser.parse_args(argv)
+
+    # PID file
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+    log(f"starting pid={os.getpid()} wake='{args.wake_word}' dry={args.dry_run}")
+
+    def _shutdown(sig, _frame):
+        log(f"signal {sig} — stopping")
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
+
+    # Validate model
+    model_path = Path(args.model_dir)
+    if not model_path.exists():
+        log(f"Vosk model not found at {model_path}")
+        log("Download: wget https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip")
+        log("Then: unzip -d models/ models/vosk-model-small-en-us.zip")
+        return 1
+
+    try:
+        import vosk
+        import pyaudio
+    except ImportError as exc:
+        log(f"missing dependency: {exc}")
+        return 1
+
+    vosk.SetLogLevel(-1)  # suppress Kaldi verbosity
+    log(f"loading model {model_path} ...")
+    model = vosk.Model(str(model_path))
+    log("model loaded")
+
+    pa = pyaudio.PyAudio()
+    try:
+        listen_loop(pa, model, args)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        log(f"fatal: {exc}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    finally:
+        pa.terminate()
+        PID_FILE.unlink(missing_ok=True)
+        log("stopped")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+PY
