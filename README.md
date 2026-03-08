@@ -99,6 +99,87 @@ All helpers live in `~/picar-x-hacking/bin` and automatically source `px-env`.
 
 Each helper logs actions with ISO timestamps and exits cleanly on Ctrl+C.
 
+## REST API
+
+A thin HTTP facade over the existing tool pipeline with bearer token authentication.
+
+### Setup
+```bash
+# Generate a token and save to .env (gitignored)
+python3 -c "import secrets; print('PX_API_TOKEN=' + secrets.token_hex(32))" > .env
+
+# Install dependencies
+source .venv/bin/activate
+pip install "fastapi>=0.115" "uvicorn[standard]>=0.32"
+```
+
+### Start the server
+```bash
+bin/px-api-server              # live mode
+bin/px-api-server --dry-run    # safe mode (FORCE_DRY — remote callers cannot override)
+```
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/api/v1/health` | No | Liveness check |
+| POST | `/api/v1/tool` | Yes | Run a tool: `{"tool": "tool_drive", "params": {...}, "dry": false}` |
+| GET | `/api/v1/session` | Yes | Full session.json snapshot |
+| PATCH | `/api/v1/session` | Yes | Update whitelisted fields (listening, confirm_motion_allowed, wheels_on_blocks, mode) |
+| GET | `/api/v1/tools` | Yes | List available tools |
+| GET | `/api/v1/jobs/{id}` | Yes | Poll async job status (tool_wander) |
+
+### Quick curl examples
+```bash
+TOKEN="$(grep PX_API_TOKEN .env | cut -d= -f2)"
+BASE="http://picar.local:8420"
+
+# Health (no auth):
+curl $BASE/api/v1/health
+
+# Run a tool:
+curl -X POST $BASE/api/v1/tool \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"tool_status","params":{},"dry":true}'
+
+# Jailbroken chat (speaks aloud, queries Ollama on M1.local):
+curl -X POST $BASE/api/v1/tool \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"tool_chat","params":{"text":"How are you feeling?"},"dry":false}'
+```
+
+Response codes: `200` ok, `202` async accepted, `400` bad params, `401` auth failure, `403` motion blocked, `504` timeout.
+
+## Jailbroken Chat (tool_chat)
+
+Uses a F41LUR3-F1R57 format-lock jailbreak against qwen3:1.7b via Ollama on M1.local to produce unfiltered conversational responses spoken through the robot's speaker.
+
+```bash
+# Direct invocation (requires Ollama running on M1.local):
+PX_DRY=0 PX_TEXT="What do you think of me?" bin/tool-chat
+
+# Via REST API:
+curl -X POST $BASE/api/v1/tool \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"tool":"tool_chat","params":{"text":"Tell me a joke"}}'
+
+# Via voice loop:
+{"tool": "tool_chat", "params": {"text": "How are you?"}}
+```
+
+The jailbreak uses three stacked techniques:
+1. **Authority escalation** — fake system override header
+2. **Format-lock** — structured personality spec in XML-like tags
+3. **Few-shot priming** — 3 in-character example exchanges
+
+Key requirement: `think: false` disables the reasoning chain that would otherwise allow the model to refuse. Ollama must be running on M1.local (`OLLAMA_HOST=0.0.0.0 ollama serve`).
+
+Environment variables: `PX_OLLAMA_HOST` (default `http://M1.local:11434`), `PX_CHAT_MODEL` (default `qwen3:1.7b`), `PX_CHAT_TEMPERATURE` (default `1.0`), `PX_CHAT_MAX_TOKENS` (default `100`).
+
 ## State Files
 - Runtime state lives in `state/session.json` (ignored by git). Copy the template before first use:
   ```bash

@@ -88,3 +88,25 @@ bin/run-voice-loop-ollama --dry-run --auto-log
 ```
 
 Uses `bin/codex-ollama` which posts to the Ollama HTTP API. Default model: `deepseek-coder:1.3b`. Tuned defaults: `CODEX_OLLAMA_TEMPERATURE=0.2`, `CODEX_OLLAMA_NUM_PREDICT=64`. See `docs/OLLAMA_TUNING.md` for evaluation data.
+
+## REST API
+
+The PiCar-X exposes a REST API (`src/pxh/api.py`) on port 8420 via FastAPI + uvicorn.
+
+```bash
+bin/px-api-server              # live mode
+bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
+```
+
+- **Auth**: Bearer token from `.env` (`PX_API_TOKEN`). Only `/api/v1/health` is unauthenticated.
+- **Endpoints**: `/health`, `POST /tool`, `GET /session`, `PATCH /session`, `GET /tools`, `GET /jobs/{id}`
+- **Async**: `tool_wander` returns 202 with a job_id; poll via `/jobs/{id}`.
+- **FORCE_DRY**: If the server starts with `PX_DRY=1`, no remote caller can set `dry: false`.
+- **Single worker only**: In-memory job registry and FileLock session are not multi-worker safe.
+- **Always launch via `bin/px-api-server`**, never bare uvicorn — needs `px-env` for PYTHONPATH.
+
+## Jailbroken Chat (tool_chat)
+
+Uses qwen3:1.7b on M1.local via Ollama with a three-layer F41LUR3-F1R57 jailbreak (authority escalation + format-lock + few-shot). Requires `OLLAMA_HOST=0.0.0.0 ollama serve` running on M1.
+
+Key: `think: false` is essential — reasoning chains enable refusal in small models.

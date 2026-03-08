@@ -44,6 +44,7 @@ ALLOWED_TOOLS = {
     "tool_timer",
     "tool_api_start",
     "tool_api_stop",
+    "tool_chat",
 }
 
 TOOL_COMMANDS = {
@@ -70,6 +71,7 @@ TOOL_COMMANDS = {
     "tool_timer":          BIN_DIR / "tool-timer",
     "tool_api_start":     BIN_DIR / "tool-api-start",
     "tool_api_stop":      BIN_DIR / "tool-api-stop",
+    "tool_chat":          BIN_DIR / "tool-chat",
 }
 
 
@@ -409,6 +411,13 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         label   = str(params.get("label", ""))[:100]
         sanitized["PX_TIMER_SECONDS"] = str(seconds)
         sanitized["PX_TIMER_LABEL"]   = label
+    elif tool == "tool_chat":
+        text = params.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise VoiceLoopError("tool_chat requires a non-empty text parameter")
+        if len(text) > 300:
+            text = text[:300]
+        sanitized["PX_TEXT"] = text
     elif tool in ("tool_api_start", "tool_api_stop"):
         pass  # no params required
     else:

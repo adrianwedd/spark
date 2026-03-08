@@ -171,6 +171,29 @@ def test_tool_wander_dry_run(isolated_project):
     assert payload["dry"] is True
 
 
+def test_tool_chat_dry_run(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_TEXT"] = "how are you feeling"
+    stdout = run_tool(["bin/tool-chat"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["dry"] is True
+    assert "model" in payload
+
+
+def test_tool_chat_missing_text(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env.pop("PX_TEXT", None)
+    result = subprocess.run(
+        ["bin/tool-chat"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, check=False, env=env,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
+
+
 def test_px_wake_set_and_pulse(isolated_project):
     env = isolated_project["env"]
     session_path = isolated_project["session_path"]
