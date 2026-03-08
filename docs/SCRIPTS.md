@@ -549,7 +549,7 @@ PX_TEXT="Hello world" PX_DRY=0 bin/tool-voice
 **Environment variables:**
 | Variable | Required | Description |
 |---|---|---|
-| `PX_TEXT` | Yes | Text to speak (max ~180 chars in voice_loop) |
+| `PX_TEXT` | Yes | Text to speak (max 2000 chars in voice_loop) |
 | `PX_DRY` | No (default `1`) | `0` = actually speak, `1` = dry-run |
 | `PX_VOICE_DEVICE` | No | ALSA device (default: `robothat`) |
 | `PX_VOICE_RATE` | No | espeak speaking rate in wpm (default: `150`) |

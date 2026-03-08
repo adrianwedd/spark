@@ -19,7 +19,7 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (53 tests)
+python -m pytest                          # full suite (99 tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
 ```

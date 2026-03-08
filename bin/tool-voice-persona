@@ -96,7 +96,7 @@ def rephrase_via_ollama(text: str, persona: str) -> str:
             # Strip any "GREMLIN:" or "SIREN:" prefix the model might add
             rephrased = re.sub(r'^(GREMLIN|SIREN|Gremlin|Siren)\s*[:\-]\s*', '', rephrased)
             if rephrased and len(rephrased) > 10:
-                return rephrased[:180]
+                return rephrased[:2000]
             return text  # fallback if rephrasing failed
     except Exception:
         return text  # Ollama down, pass through original

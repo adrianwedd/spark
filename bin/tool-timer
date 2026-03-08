@@ -101,7 +101,7 @@ def main() -> int:
     if label:
         confirm_text += f", {label}"
     confirm_env = os.environ.copy()
-    confirm_env["PX_TEXT"] = confirm_text[:180]
+    confirm_env["PX_TEXT"] = confirm_text[:2000]
     subprocess.run([str(TOOL_VOICE)], capture_output=True, check=False, env=confirm_env)
 
     payload = {

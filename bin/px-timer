@@ -68,7 +68,7 @@ def main() -> int:
         # Speak completion message
         message = f"Timer done! {label}" if label else "Timer done!"
         env = os.environ.copy()
-        env["PX_TEXT"] = message[:180]
+        env["PX_TEXT"] = message[:2000]
         subprocess.run([str(TOOL_VOICE)], capture_output=True, check=False, env=env)
 
         result = {"status": "ok", "seconds": seconds, "label": label, "dry": dry_mode}

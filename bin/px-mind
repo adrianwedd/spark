@@ -376,7 +376,7 @@ def expression(thought: dict, dry: bool) -> None:
             )
 
         elif action == "comment":
-            env["PX_TEXT"] = text[:180]
+            env["PX_TEXT"] = text[:2000]
             subprocess.run(
                 [str(BIN_DIR / "tool-voice")],
                 capture_output=True, text=True, check=False, env=env, timeout=20,

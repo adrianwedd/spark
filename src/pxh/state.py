@@ -31,6 +31,7 @@ def default_state() -> Dict[str, Any]:
         "last_prompt_excerpt": None,
         "last_model_action": None,
         "last_tool_payload": None,
+        "persona": None,
         "listening": False,
         "listening_since": None,
         "history": [],
