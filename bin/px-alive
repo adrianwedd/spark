@@ -142,6 +142,7 @@ def scan_chat(turns: int = SCAN_CHAT_TURNS, dry: bool = False) -> None:
 
         env = os.environ.copy()
         env["PX_TEXT"] = prompt
+        env["PX_DRY"] = "0"  # tool-chat defaults dry=True when PX_DRY unset; force live
         try:
             result = subprocess.run(
                 [str(tool_chat)],
