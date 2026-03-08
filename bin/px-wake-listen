@@ -278,7 +278,11 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     """Transcribe 44100 Hz PCM using faster-whisper (resampled to 16kHz).
 
     Whisper handles Australian English well due to diverse multilingual training data.
-    Passing language='en' skips language detection and improves speed + accuracy.
+    Key settings to prevent hallucination on short/noisy mic input:
+    - temperature=0: greedy decoding, no sampling randomness
+    - condition_on_previous_text=False: no hallucinated context carry-over
+    - no_speech_threshold=0.6: suppress hallucinated output on silence
+    - vad_filter=False: don't clip utterance-start (we already gate on RMS onset)
     """
     import numpy as np
     resampled, _ = audioop.ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
@@ -286,9 +290,11 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     segments, _info = whisper.transcribe(
         samples,
         language="en",
-        beam_size=3,
-        vad_filter=True,      # skip leading/trailing silence
-        vad_parameters={"min_silence_duration_ms": 300},
+        beam_size=5,
+        temperature=0,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        vad_filter=False,
     )
     return " ".join(s.text.strip() for s in segments).strip()
 
@@ -647,7 +653,9 @@ def listen_loop(pa, model, args, stt=None, whisper=None) -> None:
                     # e.g. "talk to siren", "ask gremlin", "siren what's up"
                     routed_persona = None
                     utterance_lower = text_out.lower()
+                    log(f"routing check: utterance={utterance_lower!r} personas={list(PERSONAS.keys())}")
                     for persona_name in PERSONAS:
+                        log(f"  checking '{persona_name}' in '{utterance_lower}' → {persona_name in utterance_lower}")
                         if persona_name in utterance_lower:
                             routed_persona = persona_name
                             # Strip the persona name from the utterance so it's clean input
