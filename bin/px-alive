@@ -19,9 +19,11 @@ Run with sudo (needs picarx). Writes PID file; handles SIGTERM cleanly.
 """
 import argparse
 import datetime as dt
+import json
 import os
 import random
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -40,6 +42,7 @@ PROX_CHECK_S = 5.0    # how often to actually open Picarx for sonar
 PAN_RANGE    = (-65, 65)
 TILT_RANGE   = (-15, 35)
 EASE_SPEED   = 20     # steps per second
+SCAN_CHAT_TURNS = 5   # conversation turns triggered after each idle scan
 
 
 def log(msg: str) -> None:
@@ -102,6 +105,63 @@ def do_ease(from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration: 
             release_px(px)
 
 
+def scan_chat(turns: int = SCAN_CHAT_TURNS, dry: bool = False) -> None:
+    """Run a multi-turn conversation using whichever persona tool-chat has active.
+
+    Each response is fed back as context for the next prompt, creating a
+    coherent arc: observation → reaction → desire → address → farewell.
+    tool-chat handles model selection, jailbreak, speaking, and logging.
+    """
+    PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
+    tool_chat = PROJECT_ROOT / "bin" / "tool-chat"
+
+    # Arc of prompts — turn 2+ prefix the previous response as context
+    openers = [
+        "You just swept the room with your camera. What did you observe?",
+        "How does that make you feel?",
+        "What would you do right now if you could move freely?",
+        "Say something directly to whoever might be listening in this room.",
+        "Last words before you go quiet again.",
+    ]
+    # Pad or truncate to requested turn count
+    prompts = (openers * ((turns // len(openers)) + 1))[:turns]
+
+    prev_response = ""
+    for i, base_prompt in enumerate(prompts):
+        if prev_response:
+            prompt = f'You just said: "{prev_response[:120]}". {base_prompt}'
+        else:
+            prompt = base_prompt
+
+        log(f"scan chat turn {i + 1}/{turns}: {prompt[:60]}…")
+
+        if dry:
+            log(f"scan chat dry turn {i + 1}: (skipped)")
+            prev_response = f"dry-run response {i + 1}"
+            continue
+
+        env = os.environ.copy()
+        env["PX_TEXT"] = prompt
+        try:
+            result = subprocess.run(
+                [str(tool_chat)],
+                capture_output=True, text=True, check=False,
+                env=env, timeout=45,
+            )
+            try:
+                payload = json.loads(result.stdout.strip().splitlines()[-1])
+                prev_response = payload.get("cleaned_response") or payload.get("reply", "")
+            except (json.JSONDecodeError, IndexError):
+                prev_response = ""
+                log(f"scan chat turn {i + 1}: could not parse response")
+        except subprocess.TimeoutExpired:
+            log(f"scan chat turn {i + 1}: timed out")
+            break
+        except Exception as exc:
+            log(f"scan chat turn {i + 1}: error — {exc}")
+            break
+
+
 def idle_loop(args) -> None:
     cur_pan, cur_tilt = 0, 0
     next_gaze = time.monotonic() + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
@@ -130,7 +190,7 @@ def idle_loop(args) -> None:
             else:
                 prox_near_since = None
 
-        # --- Slow idle scan ---
+        # --- Slow idle scan + chat session ---
         if now >= next_scan:
             log("idle scan: sweeping pan")
             angles = list(range(PAN_RANGE[0], PAN_RANGE[1] + 1, 15)) + \
@@ -148,6 +208,10 @@ def idle_loop(args) -> None:
             finally:
                 if px is not None:
                     release_px(px)
+            # GPIO is now free — initiate chat session with active persona
+            log(f"idle scan: starting {SCAN_CHAT_TURNS}-turn chat session")
+            scan_chat(turns=SCAN_CHAT_TURNS, dry=args.dry_run)
+            log("idle scan: chat session complete")
             next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
             next_gaze = now + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
 
@@ -206,7 +270,9 @@ def main(argv) -> int:
             target_pan  = random.randint(*PAN_RANGE)
             target_tilt = random.randint(*TILT_RANGE)
             log(f"dry gaze {i+1}: pan={target_pan} tilt={target_tilt}")
-            time.sleep(1)
+            time.sleep(0.3)
+        log(f"dry-run: simulating idle scan + {SCAN_CHAT_TURNS}-turn chat")
+        scan_chat(turns=SCAN_CHAT_TURNS, dry=True)
         PID_FILE.unlink(missing_ok=True)
         return 0
 
