@@ -620,7 +620,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None) -> None:
     )
     stream.start_stream()
     persona_names = [k.split()[-1] for k in PERSONA_WAKE]
-    log(f"listening for wake word: '{wake_phrase}' (say 'siren' or 'gremlin' after wake to switch persona)")
+    log(f"listening for wake word: '{wake_phrase}' (say 'vixen' or 'gremlin' after wake to switch persona)")
 
     try:
         while True:
