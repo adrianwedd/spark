@@ -106,9 +106,11 @@ class SessionPatch(BaseModel):
     confirm_motion_allowed: Optional[bool] = None
     wheels_on_blocks: Optional[bool] = None
     mode: Optional[str] = None
+    persona: Optional[str] = None  # "siren", "gremlin", or "claude" (clears persona)
 
 
-PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode"}
+PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona"}
+VALID_PERSONAS = {"siren", "gremlin", "claude", ""}  # "claude" or "" clears persona
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -155,6 +157,15 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
             fields[key] = value
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields provided")
+    # Validate and normalize persona
+    if "persona" in fields:
+        p = (fields["persona"] or "").lower().strip()
+        if p in ("claude", ""):
+            fields["persona"] = None  # clear persona → default Claude
+        elif p not in VALID_PERSONAS:
+            raise HTTPException(status_code=400, detail=f"invalid persona: {p!r} (valid: siren, gremlin, claude)")
+        else:
+            fields["persona"] = p
     return update_session(fields=fields)
 
 

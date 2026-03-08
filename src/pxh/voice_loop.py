@@ -77,6 +77,29 @@ TOOL_COMMANDS = {
 }
 
 
+# Persona voice settings — injected into tool env when persona is active
+# Persona prompt files — used instead of default system prompt when persona active
+PERSONA_PROMPTS = {
+    "siren": PROJECT_ROOT / "docs" / "prompts" / "persona-siren.md",
+    "gremlin": PROJECT_ROOT / "docs" / "prompts" / "persona-gremlin.md",
+}
+
+PERSONA_VOICE_ENV = {
+    "siren": {
+        "PX_PERSONA": "siren",
+        "PX_VOICE_VARIANT": "en+f4",
+        "PX_VOICE_PITCH": "72",
+        "PX_VOICE_RATE": "135",
+    },
+    "gremlin": {
+        "PX_PERSONA": "gremlin",
+        "PX_VOICE_VARIANT": "en+croak",
+        "PX_VOICE_PITCH": "20",
+        "PX_VOICE_RATE": "180",
+    },
+}
+
+
 class VoiceLoopError(Exception):
     """Domain-specific errors."""
 
@@ -443,6 +466,11 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool) -> Tu
     # else: leave PX_DRY as inherited from the operator's environment
     for key, value in env_overrides.items():
         env[key] = value
+    # Inject persona voice settings if a persona is active in session
+    session_persona = load_session().get("persona") or ""
+    if session_persona and session_persona in PERSONA_VOICE_ENV:
+        for k, v in PERSONA_VOICE_ENV[session_persona].items():
+            env[k] = v
 
     result = subprocess.run(
         [str(command_path)],
@@ -487,7 +515,17 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             break
 
         heartbeat_q.put(time.monotonic())
-        prompt = build_model_prompt(system_prompt, session, user_text)
+        # Use persona prompt if one is active in session
+        active_persona = (session.get("persona") or "").lower().strip()
+        if active_persona and active_persona in PERSONA_PROMPTS:
+            persona_prompt_path = PERSONA_PROMPTS[active_persona]
+            if persona_prompt_path.exists():
+                current_prompt = read_prompt(persona_prompt_path)
+            else:
+                current_prompt = system_prompt
+        else:
+            current_prompt = system_prompt
+        prompt = build_model_prompt(current_prompt, session, user_text)
         prompt_excerpt = prompt[:800]
 
         heartbeat_q.put(time.monotonic())
