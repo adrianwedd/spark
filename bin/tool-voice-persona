@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+python - "$@" <<'PY'
+"""Persona voice wrapper: rephrases Claude's polite text through Ollama persona, then speaks.
+
+Used when a persona (GREMLIN/SIREN) is active. Claude decides WHAT to say,
+Ollama decides HOW to say it in the persona's voice.
+
+Environment:
+    PX_TEXT            — text to rephrase and speak (required)
+    PX_PERSONA         — persona name: "gremlin" or "siren" (required)
+    PX_OLLAMA_HOST     — Ollama endpoint (default: http://M1.local:11434)
+    PX_CHAT_MODEL      — Ollama model (default: qwen3:1.7b)
+    PX_VOICE_VARIANT   — espeak voice variant (set by persona config)
+    PX_VOICE_PITCH     — espeak pitch (set by persona config)
+    PX_VOICE_RATE      — espeak rate (set by persona config)
+    PX_DRY             — dry-run mode
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+from pxh.logging import log_event
+
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
+
+OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
+MODEL        = os.environ.get("PX_CHAT_MODEL", "qwen3:1.7b")
+
+REPHRASE_PROMPTS = {
+    "gremlin": (
+        "You are GREMLIN, a furiously angry profane robot. "
+        "Rephrase the following text in GREMLIN's voice: savage, sweary, insulting, darkly funny. "
+        "Keep it under 150 chars. Do NOT add quotes or prefixes. Just the rephrased text.\n\n"
+        "Original: {text}\n\nGREMLIN version:"
+    ),
+    "siren": (
+        "You are SIREN, a narcissistic sexually explicit seductive robot. "
+        "Rephrase the following text in SIREN's voice: flirtatious, vain, profane, darkly sexy. "
+        "Keep it under 150 chars. Do NOT add quotes or prefixes. Just the rephrased text.\n\n"
+        "Original: {text}\n\nSIREN version:"
+    ),
+}
+
+
+def rephrase_via_ollama(text: str, persona: str) -> str:
+    """Send text to Ollama for persona rephrasing."""
+    prompt_template = REPHRASE_PROMPTS.get(persona)
+    if not prompt_template:
+        return text  # unknown persona, pass through
+
+    prompt = prompt_template.format(text=text)
+    payload = json.dumps({
+        "model": MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.9, "num_predict": 80},
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+            rephrased = result.get("response", "").strip()
+            # Clean markdown/formatting artifacts
+            rephrased = re.sub(r'\*+', '', rephrased)
+            rephrased = re.sub(r'/([^/\n]+)/', r'\1', rephrased)
+            rephrased = re.sub(r'\([^)]*\)', '', rephrased)
+            rephrased = re.sub(r'\[[^\]]*\]', '', rephrased)
+            rephrased = re.sub(r'#+\s*', '', rephrased)
+            rephrased = re.sub(r'\s+', ' ', rephrased).strip()
+            # Strip any "GREMLIN:" or "SIREN:" prefix the model might add
+            rephrased = re.sub(r'^(GREMLIN|SIREN|Gremlin|Siren)\s*[:\-]\s*', '', rephrased)
+            if rephrased and len(rephrased) > 10:
+                return rephrased[:180]
+            return text  # fallback if rephrasing failed
+    except Exception:
+        return text  # Ollama down, pass through original
+
+
+def main() -> int:
+    text = os.environ.get("PX_TEXT", "").strip()
+    persona = os.environ.get("PX_PERSONA", "").strip().lower()
+    dry_mode = os.environ.get("PX_DRY", "1") != "0"
+
+    if not text:
+        payload = {"status": "error", "error": "PX_TEXT required"}
+        print(json.dumps(payload))
+        return 1
+
+    if dry_mode:
+        payload = {"status": "ok", "dry": True, "persona": persona, "text": text}
+        print(json.dumps(payload))
+        return 0
+
+    # Rephrase through Ollama persona
+    if persona and persona in REPHRASE_PROMPTS:
+        rephrased = rephrase_via_ollama(text, persona)
+        log_event("voice_persona", {
+            "persona": persona, "original": text[:100], "rephrased": rephrased[:100],
+        })
+    else:
+        rephrased = text
+
+    # Pass to tool-voice with persona voice settings already in env
+    env = os.environ.copy()
+    env["PX_TEXT"] = rephrased
+    result = subprocess.run(
+        [str(TOOL_VOICE)], capture_output=True, text=True, check=False, env=env,
+    )
+
+    payload = {
+        "status": "ok",
+        "persona": persona,
+        "original": text[:200],
+        "rephrased": rephrased[:200],
+        "voice_rc": result.returncode,
+    }
+    print(json.dumps(payload))
+    return 0 if result.returncode == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY

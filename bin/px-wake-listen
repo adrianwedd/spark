@@ -53,11 +53,29 @@ END_PHRASES = {"stop", "bye", "goodbye", "that's all", "done", "end", "no thanks
 DEFAULT_MODEL = str(PROJECT_ROOT / "models" / "vosk-model-small-en-us-0.15")
 DEFAULT_WAKE  = "hey robot"
 
-# Persona wake phrases → direct chat tool routing (bypasses full voice loop)
-PERSONA_WAKE = {
-    "hey siren":  "tool-chat-siren",
-    "hey gremlin": "tool-chat",
+# Persona config: prompt file, voice settings, and fallback chat tool
+PERSONAS = {
+    "siren": {
+        "prompt": str(PROJECT_ROOT / "docs" / "prompts" / "persona-siren.md"),
+        "chat_tool": str(PROJECT_ROOT / "bin" / "tool-chat-siren"),
+        "voice_env": {
+            "PX_VOICE_VARIANT": "en+f4",
+            "PX_VOICE_PITCH": "72",
+            "PX_VOICE_RATE": "135",
+        },
+    },
+    "gremlin": {
+        "prompt": str(PROJECT_ROOT / "docs" / "prompts" / "persona-gremlin.md"),
+        "chat_tool": str(PROJECT_ROOT / "bin" / "tool-chat"),
+        "voice_env": {
+            "PX_VOICE_VARIANT": "en+croak",
+            "PX_VOICE_PITCH": "20",
+            "PX_VOICE_RATE": "180",
+        },
+    },
 }
+# Legacy mapping used for utterance keyword routing
+PERSONA_WAKE = {f"hey {name}": cfg["chat_tool"] for name, cfg in PERSONAS.items()}
 DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-claude")
 DEFAULT_STT_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-streaming-zipformer-en-2023-06-26")
 
@@ -340,36 +358,71 @@ def record_followup(stream, model, stt=None) -> str:
     return ""  # timeout — no speech
 
 
-def run_persona_conversation(persona_tool: str, initial_text: str, dry: bool,
-                             stream, model, aplay_device: str, max_turns: int, stt=None) -> None:
-    """Run a multi-turn conversation with a persona chat tool (SIREN, GREMLIN).
+def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
+                             stream, model, aplay_device: str, max_turns: int,
+                             voice_cmd: str, stt=None) -> None:
+    """Run a multi-turn conversation using Claude voice loop with a persona prompt.
 
-    Simpler than run_conversation: calls the chat tool directly with PX_TEXT
-    instead of piping through the full Claude voice loop.
+    Uses the full Claude tool-calling pipeline but with an alternate system
+    prompt (persona personality) and voice settings (distinct espeak voice).
+    Falls back to the raw chat tool if the persona prompt file is missing.
     """
     if not initial_text:
         log("empty transcript — skipping persona conversation")
         return
+
+    cfg = PERSONAS.get(persona_name)
+    if not cfg:
+        log(f"unknown persona: {persona_name}")
+        return
+
     if dry:
-        log(f"dry_run: persona {persona_tool} with {initial_text!r} ({max_turns} turns max)")
+        log(f"dry_run: persona {persona_name} with {initial_text!r} ({max_turns} turns max)")
         return
 
     had_alive = _stop_alive()
-    tool_path = str(PROJECT_ROOT / "bin" / persona_tool)
     env = os.environ.copy()
     env["PX_DRY"] = "0"
+
+    # Set persona voice so all tool_voice/tool_perform calls use the right voice
+    for k, v in cfg["voice_env"].items():
+        env[k] = v
+
+    # Use Claude voice loop with persona prompt if available
+    prompt_path = cfg["prompt"]
+    use_voice_loop = Path(prompt_path).exists()
+
+    if use_voice_loop:
+        persona_voice_cmd = voice_cmd  # same claude bridge
+        log(f"persona {persona_name}: using Claude voice loop with {Path(prompt_path).name}")
+    else:
+        log(f"persona {persona_name}: prompt missing, falling back to chat tool")
 
     current_text = initial_text
     try:
         for turn in range(1, max_turns + 1):
-            log(f"persona {persona_tool} turn {turn}/{max_turns}: {current_text!r}")
-            env["PX_TEXT"] = current_text
-            result = subprocess.run(
-                [tool_path], capture_output=True, text=True, check=False, env=env,
-            )
-            log(f"persona tool rc={result.returncode}")
+            log(f"persona {persona_name} turn {turn}/{max_turns}: {current_text!r}")
+
+            if use_voice_loop:
+                result = subprocess.run(
+                    [persona_voice_cmd, "--prompt", prompt_path, "--max-turns", "3"],
+                    input=current_text,
+                    text=True,
+                    capture_output=False,
+                    env=env,
+                    check=False,
+                )
+                log(f"persona voice loop rc={result.returncode}")
+            else:
+                # Fallback: raw Ollama chat tool
+                env["PX_TEXT"] = current_text
+                result = subprocess.run(
+                    [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
+                )
+                log(f"persona chat tool rc={result.returncode}")
+
             if result.returncode != 0:
-                log(f"persona tool error: {result.stderr[:200]}")
+                log(f"persona error (rc={result.returncode})")
                 break
 
             if turn >= max_turns:
@@ -388,11 +441,21 @@ def run_persona_conversation(persona_tool: str, initial_text: str, dry: bool,
             log(f"persona conversation: follow-up: {follow_text!r}")
 
             if any(phrase in follow_text.lower() for phrase in END_PHRASES):
-                log("persona conversation: end phrase detected — final turn")
-                env["PX_TEXT"] = follow_text
-                subprocess.run(
-                    [tool_path], capture_output=True, text=True, check=False, env=env,
-                )
+                log("persona conversation: end phrase — final turn")
+                if use_voice_loop:
+                    subprocess.run(
+                        [persona_voice_cmd, "--prompt", prompt_path, "--max-turns", "3"],
+                        input=follow_text,
+                        text=True,
+                        capture_output=False,
+                        env=env,
+                        check=False,
+                    )
+                else:
+                    env["PX_TEXT"] = follow_text
+                    subprocess.run(
+                        [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
+                    )
                 break
 
             current_text = follow_text
@@ -527,11 +590,9 @@ def listen_loop(pa, model, args, stt=None) -> None:
                     # e.g. "talk to siren", "ask gremlin", "siren what's up"
                     routed_persona = None
                     utterance_lower = text_out.lower()
-                    for keyword, persona_tool in PERSONA_WAKE.items():
-                        # PERSONA_WAKE keys are "hey siren" etc — extract the name
-                        persona_name = keyword.split()[-1]
+                    for persona_name in PERSONAS:
                         if persona_name in utterance_lower:
-                            routed_persona = persona_tool
+                            routed_persona = persona_name
                             # Strip the persona name from the utterance so it's clean input
                             import re as _re
                             clean_utterance = _re.sub(
@@ -540,15 +601,16 @@ def listen_loop(pa, model, args, stt=None) -> None:
                             ).strip()
                             if not clean_utterance:
                                 clean_utterance = "hello"
-                            log(f"persona routed: {persona_name} → {persona_tool} (utterance: {clean_utterance!r})")
+                            log(f"persona routed: {persona_name} (utterance: {clean_utterance!r})")
                             text_out = clean_utterance
                             break
 
                     if routed_persona:
-                        # --- Persona conversation (direct chat tool) ---
+                        # --- Persona conversation (Claude voice loop + persona prompt) ---
                         run_persona_conversation(
                             routed_persona, text_out, args.dry_run,
-                            stream, model, args.aplay_device, args.convo_turns, stt,
+                            stream, model, args.aplay_device, args.convo_turns,
+                            args.voice_cmd, stt,
                         )
                     else:
                         # --- Standard Claude conversation ---
@@ -590,9 +652,9 @@ def main(argv) -> int:
     # PID file
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
-    persona_phrases = ", ".join(f"'{p}'" for p in PERSONA_WAKE)
+    persona_names = list(PERSONAS.keys())
     log(f"starting pid={os.getpid()} dry={args.dry_run}")
-    log(f"wake phrases: '{args.wake_word}' (claude), {persona_phrases} (personas)")
+    log(f"personas available: {', '.join(persona_names)} (say name after wake word)")
 
     def _shutdown(sig, _frame):
         log(f"signal {sig} — stopping")

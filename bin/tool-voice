@@ -37,6 +37,20 @@ def main() -> int:
         print(json.dumps(payload))
         return 1
 
+    # If a persona is active, reroute through the persona voice wrapper
+    # which rephrases text via Ollama before speaking
+    persona = os.environ.get("PX_PERSONA", "")
+    if persona and not os.environ.get("_PX_VOICE_PERSONA_DONE"):
+        persona_wrapper = Path(os.environ.get("PROJECT_ROOT", ".")) / "bin" / "tool-voice-persona"
+        if persona_wrapper.exists():
+            env = os.environ.copy()
+            env["_PX_VOICE_PERSONA_DONE"] = "1"  # prevent infinite recursion
+            result = subprocess.run(
+                [str(persona_wrapper)], capture_output=True, text=True, check=False, env=env,
+            )
+            print(result.stdout, end="")
+            return result.returncode
+    
     dry_mode = os.environ.get("PX_DRY", "1") != "0"
     payload = {
         "status": "ok",
