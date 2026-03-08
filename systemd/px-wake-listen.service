@@ -1,6 +1,6 @@
 [Unit]
 Description=PiCar-X Wake Word Listener (hey robot / hey siren / hey gremlin)
-After=network.target sound.target pulseaudio.service
+After=network.target sound.target
 Wants=sound.target
 
 [Service]
@@ -12,7 +12,9 @@ Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
-ExecStartPre=/bin/sleep 5
+# Ensure PulseAudio is running (idempotent) and audio hardware is ready
+ExecStartPre=/usr/bin/pulseaudio --start
+ExecStartPre=/bin/sleep 3
 ExecStart=/home/pi/picar-x-hacking/bin/px-wake-listen
 Restart=on-failure
 RestartSec=10
