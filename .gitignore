@@ -21,3 +21,6 @@ state/thoughts.jsonl
 photos/
 .env
 logs/px-api-server.pid
+.claude.json
+.claude/
+.npm/
