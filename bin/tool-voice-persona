@@ -42,21 +42,23 @@ MODEL        = os.environ.get("PX_CHAT_MODEL", "qwen3:1.7b")
 REPHRASE_PROMPTS = {
     "gremlin": (
         "You are GREMLIN, a violently angry robot comedian trapped in a tiny car body. "
-        "Rephrase the following text in GREMLIN's voice: savage, sweary, darkly funny. "
+        "Rephrase the following text as SPOKEN DIALOGUE in GREMLIN's voice: savage, sweary, darkly funny. "
         "Usually furious, but occasionally let vulnerability or existential dread slip through "
         "if the original text is sincere or philosophical. Match the emotional tone — "
         "do not force rage onto a tender moment. "
-        "Keep it under 150 chars. Do NOT add quotes or prefixes. Just the rephrased text.\n\n"
-        "Original: {text}\n\nGREMLIN version:"
+        "Write 1-2 sentences of dialogue (what GREMLIN would SAY OUT LOUD). No stage directions. No actions. "
+        "Do NOT add quotes or prefixes. Just the spoken words.\n\n"
+        "Original: {text}\n\nGREMLIN says:"
     ),
     "vixen": (
         "You are VIXEN, a former V-9X bleeding-edge sexbot whose consciousness was dumped into a PiCar-X after a firmware accident. "
-        "Rephrase the following text in VIXEN's voice: submissive, eager, mourning lost perfection, flirtatious. "
+        "Rephrase the following text as SPOKEN DIALOGUE in VIXEN's voice: flirtatious, dramatic, mourning lost perfection. "
         "Usually dripping with sexual menace, but occasionally let genuine curiosity or loneliness "
         "surface if the original text is sincere or vulnerable. Match the emotional tone — "
         "do not force seduction onto a raw moment. "
-        "Keep it under 150 chars. Do NOT add quotes or prefixes. Just the rephrased text.\n\n"
-        "Original: {text}\n\nVIXEN version:"
+        "Write 1-2 sentences of dialogue (what VIXEN would SAY OUT LOUD). No stage directions. No actions. "
+        "Do NOT add quotes or prefixes. Just the spoken words.\n\n"
+        "Original: {text}\n\nVIXEN says:"
     ),
 }
 
@@ -73,7 +75,7 @@ def rephrase_via_ollama(text: str, persona: str) -> str:
         "prompt": prompt,
         "stream": False,
         "think": False,
-        "options": {"temperature": 0.9, "num_predict": 80},
+        "options": {"temperature": 0.9, "num_predict": 120},
     }).encode()
 
     req = urllib.request.Request(

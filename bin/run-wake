@@ -5,8 +5,9 @@
 # Environment:
 #   PX_WAKE_WORD      Wake phrase (default: "hey robot")
 #   PX_WAKE_MODEL     Vosk grammar model dir (default: vosk-model-small-en-us-0.15)
-#   PX_WHISPER_MODEL  faster-whisper snapshot dir (preferred STT, best AU accent)
-#   PX_STT_MODEL      Sherpa-onnx Zipformer dir (fallback STT if whisper unavailable)
+#   PX_SENSEVOICE_MODEL  SenseVoice-Small dir (fastest STT, non-autoregressive)
+#   PX_WHISPER_MODEL     faster-whisper snapshot dir (fallback STT, best AU accent)
+#   PX_STT_MODEL         Sherpa-onnx Zipformer dir (fallback STT if whisper unavailable)
 #   PX_VOICE_DEVICE   ALSA device for chime output
 set -euo pipefail
 
@@ -25,5 +26,6 @@ exec "$SCRIPT_DIR/px-wake-listen" \
     --stt-model-dir "$STT_DIR" \
     --wake-word "$WAKE_WORD" \
     ${APLAY_DEV:+--aplay-device "$APLAY_DEV"} \
+    ${PX_SENSEVOICE_MODEL:+--sensevoice-model "$PX_SENSEVOICE_MODEL"} \
     ${PX_WHISPER_MODEL:+--whisper-model "$PX_WHISPER_MODEL"} \
     "$@"

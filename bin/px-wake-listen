@@ -78,6 +78,7 @@ PERSONAS = {
 PERSONA_WAKE = {f"hey {name}": cfg["chat_tool"] for name, cfg in PERSONAS.items()}
 DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-claude")
 DEFAULT_STT_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-streaming-zipformer-en-2023-06-26")
+DEFAULT_SENSEVOICE_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
 
 def _find_whisper_model() -> str:
     """Auto-detect the faster-whisper-base.en snapshot directory."""
@@ -325,6 +326,90 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     return text
 
 
+def load_sensevoice(model_dir: str):
+    """Load SenseVoice-Small via sherpa-onnx OfflineRecognizer. Returns None if unavailable.
+
+    SenseVoice is non-autoregressive — processes entire utterance in a single forward
+    pass with no beam search. Significantly faster than autoregressive models (Whisper).
+    """
+    try:
+        import sherpa_onnx
+        path = Path(model_dir)
+        if not path.exists():
+            return None
+        model = str(path / "model.int8.onnx")
+        tokens = str(path / "tokens.txt")
+        if not Path(model).exists() or not Path(tokens).exists():
+            return None
+        return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=model,
+            tokens=tokens,
+            num_threads=4,
+            sample_rate=VOSK_RATE,
+            language="en",
+            use_itn=False,
+            provider="cpu",
+        )
+    except Exception as exc:
+        try:
+            import datetime as _dt
+            print(f"{_dt.datetime.now().isoformat(timespec='seconds')} [wake] SenseVoice load error: {exc}", flush=True)
+        except Exception:
+            pass
+        return None
+
+
+import re as _sensevoice_re
+_SENSEVOICE_TAG_RE = _sensevoice_re.compile(r"<\|[^|]+\|>")
+
+def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
+    """Transcribe 44100 Hz PCM using SenseVoice (non-autoregressive, single forward pass).
+
+    Strips emotion/event tags (<|HAPPY|>, <|Speech|>, etc.) and applies
+    the same anti-hallucination filters as Whisper.
+    """
+    import numpy as np
+    resampled, _ = audioop.ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
+
+    stream = sv.create_stream()
+    stream.accept_waveform(VOSK_RATE, samples)
+    sv.decode_stream(stream)
+    text = stream.result.text.strip()
+
+    # Strip SenseVoice special tags: <|HAPPY|>, <|NEUTRAL|>, <|Speech|>, etc.
+    text = _SENSEVOICE_TAG_RE.sub("", text).strip()
+
+    # Non-ASCII dominant → hallucination (CJK leaking through)
+    ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
+    if text != ascii_text:
+        if len(ascii_text) < len(text) * 0.5:
+            log(f"sensevoice hallucination (non-ASCII dominant): {text!r}")
+            return ""
+        log(f"sensevoice stripped non-ASCII: {text!r} → {ascii_text!r}")
+        text = ascii_text
+
+    # Phantom phrase rejection
+    PHANTOM_PHRASES = {
+        "thank you", "thank you.", "thanks for watching", "thanks for watching.",
+        "you", "the", "bye", "bye.", "so", "i'm sorry",
+        "subscribe", "like and subscribe",
+    }
+    if text.lower().strip(".!? ") in PHANTOM_PHRASES:
+        log(f"sensevoice hallucination (phantom): {text!r}")
+        return ""
+
+    # Repetitive text rejection
+    words = text.lower().split()
+    if len(words) >= 6:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.3:
+            log(f"sensevoice hallucination (repetitive): {text!r}")
+            return ""
+
+    return text
+
+
 def _alive_pid() -> int | None:
     """Return px-alive PID if running, else None."""
     try:
@@ -422,8 +507,10 @@ def record_utterance(stream, max_s: float, silence_s: float) -> bytes:
     return b"".join(captured)
 
 
-def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None) -> str:
-    """Transcribe audio using the best available backend: whisper > sherpa > vosk."""
+def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice=None) -> str:
+    """Transcribe audio using the best available backend: sensevoice > whisper > sherpa > vosk."""
+    if sensevoice is not None:
+        return transcribe_sensevoice(sensevoice, audio_bytes)
     if whisper is not None:
         return transcribe_whisper(whisper, audio_bytes)
     if stt is not None:
@@ -431,11 +518,11 @@ def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None) -> str:
     return transcribe(model, audio_bytes)
 
 
-def record_followup(stream, model, stt=None, whisper=None) -> str:
+def record_followup(stream, model, stt=None, whisper=None, sensevoice=None) -> str:
     """Wait up to FOLLOWUP_TIMEOUT_S for speech onset, then record and transcribe.
 
-    Uses faster-whisper if available (best AU accent support), then sherpa-onnx,
-    then Vosk. Returns transcribed text, or '' if no speech detected within timeout.
+    Uses SenseVoice if available (fastest), then faster-whisper (best AU accent),
+    then sherpa-onnx, then Vosk. Returns transcribed text, or '' if no speech detected.
     """
     timeout_chunks = int(FOLLOWUP_TIMEOUT_S * MIC_RATE / CHUNK)
     # Phase 1: wait for speech onset
@@ -446,13 +533,13 @@ def record_followup(stream, model, stt=None, whisper=None) -> str:
             onset = [data]
             rest = record_utterance(stream, FOLLOWUP_MAX_S, FOLLOWUP_SILENCE_S)
             audio = b"".join(onset) + rest
-            return _do_transcribe(audio, model, stt, whisper)
+            return _do_transcribe(audio, model, stt, whisper, sensevoice)
     return ""  # timeout — no speech
 
 
 def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
                              stream, model, aplay_device: str, max_turns: int,
-                             voice_cmd: str, stt=None, whisper=None) -> None:
+                             voice_cmd: str, stt=None, whisper=None, sensevoice=None) -> None:
     """Run a multi-turn conversation using Claude voice loop with a persona prompt.
 
     Uses the full Claude tool-calling pipeline but with an alternate system
@@ -505,7 +592,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             flush_stream(stream)
             play_chime_followup(aplay_device)
             log("persona conversation: listening for follow-up...")
-            follow_text = record_followup(stream, model, stt, whisper)
+            follow_text = record_followup(stream, model, stt, whisper, sensevoice)
 
             if not follow_text:
                 log("persona conversation: silence — ending")
@@ -529,7 +616,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
 
 
 def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
-                     stream, model, aplay_device: str, max_turns: int, stt=None, whisper=None) -> None:
+                     stream, model, aplay_device: str, max_turns: int, stt=None, whisper=None, sensevoice=None) -> None:
     """Run a multi-turn conversation. Blocks wake detection for its duration."""
     if not initial_text:
         log("empty transcript — skipping")
@@ -568,7 +655,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
 
             # Listen for follow-up
             log("conversation: listening for follow-up...")
-            follow_text = record_followup(stream, model, stt, whisper)
+            follow_text = record_followup(stream, model, stt, whisper, sensevoice)
 
             if not follow_text:
                 log("conversation: silence — ending")
@@ -596,7 +683,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
             _restart_alive()
 
 
-def listen_loop(pa, model, args, stt=None, whisper=None) -> None:
+def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> None:
     """Main listen loop: wake-word detect → conversation → return to listening."""
     import vosk
     import pyaudio
@@ -643,7 +730,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None) -> None:
                     audio_bytes = record_utterance(stream, MAX_RECORD_S, SILENCE_S)
                     chunks_n = len(audio_bytes) // (CHUNK * 2)
                     log(f"captured {chunks_n} chunks ({chunks_n * CHUNK / MIC_RATE:.1f}s)")
-                    text_out = _do_transcribe(audio_bytes, model, stt, whisper)
+                    text_out = _do_transcribe(audio_bytes, model, stt, whisper, sensevoice)
                     log(f"utterance: {text_out!r}")
 
                     # Check session for persistent persona (set via API)
@@ -689,13 +776,13 @@ def listen_loop(pa, model, args, stt=None, whisper=None) -> None:
                         run_persona_conversation(
                             routed_persona, text_out, args.dry_run,
                             stream, model, args.aplay_device, args.convo_turns,
-                            args.voice_cmd, stt, whisper,
+                            args.voice_cmd, stt, whisper, sensevoice,
                         )
                     else:
                         # --- Standard Claude conversation ---
                         run_conversation(
                             text_out, args.voice_cmd, args.dry_run,
-                            stream, model, args.aplay_device, args.convo_turns, stt, whisper,
+                            stream, model, args.aplay_device, args.convo_turns, stt, whisper, sensevoice,
                         )
 
                     # Reset wake recognizer after conversation ends
@@ -716,8 +803,10 @@ def main(argv) -> int:
                         help="Path to Vosk model directory (wake word grammar)")
     parser.add_argument("--stt-model-dir", default=DEFAULT_STT_MODEL,
                         help="Path to sherpa-onnx Zipformer model directory for utterance STT (fallback)")
+    parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL,
+                        help="Path to SenseVoice-Small model dir (fastest STT, non-autoregressive)")
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL,
-                        help="Path to faster-whisper model snapshot dir (preferred STT, best AU accent support)")
+                        help="Path to faster-whisper model snapshot dir (fallback STT, best AU accent support)")
     parser.add_argument("--mic",           default="USB",
                         help="Substring to match in mic device name (default: USB)")
     parser.add_argument("--aplay-device",  default="",
@@ -768,9 +857,19 @@ def main(argv) -> int:
     model = vosk.Model(str(model_path))
     log("Vosk model loaded")
 
-    # Load faster-whisper (preferred: best AU accent + diverse English support)
+    # Load SenseVoice (fastest: non-autoregressive single-pass, ~228MB int8)
+    sensevoice = None
+    if args.sensevoice_model:
+        log(f"loading SenseVoice model {args.sensevoice_model} ...")
+        sensevoice = load_sensevoice(args.sensevoice_model)
+        if sensevoice is not None:
+            log("SenseVoice model loaded (int8, non-autoregressive — fastest STT)")
+        else:
+            log("SenseVoice model not available — will try Whisper")
+
+    # Load faster-whisper as fallback (best AU accent support)
     whisper = None
-    if args.whisper_model:
+    if sensevoice is None and args.whisper_model:
         log(f"loading Whisper model {args.whisper_model} ...")
         whisper = load_whisper_model(args.whisper_model)
         if whisper is not None:
@@ -778,9 +877,9 @@ def main(argv) -> int:
         else:
             log("Whisper model load failed — will try sherpa-onnx")
 
-    # Load sherpa-onnx as fallback if whisper unavailable
+    # Load sherpa-onnx Zipformer as last resort before Vosk
     stt = None
-    if whisper is None:
+    if sensevoice is None and whisper is None:
         stt_path = Path(args.stt_model_dir)
         if stt_path.exists():
             log(f"loading STT model {stt_path} ...")
@@ -792,7 +891,7 @@ def main(argv) -> int:
         else:
             log(f"STT model dir not found ({stt_path}) — using Vosk fallback")
 
-    backend = "faster-whisper" if whisper else ("sherpa-onnx" if stt else "vosk")
+    backend = "sensevoice" if sensevoice else ("faster-whisper" if whisper else ("sherpa-onnx" if stt else "vosk"))
     log(f"STT backend: {backend}")
 
     # PyAudio init spams ALSA warnings to stderr — suppress at the fd level
@@ -809,7 +908,7 @@ def main(argv) -> int:
     except Exception:
         pa = pyaudio.PyAudio()
     try:
-        listen_loop(pa, model, args, stt, whisper)
+        listen_loop(pa, model, args, stt, whisper, sensevoice)
     except KeyboardInterrupt:
         pass
     except Exception as exc:
