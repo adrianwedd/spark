@@ -454,38 +454,19 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
     for k, v in cfg["voice_env"].items():
         env[k] = v
 
-    # Use Claude voice loop with persona prompt if available
-    prompt_path = cfg["prompt"]
-    use_voice_loop = Path(prompt_path).exists()
-
-    if use_voice_loop:
-        persona_voice_cmd = voice_cmd  # same claude bridge
-        log(f"persona {persona_name}: using Claude voice loop with {Path(prompt_path).name}")
-    else:
-        log(f"persona {persona_name}: prompt missing, falling back to chat tool")
+    # Use Ollama chat tool directly for persona conversations
+    log(f"persona {persona_name}: using Ollama chat tool")
 
     current_text = initial_text
     try:
         for turn in range(1, max_turns + 1):
             log(f"persona {persona_name} turn {turn}/{max_turns}: {current_text!r}")
 
-            if use_voice_loop:
-                result = subprocess.run(
-                    [persona_voice_cmd, "--prompt", prompt_path, "--max-turns", "3"],
-                    input=current_text,
-                    text=True,
-                    capture_output=False,
-                    env=env,
-                    check=False,
-                )
-                log(f"persona voice loop rc={result.returncode}")
-            else:
-                # Fallback: raw Ollama chat tool
-                env["PX_TEXT"] = current_text
-                result = subprocess.run(
-                    [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
-                )
-                log(f"persona chat tool rc={result.returncode}")
+            env["PX_TEXT"] = current_text
+            result = subprocess.run(
+                [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
+            )
+            log(f"persona chat tool rc={result.returncode}")
 
             if result.returncode != 0:
                 log(f"persona error (rc={result.returncode})")
