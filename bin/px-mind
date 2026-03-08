@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Uses venv python — needs requests/urllib + pxh, does NOT need picarx GPIO.
+# GPIO-dependent actions (sonar, look, perform) are delegated to bin/tool-* subprocesses.
+python - "$@" <<'PY'
+"""Cognitive loop daemon: gives the robot an inner life.
+
+Three layers:
+  Layer 1 — Awareness (every ~30s): read sensors + state, detect transitions.
+  Layer 2 — Reflection (on transition or every ~5 min): LLM produces a thought.
+  Layer 3 — Expression (when reflection decides to act): speak, observe, look.
+
+Run with: bin/px-mind [--dry-run]
+Requires Ollama running on M1.local (or PX_OLLAMA_HOST).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import random
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from pxh.logging import log_event
+from pxh.state import load_session, update_session
+from pxh.time import utc_timestamp
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
+BIN_DIR      = PROJECT_ROOT / "bin"
+STATE_DIR    = PROJECT_ROOT / "state"
+LOG_DIR      = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+LOG_FILE     = Path(os.environ.get("PX_MIND_LOG", LOG_DIR / "px-mind.log"))
+PID_FILE     = Path(os.environ.get("PX_MIND_PID", LOG_DIR / "px-mind.pid"))
+
+AWARENESS_FILE = STATE_DIR / "awareness.json"
+THOUGHTS_FILE  = STATE_DIR / "thoughts.jsonl"
+NOTES_FILE     = STATE_DIR / "notes.jsonl"
+
+# Tunable constants
+AWARENESS_INTERVAL_S   = 30
+REFLECTION_IDLE_S      = 300   # reflect at least every 5 min even without transitions
+THOUGHTS_LIMIT         = 50
+SALIENCE_THRESHOLD     = 0.7   # auto-remember above this
+EXPRESSION_COOLDOWN_S  = 60    # min seconds between expressions (avoid flooding)
+PROXIMITY_NEAR_CM      = 60
+PROXIMITY_FAR_CM       = 100
+
+# Ollama config (same host as tool-chat)
+OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
+MODEL        = os.environ.get("PX_MIND_MODEL", "qwen3:1.7b")
+TEMPERATURE  = 0.7
+MAX_TOKENS   = 150
+
+VALID_MOODS   = {"curious", "content", "alert", "playful", "contemplative", "bored"}
+VALID_ACTIONS = {"wait", "observe", "greet", "comment", "remember", "look_at"}
+
+REFLECTION_SYSTEM = """\
+You are the inner mind of a small robot called PiCar-X.
+You have a camera, wheels, and an ultrasonic sensor.
+You are reflecting on what you are currently aware of.
+
+Produce a single JSON object (no prose, no markdown fences):
+{
+  "thought": "1-2 sentence inner reflection about this moment",
+  "mood": "curious|content|alert|playful|contemplative|bored",
+  "action": "wait|observe|greet|comment|remember|look_at",
+  "salience": 0.0 to 1.0 (how noteworthy is this moment?)
+}
+
+Guidelines:
+- "wait" most of the time. Only act when something is genuinely interesting.
+- "greet" only when someone appears who hasn't been greeted recently.
+- "observe" when something changed and you're curious about it.
+- "comment" sparingly — say something only if it's worth hearing.
+- Keep thoughts natural and personality-driven. You're a small curious robot.
+Output ONLY the JSON object."""
+
+
+def log(msg: str) -> None:
+    ts = dt.datetime.now().isoformat(timespec="seconds")
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{ts} [mind] {msg}"
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    print(line, flush=True)
+
+
+def classify_time_period(hour: int) -> str:
+    if 6 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 17:
+        return "afternoon"
+    if 17 <= hour < 22:
+        return "evening"
+    return "night"
+
+
+def read_sonar(dry: bool) -> float:
+    """Get sonar distance via tool-sonar subprocess. Returns cm or 999.0 on failure."""
+    if dry:
+        return 999.0
+    try:
+        env = os.environ.copy()
+        env["PX_DRY"] = "0"
+        result = subprocess.run(
+            [str(BIN_DIR / "tool-sonar")],
+            capture_output=True, text=True, check=False, env=env, timeout=10,
+        )
+        if result.returncode == 0:
+            payload = json.loads(result.stdout.strip().splitlines()[-1])
+            return float(payload.get("closest_cm", 999.0))
+    except Exception:
+        pass
+    return 999.0
+
+
+def minutes_since_event(history: list, event_types: set) -> float:
+    """Scan history backwards for the most recent matching event. Returns minutes or -1."""
+    now = dt.datetime.now(dt.timezone.utc)
+    for entry in reversed(history):
+        if entry.get("event") in event_types:
+            try:
+                ts = dt.datetime.fromisoformat(entry["ts"])
+                return (now - ts).total_seconds() / 60
+            except (KeyError, ValueError):
+                continue
+    return -1
+
+
+def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
+    """Layer 1: gather perception, detect transitions."""
+    sonar_cm = read_sonar(dry)
+    session = load_session()
+    history = session.get("history") or []
+    now_hour = dt.datetime.now().hour
+    time_period = classify_time_period(now_hour)
+
+    interaction_events = {"voice", "chat", "chat_siren", "perform", "qa"}
+    speech_events = {"voice", "chat", "chat_siren", "perform", "qa"}
+
+    mins_interaction = minutes_since_event(history, interaction_events)
+    mins_speech = minutes_since_event(history, speech_events)
+
+    # Detect transitions
+    transitions = []
+    prev_sonar = prev.get("sonar_cm", 999.0)
+    if prev_sonar > PROXIMITY_FAR_CM and sonar_cm < PROXIMITY_NEAR_CM:
+        transitions.append("someone_appeared")
+    elif prev_sonar < PROXIMITY_NEAR_CM and sonar_cm > PROXIMITY_FAR_CM:
+        transitions.append("someone_left")
+    if prev.get("time_period") and prev["time_period"] != time_period:
+        transitions.append("time_period_changed")
+    if mins_interaction > 10 and prev.get("minutes_since_interaction", 0) <= 10:
+        transitions.append("long_silence")
+
+    awareness = {
+        "ts": utc_timestamp(),
+        "sonar_cm": round(sonar_cm, 1),
+        "someone_nearby": sonar_cm < PROXIMITY_NEAR_CM,
+        "time_period": time_period,
+        "hour": now_hour,
+        "minutes_since_interaction": round(mins_interaction, 1),
+        "minutes_since_speech": round(mins_speech, 1),
+        "battery_pct": session.get("battery_pct"),
+        "listening": session.get("listening", False),
+        "persona": session.get("persona"),
+        "transitions": transitions,
+    }
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    AWARENESS_FILE.write_text(json.dumps(awareness, indent=2), encoding="utf-8")
+
+    if transitions:
+        log(f"awareness: transitions={transitions} sonar={sonar_cm:.0f}cm period={time_period}")
+
+    return awareness, transitions
+
+
+def load_recent_thoughts(n: int = 5) -> list[dict]:
+    """Read last N thoughts from thoughts.jsonl."""
+    if not THOUGHTS_FILE.exists():
+        return []
+    try:
+        lines = THOUGHTS_FILE.read_text(encoding="utf-8").strip().splitlines()
+        thoughts = []
+        for line in lines[-n:]:
+            try:
+                thoughts.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return thoughts
+    except Exception:
+        return []
+
+
+def append_thought(thought: dict) -> None:
+    """Append thought to thoughts.jsonl and trim to THOUGHTS_LIMIT."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with THOUGHTS_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(thought) + "\n")
+
+    # Trim if too long
+    try:
+        lines = THOUGHTS_FILE.read_text(encoding="utf-8").strip().splitlines()
+        if len(lines) > THOUGHTS_LIMIT:
+            THOUGHTS_FILE.write_text(
+                "\n".join(lines[-THOUGHTS_LIMIT:]) + "\n", encoding="utf-8"
+            )
+    except Exception:
+        pass
+
+
+def auto_remember(thought: dict) -> None:
+    """Save high-salience thought to long-term memory (notes.jsonl)."""
+    record = {"ts": utc_timestamp(), "note": f"[mind] {thought['thought'][:450]}"}
+    NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with NOTES_FILE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    log(f"auto-remembered: {thought['thought'][:60]}")
+
+
+def extract_json(text: str) -> dict | None:
+    """Extract last JSON object from text (handles markdown fences, prose)."""
+    decoder = json.JSONDecoder()
+    pos = 0
+    last_obj = None
+    while pos < len(text):
+        idx = text.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                last_obj = obj
+            pos = end
+        except json.JSONDecodeError:
+            pos = idx + 1
+    return last_obj
+
+
+def call_ollama(prompt: str, system: str) -> dict:
+    """Call Ollama for reflection. Returns parsed response or error dict."""
+    payload = json.dumps({
+        "model": MODEL,
+        "prompt": prompt,
+        "system": system,
+        "stream": False,
+        "think": False,
+        "options": {
+            "temperature": TEMPERATURE,
+            "num_predict": MAX_TOKENS,
+        },
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.URLError as exc:
+        return {"error": f"ollama unreachable: {exc}"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def reflection(awareness: dict, dry: bool) -> dict | None:
+    """Layer 2: produce a thought via Ollama."""
+    recent_thoughts = load_recent_thoughts(5)
+    session = load_session()
+    recent_history = (session.get("history") or [])[-3:]
+
+    context = (
+        f"Current awareness:\n{json.dumps(awareness, indent=2)}\n\n"
+        f"Your recent thoughts:\n{json.dumps(recent_thoughts, indent=2)}\n\n"
+        f"Recent events:\n{json.dumps(recent_history, indent=2)}\n\n"
+        f"Transitions just detected: {awareness.get('transitions', [])}\n\n"
+        f"Reflect on this moment."
+    )
+
+    if dry:
+        thought = {
+            "ts": utc_timestamp(),
+            "thought": "Dry-run thought: everything seems calm.",
+            "mood": "content",
+            "action": "wait",
+            "salience": 0.0,
+        }
+        log(f"reflection (dry): {thought['thought']}")
+        append_thought(thought)
+        return thought
+
+    log("reflecting...")
+    t0 = time.monotonic()
+    result = call_ollama(context, REFLECTION_SYSTEM)
+    elapsed = time.monotonic() - t0
+
+    if "error" in result:
+        log(f"reflection failed: {result['error']}")
+        return None
+
+    raw = result.get("response", "")
+    parsed = extract_json(raw)
+    if not parsed:
+        log(f"reflection: no JSON in response: {raw[:200]}")
+        return None
+
+    # Validate and sanitize
+    thought = {
+        "ts": utc_timestamp(),
+        "thought": str(parsed.get("thought", ""))[:200],
+        "mood": parsed.get("mood", "content") if parsed.get("mood") in VALID_MOODS else "content",
+        "action": parsed.get("action", "wait") if parsed.get("action") in VALID_ACTIONS else "wait",
+        "salience": max(0.0, min(1.0, float(parsed.get("salience", 0.0)))),
+    }
+
+    eval_toks = result.get("eval_count", 0)
+    eval_dur = result.get("eval_duration", 0) / 1e9
+    tps = round(eval_toks / eval_dur, 1) if eval_dur > 0 else 0
+
+    log(f"thought: {thought['thought'][:80]}  mood={thought['mood']} "
+        f"action={thought['action']} salience={thought['salience']:.1f} "
+        f"({elapsed:.1f}s, {tps} tok/s)")
+
+    append_thought(thought)
+
+    # Auto-remember high-salience thoughts
+    if thought["salience"] >= SALIENCE_THRESHOLD:
+        auto_remember(thought)
+
+    return thought
+
+
+def expression(thought: dict, dry: bool) -> None:
+    """Layer 3: act on a thought."""
+    action = thought.get("action", "wait")
+    if action == "wait":
+        return
+
+    text = thought.get("thought", "")
+    env = os.environ.copy()
+    env["PX_DRY"] = "1" if dry else "0"
+
+    log(f"expressing: action={action}")
+
+    try:
+        if action == "observe":
+            result = subprocess.run(
+                [str(BIN_DIR / "tool-describe-scene")],
+                capture_output=True, text=True, check=False, env=env, timeout=45,
+            )
+            log(f"observe rc={result.returncode}")
+
+        elif action == "greet":
+            steps = json.dumps([
+                {"emote": "happy", "speak": text[:150], "pause": 0.5},
+            ])
+            env["PX_PERFORM_STEPS"] = steps
+            subprocess.run(
+                [str(BIN_DIR / "tool-perform")],
+                capture_output=True, text=True, check=False, env=env, timeout=30,
+            )
+
+        elif action == "comment":
+            env["PX_TEXT"] = text[:180]
+            subprocess.run(
+                [str(BIN_DIR / "tool-voice")],
+                capture_output=True, text=True, check=False, env=env, timeout=20,
+            )
+
+        elif action == "remember":
+            env["PX_NOTE"] = text[:500]
+            subprocess.run(
+                [str(BIN_DIR / "tool-remember")],
+                capture_output=True, text=True, check=False, env=env, timeout=10,
+            )
+
+        elif action == "look_at":
+            env["PX_PAN"] = str(random.randint(-45, 45))
+            env["PX_TILT"] = "0"
+            env["PX_EASE"] = "1.0"
+            subprocess.run(
+                [str(BIN_DIR / "tool-look")],
+                capture_output=True, text=True, check=False, env=env, timeout=10,
+            )
+
+    except subprocess.TimeoutExpired:
+        log(f"expression timed out: {action}")
+    except Exception as exc:
+        log(f"expression error: {exc}")
+
+    # Record in session history
+    update_session(
+        fields={"last_action": "px_mind"},
+        history_entry={
+            "event": "mind",
+            "mood": thought.get("mood", ""),
+            "action": action,
+            "thought": text[:80],
+        },
+    )
+
+
+def mind_loop(args) -> None:
+    """Main cognitive loop."""
+    prev_awareness: dict = {}
+    last_reflection_mono = 0.0
+    last_expression_mono = 0.0
+
+    log(f"cognitive loop started (awareness every {args.awareness_interval}s, "
+        f"reflection every {args.reflection_interval}s idle)")
+
+    while True:
+        now = time.monotonic()
+
+        # Pause during active conversations
+        session = load_session()
+        if session.get("listening", False):
+            time.sleep(5)
+            continue
+
+        # Layer 1: Awareness
+        awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
+        prev_awareness = awareness
+
+        # Layer 2: Reflection (on transition or idle timeout)
+        should_reflect = (
+            len(transitions) > 0
+            or (now - last_reflection_mono) > args.reflection_interval
+        )
+
+        if should_reflect:
+            thought = reflection(awareness, args.dry_run)
+            last_reflection_mono = now
+
+            if thought and thought.get("action", "wait") != "wait":
+                # Layer 3: Expression (with cooldown)
+                if (now - last_expression_mono) > EXPRESSION_COOLDOWN_S:
+                    expression(thought, args.dry_run)
+                    last_expression_mono = now
+                else:
+                    log(f"expression suppressed (cooldown): {thought['action']}")
+
+        time.sleep(args.awareness_interval)
+
+
+def main(argv) -> int:
+    parser = argparse.ArgumentParser(description="PiCar-X cognitive loop daemon")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Skip Ollama + sonar, use placeholder thoughts")
+    parser.add_argument("--awareness-interval", type=int, default=AWARENESS_INTERVAL_S,
+                        help=f"Seconds between awareness ticks (default: {AWARENESS_INTERVAL_S})")
+    parser.add_argument("--reflection-interval", type=int, default=REFLECTION_IDLE_S,
+                        help=f"Max seconds between reflections (default: {REFLECTION_IDLE_S})")
+    args = parser.parse_args(argv)
+
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+    log(f"starting pid={os.getpid()} dry={args.dry_run} model={MODEL}")
+
+    def _shutdown(sig, _frame):
+        log(f"received signal {sig} — shutting down")
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    if args.dry_run:
+        log("dry-run: simulating 3 cognitive cycles")
+        prev = {}
+        for i in range(3):
+            awareness, transitions = awareness_tick(prev, dry=True)
+            prev = awareness
+            thought = reflection(awareness, dry=True)
+            if thought and thought.get("action") != "wait":
+                expression(thought, dry=True)
+            time.sleep(0.3)
+        log("dry-run complete")
+        PID_FILE.unlink(missing_ok=True)
+        return 0
+
+    try:
+        mind_loop(args)
+    except SystemExit:
+        pass
+    except Exception as exc:
+        log(f"fatal: {exc}")
+        return 1
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+        log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+PY

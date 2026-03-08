@@ -264,6 +264,30 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
         context_sections.append("Recent events:")
         context_sections.append(json.dumps(recent_events, indent=2))
 
+    # Inject inner thoughts from px-mind (if running)
+    thoughts_file = PROJECT_ROOT / "state" / "thoughts.jsonl"
+    if thoughts_file.exists():
+        try:
+            lines = thoughts_file.read_text(encoding="utf-8").strip().splitlines()
+            recent_thoughts = []
+            for line in lines[-3:]:
+                try:
+                    t = json.loads(line)
+                    recent_thoughts.append({
+                        "thought": t.get("thought", ""),
+                        "mood": t.get("mood", ""),
+                    })
+                except json.JSONDecodeError:
+                    continue
+            if recent_thoughts:
+                context_sections.append("Robot's recent inner thoughts:")
+                context_sections.append(json.dumps(recent_thoughts, indent=2))
+                last_mood = recent_thoughts[-1].get("mood")
+                if last_mood:
+                    context_sections.append(f"Current mood: {last_mood}")
+        except Exception:
+            pass
+
     context_block = "\n".join(context_sections)
 
     return (

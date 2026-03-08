@@ -16,6 +16,8 @@ state/timers/
 test-frame.jpg
 track.png
 state/notes.jsonl
+state/awareness.json
+state/thoughts.jsonl
 photos/
 .env
 logs/px-api-server.pid
