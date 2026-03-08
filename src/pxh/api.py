@@ -123,7 +123,11 @@ VALID_PERSONAS = {"vixen", "gremlin", "claude", ""}  # "claude" or "" clears per
 # ---------------------------------------------------------------------------
 
 FORCE_DRY = os.environ.get("PX_DRY", "0") == "1"
-SYNC_TIMEOUT = 30.0
+SYNC_TIMEOUT_DEFAULT = float(os.environ.get("PX_API_TIMEOUT", "30"))
+
+# Tools that involve Ollama generation need longer timeouts (generation + espeak)
+SLOW_TOOLS = {"tool_chat", "tool_chat_vixen", "tool_describe_scene", "tool_wander"}
+SYNC_TIMEOUT_SLOW = float(os.environ.get("PX_API_TIMEOUT_SLOW", "120"))
 
 
 def _resolve_dry(requested: Optional[bool]) -> bool:
@@ -213,15 +217,16 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
             content={"status": "accepted", "job_id": job_id, "poll": f"/api/v1/jobs/{job_id}"},
         )
 
-    # Synchronous path
+    # Synchronous path — slow tools (Ollama, vision, wander) get longer timeout
+    timeout = SYNC_TIMEOUT_SLOW if tool in SLOW_TOOLS else SYNC_TIMEOUT_DEFAULT
     loop = asyncio.get_running_loop()
     try:
         rc, stdout, stderr = await asyncio.wait_for(
             loop.run_in_executor(None, execute_tool, tool, env_overrides, dry),
-            timeout=SYNC_TIMEOUT,
+            timeout=timeout,
         )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"tool {tool} timed out after {SYNC_TIMEOUT}s")
+        raise HTTPException(status_code=504, detail=f"tool {tool} timed out after {timeout}s")
     except VoiceLoopError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

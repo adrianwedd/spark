@@ -646,7 +646,7 @@ def expression(thought: dict, dry: bool) -> None:
             env["PX_TEXT"] = text[:2000]
             subprocess.run(
                 [str(BIN_DIR / "tool-voice")],
-                capture_output=True, text=True, check=False, env=env, timeout=20,
+                capture_output=True, text=True, check=False, env=env, timeout=45,
             )
             _last_spoken_text = text[:200]
 
@@ -654,7 +654,7 @@ def expression(thought: dict, dry: bool) -> None:
             env["PX_TEXT"] = text[:2000]
             subprocess.run(
                 [str(BIN_DIR / "tool-voice")],
-                capture_output=True, text=True, check=False, env=env, timeout=20,
+                capture_output=True, text=True, check=False, env=env, timeout=45,
             )
             _last_spoken_text = text[:200]
 
@@ -667,7 +667,7 @@ def expression(thought: dict, dry: bool) -> None:
                 env["PX_TEXT"] = text[:2000]
             subprocess.run(
                 [str(BIN_DIR / "tool-voice")],
-                capture_output=True, text=True, check=False, env=env, timeout=20,
+                capture_output=True, text=True, check=False, env=env, timeout=45,
             )
             _last_spoken_text = env["PX_TEXT"][:200]
 
@@ -677,7 +677,7 @@ def expression(thought: dict, dry: bool) -> None:
                 env["PX_TEXT"] = text[:2000]
                 subprocess.run(
                     [str(BIN_DIR / "tool-voice")],
-                    capture_output=True, text=True, check=False, env=env, timeout=20,
+                    capture_output=True, text=True, check=False, env=env, timeout=45,
                 )
                 _last_spoken_text = text[:200]
 
@@ -694,7 +694,7 @@ def expression(thought: dict, dry: bool) -> None:
                 env["PX_TEXT"] = text[:2000]
                 subprocess.run(
                     [str(BIN_DIR / "tool-voice")],
-                    capture_output=True, text=True, check=False, env=env, timeout=20,
+                    capture_output=True, text=True, check=False, env=env, timeout=45,
                 )
                 _last_spoken_text = text[:200]
 
