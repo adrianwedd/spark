@@ -278,6 +278,55 @@ class TestMotionGate:
         assert data["confirm_motion_allowed"] is True
         assert data["wheels_on_blocks"] is True
 
+    def test_patch_persona_vixen(self, api_client, auth_headers):
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": "vixen"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["persona"] == "vixen"
+
+    def test_patch_persona_gremlin(self, api_client, auth_headers):
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": "gremlin"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["persona"] == "gremlin"
+
+    def test_patch_persona_clear_with_claude(self, api_client, auth_headers):
+        # Set a persona first
+        api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": "vixen"},
+        )
+        # Clear it with "claude"
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": "claude"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["persona"] is None
+
+    def test_patch_persona_clear_with_empty(self, api_client, auth_headers):
+        api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": "gremlin"},
+        )
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": ""},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["persona"] is None
+
+    def test_patch_persona_invalid(self, api_client, auth_headers):
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"persona": "batman"},
+        )
+        assert resp.status_code == 400
+
     def test_patch_confirm_motion_allowed_false(self, api_client, auth_headers):
         """PATCH can explicitly set confirm_motion_allowed back to False."""
         # First enable
