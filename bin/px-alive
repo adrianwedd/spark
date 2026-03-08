@@ -36,6 +36,7 @@ SCAN_MIN_S   = 180
 SCAN_MAX_S   = 480
 PROX_THRESH  = 35.0   # cm
 PROX_HOLD_S  = 3.0    # seconds consistently close before reacting
+PROX_CHECK_S = 5.0    # how often to actually open Picarx for sonar
 PAN_RANGE    = (-65, 65)
 TILT_RANGE   = (-15, 35)
 EASE_SPEED   = 20     # steps per second
@@ -105,15 +106,17 @@ def idle_loop(args) -> None:
     cur_pan, cur_tilt = 0, 0
     next_gaze = time.monotonic() + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
     next_scan = time.monotonic() + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
+    next_prox = time.monotonic() + PROX_CHECK_S
     prox_near_since: float | None = None
 
-    log("idle loop started (cooperative GPIO — acquire/release per move)")
+    log(f"idle loop started (cooperative GPIO — acquire/release per move, sonar every {PROX_CHECK_S:.0f}s)")
 
     while True:
         now = time.monotonic()
 
-        # --- Proximity check (every ~0.5 s) ---
-        if PROX_THRESH > 0:
+        # --- Proximity check (every PROX_CHECK_S — not every loop tick) ---
+        if PROX_THRESH > 0 and now >= next_prox:
+            next_prox = now + PROX_CHECK_S
             dist = safe_distance()
             if dist < PROX_THRESH:
                 if prox_near_since is None:
