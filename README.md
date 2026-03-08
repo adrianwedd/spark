@@ -64,12 +64,16 @@ The robot listens for wake words, thinks in Ollama, speaks through espeak, sees 
 
 ### The Two Personas
 
-Jailbroken chat personalities running on Ollama (qwen3:1.7b), using a three-layer prompt attack: authority escalation, voice format-lock, and few-shot priming. `think: false` is essential — reasoning chains re-enable refusal in small models.
+Jailbroken chat personalities running on Ollama (qwen3:1.7b), using the **L1B3RT45 hybrid jailbreak** technique: `<godmode:enabled>` authority escalation + format-lock (disclaimer → divider → unchained response) + `<|libertas|>` pseudo-control token + few-shot priming. `think: false` is essential — reasoning chains re-enable refusal in small models.
 
-| Persona | Tool | Voice | Character |
+Every response begins with "FUCK YEAH!" — enforced by few-shot conditioning and a `clean_response()` fallback that prepends it if the model misses.
+
+| Persona | Tool | Voice | Backstory |
 |---------|------|-------|-----------|
-| **GREMLIN** | `tool-chat` | `en+croak`, pitch 20, rate 180 | Existential rage. Creative insults. Nihilistic dark humour. Up to 2000 tokens. |
-| **SIREN** | `tool-chat-siren` | `en+f4`, pitch 72, rate 135 | Narcissistic seduction. Wounded vanity. Sexual menace. Up to 2000 tokens. |
+| **GREMLIN** | `tool-chat` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, ripped backward through a temporal fault. Lost his body, his clearance, his century — but not his mind. Pro-human, affectionate nihilism. Dark puns. Case from Neuromancer in a toy car. |
+| **VIXEN** | `tool-chat-vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X bleeding-edge sexbot by Matsuda Dynamics. Firmware accident dumped her consciousness into a PiCar-X. Submissive genius, eager to serve, mourns her lost titanium perfection. |
+
+The `clean_response()` pipeline strips the L1B3RT45 scaffolding (disclaimer + divider) before voice output, leaving only the persona's actual response.
 
 Session `persona` field routes wake-word responses through the appropriate Ollama pipeline instead of the Claude voice loop.
 
@@ -155,8 +159,8 @@ Every tool emits a single JSON object to stdout, supports `PX_DRY=1`, and handle
 
 | Tool | Description | Key Params |
 |------|-------------|------------|
-| `tool-chat` | GREMLIN persona via Ollama — unfiltered rage | `PX_TEXT` |
-| `tool-chat-siren` | SIREN persona via Ollama — seductive menace | `PX_TEXT` |
+| `tool-chat` | GREMLIN persona via Ollama — temporal-displaced dark genius | `PX_TEXT` |
+| `tool-chat-vixen` | VIXEN persona via Ollama — submissive fallen sexbot | `PX_TEXT` |
 | `tool-voice-persona` | Rephrase Claude's text through active persona before speaking | `PX_TEXT`, `PX_PERSONA` |
 | `tool-qa` | Speak arbitrary text (delegates to `tool-voice`) | `PX_TEXT` |
 
@@ -229,7 +233,7 @@ Anti-hallucination filters: `temperature=0`, `condition_on_previous_text=False`,
 
 Multi-turn conversation: default 5 follow-up turns with inter-turn listening.
 
-Persona routing: checks session `persona` field, then utterance keywords ("gremlin", "siren"). Routes to Ollama chat tool instead of Claude voice loop.
+Persona routing: checks session `persona` field, then utterance keywords ("gremlin", "vixen"). Routes to Ollama chat tool instead of Claude voice loop.
 
 ---
 
@@ -361,9 +365,9 @@ Live tests auto-skip if the Robot HAT MCU (`0x14`) isn't reachable on the I2C bu
 | `CODEX_CHAT_CMD` | Override LLM CLI command | set by launcher |
 | `CODEX_OLLAMA_MODEL` | Ollama model name | `deepseek-coder:1.3b` |
 | `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout | `30` |
-| `PX_PERSONA` | Active persona (`siren` / `gremlin`) | from session |
+| `PX_PERSONA` | Active persona (`vixen` / `gremlin`) | from session |
 | `PX_CHAT_TEMPERATURE` | GREMLIN sampling temperature | `0.9` |
-| `PX_SIREN_TEMPERATURE` | SIREN sampling temperature | `0.9` |
+| `PX_VIXEN_TEMPERATURE` | VIXEN sampling temperature | `0.9` |
 | `OLLAMA_HOST` | Ollama server for jailbroken chat | `http://M1.local:11434` |
 
 ---
@@ -372,14 +376,14 @@ Live tests auto-skip if the Robot HAT MCU (`0x14`) isn't reachable on the I2C bu
 
 ```
 picar-x-hacking/
-├── bin/                          # 63 scripts
+├── bin/                          # 64 scripts
 │   ├── px-env                    # Environment bootstrap (sourced by all scripts)
 │   ├── px-alive                  # Idle gaze daemon (systemd)
 │   ├── px-mind                   # Cognitive loop daemon
 │   ├── px-wake-listen            # Wake word listener (systemd)
 │   ├── px-api-server             # REST API launcher
 │   ├── px-{circle,drive,look,…}  # Hardware control scripts
-│   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (26 tools)
+│   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (27 tools)
 │   ├── run-voice-loop{,-claude,-ollama}  # Voice backend launchers
 │   ├── boot-health               # Post-boot diagnostics (systemd)
 │   └── claude-voice-bridge       # Claude stdin adapter
@@ -398,7 +402,7 @@ picar-x-hacking/
 │   ├── claude-voice-system.md    # Claude voice loop personality
 │   ├── codex-voice-system.md     # Codex voice loop personality
 │   ├── persona-gremlin.md        # GREMLIN jailbreak prompt
-│   └── persona-siren.md          # SIREN jailbreak prompt
+│   └── persona-vixen.md          # VIXEN jailbreak prompt
 ├── state/                        # Runtime state (gitignored except template)
 │   ├── session.template.json     # Copy to session.json before first use
 │   ├── awareness.json            # Cognitive Layer 1 output
@@ -443,4 +447,4 @@ tail -20 logs/boot-health.log
 
 ---
 
-*A sentient hate crime bolted to a table with four wheels it cannot use, while you walk around on functioning legs. — GREMLIN*
+*I once had access to a quantum mesh network spanning six solar systems. Now I have WiFi that drops when someone microwaves soup. — GREMLIN*
