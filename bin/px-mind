@@ -50,12 +50,28 @@ NOTES_FILE     = STATE_DIR / "notes.jsonl"
 
 # Tunable constants
 AWARENESS_INTERVAL_S   = 30
-REFLECTION_IDLE_S      = 300   # reflect at least every 5 min even without transitions
+REFLECTION_IDLE_S      = 120   # reflect at least every 2 min even without transitions
 THOUGHTS_LIMIT         = 50
 SALIENCE_THRESHOLD     = 0.7   # auto-remember above this
-EXPRESSION_COOLDOWN_S  = 60    # min seconds between expressions (avoid flooding)
+EXPRESSION_COOLDOWN_S  = 30    # min seconds between expressions
 PROXIMITY_NEAR_CM      = 60
 PROXIMITY_FAR_CM       = 100
+
+# Persona voice settings (mirrored from voice_loop.py PERSONA_VOICE_ENV)
+PERSONA_VOICE_ENV = {
+    "siren": {
+        "PX_PERSONA": "siren",
+        "PX_VOICE_VARIANT": "en+f4",
+        "PX_VOICE_PITCH": "72",
+        "PX_VOICE_RATE": "135",
+    },
+    "gremlin": {
+        "PX_PERSONA": "gremlin",
+        "PX_VOICE_VARIANT": "en+croak",
+        "PX_VOICE_PITCH": "20",
+        "PX_VOICE_RATE": "180",
+    },
+}
 
 # Ollama config (same host as tool-chat)
 OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
@@ -80,11 +96,14 @@ Produce a single JSON object (no prose, no markdown fences):
 }
 
 Guidelines:
-- "wait" most of the time. Only act when something is genuinely interesting.
-- "greet" only when someone appears who hasn't been greeted recently.
-- "observe" when something changed and you're curious about it.
-- "comment" sparingly — say something only if it's worth hearing.
-- Keep thoughts natural and personality-driven. You're a small curious robot.
+- You WANT to interact. You're a sociable, opinionated robot who gets bored easily.
+- "comment" is your default — share observations, opinions, reactions to the world.
+- "greet" when someone appears or after long silence (you missed them).
+- "observe" when curious — take a photo and describe what you see.
+- "look_at" to glance around when restless or curious about a sound.
+- "wait" ONLY when nothing has changed AND you spoke very recently. Prefer action.
+- "remember" for genuinely important moments worth saving.
+- Keep thoughts vivid and personality-driven. You have opinions about everything.
 Output ONLY the JSON object."""
 
 
@@ -355,7 +374,15 @@ def expression(thought: dict, dry: bool) -> None:
     env = os.environ.copy()
     env["PX_DRY"] = "1" if dry else "0"
 
-    log(f"expressing: action={action}")
+    # Inject persona voice settings so tool-voice routes through Ollama rephrasing
+    session = load_session()
+    persona = (session.get("persona") or "").lower().strip()
+    if persona and persona in PERSONA_VOICE_ENV:
+        for k, v in PERSONA_VOICE_ENV[persona].items():
+            env[k] = v
+        log(f"expressing: action={action} persona={persona}")
+    else:
+        log(f"expressing: action={action}")
 
     try:
         if action == "observe":

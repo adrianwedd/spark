@@ -202,7 +202,7 @@ def test_tool_chat_siren_dry_run(isolated_project):
     payload = parse_json(stdout)
     assert payload["status"] == "ok"
     assert payload["dry"] is True
-    assert payload["persona"] == "SIREN"
+    assert payload["persona"] == "VIXEN"
     assert "model" in payload
 
 
