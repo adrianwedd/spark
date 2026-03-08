@@ -1,0 +1,17 @@
+[Unit]
+Description=PiCar-X Idle Alive Daemon (organic servo motion)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/picar-x-hacking
+Environment=HOME=/home/pi
+ExecStart=/home/pi/picar-x-hacking/bin/px-alive
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
