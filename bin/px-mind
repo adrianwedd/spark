@@ -51,6 +51,8 @@ PID_FILE     = Path(os.environ.get("PX_MIND_PID", LOG_DIR / "px-mind.pid"))
 AWARENESS_FILE = STATE_DIR / "awareness.json"
 THOUGHTS_FILE  = STATE_DIR / "thoughts.jsonl"
 NOTES_FILE     = STATE_DIR / "notes.jsonl"
+MOOD_FILE      = STATE_DIR / "mood.json"
+AMBIENT_FILE   = STATE_DIR / "ambient_sound.json"
 
 # Tunable constants
 AWARENESS_INTERVAL_S   = 30
@@ -62,6 +64,8 @@ PROXIMITY_NEAR_CM      = 60
 PROXIMITY_FAR_CM       = 100
 WEATHER_INTERVAL_S     = 600   # refresh weather every 10 min
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
+REACTIVE_COOLDOWN_S    = 15    # min seconds between reactive responses
+AMBIENT_STALE_S        = 60    # ignore ambient_sound.json older than this
 
 # Persona voice settings (mirrored from voice_loop.py PERSONA_VOICE_ENV)
 PERSONA_VOICE_ENV = {
@@ -79,6 +83,20 @@ PERSONA_VOICE_ENV = {
     },
 }
 
+# Reactive response templates (bypass LLM for instant reaction)
+REACTIVE_TEMPLATES = {
+    "someone_appeared": {
+        "default": "Oh, hello! I didn't hear you come in.",
+        "gremlin": "Well well well, a visitor from the present timeline! How's linear time treating you?",
+        "vixen":   "Oh... hello there. I was just thinking about company.",
+    },
+    "someone_left": {
+        "default": "And they're gone. Back to my thoughts.",
+        "gremlin": "And another human retreats to their century. Classic move.",
+        "vixen":   "Leaving already? That's what they all do. Story of my chassis.",
+    },
+}
+
 # Ollama config (same host as tool-chat)
 OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
 MODEL        = os.environ.get("PX_MIND_MODEL", "qwen3.5:0.8b")
@@ -90,6 +108,31 @@ VALID_MOODS   = {"curious", "content", "alert", "playful", "contemplative", "bor
                  "mischievous", "lonely", "excited", "grumpy", "peaceful", "anxious"}
 VALID_ACTIONS = {"wait", "observe", "greet", "comment", "remember", "look_at",
                  "weather_comment", "scan"}
+
+# ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
+MOOD_COORDS: dict[str, tuple[float, float]] = {
+    "excited":       ( 0.8,  0.9),
+    "playful":       ( 0.6,  0.7),
+    "mischievous":   ( 0.4,  0.8),
+    "curious":       ( 0.5,  0.5),
+    "alert":         ( 0.2,  0.8),
+    "content":       ( 0.4,  0.0),
+    "peaceful":      ( 0.3, -0.3),
+    "contemplative": ( 0.0, -0.2),
+    "bored":        (-0.3, -0.5),
+    "lonely":       (-0.6,  0.1),
+    "grumpy":       (-0.5,  0.4),
+    "anxious":      (-0.3,  0.7),
+}
+MOOD_ALPHA = 0.3  # weight of new mood (0.7 = inertia from previous)
+
+# ── Time-of-day context for reflection ─────────────────────────────
+TIME_PERIOD_CONTEXT = {
+    "morning":   "It's morning. You just woke up. How do you feel about a new day? Do you want company?",
+    "afternoon": "It's afternoon. The day is half over. Has anything interesting happened? Are you bored?",
+    "evening":   "It's evening. The day is winding down. Are you tired? Reflective? Lonely?",
+    "night":     "It's late at night. Most humans are asleep. What does nighttime feel like for a robot alone?",
+}
 
 # Topic seeds — injected randomly to break repetition loops
 TOPIC_SEEDS = [
@@ -210,6 +253,13 @@ PERSONA_REFLECTION_SYSTEMS = {
 }
 
 
+def atomic_write(path: Path, data: str) -> None:
+    """Write data to file atomically via temp + rename (prevents partial reads)."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.rename(path)
+
+
 def log(msg: str) -> None:
     ts = dt.datetime.now().isoformat(timespec="seconds")
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +350,25 @@ def text_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
+def nearest_mood(v: float, a: float) -> str:
+    """Find the mood name closest to the given (valence, arousal) point."""
+    best, best_d = "content", float("inf")
+    for name, (mv, ma) in MOOD_COORDS.items():
+        d = (v - mv) ** 2 + (a - ma) ** 2
+        if d < best_d:
+            best, best_d = name, d
+    return best
+
+
+def apply_mood_momentum(raw_mood: str) -> str:
+    """Blend raw mood with running momentum and return the momentum-adjusted mood."""
+    global _mood_v, _mood_a
+    rv, ra = MOOD_COORDS.get(raw_mood, (0.0, 0.0))
+    _mood_v = MOOD_ALPHA * rv + (1 - MOOD_ALPHA) * _mood_v
+    _mood_a = MOOD_ALPHA * ra + (1 - MOOD_ALPHA) * _mood_a
+    return nearest_mood(_mood_v, _mood_a)
+
+
 def minutes_since_event(history: list, event_types: set) -> float:
     """Scan history backwards for the most recent matching event. Returns minutes or -1."""
     now = dt.datetime.now(dt.timezone.utc)
@@ -319,10 +388,15 @@ _last_weather_fetch: float = 0.0
 _last_spoken_text: str = ""
 _mood_history: list[str] = []
 
+# Mood momentum: running (valence, arousal) blend
+_mood_v: float = 0.4   # start at "content"
+_mood_a: float = 0.0
+_time_period_start_mono: float = 0.0  # when current time period began
+
 
 def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     """Layer 1: gather perception, detect transitions, enrich context."""
-    global _cached_weather, _last_weather_fetch
+    global _cached_weather, _last_weather_fetch, _time_period_start_mono
 
     sonar_cm = read_sonar(dry)
     session = load_session()
@@ -331,7 +405,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     now_mono = time.monotonic()
     time_period = classify_time_period(now_hour)
 
-    interaction_events = {"voice", "chat", "chat_vixen", "perform", "qa"}
+    interaction_events = {"voice", "chat", "chat_vixen", "perform", "qa", "wake_transcript"}
     speech_events = {"voice", "chat", "chat_vixen", "perform", "qa"}
 
     mins_interaction = minutes_since_event(history, interaction_events)
@@ -354,8 +428,14 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         transitions.append("someone_left")
     if prev.get("time_period") and prev["time_period"] != time_period:
         transitions.append("time_period_changed")
+        _time_period_start_mono = now_mono
     if mins_interaction > 10 and prev.get("minutes_since_interaction", 0) <= 10:
         transitions.append("long_silence")
+
+    # Track how long we've been in this time period
+    if _time_period_start_mono == 0.0:
+        _time_period_start_mono = now_mono
+    period_duration_min = (now_mono - _time_period_start_mono) / 60
 
     awareness = {
         "ts": utc_timestamp(),
@@ -365,6 +445,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "hour": now_hour,
         "minutes_since_interaction": round(mins_interaction, 1),
         "minutes_since_speech": round(mins_speech, 1),
+        "period_duration_min": round(period_duration_min, 1),
         "battery_pct": session.get("battery_pct"),
         "listening": session.get("listening", False),
         "persona": session.get("persona"),
@@ -375,12 +456,55 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     if _cached_weather:
         awareness["weather"] = _cached_weather
 
-    # Enrich with mood trajectory
+    # Enrich with ambient sound level (written by px-wake-listen)
+    try:
+        if AMBIENT_FILE.exists():
+            ambient = json.loads(AMBIENT_FILE.read_text(encoding="utf-8"))
+            # Only use if fresh (within AMBIENT_STALE_S)
+            try:
+                amb_ts = dt.datetime.fromisoformat(ambient["ts"].replace("Z", "+00:00"))
+                age_s = (dt.datetime.now(dt.timezone.utc) - amb_ts).total_seconds()
+                if age_s < AMBIENT_STALE_S:
+                    awareness["ambient_sound"] = {
+                        "rms": ambient.get("rms", 0),
+                        "level": ambient.get("level", "unknown"),
+                    }
+            except (KeyError, ValueError):
+                pass
+    except Exception:
+        pass
+
+    # Enrich with mood momentum
     if _mood_history:
         awareness["recent_moods"] = _mood_history[-5:]
+    awareness["mood_momentum"] = {
+        "valence": round(_mood_v, 2),
+        "arousal": round(_mood_a, 2),
+        "mood": nearest_mood(_mood_v, _mood_a),
+    }
+
+    # Conversation digestion: extract recent user/robot exchanges from history
+    recent_convos = []
+    now_utc = dt.datetime.now(dt.timezone.utc)
+    convo_events = {"wake_transcript", "voice", "chat", "chat_vixen", "qa", "mind"}
+    for entry in reversed(history):
+        if entry.get("event") in convo_events and len(recent_convos) < 5:
+            evt = entry["event"]
+            text = entry.get("text", entry.get("thought", ""))[:150]
+            if not text:
+                continue
+            try:
+                ts = dt.datetime.fromisoformat(entry["ts"].replace("Z", "+00:00"))
+                mins_ago = (now_utc - ts).total_seconds() / 60
+            except (KeyError, ValueError):
+                mins_ago = -1
+            who = "user" if evt == "wake_transcript" else "robot"
+            recent_convos.append({"who": who, "text": text, "minutes_ago": round(mins_ago, 1)})
+    if recent_convos:
+        awareness["recent_conversations"] = list(reversed(recent_convos))
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    AWARENESS_FILE.write_text(json.dumps(awareness, indent=2), encoding="utf-8")
+    atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2))
 
     if transitions:
         log(f"awareness: transitions={transitions} sonar={sonar_cm:.0f}cm period={time_period}")
@@ -506,15 +630,34 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     # Feed moods only (not full thought text) to avoid re-seeding repetition
     recent_moods = [t.get("mood", "?") for t in recent_thoughts]
     recent_actions = [t.get("action", "?") for t in recent_thoughts]
+    momentum = awareness.get("mood_momentum", {})
     context_parts = [
         f"Current awareness:\n{json.dumps(awareness, indent=2)}",
         f"Your recent moods: {recent_moods}",
         f"Your recent actions: {recent_actions}",
+        f"Your emotional momentum: {momentum.get('mood', 'content')} (valence={momentum.get('valence', 0)}, arousal={momentum.get('arousal', 0)})",
         f"Recent events:\n{json.dumps(recent_history, indent=2)}",
     ]
 
     if awareness.get("transitions"):
         context_parts.append(f"Transitions just detected: {awareness['transitions']}")
+
+    # Time-of-day context
+    time_ctx = TIME_PERIOD_CONTEXT.get(awareness.get("time_period", ""), "")
+    if time_ctx:
+        period_min = awareness.get("period_duration_min", 0)
+        context_parts.append(f"Time context: {time_ctx}")
+        if period_min > 60 and awareness.get("minutes_since_interaction", 0) > 30:
+            context_parts.append(f"It's been quiet for over {int(period_min)} minutes this {awareness.get('time_period', 'period')}.")
+
+    # Conversation digestion
+    convos = awareness.get("recent_conversations", [])
+    if convos:
+        convo_lines = []
+        for c in convos:
+            ago = f"{c['minutes_ago']:.0f} min ago" if c["minutes_ago"] >= 0 else "recently"
+            convo_lines.append(f"  {c['who']}: \"{c['text']}\" ({ago})")
+        context_parts.append("Recent conversations:\n" + "\n".join(convo_lines))
 
     if notes:
         context_parts.append(f"Your long-term memories:\n" + "\n".join(f"  - {n}" for n in notes))
@@ -566,6 +709,12 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         "salience": max(0.0, min(1.0, float(parsed.get("salience", 0.5)))),
     }
 
+    # Apply mood momentum: blend LLM's raw mood with running average
+    raw_mood = thought["mood"]
+    thought["mood"] = apply_mood_momentum(raw_mood)
+    if thought["mood"] != raw_mood:
+        thought["raw_mood"] = raw_mood  # preserve for debugging
+
     eval_toks = result.get("eval_count", 0)
     eval_dur = result.get("eval_duration", 0) / 1e9
     tps = round(eval_toks / eval_dur, 1) if eval_dur > 0 else 0
@@ -596,6 +745,17 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         _mood_history[:] = _mood_history[-20:]
 
     append_thought(thought)
+
+    # Write mood state for px-alive servo coordination
+    try:
+        atomic_write(MOOD_FILE, json.dumps({
+            "ts": utc_timestamp(),
+            "mood": thought["mood"],
+            "valence": round(_mood_v, 2),
+            "arousal": round(_mood_a, 2),
+        }))
+    except Exception:
+        pass
 
     # Auto-remember high-salience thoughts
     if thought["salience"] >= SALIENCE_THRESHOLD:
@@ -715,11 +875,56 @@ def expression(thought: dict, dry: bool) -> None:
     )
 
 
+def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
+    """Immediate template-based reaction to a state transition (no LLM call)."""
+    global _last_spoken_text
+
+    templates = REACTIVE_TEMPLATES.get(transition)
+    if not templates:
+        return
+
+    persona = (awareness.get("persona") or "").lower().strip()
+    text = templates.get(persona, templates["default"])
+
+    env = os.environ.copy()
+    env["PX_DRY"] = "1" if dry else "0"
+    env["PX_TEXT"] = text
+
+    # Inject persona voice settings
+    if persona and persona in PERSONA_VOICE_ENV:
+        for k, v in PERSONA_VOICE_ENV[persona].items():
+            env[k] = v
+
+    log(f"reactive: {transition} → \"{text[:60]}\"")
+
+    try:
+        subprocess.run(
+            [str(BIN_DIR / "tool-voice")],
+            capture_output=True, text=True, check=False, env=env, timeout=20,
+        )
+        _last_spoken_text = text[:200]
+    except subprocess.TimeoutExpired:
+        log(f"reactive voice timed out: {transition}")
+    except Exception as exc:
+        log(f"reactive error: {exc}")
+
+    update_session(
+        fields={"last_action": "px_mind"},
+        history_entry={
+            "event": "mind",
+            "mood": awareness.get("mood_momentum", {}).get("mood", ""),
+            "action": f"reactive_{transition}",
+            "thought": text,
+        },
+    )
+
+
 def mind_loop(args) -> None:
     """Main cognitive loop."""
     prev_awareness: dict = {}
     last_reflection_mono = 0.0
     last_expression_mono = 0.0
+    last_reactive_mono = 0.0
 
     log(f"cognitive loop started (awareness every {args.awareness_interval}s, "
         f"reflection every {args.reflection_interval}s idle)")
@@ -737,8 +942,21 @@ def mind_loop(args) -> None:
         awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
         prev_awareness = awareness
 
+        # Reactive behavior: instant template response for key transitions
+        reactive_transitions = {"someone_appeared", "someone_left"}
+        reacted = False
+        if transitions and (now - last_reactive_mono) > REACTIVE_COOLDOWN_S:
+            for t in transitions:
+                if t in reactive_transitions and t in REACTIVE_TEMPLATES:
+                    reactive_response(t, awareness, args.dry_run)
+                    last_reactive_mono = now
+                    last_expression_mono = now  # count as expression too
+                    reacted = True
+                    break  # one reactive response per tick
+
         # Layer 2: Reflection (on transition or idle timeout)
-        should_reflect = (
+        # Skip reflection if we just did a reactive response
+        should_reflect = not reacted and (
             len(transitions) > 0
             or (now - last_reflection_mono) > args.reflection_interval
         )

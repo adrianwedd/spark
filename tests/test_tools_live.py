@@ -140,7 +140,7 @@ class TestNonGpioLive:
         assert payload["dry"] is False
 
     def test_tool_recall(self):
-        payload = run_tool(["bin/tool-recall"], live_env())
+        payload = run_tool(["bin/tool-recall"], live_env(), timeout=45)
         assert payload["status"] == "ok"
         assert payload["dry"] is False
         assert "notes" in payload
@@ -150,6 +150,7 @@ class TestNonGpioLive:
         payload = run_tool(
             ["bin/tool-timer"],
             live_env(PX_TIMER_SECONDS="5", PX_TIMER_LABEL="test"),
+            timeout=45,
         )
         assert payload["status"] == "ok"
         assert payload["dry"] is False

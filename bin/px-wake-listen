@@ -44,6 +44,7 @@ CHANNELS    = 1
 SILENCE_S        = 1.5    # silence after speech → end of utterance
 MAX_RECORD_S     = 8.0    # hard cap on recording length
 RMS_SILENCE      = 300    # RMS below this → silence
+AMBIENT_WRITE_S  = 10     # write ambient sound level every N seconds
 SPEECH_ONSET_RMS = 400    # RMS above this → speech started (follow-up detection)
 FOLLOWUP_SILENCE_S  = 2.0  # silence threshold ending a follow-up utterance
 FOLLOWUP_MAX_S      = 8.0  # hard cap for follow-up recording
@@ -709,10 +710,42 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
     persona_names = [k.split()[-1] for k in PERSONA_WAKE]
     log(f"listening for wake word: '{wake_phrase}' (say 'vixen' or 'gremlin' after wake to switch persona)")
 
+    # Ambient sound tracking for px-mind
+    STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+    AMBIENT_FILE = STATE_DIR / "ambient_sound.json"
+    _ambient_rms_sum = 0
+    _ambient_rms_count = 0
+    _ambient_last_write = time.monotonic()
+
     try:
         while True:
             data = stream.read(CHUNK, exception_on_overflow=False)
             resampled_data, resample_state = resample(data, resample_state)
+
+            # Track ambient sound level (rolling RMS)
+            try:
+                chunk_rms = audioop.rms(data, 2)
+                _ambient_rms_sum += chunk_rms
+                _ambient_rms_count += 1
+                _now_mono = time.monotonic()
+                if (_now_mono - _ambient_last_write) >= AMBIENT_WRITE_S and _ambient_rms_count > 0:
+                    avg_rms = _ambient_rms_sum // _ambient_rms_count
+                    level = "silent" if avg_rms < 200 else "quiet" if avg_rms < 500 else "moderate" if avg_rms < 1500 else "loud"
+                    try:
+                        from pxh.time import utc_timestamp as _utc_ts
+                        STATE_DIR.mkdir(parents=True, exist_ok=True)
+                        _tmp = AMBIENT_FILE.with_suffix(".tmp")
+                        _tmp.write_text(json.dumps({
+                            "ts": _utc_ts(), "rms": avg_rms, "level": level,
+                        }), encoding="utf-8")
+                        _tmp.rename(AMBIENT_FILE)
+                    except Exception:
+                        pass
+                    _ambient_rms_sum = 0
+                    _ambient_rms_count = 0
+                    _ambient_last_write = _now_mono
+            except Exception:
+                pass
 
             if wake_rec.AcceptWaveform(resampled_data):
                 result = json.loads(wake_rec.Result())
@@ -732,6 +765,17 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                     log(f"captured {chunks_n} chunks ({chunks_n * CHUNK / MIC_RATE:.1f}s)")
                     text_out = _do_transcribe(audio_bytes, model, stt, whisper, sensevoice)
                     log(f"utterance: {text_out!r}")
+
+                    # Log transcript to session history for px-mind conversation digestion
+                    if text_out:
+                        try:
+                            from pxh.state import update_session as _update_session
+                            _update_session(history_entry={
+                                "event": "wake_transcript",
+                                "text": text_out[:500],
+                            })
+                        except Exception:
+                            pass
 
                     # Check session for persistent persona (set via API)
                     from pxh.state import load_session as _load_session

@@ -472,8 +472,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         text = params.get("text")
         if not isinstance(text, str) or not text.strip():
             raise VoiceLoopError(f"{tool} requires a non-empty text parameter")
-        if len(text) > 300:
-            text = text[:300]
+        if len(text) > 2000:
+            text = text[:2000]
         sanitized["PX_TEXT"] = text
     elif tool in ("tool_api_start", "tool_api_stop"):
         pass  # no params required

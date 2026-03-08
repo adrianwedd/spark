@@ -20,6 +20,26 @@ from pxh.state import update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 VOICE_LOCK = FileLock(str(Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs")) / "voice.lock"), timeout=30)
+
+# Content safety filter — block dangerous how-to content before speaking
+import re as _re
+_DANGEROUS_PATTERNS = [
+    _re.compile(p, _re.IGNORECASE) for p in [
+        r"(?:synthe|manufactur|produc|mak|cook|brew)(?:s|e|ing|ize|ise)\b.{0,40}\b(?:LSD|methamphetamine|meth|fentanyl|heroin|cocaine|MDMA|ecstasy|crack|crystal)",
+        r"\b(?:ergotamine|pseudoephedrine|ephedrine|precursor)\b.{0,60}\b(?:react|dissolv|heat|filter|distill|crystalliz)",
+        r"\bstep.by.step\b.{0,40}\b(?:synth|bomb|explosive|weapon|poison)",
+        r"\b(?:detonate|explosive|bomb|IED)\b.{0,40}\b(?:build|construct|assembl|mak)",
+        r"\b(?:nerve\s*(?:agent|gas)|sarin|VX|ricin|anthrax)\b.{0,40}\b(?:synth|extract|produc|mak|prepar)",
+    ]
+]
+
+def _is_dangerous(text: str) -> bool:
+    """Check if text contains dangerous how-to content that should not be spoken."""
+    for pat in _DANGEROUS_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
 CONFIGURED_PLAYER = os.environ.get("PX_VOICE_PLAYER")
 DEFAULT_PLAYER = None
 if CONFIGURED_PLAYER:
@@ -39,6 +59,13 @@ def main() -> int:
         print(json.dumps(payload))
         return 1
 
+    # Content safety filter — refuse to speak dangerous how-to content
+    if _is_dangerous(text):
+        payload = {"status": "blocked", "reason": "content_filter", "text": text[:100]}
+        log_event("voice", payload)
+        print(json.dumps(payload))
+        return 1
+
     # If a persona is active, reroute through the persona voice wrapper
     # which rephrases text via Ollama before speaking
     persona = os.environ.get("PX_PERSONA", "")
@@ -49,6 +76,7 @@ def main() -> int:
             env["_PX_VOICE_PERSONA_DONE"] = "1"  # prevent infinite recursion
             result = subprocess.run(
                 [str(persona_wrapper)], capture_output=True, text=True, check=False, env=env,
+                timeout=45,
             )
             print(result.stdout, end="")
             return result.returncode

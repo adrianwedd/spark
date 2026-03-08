@@ -51,10 +51,12 @@ def main() -> int:
     if not notes:
         spoken = "I don't have any notes saved yet."
     elif len(notes) == 1:
-        spoken = f"I remember: {notes[0]}"
+        spoken = f"I remember: {notes[0][:200]}"
     else:
-        items = "; ".join(notes)
-        spoken = f"I remember {len(notes)} things: {items}."
+        # Truncate each note for speech — full text stays in JSON payload
+        short = [n[:120] for n in notes]
+        items = "; ".join(short)
+        spoken = f"I remember {len(notes)} things: {items}."[:500]
 
     update_session(
         fields={"last_action": "tool_recall"},

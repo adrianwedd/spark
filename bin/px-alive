@@ -20,6 +20,7 @@ Run with sudo (needs picarx). Writes PID file; handles SIGTERM cleanly.
 """
 import argparse
 import datetime as dt
+import json
 import os
 import random
 import signal
@@ -49,6 +50,27 @@ FACE_FRAME_W         = 640    # Vilib camera frame width
 FACE_FRAME_H         = 480    # Vilib camera frame height
 FACE_DEADZONE        = 40     # pixels from center before tracking kicks in
 FACE_LOST_TIMEOUT    = 3.0    # seconds without face before returning to gaze drift
+
+# Emotional servo coordination: mood → body language
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
+STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+MOOD_FILE    = STATE_DIR / "mood.json"
+MOOD_CHECK_S = 10    # how often to read mood file
+
+MOOD_BEHAVIOR = {
+    "excited":       {"gaze_min": 5,  "gaze_max": 12, "tilt_bias": 10},
+    "playful":       {"gaze_min": 6,  "gaze_max": 15, "tilt_bias": 5},
+    "mischievous":   {"gaze_min": 6,  "gaze_max": 14, "tilt_bias": 8},
+    "curious":       {"gaze_min": 8,  "gaze_max": 18, "tilt_bias": 5},
+    "alert":         {"gaze_min": 5,  "gaze_max": 10, "tilt_bias": 0},
+    "content":       {"gaze_min": 10, "gaze_max": 25, "tilt_bias": 0},
+    "peaceful":      {"gaze_min": 15, "gaze_max": 30, "tilt_bias": -5},
+    "contemplative": {"gaze_min": 12, "gaze_max": 28, "tilt_bias": -5},
+    "bored":         {"gaze_min": 20, "gaze_max": 40, "tilt_bias": -10},
+    "lonely":        {"gaze_min": 15, "gaze_max": 35, "tilt_bias": -8},
+    "grumpy":        {"gaze_min": 8,  "gaze_max": 20, "tilt_bias": -3},
+    "anxious":       {"gaze_min": 4,  "gaze_max": 8,  "tilt_bias": 0},
+}
 def log(msg: str) -> None:
     ts = dt.datetime.now().isoformat(timespec="seconds")
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -159,11 +181,26 @@ def get_face() -> tuple[int, int] | None:
     return None
 
 
+def read_mood() -> dict:
+    """Read mood.json written by px-mind. Returns behavior params or defaults."""
+    try:
+        if MOOD_FILE.exists():
+            data = json.loads(MOOD_FILE.read_text(encoding="utf-8"))
+            mood = data.get("mood", "content")
+            behavior = MOOD_BEHAVIOR.get(mood, MOOD_BEHAVIOR["content"])
+            return behavior
+    except Exception:
+        pass
+    return MOOD_BEHAVIOR["content"]
+
+
 def idle_loop(args) -> None:
     cur_pan, cur_tilt = 0, 0
     next_gaze = time.monotonic() + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
     next_scan = time.monotonic() + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
     next_prox = time.monotonic() + PROX_CHECK_S
+    next_mood_check = time.monotonic() + MOOD_CHECK_S
+    cur_mood_behavior = MOOD_BEHAVIOR["content"]
     prox_near_since: float | None = None
     i2c_ok_after: float = 0.0  # monotonic time after which I2C retries are allowed
     face_tracking = not args.no_face
@@ -211,6 +248,11 @@ def idle_loop(args) -> None:
                 continue
 
             try:
+                # --- Mood check (read px-mind's mood.json) ---
+                if now >= next_mood_check:
+                    next_mood_check = now + MOOD_CHECK_S
+                    cur_mood_behavior = read_mood()
+
                 # --- Proximity check (every PROX_CHECK_S — not every loop tick) ---
                 if PROX_THRESH > 0 and now >= next_prox:
                     next_prox = now + PROX_CHECK_S
@@ -227,7 +269,7 @@ def idle_loop(args) -> None:
                             ease(get_px(), cur_pan, cur_tilt, 0, 5, 0.5)
                             cur_pan, cur_tilt = 0, 5
                             prox_near_since = None
-                            next_gaze = now + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
+                            next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
                     else:
                         prox_near_since = None
 
@@ -258,7 +300,7 @@ def idle_loop(args) -> None:
 
                         face_tracked = True
                         # Defer gaze/scan while tracking a face
-                        next_gaze = now + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
+                        next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
                         next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
 
                     elif face_last_seen > 0 and (now - face_last_seen) < FACE_LOST_TIMEOUT:
@@ -279,23 +321,31 @@ def idle_loop(args) -> None:
                     cur_pan, cur_tilt = 0, 0
                     log("idle scan: sweep complete")
                     next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
-                    next_gaze = now + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
+                    next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
 
                 # --- Gaze drift (only when not tracking a face) ---
                 elif not face_tracked and now >= next_gaze:
                     target_pan  = random.randint(*PAN_RANGE)
-                    target_tilt = random.randint(*TILT_RANGE)
+                    # Apply mood tilt bias (positive = head up/alert, negative = drooping)
+                    tilt_bias = cur_mood_behavior.get("tilt_bias", 0)
+                    tilt_lo = max(TILT_RANGE[0], TILT_RANGE[0] + tilt_bias)
+                    tilt_hi = min(TILT_RANGE[1], TILT_RANGE[1] + tilt_bias)
+                    if tilt_lo > tilt_hi:
+                        tilt_lo, tilt_hi = tilt_hi, tilt_lo  # guard against inverted range
+                    target_tilt = random.randint(tilt_lo, tilt_hi)
                     duration    = random.uniform(0.8, 2.2)
                     log(f"gaze drift: ({cur_pan},{cur_tilt}) → ({target_pan},{target_tilt}) over {duration:.1f}s")
                     ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt, duration)
                     cur_pan, cur_tilt = target_pan, target_tilt
-                    next_gaze = now + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
+                    gaze_min = cur_mood_behavior.get("gaze_min", GAZE_MIN_S)
+                    gaze_max = cur_mood_behavior.get("gaze_max", GAZE_MAX_S)
+                    next_gaze = now + random.uniform(gaze_min, gaze_max)
 
             except OSError as exc:
                 log(f"I2C error (will retry in {I2C_BACKOFF_S}s): {exc}")
                 drop_px()  # release broken handle so get_px() recreates it
                 i2c_ok_after = time.monotonic() + I2C_BACKOFF_S
-                next_gaze = i2c_ok_after + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
+                next_gaze = i2c_ok_after + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
                 next_scan = i2c_ok_after + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
                 next_prox = i2c_ok_after + PROX_CHECK_S
 
