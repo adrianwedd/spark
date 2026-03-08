@@ -182,7 +182,6 @@ def load_stt_model(model_dir: str):
         decoder = _pick("decoder*.onnx", "decoder*.int8.onnx")
         joiner  = _pick("joiner*.onnx",  "joiner*.int8.onnx")
         tokens  = str(path / "tokens.txt")
-        bpe     = str(path / "bpe.model") if (path / "bpe.model").exists() else ""
         if not all([encoder, decoder, joiner]) or not Path(tokens).exists():
             return None
 
@@ -197,10 +196,13 @@ def load_stt_model(model_dir: str):
             decoding_method="greedy_search",
             provider="cpu",
         )
-        if bpe:
-            kwargs["bpe_model"] = bpe
         return sherpa_onnx.OnlineRecognizer.from_transducer(**kwargs)
     except Exception as exc:
+        try:
+            import datetime as _dt
+            print(f"{_dt.datetime.now().isoformat(timespec='seconds')} [wake] STT load error: {exc}", flush=True)
+        except Exception:
+            pass
         return None
 
 
@@ -478,8 +480,7 @@ def listen_loop(pa, model, args, stt=None) -> None:
 
     # Grammar recognizer for wake word (fast, low-CPU)
     wake_phrase = args.wake_word.lower().strip()
-    all_phrases = [wake_phrase] + list(PERSONA_WAKE.keys())
-    grammar = json.dumps(all_phrases + ["[unk]"])
+    grammar = json.dumps([wake_phrase, "[unk]"])
     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
     resample_state = None  # audioop.ratecv state for wake recognizer
 
@@ -492,8 +493,8 @@ def listen_loop(pa, model, args, stt=None) -> None:
         frames_per_buffer=CHUNK,
     )
     stream.start_stream()
-    all_phrases = [wake_phrase] + list(PERSONA_WAKE.keys())
-    log(f"listening for wake words: {', '.join(all_phrases)}")
+    persona_names = [k.split()[-1] for k in PERSONA_WAKE]
+    log(f"listening for wake word: '{wake_phrase}' (say 'siren' or 'gremlin' after wake to switch persona)")
 
     try:
         while True:
@@ -503,19 +504,11 @@ def listen_loop(pa, model, args, stt=None) -> None:
             if wake_rec.AcceptWaveform(resampled_data):
                 result = json.loads(wake_rec.Result())
                 text = result.get("text", "")
-                # Check for any known wake phrase (main or persona)
-                matched_persona = None
-                matched_wake = False
-                for persona_phrase, persona_tool in PERSONA_WAKE.items():
-                    if persona_phrase in text:
-                        matched_persona = persona_tool
-                        log(f"persona wake detected: {text!r} → {persona_tool}")
-                        break
-                if not matched_persona and wake_phrase in text:
-                    matched_wake = True
-                    log(f"wake word detected: {text!r}")
+                if text and text != "[unk]":
+                    log(f"vosk heard: {text!r}")
 
-                if matched_wake or matched_persona:
+                if wake_phrase in text:
+                    log(f"wake word detected: {text!r}")
                     # Chime in background while we start recording
                     threading.Thread(target=play_chime, args=(args.aplay_device,), daemon=True).start()
 
@@ -530,10 +523,31 @@ def listen_loop(pa, model, args, stt=None) -> None:
                         text_out = transcribe(model, audio_bytes)
                     log(f"utterance: {text_out!r}")
 
-                    if matched_persona:
+                    # Route by keyword in utterance: "siren", "gremlin" → persona
+                    # e.g. "talk to siren", "ask gremlin", "siren what's up"
+                    routed_persona = None
+                    utterance_lower = text_out.lower()
+                    for keyword, persona_tool in PERSONA_WAKE.items():
+                        # PERSONA_WAKE keys are "hey siren" etc — extract the name
+                        persona_name = keyword.split()[-1]
+                        if persona_name in utterance_lower:
+                            routed_persona = persona_tool
+                            # Strip the persona name from the utterance so it's clean input
+                            import re as _re
+                            clean_utterance = _re.sub(
+                                rf"\b(talk to |ask |hey |speak to |call )?{persona_name}\b[,:]?\s*",
+                                "", utterance_lower, count=1,
+                            ).strip()
+                            if not clean_utterance:
+                                clean_utterance = "hello"
+                            log(f"persona routed: {persona_name} → {persona_tool} (utterance: {clean_utterance!r})")
+                            text_out = clean_utterance
+                            break
+
+                    if routed_persona:
                         # --- Persona conversation (direct chat tool) ---
                         run_persona_conversation(
-                            matched_persona, text_out, args.dry_run,
+                            routed_persona, text_out, args.dry_run,
                             stream, model, args.aplay_device, args.convo_turns, stt,
                         )
                     else:
@@ -546,7 +560,7 @@ def listen_loop(pa, model, args, stt=None) -> None:
                     # Reset wake recognizer after conversation ends
                     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
                     resample_state = None
-                    log(f"listening for wake words: {', '.join(all_phrases)}")
+                    log(f"listening for wake word: '{wake_phrase}'")
 
     finally:
         stream.stop_stream()
