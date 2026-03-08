@@ -13,11 +13,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from filelock import FileLock
 
 from pxh.logging import log_event
 from pxh.state import update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+VOICE_LOCK = FileLock(str(Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs")) / "voice.lock"), timeout=30)
 CONFIGURED_PLAYER = os.environ.get("PX_VOICE_PLAYER")
 DEFAULT_PLAYER = None
 if CONFIGURED_PLAYER:
@@ -63,52 +65,54 @@ def main() -> int:
     elif not DEFAULT_PLAYER:
         payload["note"] = "no speech engine available"
     else:
-        if DEFAULT_PLAYER == "espeak":
-            rate = os.environ.get("PX_VOICE_RATE", "150")
-            pitch = os.environ.get("PX_VOICE_PITCH", "50")
-            voice_variant = os.environ.get("PX_VOICE_VARIANT", "en")
-            device = os.environ.get("PX_VOICE_DEVICE")
-            # Enable robot-hat speaker amplifier (GPIO 20) before audio
-            subprocess.run(
-                ["sudo", "-n", "/usr/bin/python3", "-c",
-                 "from robot_hat import enable_speaker; enable_speaker()"],
-                check=False, capture_output=True,
-            )
-            es_res = subprocess.run(
-                [DEFAULT_PLAYER, "-v", voice_variant, "-p", pitch, "-s", rate, "--stdout", text],
-                capture_output=True,
-                text=False,
-                check=False,
-            )
-            play_descriptor = device or "default"
-            payload["player"] = f"espeak->{play_descriptor}"
-            payload["returncode"] = es_res.returncode
-            payload["stdout"] = es_res.stdout[-1024:].decode("latin1", errors="ignore")
-            payload["stderr"] = es_res.stderr[-1024:].decode("latin1", errors="ignore")
-            if es_res.returncode == 0 and shutil.which("aplay"):
-                play_cmd = ["aplay", "-q"]
-                if device:
-                    play_cmd.extend(["-D", device])
-                play_res = subprocess.run(
-                    play_cmd,
-                    input=es_res.stdout,
+        # Serialize audio playback — only one voice at a time
+        with VOICE_LOCK:
+            if DEFAULT_PLAYER == "espeak":
+                rate = os.environ.get("PX_VOICE_RATE", "150")
+                pitch = os.environ.get("PX_VOICE_PITCH", "50")
+                voice_variant = os.environ.get("PX_VOICE_VARIANT", "en")
+                device = os.environ.get("PX_VOICE_DEVICE")
+                # Enable robot-hat speaker amplifier (GPIO 20) before audio
+                subprocess.run(
+                    ["sudo", "-n", "/usr/bin/python3", "-c",
+                     "from robot_hat import enable_speaker; enable_speaker()"],
+                    check=False, capture_output=True,
+                )
+                es_res = subprocess.run(
+                    [DEFAULT_PLAYER, "-v", voice_variant, "-p", pitch, "-s", rate, "--stdout", text],
                     capture_output=True,
                     text=False,
                     check=False,
                 )
-                payload["player"] = f"espeak+aplay({play_descriptor})"
-                payload["returncode"] = play_res.returncode
-                payload["stdout"] = play_res.stdout[-1024:].decode("latin1", errors="ignore")
-                payload["stderr"] = play_res.stderr[-1024:].decode("latin1", errors="ignore")
-            elif es_res.returncode == 0:
-                payload["note"] = "aplay not found"
-        else:
-            command = [DEFAULT_PLAYER, text]
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-            payload["player"] = DEFAULT_PLAYER
-            payload["returncode"] = result.returncode
-            payload["stdout"] = result.stdout[-1024:]
-            payload["stderr"] = result.stderr[-1024:]
+                play_descriptor = device or "default"
+                payload["player"] = f"espeak->{play_descriptor}"
+                payload["returncode"] = es_res.returncode
+                payload["stdout"] = es_res.stdout[-1024:].decode("latin1", errors="ignore")
+                payload["stderr"] = es_res.stderr[-1024:].decode("latin1", errors="ignore")
+                if es_res.returncode == 0 and shutil.which("aplay"):
+                    play_cmd = ["aplay", "-q"]
+                    if device:
+                        play_cmd.extend(["-D", device])
+                    play_res = subprocess.run(
+                        play_cmd,
+                        input=es_res.stdout,
+                        capture_output=True,
+                        text=False,
+                        check=False,
+                    )
+                    payload["player"] = f"espeak+aplay({play_descriptor})"
+                    payload["returncode"] = play_res.returncode
+                    payload["stdout"] = play_res.stdout[-1024:].decode("latin1", errors="ignore")
+                    payload["stderr"] = play_res.stderr[-1024:].decode("latin1", errors="ignore")
+                elif es_res.returncode == 0:
+                    payload["note"] = "aplay not found"
+            else:
+                command = [DEFAULT_PLAYER, text]
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                payload["player"] = DEFAULT_PLAYER
+                payload["returncode"] = result.returncode
+                payload["stdout"] = result.stdout[-1024:]
+                payload["stderr"] = result.stderr[-1024:]
 
     update_session(
         fields={"last_action": "tool_voice"},
