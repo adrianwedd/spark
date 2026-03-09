@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# px-spark — launch the Claude voice loop as SPARK, the child companion persona.
+#
+# SPARK (Support Partner for Awareness, Regulation & Kindness) is a warm,
+# calm robot companion designed for neurodivergent kids. It uses declarative
+# language, connection-before-direction, and meltdown-aware quiet mode.
+#
+# Usage:
+#   bin/px-spark [--dry-run] [--input-mode voice|text] [extra codex-voice-loop args]
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Activate SPARK persona in session state
+python3 - <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["PROJECT_ROOT"] + "/src")
+from pxh.state import update_session
+update_session(fields={
+    "persona": "spark",
+    "spark_quiet_mode": False,
+})
+print("[spark] persona activated")
+PY
+
+# Set SPARK voice environment
+export PX_PERSONA=spark
+export PX_VOICE_VARIANT=en+m3
+export PX_VOICE_PITCH=58
+export PX_VOICE_RATE=120
+
+# Greet — calm, warm, not performative
+python3 - <<'PY'
+import os, subprocess
+from pathlib import Path
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+subprocess.run(
+    [str(PROJECT_ROOT / "bin" / "tool-voice")],
+    env={**os.environ, "PX_TEXT": "Hey. I'm here."},
+    check=False,
+)
+PY
+
+# Launch Claude voice loop with SPARK system prompt
+export CODEX_CHAT_CMD="$SCRIPT_DIR/claude-voice-bridge"
+
+exec "$SCRIPT_DIR/codex-voice-loop" \
+    --prompt "$SCRIPT_DIR/../docs/prompts/spark-voice-system.md" \
+    "$@"

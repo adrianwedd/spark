@@ -82,6 +82,7 @@ TOOL_COMMANDS = {
 PERSONA_PROMPTS = {
     "vixen": PROJECT_ROOT / "docs" / "prompts" / "persona-vixen.md",
     "gremlin": PROJECT_ROOT / "docs" / "prompts" / "persona-gremlin.md",
+    "spark": PROJECT_ROOT / "docs" / "prompts" / "spark-voice-system.md",
 }
 
 PERSONA_VOICE_ENV = {
@@ -96,6 +97,12 @@ PERSONA_VOICE_ENV = {
         "PX_VOICE_VARIANT": "en+croak",
         "PX_VOICE_PITCH": "20",
         "PX_VOICE_RATE": "180",
+    },
+    "spark": {
+        "PX_PERSONA": "spark",
+        "PX_VOICE_VARIANT": "en+m3",
+        "PX_VOICE_PITCH": "58",
+        "PX_VOICE_RATE": "120",
     },
 }
 

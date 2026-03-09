@@ -15,5 +15,10 @@
   "persona": null,
   "listening": false,
   "listening_since": null,
+  "obi_routine": null,
+  "obi_step": 0,
+  "obi_mood": null,
+  "obi_streak": 0,
+  "spark_quiet_mode": false,
   "history": []
 }
