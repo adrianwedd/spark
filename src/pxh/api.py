@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .state import load_session, update_session
 from .voice_loop import (
@@ -81,6 +82,20 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
+
+# Catch path-traversal attempts that Starlette collapses before routing.
+# e.g. /api/v1/logs/../../etc/passwd normalizes to /api/etc/passwd (not under /api/v1/)
+# Return 400 so callers know the request was explicitly rejected, not merely not found.
+_VALID_API_PREFIXES = ("/api/v1/",)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    path = request.url.path
+    if exc.status_code == 404 and path.startswith("/api/"):
+        if not any(path.startswith(p) for p in _VALID_API_PREFIXES):
+            return JSONResponse({"detail": "invalid path"}, status_code=400)
+    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +437,30 @@ async def control_service(service: str, action: str) -> JSONResponse:
         status_code=200 if result.get("status") == "ok" else 500,
         content=result,
     )
+
+
+# ---------------------------------------------------------------------------
+# Log tailing endpoint
+# ---------------------------------------------------------------------------
+
+_LOG_ALLOWLIST = {
+    "px-mind", "px-wake-listen", "px-alive",
+    "tool-voice", "tool-describe_scene",
+}
+
+
+@app.get("/api/v1/logs/{service}", dependencies=[Depends(_verify_token)])
+async def tail_log(service: str, lines: int = 100) -> JSONResponse:
+    """Return last N lines from a named log file."""
+    if service not in _LOG_ALLOWLIST:
+        raise HTTPException(status_code=400, detail=f"unknown log: {service}")
+    log_dir = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+    log_path = log_dir / f"{service}.log"
+    if not log_path.exists():
+        return JSONResponse(content={"lines": [], "service": service})
+    text = log_path.read_text(errors="replace")
+    tail = text.splitlines()[-lines:]
+    return JSONResponse(content={"lines": tail, "service": service})
 
 
 # ---------------------------------------------------------------------------

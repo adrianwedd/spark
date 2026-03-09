@@ -339,6 +339,21 @@ class TestMotionGate:
         assert resp.json()["confirm_motion_allowed"] is False
 
 
+class TestLogs:
+    def test_log_rejects_invalid_service(self, api_client, auth_headers):
+        r = api_client.get("/api/v1/logs/../../etc/passwd", headers=auth_headers)
+        assert r.status_code == 400
+
+    def test_log_requires_auth(self, api_client):
+        r = api_client.get("/api/v1/logs/px-mind")
+        assert r.status_code in (401, 403)
+
+    def test_log_missing_file_returns_empty(self, api_client, auth_headers):
+        r = api_client.get("/api/v1/logs/px-alive", headers=auth_headers)
+        assert r.status_code == 200
+        assert isinstance(r.json()["lines"], list)
+
+
 class TestWebUI:
     def test_root_returns_html(self, api_client):
         resp = api_client.get("/")
