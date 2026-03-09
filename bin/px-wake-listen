@@ -41,14 +41,14 @@ MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 onl
 VOSK_RATE   = 16000  # Vosk model input rate
 CHUNK       = 2048   # frames per buffer at 44100 Hz (~46 ms)
 CHANNELS    = 1
-SILENCE_S        = 1.5    # silence after speech → end of utterance
-MAX_RECORD_S     = 8.0    # hard cap on recording length
+SILENCE_S        = 3.0    # silence after speech → end of utterance (patient — handles mid-sentence pauses)
+MAX_RECORD_S     = 20.0   # hard cap on recording length
 RMS_SILENCE      = 300    # RMS below this → silence
 AMBIENT_WRITE_S  = 10     # write ambient sound level every N seconds
 SPEECH_ONSET_RMS = 400    # RMS above this → speech started (follow-up detection)
-FOLLOWUP_SILENCE_S  = 2.0  # silence threshold ending a follow-up utterance
-FOLLOWUP_MAX_S      = 8.0  # hard cap for follow-up recording
-FOLLOWUP_TIMEOUT_S  = 4.0  # seconds to wait for follow-up speech to begin
+FOLLOWUP_SILENCE_S  = 3.5  # silence threshold ending a follow-up utterance
+FOLLOWUP_MAX_S      = 20.0  # hard cap for follow-up recording
+FOLLOWUP_TIMEOUT_S  = 30.0  # seconds to wait for follow-up speech to begin (timeout → end session)
 END_PHRASES = {"stop", "bye", "goodbye", "that's all", "done", "end", "no thanks"}
 
 DEFAULT_MODEL = str(PROJECT_ROOT / "models" / "vosk-model-small-en-us-0.15")
@@ -138,29 +138,34 @@ def find_input_device(pa, preferred_name: str = "") -> int:
     return result
 
 
-def play_chime(device: str = "") -> None:
-    """Play a short 440 Hz beep via aplay to signal wake detection."""
+def _play_tone_sequence(freqs_durs: list, device: str = "", amplitude: int = 22000) -> None:
+    """Render and play a sequence of (freq_hz, duration_s) sine tones with 10ms fade and 40ms gap."""
     try:
         from robot_hat import enable_speaker
         enable_speaker()
     except Exception:
         pass
     try:
-        # Generate a short beep: 0.25 s 440 Hz sine, 16-bit 44100 Hz mono WAV
         import math, wave as wv, tempfile
-        beep_f = 440
-        dur    = 0.25
-        n      = int(MIC_RATE * dur)
-        samples = bytes(struct.pack(f"{n}h", *[
-            int(28000 * math.sin(2 * math.pi * beep_f * t / MIC_RATE))
-            for t in range(n)
-        ]))
+        all_samples: list[int] = []
+        fade_n = int(MIC_RATE * 0.010)  # 10ms linear fade to avoid clicks
+        gap_n  = int(MIC_RATE * 0.040)  # 40ms silence between tones
+        for freq, dur in freqs_durs:
+            n = int(MIC_RATE * dur)
+            for t in range(n):
+                s = int(amplitude * math.sin(2 * math.pi * freq * t / MIC_RATE))
+                if t < fade_n:
+                    s = int(s * t / fade_n)
+                elif t > n - fade_n:
+                    s = int(s * (n - t) / fade_n)
+                all_samples.append(s)
+            all_samples.extend([0] * gap_n)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             with wv.open(tf.name, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(MIC_RATE)
-                wf.writeframes(samples)
+                wf.writeframes(struct.pack(f"{len(all_samples)}h", *all_samples))
             tmp = tf.name
         cmd = ["aplay", "-q"]
         if device:
@@ -169,7 +174,27 @@ def play_chime(device: str = "") -> None:
         subprocess.run(cmd, check=False, capture_output=True)
         os.unlink(tmp)
     except Exception as exc:
-        log(f"chime error: {exc}")
+        log(f"tone error: {exc}")
+
+
+def play_chime(device: str = "") -> None:
+    """Single 440 Hz tone — wake word acknowledged, starting to record."""
+    _play_tone_sequence([(440, 0.25)], device, amplitude=28000)
+
+
+def play_chime_listening(device: str = "") -> None:
+    """Two ascending tones (600→900 Hz) — 'I'm listening, your turn'."""
+    _play_tone_sequence([(600, 0.10), (900, 0.13)], device, amplitude=18000)
+
+
+def play_chime_processing(device: str = "") -> None:
+    """Descending double-blip (800→500 Hz) — 'Got it, I'm thinking'."""
+    _play_tone_sequence([(800, 0.07), (500, 0.07)], device, amplitude=15000)
+
+
+def play_chime_timeout(device: str = "") -> None:
+    """Three descending tones (700→500→300 Hz) — 'Stopping, session ended'."""
+    _play_tone_sequence([(700, 0.09), (500, 0.09), (300, 0.14)], device, amplitude=13000)
 
 
 def resample(data: bytes, state=None):
@@ -448,38 +473,6 @@ def _restart_alive() -> None:
         )
 
 
-def play_chime_followup(device: str = "") -> None:
-    """Play a soft lower-pitch tone: signals 'still listening for follow-up'."""
-    try:
-        from robot_hat import enable_speaker
-        enable_speaker()
-    except Exception:
-        pass
-    try:
-        import math, wave as wv, tempfile
-        beep_f = 300
-        dur    = 0.15
-        n      = int(MIC_RATE * dur)
-        samples = bytes(struct.pack(f"{n}h", *[
-            int(16000 * math.sin(2 * math.pi * beep_f * t / MIC_RATE))
-            for t in range(n)
-        ]))
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            with wv.open(tf.name, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(MIC_RATE)
-                wf.writeframes(samples)
-            tmp = tf.name
-        cmd = ["aplay", "-q"]
-        if device:
-            cmd += ["-D", device]
-        cmd.append(tmp)
-        subprocess.run(cmd, check=False, capture_output=True)
-        os.unlink(tmp)
-    except Exception as exc:
-        log(f"follow-up chime error: {exc}")
-
 
 def flush_stream(stream, chunks: int = 15) -> None:
     """Discard buffered audio that built up while the robot was speaking."""
@@ -519,11 +512,12 @@ def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice
     return transcribe(model, audio_bytes)
 
 
-def record_followup(stream, model, stt=None, whisper=None, sensevoice=None) -> str:
+def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
+                    aplay_device: str = "") -> str:
     """Wait up to FOLLOWUP_TIMEOUT_S for speech onset, then record and transcribe.
 
-    Uses SenseVoice if available (fastest), then faster-whisper (best AU accent),
-    then sherpa-onnx, then Vosk. Returns transcribed text, or '' if no speech detected.
+    Plays a processing beep after recording ends (before STT) so the user knows
+    their input was captured. Returns transcribed text, or '' if no speech detected.
     """
     timeout_chunks = int(FOLLOWUP_TIMEOUT_S * MIC_RATE / CHUNK)
     # Phase 1: wait for speech onset
@@ -534,6 +528,7 @@ def record_followup(stream, model, stt=None, whisper=None, sensevoice=None) -> s
             onset = [data]
             rest = record_utterance(stream, FOLLOWUP_MAX_S, FOLLOWUP_SILENCE_S)
             audio = b"".join(onset) + rest
+            play_chime_processing(aplay_device)
             return _do_transcribe(audio, model, stt, whisper, sensevoice)
     return ""  # timeout — no speech
 
@@ -588,15 +583,18 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
 
             if turn >= max_turns:
                 log("persona conversation: max turns reached")
+                play_chime_timeout(aplay_device)
                 break
 
             flush_stream(stream)
-            play_chime_followup(aplay_device)
+            play_chime_listening(aplay_device)
             log("persona conversation: listening for follow-up...")
-            follow_text = record_followup(stream, model, stt, whisper, sensevoice)
+            follow_text = record_followup(stream, model, stt, whisper, sensevoice,
+                                          aplay_device=aplay_device)
 
             if not follow_text:
                 log("persona conversation: silence — ending")
+                play_chime_timeout(aplay_device)
                 break
 
             log(f"persona conversation: follow-up: {follow_text!r}")
@@ -607,6 +605,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
                 subprocess.run(
                     [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
                 )
+                play_chime_timeout(aplay_device)
                 break
 
             current_text = follow_text
@@ -646,20 +645,23 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
 
             if turn >= max_turns:
                 log("conversation: max turns reached")
+                play_chime_timeout(aplay_device)
                 break
 
             # Flush stale audio buffered while robot was speaking
             flush_stream(stream)
 
-            # Soft chime: "still listening"
-            play_chime_followup(aplay_device)
+            # Ascending chime: "your turn, I'm listening"
+            play_chime_listening(aplay_device)
 
-            # Listen for follow-up
+            # Listen for follow-up (patient: 30s onset wait, 3.5s in-speech silence)
             log("conversation: listening for follow-up...")
-            follow_text = record_followup(stream, model, stt, whisper, sensevoice)
+            follow_text = record_followup(stream, model, stt, whisper, sensevoice,
+                                          aplay_device=aplay_device)
 
             if not follow_text:
                 log("conversation: silence — ending")
+                play_chime_timeout(aplay_device)
                 break
 
             log(f"conversation: follow-up: {follow_text!r}")
@@ -675,6 +677,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
                     env=env,
                     check=False,
                 )
+                play_chime_timeout(aplay_device)
                 break
 
             current_text = follow_text
@@ -763,6 +766,8 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                     audio_bytes = record_utterance(stream, MAX_RECORD_S, SILENCE_S)
                     chunks_n = len(audio_bytes) // (CHUNK * 2)
                     log(f"captured {chunks_n} chunks ({chunks_n * CHUNK / MIC_RATE:.1f}s)")
+                    # Processing beep: "got it, I'm thinking" — fires before STT + LLM
+                    play_chime_processing(args.aplay_device)
                     text_out = _do_transcribe(audio_bytes, model, stt, whisper, sensevoice)
                     log(f"utterance: {text_out!r}")
 
