@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# px-battery-poll — write battery voltage to state/battery.json every 60s
+# Run as root (needs I2C access for robot_hat ADC)
+# Called by cron or systemd; safe to run repeatedly.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/px-env"
+
+/usr/bin/python3 - <<'PY'
+import json, os, time
+from datetime import datetime, timezone
+from pathlib import Path
+from robot_hat.utils import get_battery_voltage
+
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking") + "/state"))
+OUT = STATE_DIR / "battery.json"
+TMP = STATE_DIR / "battery.tmp"
+
+while True:
+    try:
+        volts = round(get_battery_voltage(), 2)
+        pct   = max(0, min(100, int((volts - 6.0) / (8.4 - 6.0) * 100)))
+        ts    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        TMP.write_text(json.dumps({"ts": ts, "volts": volts, "pct": pct}))
+        TMP.rename(OUT)
+    except Exception:
+        pass
+    time.sleep(60)
+PY

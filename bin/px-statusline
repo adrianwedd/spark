@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""px-statusline — compact one-line status for Claude Code statusbar.
+
+Reads only fast sources (state files, /sys, vcgencmd).
+No I2C/GPIO/sudo — must complete in <200ms.
+"""
+from __future__ import annotations
+import json
+import os
+import subprocess
+from pathlib import Path
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
+STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def cpu_temp() -> str:
+    try:
+        t = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000
+        warn = "🔥" if t >= 80 else ("♨️ " if t >= 70 else "")
+        return f"{warn}{t:.0f}°C"
+    except Exception:
+        return "?°C"
+
+
+def throttle() -> str:
+    try:
+        raw = subprocess.check_output(["vcgencmd", "get_throttled"], text=True, timeout=1).strip()
+        val = int(raw.split("=")[1], 16)
+        if val == 0:
+            return ""
+        flags = []
+        if val & 0x1:   flags.append("under-V")
+        if val & 0x4:   flags.append("throttled")
+        if val & 0x2:   flags.append("freq-cap")
+        return " ⚡" + ",".join(flags) if flags else ""
+    except Exception:
+        return ""
+
+
+def mem() -> str:
+    try:
+        info = Path("/proc/meminfo").read_text()
+        avail = next(int(l.split()[1]) for l in info.splitlines() if l.startswith("MemAvailable"))
+        mb = avail // 1024
+        warn = "⚠️ " if mb < 200 else ""
+        return f"{warn}{mb}MB"
+    except Exception:
+        return "?MB"
+
+
+def battery() -> str:
+    d = _read_json(STATE_DIR / "battery.json")
+    if not d:
+        return "🔋?"
+    v, pct = d.get("volts", 0), d.get("pct", 0)
+    icon = "🔋" if pct > 30 else ("🪫" if pct > 10 else "❌")
+    return f"{icon}{v:.1f}V({pct}%)"
+
+
+def mood() -> str:
+    d = _read_json(STATE_DIR / "mood.json")
+    if not d:
+        return ""
+    icons = {
+        "curious": "🔍", "content": "😌", "alert": "👀", "playful": "😄",
+        "contemplative": "🤔", "bored": "😐", "mischievous": "😏",
+        "lonely": "😔", "excited": "✨", "grumpy": "😤",
+        "peaceful": "🕊️", "anxious": "😰",
+    }
+    m = d.get("mood", "")
+    return icons.get(m, "🧠") + m
+
+
+def sonar() -> str:
+    d = _read_json(STATE_DIR / "awareness.json")
+    cm = d.get("sonar_cm")
+    if cm is None:
+        return ""
+    if cm >= 999:
+        return "📡—"
+    warn = "🚨" if cm < 20 else ("⚠️ " if cm < 35 else "📡")
+    return f"{warn}{cm:.0f}cm"
+
+
+def session() -> str:
+    d = _read_json(STATE_DIR / "session.json")
+    persona = d.get("persona") or ""
+    listening = d.get("listening", False)
+    parts = []
+    if persona:
+        p_icons = {"gremlin": "👹", "vixen": "🦊", "obi": "🤖"}
+        parts.append(p_icons.get(persona, "🎭") + persona)
+    if listening:
+        parts.append("🎤")
+    return " ".join(parts)
+
+
+def services() -> str:
+    svcs = {"alive": "px-alive", "mind": "px-mind", "wake": "px-wake-listen"}
+    states = []
+    for label, svc in svcs.items():
+        try:
+            r = subprocess.run(
+                ["systemctl", "is-active", svc],
+                capture_output=True, text=True, timeout=1,
+            )
+            active = r.returncode == 0
+        except Exception:
+            active = False
+        states.append(("●" if active else "○") + label)
+    return " ".join(states)
+
+
+def main() -> None:
+    parts = []
+
+    # Session persona / listening
+    s = session()
+    if s:
+        parts.append(s)
+
+    # px-mind mood
+    m = mood()
+    if m:
+        parts.append(m)
+
+    # Sonar proximity
+    sr = sonar()
+    if sr:
+        parts.append(sr)
+
+    # Hardware
+    parts.append(cpu_temp() + throttle())
+    parts.append(mem())
+    parts.append(battery())
+
+    # Services
+    parts.append(services())
+
+    print(" │ ".join(parts))
+
+
+if __name__ == "__main__":
+    main()

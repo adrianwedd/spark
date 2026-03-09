@@ -1,0 +1,17 @@
+[Unit]
+Description=PiCar-X Battery Voltage Poller
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/pi/picar-x-hacking
+Environment=HOME=/home/pi
+ExecStart=/home/pi/picar-x-hacking/bin/px-battery-poll
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

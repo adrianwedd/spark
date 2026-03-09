@@ -20,6 +20,7 @@ state/awareness.json
 state/thoughts.jsonl
 state/mood.json
 state/ambient_sound.json
+state/battery.json
 state/*.lock
 photos/
 .env
