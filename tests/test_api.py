@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -424,6 +425,16 @@ class TestDeviceControl:
 
 
 class TestPinVerify:
+    @pytest.fixture(autouse=True)
+    def reset_pin_state(self):
+        """Reset rate-limit state before each PIN test."""
+        import pxh.api as api
+        api._pin_attempts = 0
+        api._pin_lockout_until = 0.0
+        yield
+        api._pin_attempts = 0
+        api._pin_lockout_until = 0.0
+
     def test_pin_verify_correct(self, api_client):
         import unittest.mock
         with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
@@ -450,4 +461,24 @@ class TestPinVerify:
         import unittest.mock
         with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
             resp = api_client.post("/api/v1/pin/verify", json={"pin": "9999"})
-        assert resp.status_code != 401
+        assert resp.status_code == 200
+        assert "verified" in resp.json()
+
+    def test_pin_verify_empty_pin_rejected(self, api_client):
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "   "})
+        # Whitespace-only pin should not match
+        assert resp.status_code == 200
+        assert resp.json()["verified"] is False
+
+    def test_pin_verify_rate_limit(self, api_client):
+        """5 wrong PINs trigger lockout; 6th attempt gets 429."""
+        import unittest.mock
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
+            for _ in range(5):
+                resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+                assert resp.status_code == 200
+                assert resp.json()["verified"] is False
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+        assert resp.status_code == 429
+        assert resp.json()["verified"] is False

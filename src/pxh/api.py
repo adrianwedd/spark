@@ -128,8 +128,10 @@ PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 
 
+
 class PinRequest(BaseModel):
-    pin: str
+    pin: str = Field(min_length=1, max_length=16)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -169,13 +171,36 @@ async def health() -> Dict[str, str]:
 
 
 @app.post("/api/v1/pin/verify")
-async def verify_pin(body: PinRequest) -> Dict[str, bool]:
+async def verify_pin(body: PinRequest) -> JSONResponse:
     """Verify the admin PIN. Public endpoint — no Bearer token required."""
+    global _pin_attempts, _pin_lockout_until
+    import time as _time
+    now = _time.monotonic()
+    with _pin_lock:
+        if now < _pin_lockout_until:
+            return JSONResponse(status_code=429, content={"verified": False, "error": "too many attempts"})
+
+    submitted = body.pin.strip()
+    if not submitted:
+        return JSONResponse(status_code=200, content={"verified": False})
+
     expected = os.environ.get("PX_ADMIN_PIN", "").strip()
     if not expected:
-        return {"verified": False}
-    match = secrets.compare_digest(body.pin, expected)
-    return {"verified": match}
+        return JSONResponse(status_code=200, content={"verified": False})
+
+    match = secrets.compare_digest(submitted, expected)
+    if match:
+        with _pin_lock:
+            _pin_attempts = 0
+            _pin_lockout_until = 0.0
+        return JSONResponse(status_code=200, content={"verified": True})
+    else:
+        with _pin_lock:
+            _pin_attempts += 1
+            if _pin_attempts >= _PIN_MAX_ATTEMPTS:
+                _pin_lockout_until = _time.monotonic() + _PIN_LOCKOUT_SECONDS
+                _pin_attempts = 0
+        return JSONResponse(status_code=200, content={"verified": False})
 
 
 @app.get("/api/v1/tools", dependencies=[Depends(_verify_token)])
@@ -445,6 +470,12 @@ _DEVICE_ACTIONS: dict[str, list[str]] = {
     "reboot": ["sudo", "/usr/bin/systemctl", "reboot"],
     "shutdown": ["sudo", "/sbin/shutdown", "-h", "now"],
 }
+
+_pin_lock = threading.Lock()
+_pin_attempts = 0
+_pin_lockout_until = 0.0
+_PIN_MAX_ATTEMPTS = 5
+_PIN_LOCKOUT_SECONDS = 30
 
 
 @app.post("/api/v1/device/{action}", dependencies=[Depends(_verify_token)])
