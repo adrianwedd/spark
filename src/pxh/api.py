@@ -650,7 +650,22 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       </div>
     </div>
   </div>
-  <div id="panel-spark"   class="tab-panel"><!-- SPARK FACE --></div>
+  <div id="panel-spark"   class="tab-panel">
+    <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:20px">
+      <div id="f-status" style="font-size:13px;font-weight:800;color:var(--muted);letter-spacing:.1em;text-transform:uppercase">idle</div>
+      <div id="f-ring" style="width:140px;height:140px;border-radius:50%;border:5px solid var(--spark);display:flex;align-items:center;justify-content:center;font-size:72px;box-shadow:0 0 30px rgba(0,212,170,.3);transition:border-color .5s,box-shadow .5s;animation:pulse-ring 2s ease-in-out infinite">&#x1F914;</div>
+      <div style="background:var(--surface2);border-radius:var(--radius);padding:18px 20px;max-width:340px;width:100%;border-left:4px solid var(--spark)">
+        <div style="font-size:11px;font-weight:800;color:var(--spark);margin-bottom:8px;letter-spacing:.05em">SPARK IS THINKING</div>
+        <div id="f-thought" style="font-size:15px;line-height:1.6;font-style:italic">Loading&#x2026;</div>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center">
+        <div class="spark-stat"><span id="st-mood">&#x2013;</span><br><span class="stat-lbl">mood</span></div>
+        <div class="spark-stat"><span id="st-sonar">&#x2013;</span><br><span class="stat-lbl">sonar</span></div>
+        <div class="spark-stat"><span id="st-period">&#x2013;</span><br><span class="stat-lbl">time</span></div>
+        <div class="spark-stat"><span id="st-persona">&#x2013;</span><br><span class="stat-lbl">persona</span></div>
+      </div>
+    </div>
+  </div>
   <div id="panel-admin"   class="tab-panel"><!-- ADMIN --></div>
 </div>
 <nav id="tab-bar">
@@ -664,7 +679,35 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
 const tok=()=>document.getElementById('tok').value;
 const api=(path,opts={})=>fetch(path,{headers:{'Authorization':'Bearer '+tok(),'Content-Type':'application/json',...(opts.headers||{})}, ...opts}).then(r=>r.json());
 function showPin(){}
-function pollFace(){}
+const MOOD_EMOJI={curious:'&#x1F914;',content:'&#x1F60C;',alert:'&#x1F440;',playful:'&#x1F604;',contemplative:'&#x1F319;',bored:'&#x1F611;',mischievous:'&#x1F60F;',lonely:'&#x1F97A;',excited:'&#x1F929;',grumpy:'&#x1F624;',peaceful:'&#x2601;&#xFE0F;',anxious:'&#x1F630;'};
+const MOOD_COL={curious:'#00d4aa',content:'#5b9cf6',alert:'#f5a623',playful:'#f7d547',contemplative:'#9b7be8',bored:'#8884aa',mischievous:'#f5a623',lonely:'#5b9cf6',excited:'#f7d547',grumpy:'#e05c5c',peaceful:'#5b9cf6',anxious:'#e05c5c'};
+async function pollFace(){
+  try{
+    const s=await api('/api/v1/session');
+    const mood=(s.obi_mood||'curious').toLowerCase();
+    document.getElementById('f-ring').textContent=MOOD_EMOJI[mood]||String.fromCodePoint(0x1F914);
+    const col=MOOD_COL[mood]||'var(--spark)';
+    const ring=document.getElementById('f-ring');
+    ring.style.borderColor=col;ring.style.boxShadow='0 0 30px '+col+'55';
+    if(s.listening){ring.style.animation='ring-listen .5s ease-in-out infinite alternate';document.getElementById('f-status').textContent='listening\u2026';}
+    else{ring.style.animation='pulse-ring 2s ease-in-out infinite';document.getElementById('f-status').textContent='idle';}
+    document.getElementById('st-mood').textContent=mood;
+    document.getElementById('st-persona').textContent=s.persona||'spark';
+    if(document.getElementById('av-mood'))document.getElementById('av-mood').textContent=mood+' \u00b7 ready';
+    if(document.getElementById('av-ring'))document.getElementById('av-ring').textContent=MOOD_EMOJI[mood]||String.fromCodePoint(0x1F914);
+  }catch(e){}
+  try{
+    const logs=await api('/api/v1/logs/px-mind?lines=50');
+    const tl=[...(logs.lines||[])].reverse().find(l=>l.includes('[mind] thought:'));
+    if(tl){const m=tl.match(/thought: (.+?)  mood=/);if(m)document.getElementById('f-thought').textContent=m[1];}
+    const sl=[...(logs.lines||[])].reverse().find(l=>l.includes('sonar='));
+    if(sl){
+      const ms=sl.match(/sonar=(\d+)cm/);if(ms)document.getElementById('st-sonar').textContent=ms[1]+'cm';
+      const mp=sl.match(/period=(\w+)/);if(mp)document.getElementById('st-period').textContent=mp[1];
+    }
+  }catch(e){}
+}
+setInterval(pollFace,5000);
 function addMsg(role,content,tool){
   const feed=document.getElementById('msgs');
   const d=document.createElement('div');
