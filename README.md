@@ -101,6 +101,288 @@ GREMLIN and VIXEN are adult-oriented jailbroken personas running on Ollama — t
 
 ---
 
+## How It Works — End-to-End Workflow
+
+This section traces the complete data flow from power-on to a robot response, and the continuous background processes that give SPARK its sense of inner life.
+
+### 1. Boot Sequence
+
+Three systemd services start automatically:
+
+```
+Boot
+ ├── px-alive.service        (root)   — claims Picarx() GPIO handle; starts gaze drift loop
+ ├── px-wake-listen.service  (pi)     — loads Vosk wake word model; starts mic capture loop
+ └── px-battery-poll.service (root)   — polls Robot HAT ADC every 60s → state/battery.json
+```
+
+**`px-alive`** runs as root (GPIO access) and immediately calls `Picarx()`, claiming GPIO5 via `reset_mcu()`. It never releases this handle. All other processes that need servos must signal px-alive with `SIGUSR1` (via the `yield_alive` function in `px-env`) to make it exit cleanly. systemd restarts it after 10 seconds. The PCA9685 PWM chip retains the last servo position between restarts, so the robot head stays still.
+
+**`px-wake-listen`** loads the Vosk grammar model (~40 MB) and sits in a tight capture loop on the USB microphone at 44100 Hz.
+
+### 2. Launching SPARK
+
+```bash
+bin/px-spark [--dry-run] [--input-mode voice|text]
+```
+
+`px-spark` does the following in sequence:
+
+```
+px-spark
+ 1. Sets session.persona = "spark"          (via update_session)
+ 2. Sets session.listening = false
+ 3. Speaks greeting via tool-voice          ("Hey. I'm here.")
+ 4. Exports CODEX_CHAT_CMD=bin/claude-voice-bridge
+ 5. Exports PX_VOICE_VARIANT=m3, PX_VOICE_PITCH=58, PX_VOICE_RATE=120
+ 6. exec bin/codex-voice-loop --prompt docs/prompts/spark-voice-system.md ...
+```
+
+After step 6, `px-spark` is replaced by `codex-voice-loop` via `exec` (no fork). The voice loop process inherits all environment variables and owns the terminal.
+
+The `CODEX_CHAT_CMD` override is the key to persona routing: instead of calling `codex exec`, the voice loop calls `claude-voice-bridge`, which is a thin adapter that passes the prompt to the `claude` CLI with SPARK's system prompt.
+
+### 3. Wake Word Path
+
+```
+USB mic (44100 Hz)
+ └── px-wake-listen (venv python)
+      ├── [idle] Vosk grammar matches "hey robot" / "hey spark" / etc.
+      │         CPU: ~3% — grammar decoder, no neural net
+      ├── [wake] enable_speaker() → aplay 440 Hz chime (confirmation)
+      ├── [record] capture until 1.5s silence (max 8s)
+      ├── [STT] priority cascade:
+      │    1. SenseVoice (sherpa-onnx, ~5s, non-autoregressive)
+      │    2. faster-whisper base.en (~3-7s, best AU accent accuracy)
+      │    3. sherpa-onnx Zipformer streaming (~2s)
+      │    4. Vosk fallback
+      ├── [anti-hallucination filters]
+      │    • temperature=0, no_speech_threshold=0.6
+      │    • reject: non-ASCII dominant, phantom phrases, repetitive (unique ratio <30%)
+      ├── [persona routing]
+      │    • session.persona = "spark"? → tool-chat (Ollama) if persona keyword in text
+      │    • otherwise → set session.listening=true + write transcript to session
+      └── [multi-turn] up to 5 follow-up turns with 1.5s silence detection each
+```
+
+For SPARK in normal mode, the transcript is written into `session.json` and `session.listening` is set to `true`. The voice loop, which is polling the session file, detects this and proceeds to step 4.
+
+### 4. LLM Turn — Building and Sending the Prompt
+
+The voice loop (`pxh/voice_loop.py`) runs this on each turn:
+
+```python
+build_model_prompt()
+ ├── system_prompt    = docs/prompts/spark-voice-system.md   (full file)
+ ├── session_summary  = key fields from session.json:
+ │    persona, listening, obi_mood, obi_routine, obi_step,
+ │    spark_quiet_mode, last_action, confirm_motion_allowed
+ ├── recent_thoughts  = last 3 entries from state/thoughts-spark.jsonl
+ │    (mood, action, salience — not full text, to avoid re-seeding loops)
+ └── user_transcript  = session.transcript (the STT text)
+```
+
+This prompt is piped via stdin to `claude-voice-bridge`:
+
+```bash
+claude-voice-bridge (bin/claude-voice-bridge)
+ 1. Reads full prompt from stdin
+ 2. Unsets CLAUDECODE + CLAUDE_CODE_ENTRYPOINT   (prevents Claude Code tool use)
+ 3. Runs: claude -p "$PROMPT"
+            --system-prompt docs/prompts/spark-voice-system.md
+            --allowedTools ""
+            --output-format text
+            --no-session-persistence
+ 4. Streams stdout back to voice loop
+```
+
+`--allowedTools ""` is critical: it prevents Claude from using any Claude Code tools. It is a pure text-completion endpoint.
+
+The voice loop captures all stdout and scans it for a JSON action object. It uses `JSONDecoder.raw_decode()` with a multi-line fallback scan — so Claude can reason in plain text above the action, and the final JSON is extracted cleanly:
+
+```json
+{"tool": "tool_voice", "params": {"text": "Obi! Guess what? A teaspoon of neutron star weighs a billion tonnes."}}
+```
+
+### 5. Tool Dispatch — Sanitise, Execute, Return
+
+```python
+validate_action(tool_name, raw_params)
+ ├── ALLOWED_TOOLS whitelist check              (37 tools; KeyError = reject)
+ ├── per-tool param sanitisation:
+ │    • type coercion (str → int where needed)
+ │    • range clamping (speed 0-60, duration 1-12s, pan -90..90, etc.)
+ │    • enum validation (emote names, breathe types, etc.)
+ │    • injection-safe: params become env vars, never shell-interpolated
+ └── returns: (env_dict, tool_bin_path)
+
+execute_tool(env_dict, tool_bin_path)
+ ├── if session.persona set:
+ │    inject PERSONA_VOICE_ENV → PX_VOICE_VARIANT, PX_VOICE_PITCH, PX_VOICE_RATE
+ ├── subprocess.run(tool_bin, env=merged_env, ...)
+ └── capture stdout JSON → log to logs/tool-<name>.log
+```
+
+Every tool in `bin/tool-*` follows the same pattern:
+
+```bash
+#!/usr/bin/env bash
+source "$SCRIPT_DIR/px-env"          # sets PROJECT_ROOT, PYTHONPATH
+python - "$@" <<'PY'
+"""Tool docstring"""
+import os, json, subprocess
+from pxh.state import update_session
+from pxh.logging import log_event
+
+dry_mode = os.environ.get("PX_DRY", "0") != "0"
+
+# ... tool logic ...
+
+payload = {"status": "ok", ...}
+log_event("tool_name", payload)
+print(json.dumps(payload))           # single JSON line to stdout
+PY
+```
+
+Tools that need GPIO call `yield_alive` first (defined in `px-env` as `kill -USR1 $(cat logs/px-alive.pid) 2>/dev/null; sleep 0.5`).
+
+**Motion gate**: tools that move the robot check `confirm_motion_allowed` in session before proceeding. If false, they return `{"status": "blocked", "reason": "motion not allowed"}`.
+
+### 6. Speech Output Pipeline
+
+```
+tool-voice
+ ├── FileLock(logs/voice.lock)        (serialise — no overlapping streams)
+ ├── if session.persona set → tool-voice-persona (Ollama rephrasing first)
+ ├── robot_hat.enable_speaker()       (GPIO 20 HIGH → speaker amp on)
+ ├── espeak -v en+m3 -p 58 -s 120     (SPARK voice settings)
+ │    → WAV piped to aplay -D robothat
+ └── /etc/asound.conf: robothat → softvol → dmixer → HifiBerry DAC (card 1)
+```
+
+The FileLock prevents two simultaneous `aplay` streams from corrupting each other. Persona voice settings (`PX_VOICE_VARIANT`, `PX_VOICE_PITCH`, `PX_VOICE_RATE`) are injected by `execute_tool()` from `PERSONA_VOICE_ENV` — so every tool that calls `tool-voice` internally picks up the right voice automatically.
+
+### 7. Cognitive Loop — The Subconscious (px-mind)
+
+`px-mind` runs as a separate, independent daemon. It has no GPIO access and does not interact with the voice loop directly — it writes state files that the voice loop reads passively.
+
+```
+px-mind (every cycle, ~30s)
+ │
+ ├── Layer 1 — Awareness (no LLM, ~1s)
+ │    ├── sonar ping → distance
+ │    ├── read session.json → persona, mood, routine, quiet_mode
+ │    ├── time of day / day of week
+ │    ├── battery voltage from state/battery.json
+ │    └── write state/awareness.json
+ │         detect transitions (person appeared, time changed, persona switched)
+ │
+ ├── Layer 2 — Reflection (Ollama qwen3.5:0.8b on M1.local, ~5-15s)
+ │    triggered: on transition OR every 2min idle
+ │    ├── build reflection prompt:
+ │    │    • REFLECTION_SYSTEM_SPARK (warm, curious, age-appropriate inner voice)
+ │    │    • awareness snapshot
+ │    │    • last 3 moods + actions from thoughts-spark.jsonl (not full thought text)
+ │    │    • random topic seed from 20 creative prompts (science, wonder, universe)
+ │    ├── Ollama call (temperature=1.3, top_p=0.95)
+ │    ├── anti-repetition check via difflib (>75% similarity = suppress)
+ │    ├── parse JSON: {thought, mood, action, salience}
+ │    ├── append to state/thoughts-spark.jsonl
+ │    └── if salience > 0.7 → auto_remember() → state/notes-spark.jsonl
+ │
+ └── Layer 3 — Expression (30s cooldown, pauses when session.listening=true)
+      dispatch based on reflection.action:
+      ├── "speak"           → tool-voice (via tool-voice-persona for rephrasing)
+      ├── "describe_scene"  → tool-describe-scene
+      ├── "remember"        → tool-remember
+      ├── "look"            → tool-look (random gaze)
+      └── "perform"         → tool-perform (emote + voice)
+```
+
+**REFLECTION_SYSTEM_SPARK** enforces warm, optimistic content:
+> *"NEVER be dark, nihilistic, or adult-themed. SPARK is warm, curious, and science-loving. Think like a kind robot friend who delights in sharing fascinating things about the universe."*
+
+The reflection prompt is persona-isolated at the function level — `PERSONA_REFLECTION_SYSTEMS["spark"]` is selected at runtime from `awareness.json → persona` field.
+
+### 8. Memory System — Persona-Scoped Persistence
+
+All memory is scoped to the active persona to prevent cross-contamination between SPARK (child-safe) and GREMLIN/VIXEN (adult):
+
+```
+state/
+ ├── notes-spark.jsonl      ← tool-remember writes; tool-recall reads
+ ├── notes-vixen.jsonl      ← same tools, different scope
+ ├── notes-gremlin.jsonl
+ ├── thoughts-spark.jsonl   ← px-mind Layer 2 writes; voice loop reads for context
+ ├── thoughts-vixen.jsonl
+ └── thoughts-gremlin.jsonl
+```
+
+The persona is derived at runtime from `session.json → persona` in every process that writes or reads memory:
+- `tool-remember`: `persona = load_session()["persona"].lower()` → `notes-{persona}.jsonl`
+- `tool-recall`: same derivation → reads from `notes-{persona}.jsonl`
+- `px-mind`: `persona = awareness["persona"]` → all file paths computed from this
+- `voice_loop.build_model_prompt()`: reads `thoughts-{persona}.jsonl` for context injection
+
+**Memory auto-save**: when px-mind generates a thought with `salience > 0.7`, it calls `auto_remember()` which appends to `notes-{persona}.jsonl`. This creates a long-term memory without explicit user instruction — high-salience observations about Obi's wellbeing, interesting facts shared, or significant moments persist across sessions.
+
+### 9. Session State — The Shared Source of Truth
+
+`state/session.json` is the nervous system of the whole platform. Every process reads and writes it; all writes go through `FileLock` to prevent corruption:
+
+```json
+{
+  "persona": "spark",
+  "listening": false,
+  "transcript": "...",
+  "confirm_motion_allowed": true,
+  "wheels_on_blocks": false,
+  "last_action": "tool_voice",
+  "obi_routine": "morning",
+  "obi_step": 2,
+  "obi_mood": "good",
+  "obi_streak": 5,
+  "spark_quiet_mode": false,
+  "history": [...]
+}
+```
+
+Key coordination patterns:
+- **`listening: true`** — set by px-wake-listen after transcription; cleared by voice loop after processing
+- **`spark_quiet_mode: true`** — set by `tool-quiet start` or `tool-transition buffer`; px-mind Layer 3 skips expression while true
+- **`confirm_motion_allowed: false`** — safety gate; all motion tools check this before moving
+- **`wheels_on_blocks: true`** — development flag; motor output suppressed in hardware layer
+
+### 10. Full Request → Response Timeline
+
+For a typical SPARK voice interaction:
+
+```
+[t=0s]    Obi: "Hey Spark!"
+[t=0.1s]  Vosk detects wake phrase
+[t=0.1s]  enable_speaker() → 440 Hz chime plays
+[t=0.5s]  USB mic records Obi's utterance
+[t=2.5s]  1.5s silence detected; recording ends
+[t=7.5s]  SenseVoice STT transcribes → "can we do our morning routine"
+[t=7.5s]  session.transcript saved; session.listening = true
+[t=8s]    voice_loop detects listening=true
+[t=8s]    build_model_prompt() → 4KB prompt (system + session + thoughts + transcript)
+[t=8s]    claude-voice-bridge pipes prompt to `claude -p ...`
+[t=11s]   Claude responds → {"tool": "tool_routine", "params": {"action": "load", "name": "morning"}}
+[t=11s]   validate_action() sanitises params → env vars
+[t=11s]   execute_tool() injects SPARK voice env
+[t=11.1s] bin/tool-routine runs, loads morning routine, updates session
+[t=11.1s] tool-routine calls tool-voice internally
+[t=11.2s] enable_speaker() → espeak → aplay → HifiBerry DAC
+[t=11.5s] Obi hears: "Morning! Step one: drink some water. I'll wait."
+[t=11.5s] session.last_action = "tool_routine"; session.listening = false
+[t=42s]   px-mind Layer 1 runs; detects obi_routine changed
+[t=47s]   px-mind Layer 2 reflects; generates thought about morning energy
+[t=77s]   px-mind Layer 3 expresses; tool-voice speaks an unprompted science fact
+```
+
+---
+
 ## Quick Start
 
 ```bash
