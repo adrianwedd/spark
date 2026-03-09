@@ -93,7 +93,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 | Persona | Launcher | Voice | Character |
 |---|---|---|---|
-| **SPARK** | `bin/px-spark` | `en+m3`, pitch 58, rate 120 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
+| **SPARK** | `bin/px-spark` | `en+m3`, pitch 82, rate 120 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
 | **GREMLIN** | session `persona=gremlin` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama. |
 | **VIXEN** | session `persona=vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama. |
 

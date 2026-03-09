@@ -125,7 +125,7 @@ PERSONA_VOICE_ENV = {
     "spark": {
         "PX_PERSONA": "spark",
         "PX_VOICE_VARIANT": "en+m3",
-        "PX_VOICE_PITCH": "58",
+        "PX_VOICE_PITCH": "82",
         "PX_VOICE_RATE": "120",
     },
 }

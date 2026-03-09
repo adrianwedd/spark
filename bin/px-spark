@@ -29,7 +29,7 @@ PY
 # Set SPARK voice environment
 export PX_PERSONA=spark
 export PX_VOICE_VARIANT=en+m3
-export PX_VOICE_PITCH=58
+export PX_VOICE_PITCH=82
 export PX_VOICE_RATE=120
 
 # Greet — calm, warm, not performative
