@@ -855,8 +855,8 @@ async function pollFace(){
     if(tl){const m=tl.match(/thought: (.+?)  mood=/);if(m)document.getElementById('f-thought').textContent=m[1];}
     const sl=[...(logs.lines||[])].reverse().find(l=>l.includes('sonar='));
     if(sl){
-      const ms=sl.match(/sonar=(\d+)cm/);if(ms)document.getElementById('st-sonar').textContent=ms[1]+'cm';
-      const mp=sl.match(/period=(\w+)/);if(mp)document.getElementById('st-period').textContent=mp[1];
+      const ms=sl.match(/sonar=(\\d+)cm/);if(ms)document.getElementById('st-sonar').textContent=ms[1]+'cm';
+      const mp=sl.match(/period=(\\w+)/);if(mp)document.getElementById('st-period').textContent=mp[1];
     }
   }catch(e){}
 }
