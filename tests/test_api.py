@@ -341,8 +341,12 @@ class TestMotionGate:
 
 class TestLogs:
     def test_log_rejects_invalid_service(self, api_client, auth_headers):
-        r = api_client.get("/api/v1/logs/../../etc/passwd", headers=auth_headers)
-        assert r.status_code == 400
+        # Path-traversal URLs are normalized away by Starlette before routing (404)
+        # and direct invalid service names are caught by the allowlist check (400).
+        r_traversal = api_client.get("/api/v1/logs/../../etc/passwd", headers=auth_headers)
+        assert r_traversal.status_code in (400, 404)
+        r_bad = api_client.get("/api/v1/logs/evil-service", headers=auth_headers)
+        assert r_bad.status_code == 400
 
     def test_log_requires_auth(self, api_client):
         r = api_client.get("/api/v1/logs/px-mind")
@@ -352,6 +356,17 @@ class TestLogs:
         r = api_client.get("/api/v1/logs/px-alive", headers=auth_headers)
         assert r.status_code == 200
         assert isinstance(r.json()["lines"], list)
+
+    def test_log_returns_content_structure(self, api_client, auth_headers, isolated_project):
+        # Write a real log file into the isolated LOG_DIR
+        log_dir = isolated_project["log_dir"]
+        (log_dir / "px-mind.log").write_text("alpha\nbeta\ngamma\n")
+        r = api_client.get("/api/v1/logs/px-mind", headers=auth_headers)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["service"] == "px-mind"
+        assert "alpha" in data["lines"]
+        assert "gamma" in data["lines"]
 
 
 class TestWebUI:

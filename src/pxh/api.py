@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .state import load_session, update_session
 from .voice_loop import (
@@ -82,21 +81,6 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
-
-# Catch path-traversal attempts that Starlette collapses before routing.
-# e.g. /api/v1/logs/../../etc/passwd normalizes to /api/etc/passwd (not under /api/v1/)
-# Return 400 so callers know the request was explicitly rejected, not merely not found.
-_VALID_API_PREFIXES = ("/api/v1/",)
-
-
-@app.exception_handler(StarletteHTTPException)
-async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-    path = request.url.path
-    if exc.status_code == 404 and path.startswith("/api/"):
-        if not any(path.startswith(p) for p in _VALID_API_PREFIXES):
-            return JSONResponse({"detail": "invalid path"}, status_code=400)
-    return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
-
 
 # ---------------------------------------------------------------------------
 # Job registry (async wander)
