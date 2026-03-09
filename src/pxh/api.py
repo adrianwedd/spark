@@ -120,11 +120,12 @@ class SessionPatch(BaseModel):
     listening: Optional[bool] = None
     confirm_motion_allowed: Optional[bool] = None
     wheels_on_blocks: Optional[bool] = None
+    spark_quiet_mode: Optional[bool] = None
     mode: Optional[str] = None
     persona: Optional[str] = None  # "vixen", "gremlin", "spark", or "claude" (clears persona)
 
 
-PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona"}
+PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode"}
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 
 
@@ -774,7 +775,7 @@ async function loadSvcs(){
     const r=await api('/api/v1/services');
     const list=document.getElementById('svc-list');list.textContent='';
     (r.services||[]).forEach(s=>{
-      const on=s.status==='active';
+      const on=s.active==='active';
       const n=s.service.replace('px-','');
       const ico={'alive':'\U0001F916','mind':'\U0001F9E0','wake-listen':'\U0001F442','api-server':'\U0001F310'}[n]||'\u2699\uFE0F';
       const row=document.createElement('div');
@@ -799,6 +800,7 @@ async function loadParental(){
     bm.className='btn '+(s.confirm_motion_allowed?'btn-spark':'btn-danger');
     const bq=document.getElementById('btn-quiet');
     bq.textContent=s.spark_quiet_mode?'\U0001F92B Quiet: ON':'\U0001F4AC Quiet: OFF';
+    bq.className='btn '+(s.spark_quiet_mode?'btn-danger':'btn-muted');
   } catch(e){}
 }
 async function toggleMotion(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({confirm_motion_allowed:!s.confirm_motion_allowed})});}catch(e){}loadParental();}
