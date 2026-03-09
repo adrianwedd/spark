@@ -679,13 +679,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
 const tok=()=>document.getElementById('tok').value;
 const api=(path,opts={})=>fetch(path,{headers:{'Authorization':'Bearer '+tok(),'Content-Type':'application/json',...(opts.headers||{})}, ...opts}).then(r=>r.json());
 function showPin(){}
-const MOOD_EMOJI={curious:'&#x1F914;',content:'&#x1F60C;',alert:'&#x1F440;',playful:'&#x1F604;',contemplative:'&#x1F319;',bored:'&#x1F611;',mischievous:'&#x1F60F;',lonely:'&#x1F97A;',excited:'&#x1F929;',grumpy:'&#x1F624;',peaceful:'&#x2601;&#xFE0F;',anxious:'&#x1F630;'};
+const MOOD_EMOJI={curious:'\U0001F914',content:'\U0001F60C',alert:'\U0001F440',playful:'\U0001F604',contemplative:'\U0001F319',bored:'\U0001F611',mischievous:'\U0001F60F',lonely:'\U0001F97A',excited:'\U0001F929',grumpy:'\U0001F624',peaceful:'\u2601\uFE0F',anxious:'\U0001F630'};
 const MOOD_COL={curious:'#00d4aa',content:'#5b9cf6',alert:'#f5a623',playful:'#f7d547',contemplative:'#9b7be8',bored:'#8884aa',mischievous:'#f5a623',lonely:'#5b9cf6',excited:'#f7d547',grumpy:'#e05c5c',peaceful:'#5b9cf6',anxious:'#e05c5c'};
 async function pollFace(){
   try{
     const s=await api('/api/v1/session');
     const mood=(s.obi_mood||'curious').toLowerCase();
-    document.getElementById('f-ring').textContent=MOOD_EMOJI[mood]||String.fromCodePoint(0x1F914);
+    document.getElementById('f-ring').textContent=MOOD_EMOJI[mood]||'\U0001F914';
     const col=MOOD_COL[mood]||'var(--spark)';
     const ring=document.getElementById('f-ring');
     ring.style.borderColor=col;ring.style.boxShadow='0 0 30px '+col+'55';
@@ -694,7 +694,7 @@ async function pollFace(){
     document.getElementById('st-mood').textContent=mood;
     document.getElementById('st-persona').textContent=s.persona||'spark';
     if(document.getElementById('av-mood'))document.getElementById('av-mood').textContent=mood+' \u00b7 ready';
-    if(document.getElementById('av-ring'))document.getElementById('av-ring').textContent=MOOD_EMOJI[mood]||String.fromCodePoint(0x1F914);
+    if(document.getElementById('av-ring'))document.getElementById('av-ring').textContent=MOOD_EMOJI[mood]||'\U0001F914';
   }catch(e){}
   try{
     const logs=await api('/api/v1/logs/px-mind?lines=50');
@@ -743,7 +743,7 @@ async function sendChat(){
   inp.value='';inp.disabled=true;document.getElementById('sbtn').disabled=true;
   addMsg('user',text);
   const th=document.createElement('div');th.id='thinking';th.style.cssText='color:var(--muted);font-size:13px;align-self:flex-start;padding:8px 4px';th.textContent='SPARK is thinking\u2026';document.getElementById('msgs').appendChild(th);
-  try{const r=await api('/api/v1/chat',{method:'POST',body:JSON.stringify({text})});document.getElementById('thinking')?.remove();addMsg('spark',r.result?.stdout||r.error||JSON.stringify(r),r.result?.tool)}
+  try{const r=await api('/api/v1/chat',{method:'POST',body:JSON.stringify({text})});document.getElementById('thinking')?.remove();addMsg('spark',r.tool_output||r.error||JSON.stringify(r),r.tool)}
   catch(e){document.getElementById('thinking')?.remove();addMsg('spark','Something went wrong.')}
   inp.disabled=false;document.getElementById('sbtn').disabled=false;inp.focus();
 }
