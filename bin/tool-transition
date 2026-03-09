@@ -98,14 +98,15 @@ def main() -> int:
 
     elif action == "buffer":
         # 20-minute low-demand buffer after a transition — no instructions, just presence
+        # spark_quiet_mode=True: Claude will only use tool_emote idle until tool_quiet end is called
         emote("idle", dry)
         speak("We're here. Take your time. No rush.", dry)
         update_session(
-            fields={"spark_quiet_mode": False, "last_action": "tool_transition"},
+            fields={"spark_quiet_mode": True, "last_action": "tool_transition"},
             history_entry={"event": "transition_buffer", "ts": utc_timestamp()},
         )
         payload = {"status": "ok", "action": "buffer", "dry": dry,
-                   "note": "20-min low-demand buffer — avoid instructions"}
+                   "note": "20-min low-demand buffer — avoid instructions, quiet_mode=True"}
 
     elif action == "arrived":
         # Arrived at destination — soft landing

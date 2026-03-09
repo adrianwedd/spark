@@ -134,8 +134,15 @@ VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" c
 FORCE_DRY = os.environ.get("PX_DRY", "0") == "1"
 SYNC_TIMEOUT_DEFAULT = float(os.environ.get("PX_API_TIMEOUT", "30"))
 
-# Tools that involve Ollama generation need longer timeouts (generation + espeak)
-SLOW_TOOLS = {"tool_chat", "tool_chat_vixen", "tool_describe_scene", "tool_wander"}
+# Tools that involve Ollama, network I/O, or multiple sequential subprocesses
+SLOW_TOOLS = {
+    "tool_chat", "tool_chat_vixen", "tool_describe_scene", "tool_wander",
+    # SPARK tools: multiple subprocess calls (emote + voice + timer)
+    "tool_routine", "tool_checkin", "tool_celebrate", "tool_transition",
+    "tool_quiet", "tool_breathe", "tool_sensory_check", "tool_repair",
+    # GWS tools: network I/O to Google APIs
+    "tool_gws_calendar", "tool_gws_sheets_log",
+}
 SYNC_TIMEOUT_SLOW = float(os.environ.get("PX_API_TIMEOUT_SLOW", "120"))
 
 

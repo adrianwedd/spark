@@ -34,6 +34,12 @@ def default_state() -> Dict[str, Any]:
         "persona": None,
         "listening": False,
         "listening_since": None,
+        # SPARK child-companion fields
+        "obi_routine": None,
+        "obi_step": 0,
+        "obi_mood": None,
+        "obi_streak": 0,
+        "spark_quiet_mode": False,
         "history": [],
     }
 
