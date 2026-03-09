@@ -96,7 +96,7 @@ def session() -> str:
     listening = d.get("listening", False)
     parts = []
     if persona:
-        p_icons = {"gremlin": "👹", "vixen": "🦊", "obi": "🤖"}
+        p_icons = {"gremlin": "👹", "vixen": "🦊", "spark": "⚡"}
         parts.append(p_icons.get(persona, "🎭") + persona)
     if listening:
         parts.append("🎤")
