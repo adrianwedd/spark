@@ -138,8 +138,16 @@ def find_input_device(pa, preferred_name: str = "") -> int:
     return result
 
 
-def _play_tone_sequence(freqs_durs: list, device: str = "", amplitude: int = 22000) -> None:
-    """Render and play a sequence of (freq_hz, duration_s) sine tones with 10ms fade and 40ms gap."""
+def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000,
+                        gap_s: float = 0.030) -> None:
+    """Render and play a sequence of tones with frequency sweeps (R2-D2 style chirps).
+
+    Each segment is either:
+      (freq_hz, duration_s)                 — steady tone
+      (freq_start, freq_end, duration_s)    — linear frequency sweep (chirp)
+    Segments are separated by gap_s seconds of silence.
+    10ms linear fade-in/out on each segment to prevent clicks.
+    """
     try:
         from robot_hat import enable_speaker
         enable_speaker()
@@ -148,18 +156,31 @@ def _play_tone_sequence(freqs_durs: list, device: str = "", amplitude: int = 220
     try:
         import math, wave as wv, tempfile
         all_samples: list[int] = []
-        fade_n = int(MIC_RATE * 0.010)  # 10ms linear fade to avoid clicks
-        gap_n  = int(MIC_RATE * 0.040)  # 40ms silence between tones
-        for freq, dur in freqs_durs:
+        fade_n = int(MIC_RATE * 0.010)
+        gap_n  = int(MIC_RATE * gap_s)
+
+        for seg in segments:
+            if len(seg) == 2:
+                freq_start, dur = seg
+                freq_end = freq_start
+            else:
+                freq_start, freq_end, dur = seg
+
             n = int(MIC_RATE * dur)
+            phase = 0.0
             for t in range(n):
-                s = int(amplitude * math.sin(2 * math.pi * freq * t / MIC_RATE))
+                # Instantaneous frequency: linear glide from freq_start to freq_end
+                freq = freq_start + (freq_end - freq_start) * (t / max(n - 1, 1))
+                phase += 2 * math.pi * freq / MIC_RATE
+                s = int(amplitude * math.sin(phase))
+                # Fade
                 if t < fade_n:
                     s = int(s * t / fade_n)
                 elif t > n - fade_n:
                     s = int(s * (n - t) / fade_n)
                 all_samples.append(s)
             all_samples.extend([0] * gap_n)
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
             with wv.open(tf.name, "wb") as wf:
                 wf.setnchannels(1)
@@ -178,23 +199,44 @@ def _play_tone_sequence(freqs_durs: list, device: str = "", amplitude: int = 220
 
 
 def play_chime(device: str = "") -> None:
-    """Single 440 Hz tone — wake word acknowledged, starting to record."""
-    _play_tone_sequence([(440, 0.25)], device, amplitude=28000)
+    """Wake-word ack: ascending sweep + two quick high chirps (R2-D2 'I heard you!')."""
+    _play_tone_sequence([
+        (700, 1800, 0.12),   # sweep up
+        (2100, 0.05),        # sharp high blip
+        (1650, 0.07),        # settle
+    ], device, amplitude=26000, gap_s=0.020)
 
 
 def play_chime_listening(device: str = "") -> None:
-    """Two ascending tones (600→900 Hz) — 'I'm listening, your turn'."""
-    _play_tone_sequence([(600, 0.10), (900, 0.13)], device, amplitude=18000)
+    """Listening ready: two rising questioning chirps (R2-D2 'your turn?')."""
+    _play_tone_sequence([
+        (900, 1700, 0.09),   # first rising chirp
+        (600, 0.04),         # quick dip
+        (1100, 2200, 0.11),  # second rising chirp, higher
+        (1900, 0.05),        # bright tail
+    ], device, amplitude=20000, gap_s=0.018)
 
 
 def play_chime_processing(device: str = "") -> None:
-    """Descending double-blip (800→500 Hz) — 'Got it, I'm thinking'."""
-    _play_tone_sequence([(800, 0.07), (500, 0.07)], device, amplitude=15000)
+    """Processing: rapid descending burble (R2-D2 'computing...')."""
+    _play_tone_sequence([
+        (2400, 0.04),        # high start
+        (1800, 0.03),        # step down
+        (2100, 0.03),        # bounce
+        (1400, 0.04),        # step
+        (1700, 1000, 0.10),  # sweep down
+        (700, 0.05),         # low close
+    ], device, amplitude=17000, gap_s=0.012)
 
 
 def play_chime_timeout(device: str = "") -> None:
-    """Three descending tones (700→500→300 Hz) — 'Stopping, session ended'."""
-    _play_tone_sequence([(700, 0.09), (500, 0.09), (300, 0.14)], device, amplitude=13000)
+    """Session ended: slow descending sweeps (R2-D2 'going quiet now')."""
+    _play_tone_sequence([
+        (1600, 900, 0.18),   # long sweep down
+        (750, 0.06),         # pause note
+        (600, 250, 0.22),    # slower sweep to low
+        (180, 0.14),         # low rumble tail
+    ], device, amplitude=15000, gap_s=0.045)
 
 
 def resample(data: bytes, state=None):
