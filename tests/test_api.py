@@ -381,3 +381,36 @@ class TestWebUI:
         """Web UI is unauthenticated — token is entered in the browser."""
         resp = api_client.get("/")
         assert resp.status_code == 200
+
+
+class TestDeviceControl:
+    def test_device_rejects_invalid_action(self, api_client, auth_headers):
+        resp = api_client.post("/api/v1/device/explode", headers=auth_headers)
+        assert resp.status_code == 400
+        assert "explode" in resp.json()["detail"]
+
+    def test_device_requires_auth(self, api_client):
+        resp = api_client.post("/api/v1/device/reboot")
+        assert resp.status_code in (401, 403)
+
+    def test_device_reboot_mocked(self, api_client, auth_headers):
+        from unittest.mock import patch, MagicMock
+        mock_proc = MagicMock()
+        with patch("pxh.api.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            resp = api_client.post("/api/v1/device/reboot", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["action"] == "reboot"
+        mock_popen.assert_called_once_with(["sudo", "/bin/systemctl", "reboot"])
+
+    def test_device_shutdown_mocked(self, api_client, auth_headers):
+        from unittest.mock import patch, MagicMock
+        mock_proc = MagicMock()
+        with patch("pxh.api.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            resp = api_client.post("/api/v1/device/shutdown", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["action"] == "shutdown"
+        mock_popen.assert_called_once_with(["sudo", "/sbin/shutdown", "-h", "now"])
