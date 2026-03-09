@@ -391,7 +391,7 @@ class TestDeviceControl:
 
     def test_device_requires_auth(self, api_client):
         resp = api_client.post("/api/v1/device/reboot")
-        assert resp.status_code in (401, 403)
+        assert resp.status_code == 401
 
     def test_device_reboot_mocked(self, api_client, auth_headers):
         from unittest.mock import patch, MagicMock
@@ -402,7 +402,7 @@ class TestDeviceControl:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["action"] == "reboot"
-        mock_popen.assert_called_once_with(["sudo", "/bin/systemctl", "reboot"])
+        mock_popen.assert_called_once_with(["sudo", "/usr/bin/systemctl", "reboot"])
 
     def test_device_shutdown_mocked(self, api_client, auth_headers):
         from unittest.mock import patch, MagicMock
@@ -414,3 +414,10 @@ class TestDeviceControl:
         assert data["status"] == "ok"
         assert data["action"] == "shutdown"
         mock_popen.assert_called_once_with(["sudo", "/sbin/shutdown", "-h", "now"])
+
+    def test_device_reboot_popen_error(self, api_client, auth_headers):
+        from unittest.mock import patch
+        with patch("pxh.api.subprocess.Popen", side_effect=OSError("no such file")):
+            resp = api_client.post("/api/v1/device/reboot", headers=auth_headers)
+        assert resp.status_code == 500
+        assert resp.json()["status"] == "error"

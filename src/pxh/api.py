@@ -427,8 +427,8 @@ async def control_service(service: str, action: str) -> JSONResponse:
 # Device control — reboot / shutdown
 # ---------------------------------------------------------------------------
 
-_DEVICE_ACTIONS = {
-    "reboot": ["sudo", "/bin/systemctl", "reboot"],
+_DEVICE_ACTIONS: dict[str, list[str]] = {
+    "reboot": ["sudo", "/usr/bin/systemctl", "reboot"],
     "shutdown": ["sudo", "/sbin/shutdown", "-h", "now"],
 }
 
@@ -438,7 +438,10 @@ async def device_control(action: str) -> JSONResponse:
     """Reboot or shut down the host device. Action: reboot | shutdown."""
     if action not in _DEVICE_ACTIONS:
         raise HTTPException(status_code=400, detail=f"unknown action: {action}")
-    subprocess.Popen(_DEVICE_ACTIONS[action])
+    try:
+        subprocess.Popen(_DEVICE_ACTIONS[action])
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
     return JSONResponse(status_code=200, content={"status": "ok", "action": action})
 
 
