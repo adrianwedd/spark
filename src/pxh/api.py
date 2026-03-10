@@ -602,6 +602,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <button class="btn btn-blue" onclick="promptTimer()">&#x23F1;&#xFE0F; Set a timer</button>
         <button class="btn btn-blue" onclick="promptRemember()">&#x1F4AD; Remember this</button>
         <button class="btn btn-blue" onclick="doTool('tool_recall',{})">&#x1F50D; What do you remember?</button>
+        <button class="btn btn-blue" style="grid-column:span 2" onclick="doPhoto()">&#x1F4F8; Take a photo!</button>
       </div>
       <div class="sec-hdr" style="color:var(--orange)">&#x1F4CB; Our routines</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
@@ -672,11 +673,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       <div style="font-size:48px">&#x1F527;</div>
       <div style="font-size:20px;font-weight:800">Adrian&apos;s Panel</div>
       <div style="font-size:14px;color:var(--muted);text-align:center">Enter your PIN to continue.</div>
+      <form onsubmit="subPin();return false" style="display:contents">
       <input id="pin-inp" type="password" inputmode="numeric" maxlength="8" placeholder="PIN"
         style="font-size:28px;letter-spacing:.3em;text-align:center;background:var(--surface2);border:2px solid var(--surface2);border-radius:var(--radius);padding:14px 20px;width:180px;color:var(--text);font-family:inherit;outline:none"
         onfocus="this.style.borderColor='var(--spark)'" onblur="this.style.borderColor='var(--surface2)'"
         onkeydown="if(event.key==='Enter')subPin()">
-      <button class="btn btn-spark" style="width:180px" onclick="subPin()">Unlock</button>
+      <button class="btn btn-spark" style="width:180px" type="submit">Unlock</button>
+      </form>
       <div id="pin-err" style="color:var(--danger);font-size:13px;display:none">Wrong PIN &mdash; try again</div>
     </div>
     <div id="admin-body" style="display:none;flex-direction:column;height:100%">
@@ -828,7 +831,7 @@ async function runAdminTool(){
   try{const r=await api('/api/v1/tool',{method:'POST',body:JSON.stringify({tool,params,dry:false})});document.getElementById('tool-out').textContent=JSON.stringify(r,null,2);}catch(e){document.getElementById('tool-out').textContent='Error: '+e.message;}
 }
 async function loadLog(svc){
-  try{const r=await api('/api/v1/logs/'+svc+'?lines=100');document.getElementById('log-out').textContent=(r.lines||[]).join('\n');}catch(e){}
+  try{const r=await api('/api/v1/logs/'+svc+'?lines=100');document.getElementById('log-out').textContent=(r.lines||[]).join('\\n');}catch(e){}
   const pre=document.getElementById('log-out');if(pre)pre.scrollTop=pre.scrollHeight;
 }
 setInterval(()=>{if(_pinOk&&document.getElementById('panel-admin').classList.contains('active'))loadSvcs();},15000);
@@ -877,6 +880,22 @@ async function doTool(tool,params){
   sw('chat');addMsg('spark',out,tool);}
   catch(e){sw('chat');addMsg('spark','Error: '+e.message,tool);}
 }
+async function doPhoto(){
+  sw('chat');
+  const feed=document.getElementById('msgs');
+  const th=document.createElement('div');th.style.cssText='color:var(--muted);font-size:13px;align-self:flex-start;padding:8px 4px';th.textContent='Taking a photo\u2026';feed.appendChild(th);feed.scrollTop=feed.scrollHeight;
+  try{
+    const r=await api('/api/v1/tool',{method:'POST',body:JSON.stringify({tool:'tool_describe_scene',params:{},dry:false})});
+    th.remove();
+    const desc=r.description||r.error||'Could not describe scene.';
+    const d=document.createElement('div');
+    d.style.cssText='max-width:85%;border-radius:18px 18px 18px 4px;background:var(--surface2);align-self:flex-start;overflow:hidden';
+    const lab=document.createElement('div');lab.style.cssText='font-size:10px;font-weight:800;color:var(--spark);padding:8px 12px 0';lab.textContent='\u25b8 DESCRIBE SCENE';d.appendChild(lab);
+    if(r.path){const fn=r.path.split('/').pop();const img=document.createElement('img');img.src='/photos/'+fn;img.style.cssText='width:100%;max-width:320px;display:block';d.appendChild(img);}
+    const p=document.createElement('div');p.style.cssText='padding:8px 12px 12px;font-size:15px;line-height:1.5;font-weight:600;color:var(--text)';p.textContent=desc;d.appendChild(p);
+    feed.appendChild(d);feed.scrollTop=feed.scrollHeight;
+  }catch(e){th.remove();addMsg('spark','Error: '+e.message,'tool_describe_scene');}
+}
 function promptTimer(){
   const label=prompt('Timer name?');if(!label)return;
   const mins=prompt('How many minutes?');if(!mins||isNaN(mins))return;
@@ -910,6 +929,35 @@ function sw(name){
 }
 </script>
 </body></html>"""
+
+
+@app.get("/photos/{filename}")
+async def serve_photo(filename: str):
+    from fastapi.responses import FileResponse
+    import re
+    if not re.fullmatch(r"[\w\-]+\.jpe?g", filename, re.IGNORECASE):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="not found")
+    photo_path = PROJECT_ROOT / "photos" / filename
+    if not photo_path.exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="photo not found")
+    return FileResponse(str(photo_path), media_type="image/jpeg",
+                        headers={"Cache-Control": "max-age=3600"})
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    from fastapi.responses import Response
+    # Minimal 1x1 green ICO (prevents 404 log noise)
+    ico = (b"\x00\x00\x01\x00\x01\x00\x01\x01\x00\x00\x01\x00\x18\x00"
+           b"\x28\x00\x00\x00\x16\x00\x00\x00\x28\x00\x00\x00\x01\x00"
+           b"\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00"
+           b"\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+           b"\x00\x00\x00\x00\x00\x00\x00\xd4\x00\x00\x00\x00\x00\x00"
+           b"\x00\x00\x00")
+    return Response(content=ico, media_type="image/x-icon",
+                    headers={"Cache-Control": "max-age=86400"})
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -45,7 +45,17 @@ yield_alive() {
         pid=$(<"$pid_file")
         if [[ -d "/proc/$pid" ]]; then
             kill -USR1 "$pid" 2>/dev/null || true
-            sleep 1  # wait for px-alive to release GPIO handle
+            # Poll until px-alive actually exits — sleep 1 is not reliable
+            # because gaze animations can take 2-3s to complete.
+            local i
+            for i in $(seq 25); do
+                [[ -d "/proc/$pid" ]] || break
+                sleep 0.2
+            done
+            # px.close() does NOT release GPIO5 (reset_mcu pin) — only
+            # full process exit does. lgpiod also needs time to reclaim
+            # the pin after client fd closes. 2s is empirically safe.
+            sleep 2.0
         fi
     fi
 }

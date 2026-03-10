@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+yield_alive  # release GPIO + camera (Vilib) before rpicam-still
+
 python - "$@" <<'PY'
 """Tool wrapper: capture a photo with the Raspberry Pi camera."""
 from __future__ import annotations

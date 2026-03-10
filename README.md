@@ -18,7 +18,7 @@ SPARK is not a therapist, a tutor, or an assistant. It's a robot friend that hap
 - **Meltdown protocol** — Three S's: Safety, Silence, Space. Robot goes quiet and stays present. No words.
 - **Sideways engagement** — when demand-avoidance is high, SPARK narrates rather than instructs, lets curiosity do the work
 
-SPARK runs on Claude (via `run-voice-loop-claude` / `px-spark`), with the full intelligence of the model behind every response. It uses slower, warmer espeak settings and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
+SPARK runs on Claude (via `run-voice-loop-claude` / `px-spark`), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en-gb`, pitch 95, rate 100) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
 
 ```bash
 bin/px-spark [--dry-run] [--input-mode voice|text]
@@ -84,8 +84,8 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 **Cognitive Loop (`px-mind`)** — The subconscious. Runs continuously in the background:
 - **Layer 1 — Awareness** (every 30s, no LLM): sonar + session state + time of day. Detects transitions.
-- **Layer 2 — Reflection** (on transition or every 2min): Ollama (qwen3.5:0.8b) generates a thought with mood, suggested action, and salience score.
-- **Layer 3 — Expression** (30s cooldown): dispatches to tools — describe the scene, perform a routine, speak, look around, remember something important.
+- **Layer 2 — Reflection** (on transition or every 2min): Claude CLI (SPARK persona) or Ollama qwen3.5:0.8b generates a thought with mood, suggested action, and salience score.
+- **Layer 3 — Expression** (30s cooldown): dispatches to tools — speak, look around, remember something important. Photo capture (`tool-describe-scene`) is on-request only, not autonomous.
 
 **Idle-Alive (`px-alive`)** — The autonomic nervous system. Keeps the robot looking alive when nothing else is happening: random gaze drifts every 10–25s, pan sweeps every 3–8min, proximity reaction at <35cm. Holds a persistent Picarx handle; yields GPIO via SIGUSR1 when tools need the servos.
 
@@ -93,7 +93,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 | Persona | Launcher | Voice | Character |
 |---|---|---|---|
-| **SPARK** | `bin/px-spark` | `en+m3`, pitch 82, rate 120 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
+| **SPARK** | `bin/px-spark` | `en-gb`, pitch 95, rate 100 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
 | **GREMLIN** | session `persona=gremlin` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama. |
 | **VIXEN** | session `persona=vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama. |
 
@@ -113,7 +113,7 @@ Three systemd services start automatically:
 Boot
  ├── px-alive.service        (root)   — claims Picarx() GPIO handle; starts gaze drift loop
  ├── px-wake-listen.service  (pi)     — loads Vosk wake word model; starts mic capture loop
- └── px-battery-poll.service (root)   — polls Robot HAT ADC every 60s → state/battery.json
+ └── px-battery-poll.service (root)   — polls Robot HAT ADC every 30s → state/battery.json; plays rising/falling sweep tones on plug/unplug with voice announcement; escalating warnings + emergency shutdown at 10%
 ```
 
 **`px-alive`** runs as root (GPIO access) and immediately calls `Picarx()`, claiming GPIO5 via `reset_mcu()`. It never releases this handle. All other processes that need servos must signal px-alive with `SIGUSR1` (via the `yield_alive` function in `px-env`) to make it exit cleanly. systemd restarts it after 10 seconds. The PCA9685 PWM chip retains the last servo position between restarts, so the robot head stays still.
@@ -134,7 +134,7 @@ px-spark
  2. Sets session.listening = false
  3. Speaks greeting via tool-voice          ("Hey. I'm here.")
  4. Exports CODEX_CHAT_CMD=bin/claude-voice-bridge
- 5. Exports PX_VOICE_VARIANT=m3, PX_VOICE_PITCH=58, PX_VOICE_RATE=120
+ 5. Exports PX_VOICE_VARIANT=en-gb, PX_VOICE_PITCH=95, PX_VOICE_RATE=100
  6. exec bin/codex-voice-loop --prompt docs/prompts/spark-voice-system.md ...
 ```
 
@@ -255,7 +255,7 @@ tool-voice
  ├── FileLock(logs/voice.lock)        (serialise — no overlapping streams)
  ├── if session.persona set → tool-voice-persona (Ollama rephrasing first)
  ├── robot_hat.enable_speaker()       (GPIO 20 HIGH → speaker amp on)
- ├── espeak -v en+m3 -p 58 -s 120     (SPARK voice settings)
+ ├── espeak -v en-gb -p 95 -s 100     (SPARK voice — British RP, higher pitch, slower)
  │    → WAV piped to aplay -D robothat
  └── /etc/asound.conf: robothat → softvol → dmixer → HifiBerry DAC (card 1)
 ```
@@ -277,26 +277,27 @@ px-mind (every cycle, ~30s)
  │    └── write state/awareness.json
  │         detect transitions (person appeared, time changed, persona switched)
  │
- ├── Layer 2 — Reflection (Ollama qwen3.5:0.8b on M1.local, ~5-15s)
+ ├── Layer 2 — Reflection (~5-60s, backend varies by persona)
  │    triggered: on transition OR every 2min idle
  │    ├── build reflection prompt:
  │    │    • REFLECTION_SYSTEM_SPARK (warm, curious, age-appropriate inner voice)
  │    │    • awareness snapshot
  │    │    • last 3 moods + actions from thoughts-spark.jsonl (not full thought text)
  │    │    • random topic seed from 20 creative prompts (science, wonder, universe)
- │    ├── Ollama call (temperature=1.3, top_p=0.95)
+ │    ├── LLM call: Claude CLI (SPARK persona) or Ollama qwen3.5:0.8b (others, temperature=1.3)
  │    ├── anti-repetition check via difflib (>75% similarity = suppress)
  │    ├── parse JSON: {thought, mood, action, salience}
  │    ├── append to state/thoughts-spark.jsonl
  │    └── if salience > 0.7 → auto_remember() → state/notes-spark.jsonl
  │
- └── Layer 3 — Expression (30s cooldown, pauses when session.listening=true)
+ └── Layer 3 — Expression (30s cooldown, pauses when session.listening=true or spark_quiet_mode=true)
+      valid actions: wait, greet, comment, remember, look_at, weather_comment, scan
       dispatch based on reflection.action:
-      ├── "speak"           → tool-voice (via tool-voice-persona for rephrasing)
-      ├── "describe_scene"  → tool-describe-scene
+      ├── comment/greet     → tool-voice (via tool-voice-persona for rephrasing)
       ├── "remember"        → tool-remember
-      ├── "look"            → tool-look (random gaze)
-      └── "perform"         → tool-perform (emote + voice)
+      ├── "look_at"         → tool-look (random gaze)
+      ├── "weather_comment" → tool-weather + speak
+      └── "scan"            → sonar sweep
 ```
 
 **REFLECTION_SYSTEM_SPARK** enforces warm, optimistic content:
@@ -446,7 +447,7 @@ Every tool emits a single JSON object to stdout, supports `PX_DRY=1`, and handle
 | `tool-drive` | Drive forward/backward with steering | `PX_DIRECTION`, `PX_SPEED` (0-60), `PX_DURATION` (0.1-10s), `PX_STEER` (-35..35) |
 | `tool-circle` | Clockwise circle in pulses | `PX_SPEED`, `PX_DURATION` |
 | `tool-figure8` | Two-leg figure-eight pattern | `PX_SPEED`, `PX_DURATION`, `PX_REST` |
-| `tool-wander` | Autonomous obstacle-avoiding wander (async, returns 202) | `PX_WANDER_STEPS` (1-20) |
+| `tool-wander` | Smart obstacle-avoiding wander: sonar sweep picks best direction, speaks while navigating | `PX_WANDER_STEPS` (1-20), `PX_WANDER_QUIET` |
 | `tool-stop` | Immediate halt, reset steering to neutral | — |
 
 ### Expression
@@ -521,6 +522,7 @@ bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 | PATCH | `/api/v1/session` | Yes | Update: `listening`, `confirm_motion_allowed`, `wheels_on_blocks`, `persona` |
 | GET | `/api/v1/tools` | Yes | List available tools |
 | GET | `/api/v1/jobs/{id}` | Yes | Poll async job (tool_wander returns 202) |
+| GET | `/photos/{filename}` | No | Serve captured photos (used by web UI photo button) |
 
 ---
 
@@ -570,7 +572,7 @@ cp state/session.template.json state/session.json
 | `awareness.json` | Layer 1 output — sonar + temporal state, transition detection |
 | `thoughts.jsonl` | Layer 2 output — last 50 thoughts with mood/action/salience |
 | `notes.jsonl` | Persistent memory — saved by `tool-remember`, auto-saved for high-salience thoughts |
-| `battery.json` | Battery voltage cache (written by `px-battery-poll` every 60s) |
+| `battery.json` | Battery voltage — volts, pct, charging flag (written every 30s; plug/unplug detection plays audio sweep tones) |
 | `mood.json` | Current mood from px-mind (written each reflection cycle) |
 
 SPARK-specific session fields: `obi_routine`, `obi_step`, `obi_mood`, `obi_streak`, `spark_quiet_mode`.

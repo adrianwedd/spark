@@ -104,7 +104,7 @@ sudo bin/px-alive [--gaze-min 10] [--gaze-max 25] [--no-prox] [--dry-run]
 Keeps robot looking alive when idle. Holds a **persistent Picarx handle** to avoid GPIO pin leak (reset_mcu claims GPIO5 and close() doesn't release it). Three behaviours:
 - **Gaze drift**: random pan/tilt every 10–25 s
 - **Idle scan**: pan sweep every 3–8 min
-- **Proximity react**: sonar checked every 5 s; if `< 35 cm` for 3 s, faces forward
+- **Proximity react**: sonar checked every 5 s; if `< 35 cm` for 3 s, faces forward; writes latest reading to `state/sonar_live.json` so px-mind can read sonar without restarting px-alive
 - **I2C resilience**: catches `OSError` and backs off 30 s instead of crashing
 
 **GPIO exclusivity**: Only one process can hold the Picarx handle. When other tools need servos, they call `yield_alive` (defined in `px-env`), which sends SIGUSR1 to px-alive. px-alive catches it and exits cleanly; systemd restarts it after 10 s (`Restart=always`, `RestartSec=10`).
@@ -119,12 +119,14 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer cognitive architecture:
 - **Layer 1 — Awareness** (every 30 s, no LLM): sonar + session + temporal state → `state/awareness.json` + transition detection
-- **Layer 2 — Reflection** (on transition or every 2 min idle, Ollama qwen3.5:0.8b): generates thought with mood/action/salience → `state/thoughts.jsonl`
-- **Layer 3 — Expression** (30 s cooldown): dispatches to tool-describe-scene/tool-perform/tool-voice/tool-look/tool-remember. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+- **Layer 2 — Reflection** (on transition or every 2 min idle): Claude CLI for SPARK persona, Ollama qwen3.5:0.8b for others. Generates thought with mood/action/salience → `state/thoughts.jsonl`
+- **Layer 3 — Expression** (30 s cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions: `wait, greet, comment, remember, look_at, weather_comment, scan`. Photo capture (`tool-describe-scene`) is **on-request only** — not dispatched autonomously. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
-The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`). Auto-remembers high-salience (>0.7) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
+The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`) and during quiet mode. Auto-remembers high-salience (>0.7) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
 
-State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/mood.json`, `state/ambient_sound.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
+Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escalating warnings at ≤30/20/15% and triggers emergency shutdown at ≤10% (6 beeps → speech → `sudo shutdown -h now`).
+
+State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.json`, `state/mood.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
 
 ### REST API
 
@@ -134,7 +136,8 @@ bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 ```
 
 - **Auth**: Bearer token from `.env` (`PX_API_TOKEN`). Only `/api/v1/health` is unauthenticated.
-- **Endpoints**: `/health`, `POST /tool`, `GET /session`, `PATCH /session`, `GET /tools`, `GET /jobs/{id}`
+- **Endpoints**: `/health`, `POST /tool`, `GET /session`, `PATCH /session`, `GET /tools`, `GET /jobs/{id}`, `GET /photos/{filename}` (serves captured photos; used by web UI)
+- **Web UI**: photo button (📸 Take a photo!) in Actions tab — calls `tool_describe_scene`, shows image + description inline in chat
 - **Async**: `tool_wander` returns 202 with `job_id`; poll via `/jobs/{id}`
 - Always launch via `bin/px-api-server` (not bare uvicorn — needs `px-env` for PYTHONPATH)
 
@@ -157,14 +160,14 @@ Requires `OLLAMA_HOST=0.0.0.0 ollama serve` on M1.
 
 ### Systemd Services
 
-Two services run at boot:
+Four services run at boot:
 
 | Service | Script | User | Restart |
 |---------|--------|------|---------|
-| `px-alive` | `bin/px-alive` | root | on-failure, 10 s |
-| `px-wake-listen` | `bin/px-wake-listen` | pi | on-failure, 10 s |
-
-`px-mind` is run manually (`bin/px-mind`), not as a systemd service.
+| `px-alive` | `bin/px-alive` | root | always, 10 s |
+| `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10 s |
+| `px-battery-poll` | `bin/px-battery-poll` | root | always, 10 s |
+| `px-mind` | `bin/px-mind` | pi | always, 10 s |
 
 ## Safety Model
 

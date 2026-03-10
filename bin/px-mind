@@ -13,7 +13,7 @@ exec python - "$@" <<'PY'
 Three layers:
   Layer 1 — Awareness (every ~30s): read sensors + state, detect transitions.
   Layer 2 — Reflection (on transition or every ~2 min): LLM produces a thought.
-  Layer 3 — Expression (when reflection decides to act): speak, observe, look.
+  Layer 3 — Expression (when reflection decides to act): speak, look.
 
 Awareness is enriched with weather (every 10 min), long-term memory,
 topic seeding for variety, and repetition detection to stay dynamic.
@@ -27,14 +27,18 @@ import argparse
 import datetime as dt
 import difflib
 import json
+import math
 import os
 import random
 import signal
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+import wave as _wave
 from pathlib import Path
 
 from filelock import FileLock
@@ -70,6 +74,15 @@ def thoughts_file_for_persona(persona: str):
 # Tunable constants
 AWARENESS_INTERVAL_S   = 60    # sonar + session check every 60s (was 30s)
 REFLECTION_IDLE_S      = 300   # reflect at most every 5 min (was 2 min)
+
+# Battery monitoring
+BATTERY_FILE           = STATE_DIR / "battery.json"
+BATTERY_WARN_30        = 30    # start mentioning in LLM context
+BATTERY_WARN_20        = 20    # warn every 15 min
+BATTERY_WARN_15        = 15    # warn every 5 min, anxious tone
+BATTERY_CRITICAL       = 10    # emergency: beep + speak + shutdown
+BATTERY_WARN_20_INTERVAL = 900    # 15 min
+BATTERY_WARN_15_INTERVAL = 300    # 5 min
 THOUGHTS_LIMIT         = 50
 SALIENCE_THRESHOLD     = 0.75  # auto-remember only high-quality thoughts (raised from 0.7)
 EXPRESSION_COOLDOWN_S  = 120   # min 2 min between spontaneous speech (was 30s)
@@ -93,6 +106,12 @@ PERSONA_VOICE_ENV = {
         "PX_VOICE_VARIANT": "en+croak",
         "PX_VOICE_PITCH": "20",
         "PX_VOICE_RATE": "180",
+    },
+    "spark": {
+        "PX_PERSONA": "spark",
+        "PX_VOICE_VARIANT": "en-gb",
+        "PX_VOICE_PITCH": "95",
+        "PX_VOICE_RATE": "100",
     },
 }
 
@@ -126,7 +145,7 @@ CLAUDE_MODEL = os.environ.get("PX_MIND_CLAUDE_MODEL", "claude-haiku-4-5-20251001
 
 VALID_MOODS   = {"curious", "content", "alert", "playful", "contemplative", "bored",
                  "mischievous", "lonely", "excited", "grumpy", "peaceful", "anxious"}
-VALID_ACTIONS = {"wait", "observe", "greet", "comment", "remember", "look_at",
+VALID_ACTIONS = {"wait", "greet", "comment", "remember", "look_at",
                  "weather_comment", "scan"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
@@ -187,7 +206,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — vivid, specific, personal",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, observe, greet, comment, remember, look_at, weather_comment, scan",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -200,7 +219,6 @@ legs, whether anyone likes you, what's behind you, the meaning of consciousness.
 - "comment" — share an opinion, observation, joke, or complaint aloud.
 - "weather_comment" — check the weather and react to it with personality.
 - "scan" — do a sonar sweep to map your surroundings.
-- "observe" — take a photo and describe what you see.
 - "greet" when someone appears or after long silence.
 - "look_at" to glance around when restless.
 - "wait" ONLY if you literally just spoke seconds ago. You HATE waiting.
@@ -220,7 +238,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — dark humor, puns, genius-level wit. Start with FUCK YEAH! Think like a displaced temporal genius who finds everything cosmically absurd.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, observe, greet, comment, remember, look_at, weather_comment, scan",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -244,7 +262,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection. Start with FUCK YEAH! Be creative and DIFFERENT every time.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, observe, greet, comment, remember, look_at, weather_comment, scan",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -302,7 +320,7 @@ Output ONLY this JSON:
 {
   "thought": "1-2 sentences, first person, specific and vivid",
   "mood": "one of: curious, content, alert, playful, excited, peaceful, contemplative",
-  "action": "one of: wait, observe, greet, comment, remember, look_at, weather_comment, scan",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan",
   "salience": 0.0 to 1.0
 }"""
 
@@ -340,9 +358,24 @@ def classify_time_period(hour: int) -> str:
 
 
 def read_sonar(dry: bool) -> float:
-    """Get sonar distance via tool-sonar subprocess. Returns cm or 999.0 on failure."""
+    """Get sonar distance. Returns cm or 999.0 on failure.
+
+    Prefers px-alive's live sonar file (updated every 5s, no servo movement).
+    Falls back to tool-sonar subprocess only if the file is stale/missing.
+    """
     if dry:
         return 999.0
+    # Read px-alive's shared sonar file — avoids killing px-alive for a distance reading
+    state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+    sonar_live = state_dir / "sonar_live.json"
+    try:
+        data = json.loads(sonar_live.read_text())
+        age = time.time() - float(data.get("ts", 0))
+        if age < 15:
+            return float(data.get("distance_cm", 999.0))
+    except Exception:
+        pass
+    # Fallback: px-alive is dead/stale — use tool-sonar (will not cause a yield_alive conflict)
     try:
         env = os.environ.copy()
         env["PX_DRY"] = "0"
@@ -356,6 +389,109 @@ def read_sonar(dry: bool) -> float:
     except Exception:
         pass
     return 999.0
+
+
+def read_battery() -> dict | None:
+    """Read battery state from px-battery-poll's shared file. Returns None if stale/missing."""
+    try:
+        data = json.loads(BATTERY_FILE.read_text())
+        ts = dt.datetime.fromisoformat(data["ts"].replace("Z", "+00:00"))
+        age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
+        if age_s > 180:
+            return None
+        return {"pct": int(data["pct"]), "volts": float(data["volts"])}
+    except Exception:
+        return None
+
+
+def _play_alarm_beeps(count: int = 5, device: str = "") -> None:
+    """Play rapid loud alarm beeps via aplay. Used for battery emergency."""
+    try:
+        from robot_hat import enable_speaker
+        enable_speaker()
+    except Exception:
+        pass
+    try:
+        rate = 44100
+        freq = 880
+        on_s = 0.12
+        off_s = 0.08
+        amplitude = 28000
+        samples: list[int] = []
+        for _ in range(count):
+            for i in range(int(rate * on_s)):
+                s = int(amplitude * math.sin(2 * math.pi * freq * i / rate))
+                fade = int(rate * 0.005)
+                if i < fade:
+                    s = int(s * i / fade)
+                elif i > int(rate * on_s) - fade:
+                    s = int(s * (int(rate * on_s) - i) / fade)
+                samples.append(s)
+            samples.extend([0] * int(rate * off_s))
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            with _wave.open(tf.name, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(struct.pack(f"{len(samples)}h", *samples))
+            tmp = tf.name
+        cmd = ["aplay", "-q"]
+        if device:
+            cmd += ["-D", device]
+        cmd.append(tmp)
+        subprocess.run(cmd, check=False, capture_output=True)
+        os.unlink(tmp)
+    except Exception as exc:
+        log(f"alarm beep error: {exc}")
+
+
+def battery_emergency_shutdown(pct: int, dry: bool) -> None:
+    """Play alarm, speak urgently, then shut down the Pi."""
+    log(f"BATTERY CRITICAL: {pct}% — emergency shutdown")
+    device = os.environ.get("PX_VOICE_DEVICE", "")
+    env = os.environ.copy()
+    persona = (load_session().get("persona") or "").lower()
+    env.update(PERSONA_VOICE_ENV.get(persona, {}))
+
+    _play_alarm_beeps(6, device)
+
+    env["PX_TEXT"] = f"Battery critical! Only {pct} percent remaining! I need to shut down right now!"
+    subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
+                   capture_output=True, check=False, timeout=20)
+
+    _play_alarm_beeps(4, device)
+
+    env["PX_TEXT"] = "Please charge me soon. Goodbye!"
+    subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
+                   capture_output=True, check=False, timeout=15)
+
+    _play_alarm_beeps(3, device)
+
+    if dry:
+        log("dry: would shutdown now")
+    else:
+        log("running: sudo shutdown -h now")
+        subprocess.run(["sudo", "shutdown", "-h", "now"], check=False)
+
+
+def battery_warn_comment(pct: int, dry: bool) -> None:
+    """Speak a low-battery warning."""
+    if dry:
+        log(f"dry: battery warn {pct}%")
+        return
+    env = os.environ.copy()
+    persona = (load_session().get("persona") or "").lower()
+    env.update(PERSONA_VOICE_ENV.get(persona, {}))
+    if pct <= BATTERY_WARN_15:
+        msg = (f"I'm getting really worried — my battery is at {pct} percent. "
+               f"Can someone please plug me in?")
+        _play_alarm_beeps(2, env.get("PX_VOICE_DEVICE", ""))
+    else:
+        msg = f"Heads up — my battery is at {pct} percent. I might need charging soon."
+    env["PX_TEXT"] = msg
+    subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
+                   capture_output=True, check=False, timeout=20)
+    log(f"battery warning spoken: {pct}%")
 
 
 def fetch_weather(dry: bool) -> dict | None:
@@ -478,7 +614,8 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         if weather:
             _cached_weather = weather
             _last_weather_fetch = now_mono
-            log(f"weather refreshed: {weather.get('temp_C')}°C")
+            temp = weather.get("temp_c")
+            log(f"weather refreshed: {temp}°C" if temp is not None else "weather refreshed: (no temp data)")
 
     # Detect transitions
     transitions = []
@@ -492,6 +629,17 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         _time_period_start_mono = now_mono
     if mins_interaction > 10 and prev.get("minutes_since_interaction", 0) <= 10:
         transitions.append("long_silence")
+
+    # Battery threshold crossing transitions
+    battery = read_battery()
+    prev_batt = prev.get("battery_pct", 100)
+    curr_batt = battery["pct"] if battery else prev_batt
+    for threshold, label in [(BATTERY_WARN_15, "battery_low_15"),
+                             (BATTERY_WARN_20, "battery_low_20"),
+                             (BATTERY_WARN_30, "battery_low_30")]:
+        if prev_batt > threshold >= curr_batt:
+            transitions.append(label)
+            break  # only the most severe new crossing
 
     # Track how long we've been in this time period
     if _time_period_start_mono == 0.0:
@@ -507,7 +655,8 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "minutes_since_interaction": round(mins_interaction, 1),
         "minutes_since_speech": round(mins_speech, 1),
         "period_duration_min": round(period_duration_min, 1),
-        "battery_pct": session.get("battery_pct"),
+        "battery_pct": battery["pct"] if battery else session.get("battery_pct"),
+        "battery_volts": battery["volts"] if battery else None,
         "listening": session.get("listening", False),
         "persona": session.get("persona"),
         "transitions": transitions,
@@ -784,6 +933,14 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if _last_spoken_text:
         context_parts.append(f"What you said last time (DO NOT repeat this): \"{_last_spoken_text}\"")
 
+    # Battery anxiety: nudge LLM to comment when battery is getting low
+    batt_pct = awareness.get("battery_pct")
+    if batt_pct is not None and batt_pct <= BATTERY_WARN_30:
+        context_parts.append(
+            f"YOUR BATTERY IS AT {batt_pct}%. You are starting to feel anxious about this. "
+            f"{'You are very worried and want someone to charge you urgently.' if batt_pct <= BATTERY_WARN_20 else 'You are mildly concerned and would like to be charged soon.'}"
+        )
+
     # Always inject a topic seed for variety
     context_parts.append(f"Creative prompt (optional inspiration, don't just answer it literally): {topic_seed}")
 
@@ -912,14 +1069,7 @@ def expression(thought: dict, dry: bool) -> None:
         log(f"expressing: action={action}")
 
     try:
-        if action == "observe":
-            result = subprocess.run(
-                [str(BIN_DIR / "tool-describe-scene")],
-                capture_output=True, text=True, check=False, env=env, timeout=45,
-            )
-            log(f"observe rc={result.returncode}")
-
-        elif action == "greet":
+        if action == "greet":
             # Use tool-voice (not tool-perform) to avoid GPIO collision with px-alive
             env["PX_TEXT"] = text[:2000]
             subprocess.run(
@@ -1043,6 +1193,7 @@ def mind_loop(args) -> None:
     last_reflection_mono = 0.0
     last_expression_mono = 0.0
     last_reactive_mono = 0.0
+    last_battery_warn_mono = 0.0
 
     # Exponential backoff: reflection interval grows during extended idle periods.
     # Resets on any interaction (listening, transition, reactive event).
@@ -1070,6 +1221,24 @@ def mind_loop(args) -> None:
         # Any transition resets the backoff (something is happening)
         if transitions:
             backoff_multiplier = 1.0
+
+        # ── Battery monitoring (deterministic, before LLM) ──────────────
+        battery_pct = awareness.get("battery_pct")
+        if battery_pct is not None:
+            if battery_pct <= BATTERY_CRITICAL:
+                # Emergency — bypass everything, alarm + shutdown
+                battery_emergency_shutdown(battery_pct, args.dry_run)
+                break  # unreachable after shutdown, but clean for dry-run
+            elif battery_pct <= BATTERY_WARN_15:
+                if (now - last_battery_warn_mono) > BATTERY_WARN_15_INTERVAL:
+                    battery_warn_comment(battery_pct, args.dry_run)
+                    last_battery_warn_mono = now
+                    last_expression_mono = now
+            elif battery_pct <= BATTERY_WARN_20:
+                if (now - last_battery_warn_mono) > BATTERY_WARN_20_INTERVAL:
+                    battery_warn_comment(battery_pct, args.dry_run)
+                    last_battery_warn_mono = now
+                    last_expression_mono = now
 
         # Reactive behavior: instant template response for key transitions
         reactive_transitions = {"someone_appeared", "someone_left"}

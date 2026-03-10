@@ -54,8 +54,9 @@ FACE_LOST_TIMEOUT    = 3.0    # seconds without face before returning to gaze dr
 # Emotional servo coordination: mood → body language
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
-MOOD_FILE    = STATE_DIR / "mood.json"
-SESSION_FILE = STATE_DIR / "session.json"
+MOOD_FILE       = STATE_DIR / "mood.json"
+SESSION_FILE    = STATE_DIR / "session.json"
+SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
 MOOD_CHECK_S = 10    # how often to read mood file
 SPARK_GREET_COOLDOWN_S = 120   # minimum seconds between SPARK proximity greetings
 
@@ -268,6 +269,7 @@ def idle_loop(args) -> None:
     def _on_yield(sig, _frame):
         log("SIGUSR1: tool needs GPIO — stopping so it can run")
         drop_px()
+        stop_face_detection()  # release camera before exit
         sys.exit(0)
 
     signal.signal(signal.SIGUSR1, _on_yield)
@@ -297,6 +299,12 @@ def idle_loop(args) -> None:
                         dist = float(d) if d and d > 0 else 999.0
                     except Exception:
                         dist = 999.0
+                    try:
+                        SONAR_LIVE_FILE.write_text(
+                            json.dumps({"ts": time.time(), "distance_cm": dist})
+                        )
+                    except Exception:
+                        pass
                     if dist < PROX_THRESH:
                         if prox_near_since is None:
                             prox_near_since = now
@@ -430,7 +438,8 @@ def main(argv) -> int:
             PID_FILE.unlink(missing_ok=True)
         except Exception:
             pass
-        sys.exit(0)
+        stop_face_detection()  # release camera before process exit
+        sys.exit(0)  # finally block in idle_loop handles drop_px
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)

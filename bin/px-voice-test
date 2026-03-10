@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# px-voice-test — interactively audition espeak voices for SPARK.
+# Usage:  bin/px-voice-test [phrase]
+# Plays each preset then lets you tweak interactively.
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/px-env"
+
+PHRASE="${1:-Hi Obi! I'm SPARK your robot friend. How are you today?}"
+DEVICE="${PX_VOICE_DEVICE:-robothat}"
+
+say() {
+    local variant="$1" pitch="$2" rate="$3"
+    # Enable speaker amp
+    python3 -c "from robot_hat import enable_speaker; enable_speaker()" 2>/dev/null || true
+    espeak -v "$variant" -p "$pitch" -s "$rate" --stdout "$PHRASE" 2>/dev/null \
+        | aplay -q -D "$DEVICE" 2>/dev/null || \
+      espeak -v "$variant" -p "$pitch" -s "$rate" "$PHRASE" 2>/dev/null || true
+}
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  SPARK Voice Tester"
+echo "  Phrase: \"$PHRASE\""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# ── Presets ──────────────────────────────────────────
+declare -A PRESETS
+# format: "variant pitch rate"
+PRESETS=(
+    [A]="en+m3  82  120"   # current SPARK
+    [B]="en+m3  95  105"   # higher + slower
+    [C]="en+m3 110   95"   # quite high, gentle pace
+    [D]="en+m4  85  110"   # different male timbre
+    [E]="en+m5  90  105"   # m5 — often clearer
+    [F]="en+m7  88  110"   # m7 — rounder
+    [G]="en-gb  80  110"   # British RP — very clear
+    [H]="en-gb  95  100"   # British, higher + slower
+    [I]="en    100  100"   # plain en, high+slow
+    [J]="en+m3 120   90"   # very high, leisurely
+)
+
+KEYS=(A B C D E F G H I J)
+
+for key in "${KEYS[@]}"; do
+    read -r variant pitch rate <<< "${PRESETS[$key]}"
+    printf "  [%s] %-10s pitch=%-3s rate=%s\n" "$key" "$variant" "$pitch" "$rate"
+done
+
+echo ""
+echo "  [c] Custom — enter your own settings"
+echo "  [q] Quit and apply chosen voice"
+echo ""
+
+CHOSEN=""
+CHOSEN_VARIANT="en+m3"
+CHOSEN_PITCH="82"
+CHOSEN_RATE="120"
+
+while true; do
+    read -rp "Play which? " input
+    input="${input^^}"   # uppercase
+
+    if [[ "$input" == "Q" ]]; then
+        break
+    fi
+
+    if [[ "$input" == "C" ]]; then
+        read -rp "  Variant (e.g. en+m3, en-gb): " CHOSEN_VARIANT
+        read -rp "  Pitch 0-99 (current $CHOSEN_PITCH): " CHOSEN_PITCH
+        read -rp "  Rate wpm (current $CHOSEN_RATE): " CHOSEN_RATE
+        echo "  → Playing custom: $CHOSEN_VARIANT pitch=$CHOSEN_PITCH rate=$CHOSEN_RATE"
+        say "$CHOSEN_VARIANT" "$CHOSEN_PITCH" "$CHOSEN_RATE"
+        CHOSEN="custom"
+        continue
+    fi
+
+    if [[ -v "PRESETS[$input]" ]]; then
+        read -r variant pitch rate <<< "${PRESETS[$input]}"
+        echo "  → Playing $input: $variant pitch=$pitch rate=$rate"
+        say "$variant" "$pitch" "$rate"
+        CHOSEN="$input"
+        CHOSEN_VARIANT="$variant"
+        CHOSEN_PITCH="$pitch"
+        CHOSEN_RATE="$rate"
+    else
+        echo "  Unknown option."
+    fi
+done
+
+echo ""
+if [[ -n "$CHOSEN" ]]; then
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Chosen: $CHOSEN  →  $CHOSEN_VARIANT  pitch=$CHOSEN_PITCH  rate=$CHOSEN_RATE"
+    echo ""
+    echo "  To apply, update these in:"
+    echo "    src/pxh/voice_loop.py  — PERSONA_VOICE_ENV['spark']"
+    echo "    bin/px-mind            — PERSONA_VOICE_ENV['spark']"
+    echo "    bin/tool-voice         — default fallback values"
+    echo ""
+    echo "  Quick apply (run this, then restart px-api-server):"
+    echo "    PX_VOICE_VARIANT=$CHOSEN_VARIANT PX_VOICE_PITCH=$CHOSEN_PITCH PX_VOICE_RATE=$CHOSEN_RATE"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+else
+    echo "  No voice selected."
+fi

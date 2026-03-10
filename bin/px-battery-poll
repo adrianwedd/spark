@@ -1,29 +1,151 @@
 #!/usr/bin/env bash
-# px-battery-poll — write battery voltage to state/battery.json every 60s
-# Run as root (needs I2C access for robot_hat ADC)
-# Called by cron or systemd; safe to run repeatedly.
+# px-battery-poll — write battery voltage to state/battery.json every 30s.
+# Detects plug/unplug transitions and plays sweep tones + speaks.
+# Run as root (needs I2C access for robot_hat ADC).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/px-env"
 
 /usr/bin/python3 - <<'PY'
-import json, os, time
+import json, math, os, shutil, struct, subprocess, sys, tempfile, time, wave
 from datetime import datetime, timezone
 from pathlib import Path
 from robot_hat.utils import get_battery_voltage
 
-STATE_DIR = Path(os.environ.get("PX_STATE_DIR", os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking") + "/state"))
-OUT = STATE_DIR / "battery.json"
-TMP = STATE_DIR / "battery.tmp"
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
+STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+BIN_DIR      = PROJECT_ROOT / "bin"
+OUT          = STATE_DIR / "battery.json"
+TMP          = STATE_DIR / "battery.tmp"
+
+DEVICE       = os.environ.get("PX_VOICE_DEVICE", "")
+POLL_S       = 30         # check every 30s (was 60s — faster detection)
+
+# Voltage must rise by this much per poll to count as "charging"
+CHARGE_RISE_V   = 0.05    # V/poll rise to count as charging evidence
+CHARGE_FALL_V   = 0.03    # V/poll drop to count as discharging evidence
+CHARGE_CONFIRM  = 2       # consecutive confirming readings required before transition
+
+
+def volts_to_pct(v: float) -> int:
+    return max(0, min(100, int((v - 6.0) / (8.4 - 6.0) * 100)))
+
+
+def enable_speaker() -> None:
+    try:
+        from robot_hat import enable_speaker as _es
+        _es()
+    except Exception:
+        pass
+
+
+def play_sweep(freq_start: float, freq_end: float, duration_s: float,
+               amplitude: int = 20000) -> None:
+    """Play a linear frequency sweep (rising or falling) via aplay."""
+    enable_speaker()
+    try:
+        rate = 44100
+        n = int(rate * duration_s)
+        fade = int(rate * 0.02)   # 20ms fade in/out
+        phase = 0.0
+        samples = []
+        for i in range(n):
+            t = i / max(n - 1, 1)
+            freq = freq_start + (freq_end - freq_start) * t
+            phase += 2 * math.pi * freq / rate
+            s = int(amplitude * math.sin(phase))
+            if i < fade:
+                s = int(s * i / fade)
+            elif i > n - fade:
+                s = int(s * (n - i) / fade)
+            samples.append(s)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            with wave.open(tf.name, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(rate)
+                wf.writeframes(struct.pack(f"{len(samples)}h", *samples))
+            tmp = tf.name
+        cmd = ["aplay", "-q"]
+        if DEVICE:
+            cmd += ["-D", DEVICE]
+        cmd.append(tmp)
+        subprocess.run(cmd, check=False, capture_output=True)
+        os.unlink(tmp)
+    except Exception as exc:
+        print(f"[battery-poll] sweep error: {exc}", file=sys.stderr)
+
+
+def speak(text: str) -> None:
+    """Speak text via tool-voice (handles speaker enable + persona voice)."""
+    env = os.environ.copy()
+    env["PX_TEXT"] = text
+    try:
+        subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
+                       capture_output=True, check=False, timeout=20)
+    except Exception:
+        pass
+
+
+def on_plug_in(pct: int) -> None:
+    """Rising sweep + 'Charging, X percent'."""
+    print(f"[battery-poll] plugged in: {pct}%", file=sys.stderr)
+    play_sweep(150, 1400, 1.4)
+    speak(f"Charging. {pct} percent.")
+
+
+def on_unplug(pct: int) -> None:
+    """Falling sweep + 'Unplugged at X percent'."""
+    print(f"[battery-poll] unplugged: {pct}%", file=sys.stderr)
+    play_sweep(1400, 150, 1.4)
+    speak(f"Unplugged at {pct} percent.")
+
+
+# ── Main polling loop ────────────────────────────────────────────────
+prev_volts: float | None = None
+was_charging: bool = False
+# How many consecutive readings confirm current trend
+charge_streak: int = 0
 
 while True:
     try:
         volts = round(get_battery_voltage(), 2)
-        pct   = max(0, min(100, int((volts - 6.0) / (8.4 - 6.0) * 100)))
+        pct   = volts_to_pct(volts)
         ts    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        TMP.write_text(json.dumps({"ts": ts, "volts": volts, "pct": pct}))
+
+        # Detect charging state
+        charging = was_charging  # default: maintain previous state
+        if prev_volts is not None:
+            delta = volts - prev_volts
+            if delta >= CHARGE_RISE_V:
+                charge_streak = min(charge_streak + 1, 5)
+            elif delta <= -CHARGE_FALL_V:
+                charge_streak = max(charge_streak - 1, -5)
+            # else: noise — don't move streak
+
+            # Require CHARGE_CONFIRM consecutive readings before triggering
+            now_charging = charge_streak >= CHARGE_CONFIRM
+
+            if now_charging and not was_charging:
+                charging = True
+                on_plug_in(pct)
+            elif charge_streak <= -CHARGE_CONFIRM and was_charging:
+                charging = False
+                on_unplug(pct)
+            else:
+                charging = now_charging
+
+        was_charging = charging
+        prev_volts = volts
+
+        # Write state atomically
+        data = {"ts": ts, "volts": volts, "pct": pct, "charging": charging}
+        TMP.write_text(json.dumps(data))
         TMP.rename(OUT)
-    except Exception:
-        pass
-    time.sleep(60)
+
+    except Exception as exc:
+        print(f"[battery-poll] error: {exc}", file=sys.stderr)
+
+    time.sleep(POLL_S)
 PY

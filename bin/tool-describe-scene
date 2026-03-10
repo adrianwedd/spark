@@ -23,7 +23,12 @@ TOOL_PHOTOGRAPH   = PROJECT_ROOT / "bin" / "tool-photograph"
 TOOL_VOICE        = PROJECT_ROOT / "bin" / "tool-voice"
 
 FALLBACK_DESCRIPTION = "I couldn't see anything right now."
-CLAUDE_TIMEOUT = 30
+CLAUDE_TIMEOUT = 45
+
+# claude CLI may not be on PATH when launched from systemd — find it explicitly
+CLAUDE_BIN = (shutil.which("claude")
+              or "/home/pi/.local/bin/claude"
+              or "claude")
 
 
 def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:
@@ -44,21 +49,25 @@ def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:
 
 
 def call_claude_vision(image_path: Path) -> str:
-    """Ask Claude to describe the image. Returns description string."""
+    """Ask Claude to describe the image. Returns description string.
+
+    Uses the Read tool so Claude can view the JPEG directly.
+    """
     # Unset Claude Code env vars so the CLI runs as plain claude (not code mode)
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
+    prompt = (
+        f"Read the image at {image_path} and describe what you see "
+        f"in 2 concise sentences. Focus on people, objects, and setting."
+    )
     try:
         result = subprocess.run(
             [
-                "claude", "-p",
-                "Describe what you see in this image briefly in 2 sentences.",
-                "--image", str(image_path),
-                "--allowedTools", "",
+                CLAUDE_BIN, "-p", prompt,
+                "--allowedTools", "Read",
                 "--output-format", "text",
-                "--no-session-persistence",
             ],
             capture_output=True,
             text=True,

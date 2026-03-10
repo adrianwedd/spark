@@ -103,9 +103,9 @@ def main() -> int:
         try:
             with VOICE_LOCK:
                 if DEFAULT_PLAYER == "espeak":
-                    rate = os.environ.get("PX_VOICE_RATE", "150")
-                    pitch = os.environ.get("PX_VOICE_PITCH", "50")
-                    voice_variant = os.environ.get("PX_VOICE_VARIANT", "en")
+                    rate = os.environ.get("PX_VOICE_RATE", "100")
+                    pitch = os.environ.get("PX_VOICE_PITCH", "95")
+                    voice_variant = os.environ.get("PX_VOICE_VARIANT", "en-gb")
                     device = os.environ.get("PX_VOICE_DEVICE")
                     # Enable robot-hat speaker amplifier (GPIO 20) before audio
                     subprocess.run(
@@ -113,8 +113,10 @@ def main() -> int:
                          "from robot_hat import enable_speaker; enable_speaker()"],
                         check=False, capture_output=True,
                     )
+                    import re as _re
+                    spoken = _re.sub(r'\bObi\b', 'Obee', text, flags=_re.IGNORECASE)
                     es_res = subprocess.run(
-                        [DEFAULT_PLAYER, "-v", voice_variant, "-p", pitch, "-s", rate, "--stdout", text],
+                        [DEFAULT_PLAYER, "-v", voice_variant, "-p", pitch, "-s", rate, "--stdout", spoken],
                         capture_output=True,
                         text=False,
                         check=False,

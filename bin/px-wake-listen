@@ -192,7 +192,9 @@ def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000
         if device:
             cmd += ["-D", device]
         cmd.append(tmp)
-        subprocess.run(cmd, check=False, capture_output=True)
+        res = subprocess.run(cmd, check=False, capture_output=True)
+        if res.returncode != 0:
+            log(f"tone aplay error rc={res.returncode}: {res.stderr[-120:].decode('latin1','ignore').strip()}")
         os.unlink(tmp)
     except Exception as exc:
         log(f"tone error: {exc}")
@@ -237,6 +239,32 @@ def play_chime_timeout(device: str = "") -> None:
         (600, 250, 0.22),    # slower sweep to low
         (180, 0.14),         # low rumble tail
     ], device, amplitude=15000, gap_s=0.045)
+
+
+def play_chime_tick(device: str = "") -> None:
+    """Soft periodic heartbeat blip — 'still thinking'."""
+    _play_tone_sequence([
+        (1100, 900, 0.07),   # brief descending blip
+    ], device, amplitude=10000, gap_s=0.0)
+
+
+def start_periodic_beep(device: str = "", interval_s: float = 5.0) -> threading.Event:
+    """Start a background thread that plays a soft tick every interval_s seconds.
+
+    Returns a stop Event — call stop_event.set() to end the thread.
+    """
+    stop = threading.Event()
+
+    def _loop():
+        next_tick = time.monotonic() + interval_s
+        while not stop.wait(timeout=max(0, next_tick - time.monotonic())):
+            if stop.is_set():
+                break
+            play_chime_tick(device)
+            next_tick += interval_s
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return stop
 
 
 def resample(data: bytes, state=None):
@@ -761,6 +789,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
     _ambient_rms_sum = 0
     _ambient_rms_count = 0
     _ambient_last_write = time.monotonic()
+    _vosk_partial_last_log = 0.0  # throttle non-wake-phrase vosk detections
 
     try:
         while True:
@@ -796,12 +825,26 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                 result = json.loads(wake_rec.Result())
                 text = result.get("text", "")
                 if text and text != "[unk]":
-                    log(f"vosk heard: {text!r}")
+                    if wake_phrase in text:
+                        log(f"vosk heard: {text!r}")
+                    else:
+                        _now_partial = time.monotonic()
+                        if _now_partial - _vosk_partial_last_log >= 60.0:
+                            log(f"vosk heard: {text!r}")
+                            _vosk_partial_last_log = _now_partial
 
                 if wake_phrase in text:
                     log(f"wake word detected: {text!r}")
+                    # Pre-enable speaker amp so it's warm before chime audio arrives
+                    try:
+                        from robot_hat import enable_speaker
+                        enable_speaker()
+                    except Exception:
+                        pass
                     # Chime in background while we start recording
                     threading.Thread(target=play_chime, args=(args.aplay_device,), daemon=True).start()
+                    # Periodic heartbeat: soft tick every 5s so user knows we're listening/thinking
+                    _beep_stop = start_periodic_beep(args.aplay_device, interval_s=5.0)
 
                     # --- Capture initial utterance ---
                     log("recording...")
@@ -875,6 +918,9 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                             text_out, args.voice_cmd, args.dry_run,
                             stream, model, args.aplay_device, args.convo_turns, stt, whisper, sensevoice,
                         )
+
+                    # Stop periodic heartbeat beep now that conversation is done
+                    _beep_stop.set()
 
                     # Reset wake recognizer after conversation ends
                     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)

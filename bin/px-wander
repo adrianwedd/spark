@@ -8,15 +8,18 @@ source "$SCRIPT_DIR/px-env"
 yield_alive
 
 /usr/bin/python3 - "$@" <<'PY'
-"""Autonomous wander: drive forward, avoid obstacles with sonar, repeat."""
+"""Autonomous wander: drive forward, sweep for best direction, avoid obstacles.
+
+Uses the Picarx handle directly for sonar — no subprocess, no GPIO conflict.
+Speaks while exploring if espeak is available and a persona is set.
+"""
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import json
 import os
-import random
-import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -26,11 +29,15 @@ LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wander.log"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
 
-OBSTACLE_THRESHOLD_CM = 25.0
-FORWARD_SPEED = 30
-FORWARD_DURATION = 1.0
-TURN_DURATION = 0.8
-TURN_SPEED = 25
+OBSTACLE_CM    = 30.0   # stop and re-evaluate if anything closer than this
+CLEAR_CM       = 60.0   # "definitely clear" threshold for direction choice
+FORWARD_SPEED  = 30
+FORWARD_S      = 1.2    # drive this long per step
+TURN_SPEED     = 25
+TURN_S         = 0.7
+
+# Angles to sweep for direction choice (pan servo)
+SWEEP_ANGLES   = [-50, -25, 0, 25, 50]
 
 
 def log(msg: str) -> None:
@@ -45,47 +52,75 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def run_px(name: str, args_list: list[str], dry_run: bool) -> dict:
-    cmd = [str(PROJECT_ROOT / "bin" / name)] + args_list
-    if dry_run:
-        cmd.append("--dry-run")
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+def read_dist(px) -> float:
+    """Read sonar distance using the existing Picarx handle. Returns cm or 999."""
     try:
-        return json.loads(result.stdout.strip().splitlines()[-1])
-    except (json.JSONDecodeError, IndexError):
-        return {"status": "error", "returncode": result.returncode}
+        d = px.get_distance()
+        return float(d) if d and d > 0 else 999.0
+    except Exception:
+        return 999.0
 
 
-def sonar_closest(dry_run: bool) -> float:
-    """Return closest obstacle in cm (-1 if unavailable)."""
-    d = run_px("px-sonar", [], dry_run)
-    return float(d.get("closest_cm", -1))
+def sweep_distances(px) -> dict[int, float]:
+    """Sweep camera pan across SWEEP_ANGLES, read sonar at each. Returns {angle: cm}."""
+    readings = {}
+    for angle in SWEEP_ANGLES:
+        px.set_cam_pan_angle(angle)
+        time.sleep(0.15)  # settle
+        readings[angle] = read_dist(px)
+        log(f"  sweep angle={angle:+d}° dist={readings[angle]:.0f}cm")
+    px.set_cam_pan_angle(0)  # return to center
+    return readings
+
+
+def best_direction(readings: dict[int, float]) -> tuple[int, float]:
+    """Return (best_angle, best_dist) — angle of maximum clearance."""
+    return max(readings.items(), key=lambda kv: kv[1])
+
+
+def speak(text: str) -> None:
+    """Speak text via espeak if available. Non-blocking (fire and forget)."""
+    if not shutil.which("espeak"):
+        return
+    try:
+        from robot_hat import enable_speaker
+        enable_speaker()
+    except Exception:
+        pass
+    variant = os.environ.get("PX_VOICE_VARIANT", "en+m3")
+    pitch   = os.environ.get("PX_VOICE_PITCH",   "82")
+    rate    = os.environ.get("PX_VOICE_RATE",     "150")
+    device  = os.environ.get("PX_VOICE_DEVICE",   "")
+    try:
+        es = subprocess.Popen(
+            ["espeak", "-v", variant, "-p", pitch, "-s", rate, "--stdout", text],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        if shutil.which("aplay"):
+            cmd = ["aplay", "-q"]
+            if device:
+                cmd += ["-D", device]
+            ap = subprocess.Popen(cmd, stdin=es.stdout, stderr=subprocess.DEVNULL)
+            es.stdout.close()
+            ap.wait()
+        else:
+            es.wait()
+    except Exception:
+        pass
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Autonomous wander loop")
     parser.add_argument("--steps",    type=int,   default=int(os.environ.get("PX_WANDER_STEPS", "5")))
     parser.add_argument("--dry-run",  action="store_true")
+    parser.add_argument("--quiet",    action="store_true", help="Don't speak while wandering")
     args = parser.parse_args(argv)
 
-    steps = int(clamp(args.steps, 1, 20))
-    dry   = args.dry_run
+    steps  = int(clamp(args.steps, 1, 20))
+    dry    = args.dry_run
+    quiet  = args.quiet or os.environ.get("PX_WANDER_QUIET", "0") != "0"
 
     px = None
-
-    def _shutdown(sig, _frame):
-        log(f"received signal {sig} — stopping")
-        if px is not None:
-            try:
-                px.stop()
-                px.set_dir_servo_angle(0)
-                px.close()
-            except Exception:
-                pass
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
 
     if not dry:
         try:
@@ -98,42 +133,81 @@ def main(argv: list[str]) -> int:
 
     log(f"wander start steps={steps} dry={dry}")
 
+    obstacles_avoided = 0
+    steps_driven      = 0
+
     try:
         for step in range(steps):
             log(f"step {step + 1}/{steps}")
 
-            # Check for obstacle before driving
-            closest_cm = sonar_closest(dry)
-            log(f"sonar closest_cm={closest_cm}")
+            if dry:
+                log("dry: forward 1.2s")
+                time.sleep(0.1)
+                steps_driven += 1
+                continue
 
-            if closest_cm > 0 and closest_cm < OBSTACLE_THRESHOLD_CM:
-                log(f"obstacle at {closest_cm} cm — turning")
-                turn_angle = random.choice([-30, 30])
-                if not dry and px is not None:
-                    px.set_dir_servo_angle(turn_angle)
+            # Sweep to find best direction
+            readings = sweep_distances(px)
+            best_angle, best_dist = best_direction(readings)
+            forward_dist = readings.get(0, 999.0)
+
+            log(f"best_angle={best_angle:+d}° best_dist={best_dist:.0f}cm forward={forward_dist:.0f}cm")
+
+            if forward_dist < OBSTACLE_CM:
+                # Something ahead — turn toward best clearance
+                obstacles_avoided += 1
+                if best_dist < OBSTACLE_CM:
+                    # Blocked in all directions — back up a little then turn
+                    log("blocked all around — reversing")
+                    if not quiet:
+                        speak("Hmm, I'm stuck. Backing up.")
+                    px.backward(FORWARD_SPEED)
+                    time.sleep(0.6)
+                    px.stop()
+                    turn = 30 if best_angle >= 0 else -30
+                    px.set_dir_servo_angle(turn)
                     px.forward(TURN_SPEED)
-                    time.sleep(TURN_DURATION)
+                    time.sleep(TURN_S)
                     px.stop()
                     px.set_dir_servo_angle(0)
                 else:
-                    time.sleep(0.1)
+                    log(f"obstacle ahead — turning toward {best_angle:+d}°")
+                    if not quiet:
+                        msg = "Something's in the way, going " + ("left" if best_angle < 0 else "right") + "."
+                        speak(msg)
+                    # Steer toward best direction
+                    steer = clamp(best_angle, -35, 35)
+                    px.set_dir_servo_angle(steer)
+                    px.forward(TURN_SPEED)
+                    time.sleep(TURN_S)
+                    px.stop()
+                    px.set_dir_servo_angle(0)
             else:
-                # Drive forward
-                if not dry and px is not None:
-                    px.set_dir_servo_angle(0)
-                    px.forward(FORWARD_SPEED)
-                    time.sleep(FORWARD_DURATION)
-                    px.stop()
-                else:
-                    time.sleep(0.1)
+                # Path is clear — drive forward
+                log(f"clear ahead ({forward_dist:.0f}cm) — forward")
+                if not quiet and step == 0:
+                    speak("Exploring!")
+                steps_driven += 1
+                px.set_dir_servo_angle(0)
+                px.forward(FORWARD_SPEED)
+                time.sleep(FORWARD_S)
+                px.stop()
 
-        result = {"status": "ok", "steps": steps, "dry": dry}
+        result = {
+            "status": "ok",
+            "steps": steps,
+            "steps_driven": steps_driven,
+            "obstacles_avoided": obstacles_avoided,
+            "dry": dry,
+        }
+        log(f"wander complete driven={steps_driven} avoided={obstacles_avoided}")
+        if not dry and not quiet and obstacles_avoided == 0:
+            speak("All done!")
         print(json.dumps(result))
-        log(f"wander complete steps={steps}")
         return 0
 
     except KeyboardInterrupt:
-        log("aborted by keyboard interrupt")
+        log("aborted")
         return 130
     except Exception as exc:
         log(f"runtime error: {exc}")
@@ -144,6 +218,8 @@ def main(argv: list[str]) -> int:
             try:
                 px.stop()
                 px.set_dir_servo_angle(0)
+                px.set_cam_pan_angle(0)
+                px.set_cam_tilt_angle(0)
                 px.close()
             except Exception:
                 pass
