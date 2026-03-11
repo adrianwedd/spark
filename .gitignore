@@ -28,6 +28,7 @@ state/battery.json
 state/*.lock
 photos/
 .env
+bin/go2rtc
 logs/*.pid
 diag_summary.json
 .claude.json

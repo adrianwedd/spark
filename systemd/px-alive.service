@@ -1,15 +1,19 @@
 [Unit]
 Description=PiCar-X Idle Alive Daemon (organic servo motion)
 After=network.target
+# Don't start while px-frigate-stream holds the camera. The PID file is written
+# by px-frigate-stream on startup and deleted on stop. Condition failures don't
+# increment the start counter, so Restart=always will keep polling every RestartSec.
+ConditionPathNotExists=/home/pi/picar-x-hacking/logs/px-frigate-stream.pid
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/home/pi/picar-x-hacking
 Environment=HOME=/home/pi
-ExecStart=/home/pi/picar-x-hacking/bin/px-alive
+ExecStart=/home/pi/picar-x-hacking/bin/px-alive --no-face
 Restart=always
-RestartSec=10
+RestartSec=15
 StandardOutput=journal
 StandardError=journal
 

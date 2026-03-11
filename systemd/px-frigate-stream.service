@@ -1,10 +1,14 @@
 [Unit]
-Description=PiCar-X Frigate camera stream (RTSP push to go2rtc)
+Description=PiCar-X Frigate camera stream (local go2rtc RTSP server, pull model)
 After=network.target
-# px-alive holds the libcamera pipeline via robot_hat multiprocessing FD inheritance.
-# Declaring Conflicts causes systemd to stop px-alive when streaming starts and
-# allows it to auto-restart (Restart=always, RestartSec=15) when streaming stops.
-Conflicts=px-alive.service
+# Architecture: go2rtc 1.9.7 runs locally with rpicam-vid as exec: source.
+# Frigate on pi5-hailo pulls from rtsp://picar.local:8554/picar-x (pull model).
+# This avoids Frigate-embedded go2rtc's RTSP ANNOUNCE bug (drops after 1 frame).
+#
+# px-alive holds the libcamera pipeline (robot_hat multiprocessing child inherits
+# camera FDs). We stop it explicitly in ExecStartPre rather than using Conflicts= to
+# avoid the restart loop (Restart=always on both sides would flip-flop indefinitely).
+# px-alive is prevented from restarting while the PID file exists (ConditionPathNotExists).
 
 [Service]
 Type=simple
@@ -13,8 +17,9 @@ Group=pi
 WorkingDirectory=/home/pi/picar-x-hacking
 Environment=HOME=/home/pi
 Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
-# Wait for px-alive to fully release the libcamera pipeline before opening it
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 20); do systemctl is-active px-alive >/dev/null 2>&1 || break; sleep 0.5; done; sleep 1'
+# Stop px-alive explicitly (+ prefix = run as root regardless of User=pi),
+# then wait for the camera pipeline to be released before rpicam-vid opens it.
+ExecStartPre=+/bin/bash -c 'systemctl stop px-alive 2>/dev/null; for i in $(seq 1 20); do systemctl is-active px-alive >/dev/null 2>&1 || break; sleep 0.5; done; sleep 1'
 ExecStart=/home/pi/picar-x-hacking/bin/px-frigate-stream
 Restart=on-failure
 RestartSec=15

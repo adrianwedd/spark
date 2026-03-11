@@ -11,19 +11,20 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List
 
 from pxh.logging import log_event
 
 STOP_REQUESTED = False
 LOG_DIR = Path(os.environ.get("LOG_DIR", Path(os.environ.get("PROJECT_ROOT", ".")) / "logs"))
 PID_FILE = LOG_DIR / "px-frigate-stream.pid"
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "."))
+GO2RTC_BIN = PROJECT_ROOT / "bin" / "go2rtc"
 
 
 def handle_sigint(signum, frame):
@@ -31,82 +32,57 @@ def handle_sigint(signum, frame):
     STOP_REQUESTED = True
 
 
-def build_commands(args) -> Dict[str, List[str]]:
-    cam_cmd = [
-        "rpicam-vid",
-        "--codec",
-        "h264",
-        "--profile",
-        "baseline",
-        "--inline",
-        "--timeout",
-        "0",
-        "--framerate",
-        str(args.fps),
-        "--width",
-        str(args.width),
-        "--height",
-        str(args.height),
-        "--segment",
-        "1",
-        "--output",
-        "-",
-    ]
-    ffmpeg_cmd = [
-        "ffmpeg",
-        "-re",
-        "-i",
-        "pipe:0",
-        "-fflags",
-        "+genpts",
-        # Stream-copy H264 from rpicam-vid — no re-encode.
-        # -preset/-tune are software encoder flags and cause mpeg4 fallback without -c:v copy.
-        "-c:v",
-        "copy",
-        "-f",
-        "rtsp",
-        "-rtsp_transport",
-        "tcp",
-        "-muxdelay",
-        "0.1",
-        args.url,
-    ]
-    return {"camera": cam_cmd, "ffmpeg": ffmpeg_cmd}
+def build_go2rtc_config(args) -> dict:
+    """go2rtc config that runs rpicam-vid as a local RTSP source.
+
+    Frigate (on pi5-hailo) pulls from rtsp://192.168.1.29:{port}/{stream}.
+    The exec: source starts rpicam-vid on demand when a consumer connects.
+    """
+    rpicam_cmd = (
+        f"rpicam-vid --codec h264 --profile baseline --inline"
+        f" --timeout 0 --framerate {args.fps}"
+        f" --width {args.width} --height {args.height}"
+        f" --output -"
+    )
+    return {
+        "api": {"listen": f":{args.api_port}"},
+        "rtsp": {"listen": f":{args.port}"},
+        "streams": {args.stream: [f"exec:{rpicam_cmd}"]},
+    }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Stream PiCar-X camera to Frigate/go2rtc")
-    parser.add_argument("--host", default="pi5-hailo.local", help="Frigate/go2rtc host")
-    parser.add_argument("--port", type=int, default=8554, help="RTSP port")
+    parser = argparse.ArgumentParser(
+        description="Serve PiCar-X camera as RTSP stream via local go2rtc"
+    )
+    parser.add_argument("--port", type=int, default=8554, help="RTSP listen port")
+    parser.add_argument("--api-port", type=int, default=18554, help="go2rtc API port")
     parser.add_argument("--stream", default="picar-x", help="Stream name")
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--duration", type=float, default=0, help="Stop after N seconds (0 = until Ctrl+C)")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.add_argument("--duration", type=float, default=0, help="Stop after N seconds (0 = forever)")
+    parser.add_argument("--dry-run", action="store_true", help="Print config without executing")
 
     args = parser.parse_args()
 
-    # go2rtc RTSP push: the stream name IS the URL path on the RTSP port.
-    # The /api/stream?push= form is go2rtc's HTTP API, not valid for RTSP ANNOUNCE.
-    target_url = f"rtsp://{args.host}:{args.port}/{args.stream}"
-    args.url = target_url
-    commands = build_commands(args)
+    serve_url = f"rtsp://picar.local:{args.port}/{args.stream}"
+    config = build_go2rtc_config(args)
 
     if args.dry_run or os.environ.get("PX_DRY", "0") == "1":
         payload = {
             "status": "dry-run",
-            "commands": commands,
+            "serve_url": serve_url,
+            "go2rtc_bin": str(GO2RTC_BIN),
+            "go2rtc_config": config,
         }
         log_event("frigate-stream", payload)
         print(json.dumps(payload, indent=2))
         return 0
 
-    if not shutil.which(commands["camera"][0]):
-        print("rpicam-vid not found in PATH", file=sys.stderr)
-        return 1
-    if not shutil.which(commands["ffmpeg"][0]):
-        print("ffmpeg not found in PATH", file=sys.stderr)
+    if not GO2RTC_BIN.exists():
+        print(f"go2rtc binary not found: {GO2RTC_BIN}", file=sys.stderr)
+        print("Download arm64 binary from https://github.com/AlexxIT/go2rtc/releases", file=sys.stderr)
         return 1
 
     signal.signal(signal.SIGINT, handle_sigint)
@@ -116,55 +92,65 @@ def main() -> int:
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
 
-    cam_proc = subprocess.Popen(commands["camera"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        ffmpeg_proc = subprocess.Popen(
-            commands["ffmpeg"],
-            stdin=cam_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Close parent's copy so ffmpeg receives EOF when cam_proc exits
-        cam_proc.stdout.close()
-    except Exception:
-        cam_proc.terminate()
-        cam_proc.wait(timeout=2)
-        raise
+    config_file = tempfile.NamedTemporaryFile(
+        suffix=".json", delete=False, mode="w"
+    )
+    config_path = config_file.name
+    json.dump(config, config_file)
+    config_file.close()
 
-    start_ts = time.time()
-    payload = {
-        "status": "streaming",
-        "url": target_url,
-        "camera_cmd": commands["camera"],
-        "ffmpeg_cmd": commands["ffmpeg"],
-    }
-    log_event("frigate-stream", payload)
-    print(json.dumps(payload))
+    go2rtc_proc = subprocess.Popen(
+        [str(GO2RTC_BIN), "-config", config_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
-    duration = args.duration
     try:
+        time.sleep(1.0)  # let go2rtc bind the port
+        if go2rtc_proc.poll() is not None:
+            err = go2rtc_proc.stderr.read().decode(errors="replace")
+            print(f"go2rtc exited early: {err}", file=sys.stderr)
+            return 1
+
+        start_ts = time.time()
+        payload = {
+            "status": "streaming",
+            "serve_url": serve_url,
+            "go2rtc_config": config,
+        }
+        log_event("frigate-stream", payload)
+        print(json.dumps(payload))
+
+        duration = args.duration
         while True:
             if STOP_REQUESTED:
                 break
             if duration > 0 and (time.time() - start_ts) >= duration:
                 break
+            if go2rtc_proc.poll() is not None:
+                log_event("frigate-stream", {"status": "go2rtc_exited_unexpectedly"})
+                break
             time.sleep(0.5)
+
     finally:
-        for proc in (ffmpeg_proc, cam_proc):
-            if proc.poll() is None:
-                proc.terminate()
-        for proc in (ffmpeg_proc, cam_proc):
+        if go2rtc_proc.poll() is None:
+            go2rtc_proc.terminate()
             try:
-                proc.wait(timeout=5)
+                go2rtc_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                go2rtc_proc.kill()
+        try:
+            Path(config_path).unlink(missing_ok=True)
+        except Exception:
+            pass
         try:
             PID_FILE.unlink(missing_ok=True)
         except Exception:
             pass
         log_event(
             "frigate-stream",
-            {"status": "stopped", "url": target_url, "duration": time.time() - start_ts},
+            {"status": "stopped", "serve_url": serve_url,
+             "duration": time.time() - start_ts},
         )
     return 0
 
