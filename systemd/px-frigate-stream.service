@@ -1,0 +1,21 @@
+[Unit]
+Description=PiCar-X Frigate camera stream (RTSP push to go2rtc)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/picar-x-hacking
+Environment=HOME=/home/pi
+Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/pi/picar-x-hacking/bin/px-frigate-stream
+Restart=on-failure
+RestartSec=15
+# Give rpicam-vid time to release the camera on stop
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

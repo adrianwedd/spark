@@ -22,10 +22,31 @@ from pxh.state import update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 PHOTOS_DIR   = PROJECT_ROOT / "photos"
+LOG_DIR      = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+
+
+def _check_camera_busy() -> str | None:
+    """Return error message if Frigate stream is holding the camera, else None."""
+    pid_file = LOG_DIR / "px-frigate-stream.pid"
+    if pid_file.exists():
+        try:
+            pid = int(pid_file.read_text().strip())
+            if Path(f"/proc/{pid}").is_dir():
+                return "camera busy — frigate stream active"
+        except Exception:
+            pass  # stale PID file — proceed
+    return None
 
 
 def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
+
+    busy = _check_camera_busy()
+    if busy:
+        payload = {"status": "error", "error": busy}
+        log_event("photograph", payload)
+        print(json.dumps(payload))
+        return 1
 
     try:
         timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")

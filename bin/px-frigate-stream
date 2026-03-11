@@ -16,11 +16,14 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List
 
 from pxh.logging import log_event
 
 STOP_REQUESTED = False
+LOG_DIR = Path(os.environ.get("LOG_DIR", Path(os.environ.get("PROJECT_ROOT", ".")) / "logs"))
+PID_FILE = LOG_DIR / "px-frigate-stream.pid"
 
 
 def handle_sigint(signum, frame):
@@ -107,6 +110,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
+    # Write PID file so tool-photograph/tool-describe-scene know camera is busy
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+
     cam_proc = subprocess.Popen(commands["camera"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         ffmpeg_proc = subprocess.Popen(
@@ -149,6 +156,10 @@ def main() -> int:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
         log_event(
             "frigate-stream",
             {"status": "stopped", "url": target_url, "duration": time.time() - start_ts},
