@@ -320,6 +320,22 @@ def test_tool_perform_dry_run(isolated_project):
     assert payload["steps"] == 2
 
 
+def test_px_alive_pid_race_not_duplicate(isolated_project):
+    """Second px-alive start should exit cleanly if PID file already shows a live process."""
+    import os
+    pid_file = Path(isolated_project["log_dir"]) / "px-alive.pid"
+    # Write our own PID as if we're px-alive instance 1
+    pid_file.write_text(str(os.getpid()))
+    env = {**isolated_project["env"], "PX_ALIVE_PID": str(pid_file), "PX_DRY": "1"}
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "bin" / "px-alive"), "--dry-run"],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    # Should have exited cleanly (rc=0) without overwriting the PID file
+    assert result.returncode == 0, f"expected rc=0, got {result.returncode}: {result.stderr}"
+    assert pid_file.read_text().strip() == str(os.getpid()), "PID file was overwritten by second instance"
+
+
 def test_tool_perform_missing_steps(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -662,3 +678,49 @@ def test_tool_gws_sheets_log_missing_id(isolated_project):
     payload = parse_json(result.stdout.strip())
     assert payload["status"] == "error"
     assert "PX_SHEETS_ID" in payload["error"]
+
+
+def test_session_history_clear(isolated_project, monkeypatch):
+    """POST /api/v1/session/history/clear should wipe history and return count."""
+    import os
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+
+    # Import after env is patched so the module uses the right session path
+    from fastapi.testclient import TestClient
+    import importlib, pxh.api as _api_mod
+    importlib.reload(_api_mod)
+
+    # Seed some history
+    from pxh.state import update_session, load_session
+    update_session(history_entry={"event": "test", "text": "garbled phrase"})
+    update_session(history_entry={"event": "test", "text": "another entry"})
+
+    # Use context manager so lifespan (which calls _load_token) runs
+    with TestClient(_api_mod.app, raise_server_exceptions=True) as client:
+        resp = client.post(
+            "/api/v1/session/history/clear",
+            headers={"Authorization": "Bearer testtoken"},
+        )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["cleared"] >= 2
+
+    assert load_session().get("history", []) == []
+
+
+def test_tool_photograph_camera_busy(isolated_project):
+    """tool-photograph should fail gracefully when frigate stream PID file is present."""
+    pid_file = Path(isolated_project["log_dir"]) / "px-frigate-stream.pid"
+    import os
+    pid_file.write_text(str(os.getpid()))  # our own PID = definitely alive
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "bin" / "tool-photograph")],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    data = parse_json(result.stdout.strip())
+    assert data["status"] == "error"
+    assert "camera busy" in data["error"]

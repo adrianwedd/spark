@@ -426,18 +426,33 @@ def main(argv) -> int:
     GAZE_MAX_S  = args.gaze_max
     PROX_THRESH = args.prox_cm if not args.no_prox else 0.0
 
-    # Write PID
+    # Write PID — guarded: if another live px-alive already owns the file, exit
+    # cleanly so we don't clobber its PID (race condition on rapid restarts).
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _existing_pid = None
+    try:
+        _existing_pid = int(PID_FILE.read_text().strip())
+    except Exception:
+        pass
+    if _existing_pid and _existing_pid != os.getpid() and os.path.isdir(f"/proc/{_existing_pid}"):
+        log(f"another px-alive (pid={_existing_pid}) already running — exiting")
+        return 0
     PID_FILE.write_text(str(os.getpid()))
+
+    def _safe_unlink_pid() -> None:
+        """Only delete the PID file if it still contains our own PID."""
+        try:
+            if int(PID_FILE.read_text().strip()) == os.getpid():
+                PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     log(f"starting pid={os.getpid()} dry={args.dry_run}")
 
     # Signal handler for clean shutdown
     def _shutdown(sig, _frame):
         log(f"received signal {sig} — shutting down")
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _safe_unlink_pid()
         stop_face_detection()  # release camera before process exit
         sys.exit(0)  # finally block in idle_loop handles drop_px
 
@@ -452,7 +467,7 @@ def main(argv) -> int:
             log(f"dry gaze {i+1}: pan={target_pan} tilt={target_tilt}")
             time.sleep(0.3)
         log("dry-run: simulating idle scan sweep")
-        PID_FILE.unlink(missing_ok=True)
+        _safe_unlink_pid()
         return 0
 
     # Verify picarx is importable before entering the loop
@@ -472,7 +487,7 @@ def main(argv) -> int:
     finally:
         if not args.no_face:
             stop_face_detection()
-        PID_FILE.unlink(missing_ok=True)
+        _safe_unlink_pid()
         log("stopped")
     return 0
 
