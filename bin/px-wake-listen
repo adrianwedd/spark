@@ -45,7 +45,7 @@ SILENCE_S        = 3.0    # silence after speech → end of utterance (patient �
 MAX_RECORD_S     = 20.0   # hard cap on recording length
 RMS_SILENCE      = 300    # RMS below this → silence
 AMBIENT_WRITE_S  = 10     # write ambient sound level every N seconds
-SPEECH_ONSET_RMS = 400    # RMS above this → speech started (follow-up detection)
+SPEECH_ONSET_RMS = 600    # RMS above this → speech started (follow-up detection)
 FOLLOWUP_SILENCE_S  = 3.5  # silence threshold ending a follow-up utterance
 FOLLOWUP_MAX_S      = 20.0  # hard cap for follow-up recording
 FOLLOWUP_TIMEOUT_S  = 30.0  # seconds to wait for follow-up speech to begin (timeout → end session)
@@ -393,7 +393,14 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
         no_speech_threshold=0.6,
         vad_filter=False,
     )
-    text = " ".join(s.text.strip() for s in segments).strip()
+    segs = list(segments)
+    text = " ".join(s.text.strip() for s in segs).strip()
+    # Reject word-salad hallucinations via avg_logprob — real speech scores > -1.0
+    if segs:
+        avg_logprob = sum(s.avg_logprob for s in segs) / len(segs)
+        if avg_logprob < -1.0:
+            log(f"whisper hallucination (word salad avg_logprob={avg_logprob:.2f}): {text!r}")
+            return ""
     # Strip non-ASCII chars (curly quotes, em-dashes are OK; CJK blocks are hallucination)
     ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
     if text != ascii_text:
