@@ -285,6 +285,43 @@ async def public_sonar() -> Dict[str, Any]:
         return {"sonar_cm": None, "age_seconds": None, "source": "unavailable"}
 
 
+@app.get("/api/v1/public/awareness")
+async def public_awareness() -> Dict[str, Any]:
+    """SPARK awareness snapshot: mode, Frigate, ambient, weather, time context. No auth."""
+    try:
+        awareness = json.loads((_public_state_dir() / "awareness.json").read_text())
+    except Exception:
+        awareness = {}
+
+    # frigate can be None (offline) or a dict — handle both
+    frigate = awareness.get("frigate") or {}
+    frigate_present = awareness.get("frigate") is not None
+    ambient = awareness.get("ambient_sound") or {}
+    raw_weather = awareness.get("weather")
+
+    if raw_weather is not None:
+        weather_out: Any = {
+            "temp_c": raw_weather.get("temp_C"),      # normalise uppercase → lowercase
+            "wind_kmh": raw_weather.get("wind_kmh"),
+            "humidity_pct": raw_weather.get("humidity_pct"),
+            "summary": raw_weather.get("summary"),
+        }
+    else:
+        weather_out = None
+
+    return {
+        "obi_mode": awareness.get("obi_mode"),
+        "person_present": frigate.get("person_present", False) if frigate_present else False,
+        "frigate_score": frigate.get("score"),
+        "ambient_level": ambient.get("level"),
+        "ambient_rms": ambient.get("rms"),
+        "weather": weather_out,
+        "minutes_since_speech": awareness.get("minutes_since_speech"),
+        "time_period": awareness.get("time_period"),
+        "ts": awareness.get("ts"),
+    }
+
+
 @app.post("/api/v1/pin/verify")
 async def verify_pin(body: PinRequest) -> JSONResponse:
     """Verify the admin PIN. Public endpoint — no Bearer token required."""

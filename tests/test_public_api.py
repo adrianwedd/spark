@@ -195,3 +195,98 @@ class TestPublicSonar:
         data = resp.json()
         for key in ("sonar_cm", "age_seconds", "source"):
             assert key in data, f"missing key: {key}"
+
+
+class TestPublicAwareness:
+    def test_returns_200(self, public_client):
+        resp = public_client.get("/api/v1/public/awareness")
+        assert resp.status_code == 200
+
+    def test_no_auth_required(self, public_client):
+        resp = public_client.get("/api/v1/public/awareness")
+        assert resp.status_code == 200
+
+    def test_has_required_keys(self, public_client):
+        resp = public_client.get("/api/v1/public/awareness")
+        data = resp.json()
+        for key in ("obi_mode", "person_present", "frigate_score",
+                    "ambient_level", "ambient_rms", "weather",
+                    "minutes_since_speech", "time_period", "ts"):
+            assert key in data, f"missing key: {key}"
+
+    def test_null_fields_when_no_awareness_file(self, public_client, state_dir):
+        # No awareness.json → all fields null, no 500
+        resp = public_client.get("/api/v1/public/awareness")
+        data = resp.json()
+        assert data["obi_mode"] is None
+        assert data["person_present"] is False   # false (not null) when frigate absent
+        assert data["weather"] is None
+
+    def test_flattened_projection_from_awareness_file(self, public_client, state_dir):
+        awareness = {
+            "ts": "2026-03-13T01:00:00Z",
+            "obi_mode": "calm",
+            "time_period": "night",
+            "minutes_since_speech": 4.0,
+            "frigate": {
+                "person_present": True,
+                "score": 0.74,
+                "event_count": 1,
+            },
+            "ambient_sound": {"rms": 340, "level": "quiet"},
+            "weather": {
+                "temp_C": 14.2,
+                "wind_kmh": 12,
+                "humidity_pct": 68,
+                "summary": "Cloudy",
+            },
+        }
+        (state_dir / "awareness.json").write_text(json.dumps(awareness))
+        resp = public_client.get("/api/v1/public/awareness")
+        data = resp.json()
+        assert data["obi_mode"] == "calm"
+        assert data["person_present"] is True
+        assert abs(data["frigate_score"] - 0.74) < 0.01
+        assert data["ambient_rms"] == 340
+        assert data["ambient_level"] == "quiet"
+        assert data["minutes_since_speech"] == pytest.approx(4.0, abs=0.1)
+        assert data["time_period"] == "night"
+        assert data["ts"] == "2026-03-13T01:00:00Z"
+
+    def test_temp_c_lowercase_normalised(self, public_client, state_dir):
+        # awareness.json stores temp_C (uppercase); endpoint must normalise to temp_c
+        awareness = {
+            "weather": {"temp_C": 14.2, "wind_kmh": 12, "humidity_pct": 68, "summary": "Cloudy"},
+        }
+        (state_dir / "awareness.json").write_text(json.dumps(awareness))
+        resp = public_client.get("/api/v1/public/awareness")
+        data = resp.json()
+        assert data["weather"] is not None
+        assert "temp_c" in data["weather"]
+        assert abs(data["weather"]["temp_c"] - 14.2) < 0.01
+        assert "temp_C" not in data["weather"]
+
+    def test_person_present_false_when_frigate_key_absent(self, public_client, state_dir):
+        # awareness.json with no frigate key at all
+        (state_dir / "awareness.json").write_text(json.dumps({"obi_mode": "absent"}))
+        data = public_client.get("/api/v1/public/awareness").json()
+        assert data["person_present"] is False  # false, not null
+
+    def test_person_present_false_when_frigate_is_none(self, public_client, state_dir):
+        # awareness.json with frigate: null (offline)
+        (state_dir / "awareness.json").write_text(json.dumps({"frigate": None}))
+        data = public_client.get("/api/v1/public/awareness").json()
+        assert data["person_present"] is False
+
+    def test_weather_null_when_weather_key_absent(self, public_client, state_dir):
+        (state_dir / "awareness.json").write_text(json.dumps({"obi_mode": "calm"}))
+        data = public_client.get("/api/v1/public/awareness").json()
+        assert data["weather"] is None
+
+    def test_nested_null_for_missing_subkeys(self, public_client, state_dir):
+        # ambient_sound present but missing level → null for that subfield
+        awareness = {"ambient_sound": {"rms": 200}}
+        (state_dir / "awareness.json").write_text(json.dumps(awareness))
+        data = public_client.get("/api/v1/public/awareness").json()
+        assert data["ambient_rms"] == 200
+        assert data["ambient_level"] is None
