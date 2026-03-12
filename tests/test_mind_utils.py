@@ -77,13 +77,13 @@ import urllib.error
 from unittest.mock import MagicMock, patch
 
 
-def _make_frigate_event(score=0.75, x=0.2, y=0.1, w=0.3, h=0.8,
+def _make_frigate_event(score=0.75, top_score=None, x=0.2, y=0.1, w=0.3, h=0.8,
                         speed=0.0, vel_angle=0.0, end_time=None):
     return {
         "end_time": end_time or _time.time() - 5,
         "data": {
             "box": [x, y, w, h],
-            "score": score, "top_score": score,
+            "score": score, "top_score": top_score if top_score is not None else score,
             "average_estimated_speed": speed,
             "velocity_angle": vel_angle,
             "path_data": [[[x + w / 2, y + h / 2], _time.time() - 5]],
@@ -216,10 +216,19 @@ def test_frigate_dry_run_skips_network():
 
 
 def test_frigate_filters_low_confidence():
-    events = [_make_frigate_event(score=0.45)]
+    events = [_make_frigate_event(score=0.45, top_score=0.45)]
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(events)):
         result = _fetch_frigate_presence(dry=False)
     assert result["person_present"] is False
+
+
+def test_frigate_qualifies_via_top_score():
+    # Real Frigate pattern: instantaneous score below threshold, top_score above
+    events = [_make_frigate_event(score=0.577, top_score=0.676)]
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(events)):
+        result = _fetch_frigate_presence(dry=False)
+    assert result["person_present"] is True
+    assert result["score"] == pytest.approx(0.676, abs=0.01)
 
 
 def test_frigate_reports_event_count():

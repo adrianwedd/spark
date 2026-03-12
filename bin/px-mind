@@ -482,7 +482,8 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
 
     qualifying = [
         e for e in events
-        if e.get("data", {}).get("score", 0) >= FRIGATE_MIN_SCORE
+        if max(e.get("data", {}).get("score", 0),
+               e.get("data", {}).get("top_score", 0)) >= FRIGATE_MIN_SCORE
     ]
 
     if not qualifying:
@@ -507,7 +508,7 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     return {
         "person_present": True,
         "event_count": len(qualifying),
-        "score": round(best["data"].get("score", 0), 3),
+        "score": round(max(best["data"].get("score", 0), best["data"].get("top_score", 0)), 3),
         "x_center": x_center,
         "speed": best["data"].get("average_estimated_speed"),
         "velocity_angle": best["data"].get("velocity_angle"),
