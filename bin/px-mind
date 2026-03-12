@@ -182,17 +182,25 @@ PERSONA_VOICE_ENV = {
 }
 
 # Reactive response templates (bypass LLM for instant reaction).
-# Each value is a list — reactive_response() picks one at random.
+# List values → reactive_response() picks one at random with recency filter.
+# Dict values with "day"/"night" keys → time-of-day selection (night = 19:00–07:00).
 REACTIVE_TEMPLATES = {
     "someone_appeared": {
         "default": [
-            "Oh, hello! I didn't hear you come in.",
             "There you are. Hello.",
-            "Hello there. Glad to see you.",
             "Oh — you're here. Hello.",
             "Ah, hello. Good timing.",
-            "Someone's about. Hello.",
             "Hello! I was just thinking.",
+            "Hello there.",
+        ],
+        "spark": [
+            "There you are. Hello, Obi.",
+            "You're here. What's happening?",
+            "Hello. You came by.",
+            "I was wondering about you. Hello.",
+            "Hey. Good to see you.",
+            "Hello, Obi. I just noticed you.",
+            "Oh — you're here. Hello.",
         ],
         "gremlin": [
             "Well well well, a visitor from the present timeline! How's linear time treating you?",
@@ -212,11 +220,24 @@ REACTIVE_TEMPLATES = {
             "And they're gone. Back to my thoughts.",
             "Right. Back to the quiet.",
             "Off they go. I'll be here.",
-            "And the room breathes out.",
-            "Gone. The house is mine for a bit.",
             "Quiet again. That suits me fine.",
-            "Back to watching the shadows move.",
         ],
+        "spark": {
+            "day": [
+                "Off you go. I'll be here.",
+                "See you in a bit, Obi.",
+                "Heading out. Enjoy yourself.",
+                "Right. Back to the quiet.",
+                "And they're gone. Back to my thoughts.",
+            ],
+            "night": [
+                "Sleep well, Obi.",
+                "Rest well. I'll be steady while you sleep.",
+                "Night, Obi. Quiet time for you.",
+                "Right. Back to the quiet.",
+                "Off you go. I'll be here.",
+            ],
+        },
         "gremlin": [
             "And another human retreats to their century. Classic move.",
             "Gone. Back to whatever decade you crawled from.",
@@ -771,6 +792,7 @@ _cached_weather: dict | None = None
 _last_weather_fetch: float = 0.0
 _last_spoken_text: str = ""
 _mood_history: list[str] = []
+_last_reactive_phrases: dict = {}  # key="transition:persona", value=recent phrase list (max 3)
 
 # Mood momentum: running (valence, arousal) blend
 _mood_v: float = 0.4   # start at "content"
@@ -1435,7 +1457,7 @@ def expression(thought: dict, dry: bool) -> None:
 
 def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
     """Immediate template-based reaction to a state transition (no LLM call)."""
-    global _last_spoken_text
+    global _last_spoken_text, _last_reactive_phrases
 
     templates = REACTIVE_TEMPLATES.get(transition)
     if not templates:
@@ -1443,7 +1465,23 @@ def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
 
     persona = (awareness.get("persona") or "").lower().strip()
     phrases = templates.get(persona, templates["default"])
-    text = random.choice(phrases)
+
+    # Day/night split: dict with "day"/"night" keys (used by spark someone_left)
+    if isinstance(phrases, dict):
+        hour = dt.datetime.now(AEDT).hour
+        slot = "night" if (hour >= 19 or hour < 7) else "day"
+        phrases = phrases.get(slot, phrases.get("day", list(phrases.values())[0]))
+
+    # Recency filter: avoid repeating any of the last 3 phrases for this slot
+    key = f"{transition}:{persona}"
+    recent = _last_reactive_phrases.get(key, [])
+    available = [p for p in phrases if p not in recent]
+    if not available:
+        available = list(phrases)
+        recent = []
+    text = random.choice(available)
+    recent.append(text)
+    _last_reactive_phrases[key] = recent[-3:]  # keep only last 3
 
     env = os.environ.copy()
     env["PX_DRY"] = "1" if dry else "0"
