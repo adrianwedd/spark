@@ -46,6 +46,7 @@ def _load_alive_helpers():
 
 _ALIVE = _load_alive_helpers()
 _pan_from_frigate = _ALIVE["_pan_from_frigate"]
+FRIGATE_STALE_S = _ALIVE["FRIGATE_STALE_S"]
 
 
 def test_pan_center():
@@ -90,3 +91,8 @@ def test_pan_non_numeric_x_center():
     # Non-numeric x_center must not crash the daemon
     assert _pan_from_frigate({"person_present": True, "x_center": "left"}) == 0
     assert _pan_from_frigate({"person_present": True, "x_center": None}) == 0
+
+
+def test_frigate_stale_s_constant():
+    # Staleness threshold should be defined
+    assert FRIGATE_STALE_S > 0

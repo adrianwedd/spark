@@ -60,6 +60,7 @@ MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
 SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
 FRIGATE_FILE = STATE_DIR / "frigate_presence.json"
+FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
 MOOD_CHECK_S = 10    # how often to read mood file
 SPARK_GREET_COOLDOWN_S = 120   # minimum seconds between SPARK proximity greetings
 
@@ -327,6 +328,11 @@ def idle_loop(args) -> None:
                         elif now - prox_near_since >= PROX_HOLD_S:
                             try:
                                 _fp = json.loads(FRIGATE_FILE.read_text())
+                                _fp_ts = _fp.get("ts") if isinstance(_fp, dict) else None
+                                if _fp_ts:
+                                    _age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(_fp_ts)).total_seconds()
+                                    if _age > FRIGATE_STALE_S:
+                                        _fp = None
                             except Exception:
                                 _fp = None
                             target_pan = _pan_from_frigate(_fp)
