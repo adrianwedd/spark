@@ -283,6 +283,21 @@ window.SparkDashboard = (function () {
       }
     }
 
+    // WiFi signal — inverted dBm: -100 = 0%, 0 = 100%
+    const wifiBar = $('bar-wifi');
+    if (wifiBar) {
+      wifiBar.classList.remove('warn', 'crit');
+      if (state.wifi_dbm == null) { wifiBar.style.width = '0%'; }
+      else {
+        const wifiPct = Math.max(0, Math.min(100, (state.wifi_dbm + 100) * 2));
+        wifiBar.style.width = wifiPct + '%';
+        if (wifiPct < 20) wifiBar.classList.add('crit');
+        else if (wifiPct < 40) wifiBar.classList.add('warn');
+      }
+    }
+    const valWifi = $('val-wifi');
+    if (valWifi) valWifi.textContent = state.wifi_dbm != null ? (state.wifi_dbm + ' dBm') : '—';
+
     // Services dots — built with createElement, not innerHTML
     const dotsContainer = $('services-dots');
     if (dotsContainer && state.services) {

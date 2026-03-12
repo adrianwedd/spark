@@ -643,8 +643,24 @@ def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
         return raw
 
 
+def read_wifi_signal() -> dict:
+    """Read WiFi signal from /proc/net/wireless. Returns dict with dbm and quality_pct, or {}."""
+    try:
+        text = Path("/proc/net/wireless").read_text()
+        for line in text.splitlines():
+            if "wlan" in line:
+                parts = line.split()
+                # parts[3] is the level/signal field, may have trailing dot (dBm suffix)
+                dbm = int(float(parts[3].rstrip(".")))
+                quality_pct = max(0, min(100, (dbm + 100) * 2))
+                return {"dbm": dbm, "quality_pct": quality_pct}
+    except Exception:
+        pass
+    return {}
+
+
 def read_system_stats() -> dict:
-    """Read CPU, RAM, disk, and CPU temperature. Returns a dict; never raises."""
+    """Read CPU, RAM, disk, CPU temperature, and WiFi signal. Returns a dict; never raises."""
     stats: dict = {}
     try:
         import psutil as _psutil
@@ -665,6 +681,10 @@ def read_system_stats() -> dict:
         stats["cpu_temp_c"] = round(int(raw) / 1000.0, 1)
     except Exception:
         pass
+    wifi = read_wifi_signal()
+    if wifi:
+        stats["wifi_dbm"]         = wifi["dbm"]
+        stats["wifi_quality_pct"] = wifi["quality_pct"]
     return stats
 
 

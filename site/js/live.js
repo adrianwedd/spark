@@ -113,6 +113,7 @@
         humidity_pct:    state.weather?.humidity_pct != null ? state.weather.humidity_pct : null,
         salience:        state.salience      != null ? state.salience      : null,
         mood_val:        state.mood ? (MOOD_VAL[(state.mood || '').toLowerCase()] || null) : null,
+        wifi_dbm:        state.wifi_dbm      != null ? state.wifi_dbm      : null,
       });
       try {
         localStorage.setItem(CACHE_KEY, JSON.stringify(

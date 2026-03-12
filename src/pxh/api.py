@@ -119,6 +119,23 @@ def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# WiFi signal helper (shared by history sampler and vitals endpoint)
+# ---------------------------------------------------------------------------
+
+def _read_wifi_dbm() -> Optional[int]:
+    """Read WiFi signal in dBm from /proc/net/wireless. Returns None on failure."""
+    try:
+        text = Path("/proc/net/wireless").read_text()
+        for line in text.splitlines():
+            if "wlan" in line:
+                parts = line.split()
+                return int(float(parts[3].rstrip(".")))
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # History ring buffer (background thread, 30s interval)
 # ---------------------------------------------------------------------------
 
@@ -211,10 +228,13 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         sample["salience"] = None
         sample["mood_val"] = None
 
+    # WiFi signal
+    sample["wifi_dbm"] = _read_wifi_dbm()
+
     return sample
 
 
-_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct")
+_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct", "wifi_dbm")
 
 
 def _history_worker() -> None:
@@ -405,6 +425,8 @@ async def public_vitals() -> Dict[str, Any]:
     except Exception:
         pass
 
+    wifi_dbm = _read_wifi_dbm()
+
     return {
         "cpu_pct": cpu_pct,
         "ram_pct": ram_pct,
@@ -413,6 +435,7 @@ async def public_vitals() -> Dict[str, Any]:
         "disk_pct": disk_pct,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
+        "wifi_dbm": wifi_dbm,
         "ts": utc_timestamp(),
     }
 
