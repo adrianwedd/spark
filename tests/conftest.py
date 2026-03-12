@@ -25,6 +25,7 @@ def isolated_project(tmp_path):
     env["PX_SESSION_PATH"] = str(session_path)
     env["PX_BYPASS_SUDO"] = "1"
     env["PX_VOICE_DEVICE"] = "null"
+    env["PX_STATE_DIR"] = str(state_dir)
 
     return {
         "env": env,

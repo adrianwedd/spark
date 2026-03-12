@@ -1,3 +1,4 @@
 filelock
 fastapi>=0.115
 uvicorn[standard]>=0.32
+psutil>=5.9
