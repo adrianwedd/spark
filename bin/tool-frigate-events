@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+python - "$@" <<'PY'
+"""Tool wrapper: query Frigate (on pi5-hailo) for recent ML detection events.
+
+Returns the last N detection events for the picar_x camera, including
+object labels, confidence scores, and zone information.
+
+Env vars:
+  PX_FRIGATE_HOST    Frigate base URL (default: http://pi5-hailo:5000)
+  PX_FRIGATE_CAMERA  Camera name in Frigate (default: picar_x)
+  PX_FRIGATE_LIMIT   Max events to return (default: 5)
+"""
+from __future__ import annotations
+
+import json
+import os
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+from pxh.logging import log_event
+
+FRIGATE_HOST   = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo:5000")
+FRIGATE_CAMERA = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
+FRIGATE_LIMIT  = int(os.environ.get("PX_FRIGATE_LIMIT", "5"))
+FRIGATE_TIMEOUT = 5  # seconds
+
+
+def _fetch_json(url: str) -> dict | list | None:
+    try:
+        with urllib.request.urlopen(url, timeout=FRIGATE_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def main() -> int:
+    dry_mode = os.environ.get("PX_DRY", "0") != "0"
+
+    if dry_mode:
+        payload = {
+            "status": "ok",
+            "camera": FRIGATE_CAMERA,
+            "events": [
+                {"label": "person", "score": 0.91, "zones": [], "stationary": False},
+                {"label": "cat",    "score": 0.78, "zones": [], "stationary": True},
+            ],
+            "summary": "1 person, 1 cat detected (dry run)",
+            "dry": True,
+        }
+        log_event("frigate_events", payload)
+        print(json.dumps(payload))
+        return 0
+
+    # Query recent events for this camera
+    url = (
+        f"{FRIGATE_HOST}/api/events"
+        f"?camera={FRIGATE_CAMERA}&limit={FRIGATE_LIMIT}&has_snapshot=1"
+    )
+    data = _fetch_json(url)
+    if data is None:
+        payload = {
+            "status": "error",
+            "error": f"could not reach Frigate at {FRIGATE_HOST}",
+        }
+        log_event("frigate_events", payload)
+        print(json.dumps(payload))
+        return 1
+
+    events = []
+    label_counts: dict[str, int] = {}
+    for ev in (data if isinstance(data, list) else []):
+        label = ev.get("label", "unknown")
+        score = round(float(ev.get("top_score") or ev.get("score") or 0), 3)
+        zones = ev.get("current_zones") or ev.get("entered_zones") or []
+        stationary = bool(ev.get("stationary", False))
+        events.append({"label": label, "score": score, "zones": zones, "stationary": stationary})
+        label_counts[label] = label_counts.get(label, 0) + 1
+
+    if label_counts:
+        parts = [f"{v} {k}" + ("s" if v > 1 else "") for k, v in label_counts.items()]
+        summary = ", ".join(parts) + " detected"
+    else:
+        summary = "nothing detected recently"
+
+    payload = {
+        "status": "ok",
+        "camera": FRIGATE_CAMERA,
+        "events": events,
+        "summary": summary,
+        "dry": False,
+    }
+    log_event("frigate_events", payload)
+    print(json.dumps(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY

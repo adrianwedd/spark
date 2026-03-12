@@ -129,9 +129,7 @@ def main() -> int:
                     if es_res.returncode != 0:
                         payload["status"] = "error"
                     elif shutil.which("aplay"):
-                        play_cmd = ["aplay", "-q"]
-                        if device:
-                            play_cmd.extend(["-D", device])
+                        play_cmd = ["aplay", "-q", "-D", "pulse"]
                         play_res = subprocess.run(
                             play_cmd,
                             input=es_res.stdout,

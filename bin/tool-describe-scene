@@ -12,7 +12,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 from pxh.logging import log_event
@@ -23,18 +27,68 @@ TOOL_PHOTOGRAPH   = PROJECT_ROOT / "bin" / "tool-photograph"
 TOOL_VOICE        = PROJECT_ROOT / "bin" / "tool-voice"
 LOG_DIR           = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 
+# Frigate API — set PX_FRIGATE_HOST to override (e.g. http://pi5-hailo:5000)
+FRIGATE_HOST      = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo:5000")
+FRIGATE_CAMERA    = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
+FRIGATE_TIMEOUT   = 4  # seconds
 
-def _check_camera_busy() -> str | None:
-    """Return error message if Frigate stream is holding the camera, else None."""
+
+def _frigate_latest_jpg(dest: Path) -> bool:
+    """Download latest Frigate frame for the camera. Returns True on success."""
+    url = f"{FRIGATE_HOST}/api/{FRIGATE_CAMERA}/latest.jpg"
+    try:
+        with urllib.request.urlopen(url, timeout=FRIGATE_TIMEOUT) as resp:
+            if resp.status != 200:
+                return False
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(resp.read())
+        return dest.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def _stream_pid() -> int | None:
+    """Return the running px-frigate-stream PID, or None if not running."""
     pid_file = LOG_DIR / "px-frigate-stream.pid"
-    if pid_file.exists():
-        try:
-            pid = int(pid_file.read_text().strip())
-            if Path(f"/proc/{pid}").is_dir():
-                return "camera busy — frigate stream active"
-        except Exception:
-            pass
+    if not pid_file.exists():
+        return None
+    try:
+        pid = int(pid_file.read_text().strip())
+        if Path(f"/proc/{pid}").is_dir():
+            return pid
+    except Exception:
+        pass
     return None
+
+
+def _pause_stream() -> bool:
+    """SIGTERM the stream and wait up to 8 s for it to stop. Returns True if stopped."""
+    pid = _stream_pid()
+    if pid is None:
+        return True  # already stopped
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    pid_file = LOG_DIR / "px-frigate-stream.pid"
+    for _ in range(16):  # 8 s in 0.5 s steps
+        time.sleep(0.5)
+        if not pid_file.exists() or _stream_pid() is None:
+            return True
+    return False  # timed out
+
+
+def _resume_stream() -> None:
+    """Restart px-frigate-stream via systemd (non-blocking)."""
+    bypass = os.environ.get("PX_BYPASS_SUDO", "0") == "1"
+    cmd = (["bin/px-frigate-stream"] if bypass
+           else ["sudo", "-n", "/bin/systemctl", "start", "px-frigate-stream"])
+    subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(PROJECT_ROOT),
+    )
 
 FALLBACK_DESCRIPTION = "I couldn't see anything right now."
 CLAUDE_TIMEOUT = 45
@@ -103,13 +157,6 @@ def call_claude_vision(image_path: Path) -> str:
 def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
 
-    busy = _check_camera_busy()
-    if busy:
-        payload = {"status": "error", "error": busy}
-        log_event("describe_scene", payload)
-        print(json.dumps(payload))
-        return 1
-
     if dry_mode:
         description = "A dry-run scene with a robot on a table."
         payload = {
@@ -126,24 +173,53 @@ def main() -> int:
         print(json.dumps(payload))
         return 0
 
-    # Step 1: capture photo
-    rc_photo, photo_result = run_tool(TOOL_PHOTOGRAPH, {})
-    if photo_result.get("status") != "ok":
-        payload = {
-            "status": "error",
-            "error": "photo capture failed",
-            "photo": photo_result,
-        }
-        log_event("describe_scene", payload)
-        print(json.dumps(payload))
-        return 1
+    import datetime as dt
+    timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+    photo_path = PROJECT_ROOT / "photos" / f"{timestamp}.jpg"
+    stream_was_running = _stream_pid() is not None
+    stream_paused = False
 
-    photo_path = Path(photo_result.get("path", ""))
+    # Step 1: try Frigate latest frame first (no camera interruption)
+    got_photo = _frigate_latest_jpg(photo_path)
+    source = "frigate"
+
+    if not got_photo:
+        # Step 1b: pause stream and capture directly with rpicam
+        if stream_was_running:
+            log_event("describe_scene", {"status": "pausing_stream"})
+            if not _pause_stream():
+                payload = {"status": "error", "error": "stream did not stop in time"}
+                log_event("describe_scene", payload)
+                print(json.dumps(payload))
+                return 1
+            stream_paused = True
+
+        rc_photo, photo_result = run_tool(TOOL_PHOTOGRAPH, {"PX_PHOTO_PATH": str(photo_path)})
+        if photo_result.get("status") != "ok":
+            if stream_paused:
+                _resume_stream()
+            payload = {
+                "status": "error",
+                "error": "photo capture failed",
+                "photo": photo_result,
+            }
+            log_event("describe_scene", payload)
+            print(json.dumps(payload))
+            return 1
+        source = "rpicam"
+
     if not photo_path.exists():
+        if stream_paused:
+            _resume_stream()
         payload = {"status": "error", "error": f"photo file missing: {photo_path}"}
         log_event("describe_scene", payload)
         print(json.dumps(payload))
         return 1
+
+    # Resume stream before the slow Claude vision call
+    if stream_paused:
+        _resume_stream()
+        stream_paused = False
 
     # Step 2: describe with Claude vision
     description = call_claude_vision(photo_path)
@@ -157,6 +233,7 @@ def main() -> int:
         "status": "ok",
         "path": str(photo_path),
         "description": description,
+        "source": source,
         "dry": False,
     }
     log_event("describe_scene", payload)

@@ -40,6 +40,7 @@ ALLOWED_TOOLS = {
     "tool_play_sound",
     "tool_face",
     "tool_describe_scene",
+    "tool_frigate_events",
     "tool_wander",
     "tool_timer",
     "tool_api_start",
@@ -79,7 +80,8 @@ TOOL_COMMANDS = {
     "tool_qa":             BIN_DIR / "tool-qa",
     "tool_play_sound":     BIN_DIR / "tool-play-sound",
     "tool_face":           BIN_DIR / "tool-face",
-    "tool_describe_scene": BIN_DIR / "tool-describe-scene",
+    "tool_describe_scene":   BIN_DIR / "tool-describe-scene",
+    "tool_frigate_events":   BIN_DIR / "tool-frigate-events",
     "tool_wander":         BIN_DIR / "tool-wander",
     "tool_timer":          BIN_DIR / "tool-timer",
     "tool_api_start":     BIN_DIR / "tool-api-start",
@@ -493,6 +495,9 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         pass  # no params required
     elif tool == "tool_describe_scene":
         pass  # no params required
+    elif tool == "tool_frigate_events":
+        limit = int(clamp(_num(params.get("limit", 5), "limit"), 1, 20))
+        sanitized["PX_FRIGATE_LIMIT"] = str(limit)
     elif tool == "tool_wander":
         steps = int(clamp(_num(params.get("steps", 5), "steps"), 1, 20))
         sanitized["PX_WANDER_STEPS"] = str(steps)

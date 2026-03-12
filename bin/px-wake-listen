@@ -45,7 +45,7 @@ SILENCE_S        = 3.0    # silence after speech → end of utterance (patient �
 MAX_RECORD_S     = 20.0   # hard cap on recording length
 RMS_SILENCE      = 300    # RMS below this → silence
 AMBIENT_WRITE_S  = 10     # write ambient sound level every N seconds
-SPEECH_ONSET_RMS = 600    # RMS above this → speech started (follow-up detection)
+SPEECH_ONSET_RMS = 800    # RMS above this → speech started (follow-up detection)
 FOLLOWUP_SILENCE_S  = 3.5  # silence threshold ending a follow-up utterance
 FOLLOWUP_MAX_S      = 20.0  # hard cap for follow-up recording
 FOLLOWUP_TIMEOUT_S  = 30.0  # seconds to wait for follow-up speech to begin (timeout → end session)
@@ -630,10 +630,13 @@ def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
                 audio = b"".join(onset) + rest
                 play_chime_processing(aplay_device)
                 text = _do_transcribe(audio, model, stt, whisper, sensevoice)
-                if text:
+                if text and len(text.strip()) >= 2:
                     return text
-                # Phantom — play a soft "try again" tick and keep waiting
-                log("follow-up: phantom transcript — listening again")
+                # Phantom or echo (single char like 'i') — play a soft "try again" tick and keep waiting
+                if text:
+                    log(f"follow-up: too short ({text!r}) — listening again")
+                else:
+                    log("follow-up: phantom transcript — listening again")
                 play_chime_listening(aplay_device)
                 break  # restart outer loop with remaining time
         else:
@@ -694,8 +697,11 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
                 play_chime_timeout(aplay_device)
                 break
 
+            time.sleep(0.4)
             flush_stream(stream)
+            log("persona conversation: chime — listening")
             play_chime_listening(aplay_device)
+            flush_stream(stream, chunks=15)
             log("persona conversation: listening for follow-up...")
             follow_text = record_followup(stream, model, stt, whisper, sensevoice,
                                           aplay_device=aplay_device)
@@ -756,11 +762,18 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
                 play_chime_timeout(aplay_device)
                 break
 
+            # Brief drain gap so PulseAudio finishes playing robot's last word
+            time.sleep(0.4)
+
             # Flush stale audio buffered while robot was speaking
             flush_stream(stream)
 
             # Ascending chime: "your turn, I'm listening"
+            log("conversation: chime — listening")
             play_chime_listening(aplay_device)
+
+            # Flush chime echo from mic buffer before listening
+            flush_stream(stream, chunks=15)
 
             # Listen for follow-up (patient: 30s onset wait, 3.5s in-speech silence)
             log("conversation: listening for follow-up...")

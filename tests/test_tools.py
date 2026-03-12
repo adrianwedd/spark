@@ -149,6 +149,32 @@ def test_tool_describe_scene_dry_run(isolated_project):
     assert len(payload["description"]) > 0
 
 
+def test_tool_frigate_events_dry_run(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    stdout = run_tool(["bin/tool-frigate-events"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["dry"] is True
+    assert isinstance(payload["events"], list)
+    assert len(payload["events"]) > 0
+    assert "summary" in payload
+
+
+def test_tool_frigate_events_unreachable(isolated_project):
+    """tool-frigate-events should fail gracefully when Frigate is not reachable."""
+    env = isolated_project["env"].copy()
+    env["PX_FRIGATE_HOST"] = "http://127.0.0.1:19999"  # nothing listening there
+    result = subprocess.run(
+        ["bin/tool-frigate-events"],
+        cwd=PROJECT_ROOT,
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
+    assert "frigate" in payload["error"].lower() or "reach" in payload["error"].lower()
+
+
 def test_tool_timer_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
