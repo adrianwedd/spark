@@ -39,15 +39,22 @@ window.SparkDashboard = (function () {
 
   function renderPresence(state) {
     const mood = (state.mood || '').toLowerCase();
+    const moodColor = MOOD_FAVICON_COLOR[mood] || '#e8875a';
     const pulse = $('mood-pulse');
     if (pulse) {
       pulse.classList.remove('pulse-slow', 'pulse-mid', 'pulse-fast', 'pulse-offline');
-      pulse.classList.add(state.mood ? (PULSE_CLASSES[mood] || 'pulse-mid') : 'pulse-offline');
+      if (state.mood) {
+        pulse.classList.add(PULSE_CLASSES[mood] || 'pulse-mid');
+        pulse.style.background = moodColor;
+      } else {
+        pulse.classList.add('pulse-offline');
+        pulse.style.background = '';
+      }
       const word = $('mood-word');
       if (word) word.textContent = state.mood || '—';
     }
 
-    _drawFavicon(MOOD_FAVICON_COLOR[mood] || '#e8875a');
+    _drawFavicon(moodColor);
 
     // Local time + period badge (moved into presence-mood column)
     const timeEl = $('local-time');
