@@ -430,6 +430,29 @@ class TestPublicHistory:
         sample = _api._collect_history_sample(state_dir)
         assert sample["weather_temp_c"] == 0
 
+    def test_collect_sample_persona_scoped_thoughts(self, state_dir, monkeypatch):
+        """Bug #1 fix: salience/mood_val must read persona-scoped thoughts file."""
+        import json as _json
+        default_thought = {"mood": "peaceful", "salience": 0.2, "ts": "2026-03-13T01:00:00Z"}
+        spark_thought   = {"mood": "excited",  "salience": 0.9, "ts": "2026-03-13T01:01:00Z"}
+        (state_dir / "thoughts.jsonl").write_text(_json.dumps(default_thought) + "\n")
+        (state_dir / "thoughts-spark.jsonl").write_text(_json.dumps(spark_thought) + "\n")
+        monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
+        from pxh import api as _api
+        sample = _api._collect_history_sample(state_dir, persona="spark")
+        assert sample["salience"] == pytest.approx(0.9)
+        assert sample["mood_val"] == 5  # excited → 5
+
+    def test_collect_sample_default_persona_reads_unscoped(self, state_dir, monkeypatch):
+        import json as _json
+        thought = {"mood": "content", "salience": 0.4, "ts": "2026-03-13T01:00:00Z"}
+        (state_dir / "thoughts.jsonl").write_text(_json.dumps(thought) + "\n")
+        monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
+        from pxh import api as _api
+        sample = _api._collect_history_sample(state_dir, persona="")
+        assert sample["salience"] == pytest.approx(0.4)
+        assert sample["mood_val"] == 2  # content → 2
+
     def test_collect_sample_weather_null_when_absent(self, state_dir, monkeypatch):
         (state_dir / "awareness.json").write_text(json.dumps({"obi_mode": "calm"}))
         monkeypatch.setenv("PX_STATE_DIR", str(state_dir))

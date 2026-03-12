@@ -128,7 +128,7 @@ _history_buf: "_collections.deque[Dict[str, Any]]" = _collections.deque(maxlen=6
 _history_lock = threading.Lock()
 
 
-def _collect_history_sample(state_dir: "Path") -> "Dict[str, Any]":
+def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, Any]":
     """Collect one vitals + sonar + ambient reading. Extracted for testability."""
     import time as _time
 
@@ -199,10 +199,11 @@ def _collect_history_sample(state_dir: "Path") -> "Dict[str, Any]":
         sample["wind_kmh"] = None
         sample["humidity_pct"] = None
 
-    # Salience + mood_val from latest thought
+    # Salience + mood_val from latest thought (persona-scoped)
     _MOOD_VAL = {"peaceful": 1, "content": 2, "contemplative": 2, "curious": 3, "active": 4, "excited": 5}
+    _thoughts_path = state_dir / (f"thoughts-{persona}.jsonl" if persona else "thoughts.jsonl")
     try:
-        lines = (state_dir / "thoughts.jsonl").read_text().strip().splitlines()
+        lines = _thoughts_path.read_text().strip().splitlines()
         last = json.loads(lines[-1]) if lines else {}
         sample["salience"] = last.get("salience")
         sample["mood_val"] = _MOOD_VAL.get((last.get("mood") or "").lower())
@@ -223,7 +224,8 @@ def _history_worker() -> None:
     while True:
         _time.sleep(30)
         try:
-            sample = _collect_history_sample(_public_state_dir())
+            _persona = (load_session().get("persona") or "").strip().lower()
+            sample = _collect_history_sample(_public_state_dir(), _persona)
             # Forward-fill fields that change slowly (weather, battery) so sparklines
             # don't go blank between BOM/battery poll cycles.
             with _history_lock:
