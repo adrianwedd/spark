@@ -211,14 +211,62 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 .salience-dots { letter-spacing: 0.1em; color: var(--warm-accent); }
 
-/* ── Proximity Arc ────────────────────────────────────────────── */
+/* ── Proximity Display ────────────────────────────────────────── */
 
 .presence-proximity {
   display: flex;
   flex-direction: column;
-  align-items: center;
   gap: 0.5rem;
 }
+
+.proximity-display {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  width: 100%;
+}
+
+.proximity-reading {
+  display: flex;
+  align-items: baseline;
+  gap: 0.2rem;
+  line-height: 1;
+}
+
+.proximity-cm {
+  font-size: 2.2rem;
+  font-weight: 700;
+  color: var(--warm-text);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.proximity-unit {
+  font-size: 0.7rem;
+  color: var(--warm-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-bottom: 0.2rem;
+}
+
+.proximity-bar-track {
+  width: 100%;
+  height: 4px;
+  background: rgba(0,0,0,0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.proximity-bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 2px;
+  background: #16a34a;
+  transition: width 0.6s ease, background 0.4s ease;
+}
+.proximity-bar-fill.prox-close { background: #dc2626; }
+.proximity-bar-fill.prox-mid   { background: #d97706; }
+.proximity-bar-fill.prox-far   { background: #16a34a; }
 
 .frigate-row {
   display: flex;
@@ -230,12 +278,23 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .frigate-label { font-size: 0.78rem; }
 .frigate-conf  { font-size: 0.78rem; opacity: 0.7; }
 
+/* ── World Band: Cards ─────────────────────────────────────────── */
+
+.world-col {
+  background: rgba(255,255,255,0.7);
+  border: 1px solid rgba(0,0,0,0.06);
+  border-radius: calc(var(--radius) * 0.75);
+  padding: 0.85rem 0.9rem;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+  align-self: stretch;
+}
+
 /* ── World Band: Ambient ───────────────────────────────────────── */
 
 .world-ambient {
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.5rem;
 }
 .world-ambient-head {
   display: flex;
@@ -243,11 +302,12 @@ details > *:not(summary) { margin-top: 0.75rem; }
   gap: 0.5rem;
 }
 .section-eyebrow {
-  font-size: 0.7rem;
+  font-size: 0.68rem;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.09em;
   color: var(--warm-muted);
-  font-weight: 600;
+  font-weight: 700;
+  margin: 0 0 0.2rem;
 }
 .ambient-level {
   font-size: 0.95rem;
@@ -260,7 +320,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .world-weather {
   display: flex;
   flex-direction: column;
-  gap: 0.35rem;
+  gap: 0.45rem;
   font-size: 0.9rem;
   color: var(--warm-text);
 }
@@ -269,30 +329,49 @@ details > *:not(summary) { margin-top: 0.75rem; }
   align-items: baseline;
   gap: 0.35rem;
   flex-wrap: wrap;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+  margin-bottom: 0.1rem;
 }
 .weather-temp-big {
-  font-size: 1.15rem;
-  font-weight: 600;
+  font-size: 1.25rem;
+  font-weight: 700;
 }
-.weather-symbol { font-size: 1.05rem; }
+.weather-symbol { font-size: 1.1rem; }
 .weather-summary {
   color: var(--warm-muted);
-  font-size: 0.85rem;
-}
-.weather-details {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.1rem 0.5rem;
   font-size: 0.82rem;
 }
-.weather-lbl {
-  color: var(--warm-muted);
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  align-self: center;
+
+/* ── Labeled sparkline rows (weather + ambient) ────────────────── */
+
+.wx-metric-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid rgba(0,0,0,0.05);
 }
-.weather-sparklines { display: flex; flex-direction: column; gap: 0.25rem; width: 100%; margin-top: 0.35rem; }
+.wx-metric-row:last-child { border-bottom: none; padding-bottom: 0; }
+
+.wx-metric-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.wx-metric-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--warm-muted);
+  font-weight: 600;
+}
+.wx-metric-val {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--warm-text);
+}
 
 /* ── World Band: Time ─────────────────────────────────────────── */
 
@@ -377,10 +456,15 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .metric-tile.disk-crit .metric-value { color: #dc2626; }
 
 
-/* Arc fill colours (proximity arc in SVG) */
-.arc-close { fill: var(--warm-accent); opacity: 0.85; }
-.arc-mid   { fill: #64748b; opacity: 0.55; }
-.arc-far   { fill: #94a3b8; opacity: 0.35; }
+/* Sparkline context label */
+.sparkline-ctx-label {
+  font-size: 0.65rem;
+  color: var(--warm-muted);
+  opacity: 0.6;
+  margin: 0.1rem 0 0;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
 
 /* Services strip (horizontal bar above metric tiles) */
 .services-strip {

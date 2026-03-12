@@ -98,6 +98,17 @@
   background: rgba(255,255,255,0.04);
 }
 [data-theme="dark"] .section-eyebrow,
-[data-theme="dark"] .services-strip-label { color: var(--dark-muted); }
+[data-theme="dark"] .services-strip-label,
+[data-theme="dark"] .wx-metric-label,
+[data-theme="dark"] .sparkline-ctx-label { color: var(--dark-muted); }
 [data-theme="dark"] .ambient-level,
-[data-theme="dark"] .weather-temp-big { color: var(--dark-text); }
+[data-theme="dark"] .weather-temp-big,
+[data-theme="dark"] .proximity-cm,
+[data-theme="dark"] .wx-metric-val { color: var(--dark-text); }
+[data-theme="dark"] .world-col {
+  background: rgba(255,255,255,0.05);
+  border-color: rgba(255,255,255,0.08);
+}
+[data-theme="dark"] .wx-metric-row { border-bottom-color: rgba(255,255,255,0.06); }
+[data-theme="dark"] .weather-headline { border-bottom-color: rgba(255,255,255,0.07); }
+[data-theme="dark"] .proximity-bar-track { background: rgba(255,255,255,0.1); }

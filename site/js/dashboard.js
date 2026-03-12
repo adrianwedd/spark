@@ -47,6 +47,8 @@ window.SparkDashboard = (function () {
       if (word) word.textContent = state.mood || '—';
     }
 
+    _drawFavicon(MOOD_FAVICON_COLOR[mood] || '#e8875a');
+
     const modeLine = $('obi-mode-line');
     if (modeLine) modeLine.textContent = OBI_MODE_TEXT[state.obi_mode] || '';
 
@@ -68,7 +70,22 @@ window.SparkDashboard = (function () {
       ageEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
     }
 
-    SparkCharts.drawProximityArc($('sonar-arc'), state.sonar_cm != null ? state.sonar_cm : null);
+    // Proximity: number + colour-coded bar (full = close, empty = far; 200 cm = scale max)
+    const proxCm = $('proximity-cm');
+    if (proxCm) proxCm.textContent = state.sonar_cm != null ? Math.round(state.sonar_cm) : '—';
+    const proxBar = $('proximity-bar');
+    if (proxBar) {
+      proxBar.classList.remove('prox-close', 'prox-mid', 'prox-far');
+      if (state.sonar_cm != null) {
+        const pct = Math.max(0, Math.min(100, (1 - state.sonar_cm / 200) * 100));
+        proxBar.style.width = pct + '%';
+        if (state.sonar_cm < 40)       proxBar.classList.add('prox-close');
+        else if (state.sonar_cm < 100) proxBar.classList.add('prox-mid');
+        else                            proxBar.classList.add('prox-far');
+      } else {
+        proxBar.style.width = '0%';
+      }
+    }
 
     const frigateRow = $('frigate-indicator');
     if (frigateRow) {
@@ -257,9 +274,33 @@ window.SparkDashboard = (function () {
     }
   }
 
+  // ── Dynamic favicon ──────────────────────────────────────────────────────
+
+  const MOOD_FAVICON_COLOR = {
+    peaceful:      '#7cb87d',   // sage green — restful
+    content:       '#7cb87d',
+    curious:       '#e8875a',   // terracotta — engaged
+    contemplative: '#b8957a',   // earthy — reflective
+    excited:       '#e05c3a',   // bright coral — energetic
+    active:        '#d97706',   // amber — busy
+  };
+
+  function _drawFavicon(color) {
+    const c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    const ctx = c.getContext('2d');
+    ctx.beginPath();
+    ctx.arc(16, 16, 14, 0, 2 * Math.PI);
+    ctx.fillStyle = color;
+    ctx.fill();
+    const link = document.getElementById('dynamic-favicon');
+    if (link) link.href = c.toDataURL('image/png');
+  }
+
   // ── Shared helpers ───────────────────────────────────────────────────────
 
   function setOnline(online, cachedAt) {
+    if (!online) _drawFavicon('#94a3b8');  // gray when offline
     const banner = $('offline-banner');
     if (!banner) return;
     banner.classList.toggle('hidden', online);
@@ -284,6 +325,9 @@ window.SparkDashboard = (function () {
       SparkCharts.drawSparkline(canvas, points, canvas.dataset.field);
     });
   }
+
+  // Draw initial connecting state
+  _drawFavicon('#d1c4b8');
 
   return { renderPresence, renderWorld, renderMachine, renderSparklines, setOnline, setLastUpdated };
 })();

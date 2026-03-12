@@ -32,56 +32,6 @@ window.SparkCharts = (function () {
     }
   }
 
-  // ── Proximity fan arc (SVG) ──────────────────────────────────────────────
-  function drawProximityArc(svgEl, sonarCm) {
-    if (!svgEl) return;
-
-    let angleDeg, colorClass;
-    if (sonarCm === null || sonarCm === undefined) {
-      angleDeg = 0; colorClass = 'arc-unavailable';
-    } else if (sonarCm < 40) {
-      angleDeg = 180; colorClass = 'arc-close';
-    } else if (sonarCm <= 100) {
-      angleDeg = 90; colorClass = 'arc-mid';
-    } else if (sonarCm <= 150) {
-      angleDeg = Math.round(90 - (sonarCm - 100) * (70 / 50));
-      colorClass = 'arc-far';
-    } else {
-      angleDeg = 20; colorClass = 'arc-far';
-    }
-
-    // Clear all child elements without innerHTML
-    while (svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
-
-    const CX = 60, CY = 60, R = 55;
-    const NS = 'http://www.w3.org/2000/svg';
-
-    // Outline arc
-    const outline = document.createElementNS(NS, 'path');
-    outline.setAttribute('d', _arcPath(CX, CY, R, 0, 180));
-    outline.setAttribute('fill', 'none');
-    outline.setAttribute('stroke', '#d1c4b8');
-    outline.setAttribute('stroke-width', '2');
-    svgEl.appendChild(outline);
-
-    if (angleDeg > 0) {
-      const fill = document.createElementNS(NS, 'path');
-      fill.setAttribute('d', _arcPath(CX, CY, R, 0, angleDeg) + ' L ' + CX + ' ' + CY + ' Z');
-      fill.setAttribute('class', 'arc-fill ' + colorClass);
-      svgEl.appendChild(fill);
-    }
-  }
-
-  function _arcPath(cx, cy, r, startDeg, endDeg) {
-    const toRad = d => (d - 90) * Math.PI / 180;
-    const sx = cx + r * Math.cos(toRad(startDeg));
-    const sy = cy + r * Math.sin(toRad(startDeg));
-    const ex = cx + r * Math.cos(toRad(endDeg));
-    const ey = cy + r * Math.sin(toRad(endDeg));
-    const large = (endDeg - startDeg) > 180 ? 1 : 0;
-    return 'M ' + sx + ' ' + sy + ' A ' + r + ' ' + r + ' 0 ' + large + ' 1 ' + ex + ' ' + ey;
-  }
-
   // ── Sparkline ────────────────────────────────────────────────────────────
   function drawSparkline(canvas, points, field) {
     if (!canvas || !points || points.length < 2) return;
@@ -121,5 +71,5 @@ window.SparkCharts = (function () {
     ctx.fillText(maxV.toFixed(0), 2, 9);
   }
 
-  return { drawWaveform, drawProximityArc, drawSparkline };
+  return { drawWaveform, drawSparkline };
 })();

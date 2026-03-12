@@ -6,6 +6,7 @@
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src https://spark-api.wedd.au;">
   <title>SPARK — a robot with an inner life</title>
+  <link rel="icon" id="dynamic-favicon" type="image/png" sizes="32x32">
   <link rel="stylesheet" href="css/base.css">
   <link rel="stylesheet" href="css/warm.css">
   <link rel="stylesheet" href="css/dark.css">
@@ -65,6 +66,7 @@
 
       <!-- Last Thought -->
       <div class="presence-thought">
+        <p class="section-eyebrow">Last thought</p>
         <blockquote id="dashboard-last-thought" class="pull-quote">Nothing on my mind just now…</blockquote>
         <div class="thought-meta">
           <span id="thought-salience" class="salience-dots" aria-label="thought importance"></span>
@@ -72,19 +74,26 @@
         </div>
       </div>
 
-      <!-- Proximity Arc -->
+      <!-- Proximity -->
       <div class="presence-proximity">
-        <svg id="sonar-arc" viewBox="0 0 120 65" width="120" height="65"
-             aria-label="proximity sensor" role="img">
-          <!-- drawn by charts.js -->
-        </svg>
+        <p class="section-eyebrow">Proximity</p>
+        <div class="proximity-display">
+          <div class="proximity-reading">
+            <span id="proximity-cm" class="proximity-cm">—</span>
+            <span class="proximity-unit">cm</span>
+          </div>
+          <div class="proximity-bar-track">
+            <div id="proximity-bar" class="proximity-bar-fill"></div>
+          </div>
+          <canvas class="sparkline-canvas" data-field="sonar_cm" width="120" height="22"
+                  aria-label="sonar history (1h)"></canvas>
+          <p class="sparkline-ctx-label">1h trend</p>
+        </div>
         <div id="frigate-indicator" class="frigate-row hidden">
           <span id="frigate-icon" aria-hidden="true">&#x1F464;</span>
           <span id="frigate-label" class="frigate-label"></span>
           <span id="frigate-confidence" class="frigate-conf"></span>
         </div>
-        <canvas class="sparkline-canvas" data-field="sonar_cm" width="120" height="28"
-                aria-label="sonar history"></canvas>
       </div>
 
     </div><!-- /band-presence -->
@@ -93,40 +102,52 @@
     <div class="band band-world" id="band-world">
 
       <!-- Ambient sound -->
-      <div class="world-ambient">
+      <div class="world-ambient world-col">
         <div class="world-ambient-head">
           <span class="section-eyebrow">Sound</span>
           <span id="ambient-level-label" class="ambient-level">—</span>
         </div>
         <canvas id="waveform-canvas" width="200" height="32"
                 aria-label="ambient sound level visualisation"></canvas>
-        <canvas class="sparkline-canvas" data-field="ambient_rms" width="200" height="28"
-                aria-label="noise level history"></canvas>
+        <div class="wx-metric-row">
+          <span class="wx-metric-label">Noise level (1h)</span>
+          <canvas class="sparkline-canvas" data-field="ambient_rms" width="200" height="22"
+                  aria-label="noise level history"></canvas>
+        </div>
       </div>
 
-      <!-- Weather strip -->
-      <div class="world-weather" id="world-weather-strip">
+      <!-- Weather -->
+      <div class="world-weather world-col" id="world-weather-strip">
         <div class="weather-headline">
           <span id="weather-temp" class="weather-temp-big"></span>
           <span id="weather-symbol" class="weather-symbol" aria-hidden="true"></span>
           <span id="weather-summary" class="weather-summary"></span>
         </div>
-        <div class="weather-details">
-          <span class="weather-lbl">Wind</span><span id="weather-wind"></span>
-          <span class="weather-lbl">Humidity</span><span id="weather-humidity"></span>
-        </div>
-        <div class="weather-sparklines">
-          <canvas class="sparkline-canvas" data-field="weather_temp_c" width="160" height="28"
-                  aria-label="temperature history"></canvas>
-          <canvas class="sparkline-canvas" data-field="wind_kmh" width="160" height="28"
+        <div class="wx-metric-row">
+          <div class="wx-metric-head">
+            <span class="wx-metric-label">Wind</span>
+            <span class="wx-metric-val" id="weather-wind"></span>
+          </div>
+          <canvas class="sparkline-canvas" data-field="wind_kmh" width="160" height="22"
                   aria-label="wind history"></canvas>
-          <canvas class="sparkline-canvas" data-field="humidity_pct" width="160" height="28"
+        </div>
+        <div class="wx-metric-row">
+          <div class="wx-metric-head">
+            <span class="wx-metric-label">Humidity</span>
+            <span class="wx-metric-val" id="weather-humidity"></span>
+          </div>
+          <canvas class="sparkline-canvas" data-field="humidity_pct" width="160" height="22"
                   aria-label="humidity history"></canvas>
+        </div>
+        <div class="wx-metric-row">
+          <span class="wx-metric-label">Temp (1h)</span>
+          <canvas class="sparkline-canvas" data-field="weather_temp_c" width="160" height="22"
+                  aria-label="temperature history"></canvas>
         </div>
       </div>
 
       <!-- Time context -->
-      <div class="world-time">
+      <div class="world-time world-col">
         <div class="world-time-row">
           <span id="local-time" class="local-time"></span>
           <span id="time-period-badge" class="period-badge"></span>
@@ -152,7 +173,8 @@
           <div class="metric-label">CPU</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-cpu"></div></div>
           <div class="metric-value" id="val-cpu">—</div>
-          <canvas class="sparkline-canvas" data-field="cpu_pct" height="28"></canvas>
+          <canvas class="sparkline-canvas" data-field="cpu_pct" height="22"></canvas>
+          <p class="sparkline-ctx-label">1h trend</p>
         </div>
 
         <!-- CPU Temp -->
@@ -160,7 +182,8 @@
           <div class="metric-label">CPU Temp</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-temp"></div></div>
           <div class="metric-value" id="val-temp">—</div>
-          <canvas class="sparkline-canvas" data-field="cpu_temp_c" height="28"></canvas>
+          <canvas class="sparkline-canvas" data-field="cpu_temp_c" height="22"></canvas>
+          <p class="sparkline-ctx-label">1h trend</p>
         </div>
 
         <!-- RAM % -->
@@ -168,7 +191,8 @@
           <div class="metric-label">RAM</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-ram"></div></div>
           <div class="metric-value" id="val-ram">—</div>
-          <canvas class="sparkline-canvas" data-field="ram_pct" height="28"></canvas>
+          <canvas class="sparkline-canvas" data-field="ram_pct" height="22"></canvas>
+          <p class="sparkline-ctx-label">1h trend</p>
         </div>
 
         <!-- Disk % -->
@@ -176,7 +200,8 @@
           <div class="metric-label">Disk</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-disk"></div></div>
           <div class="metric-value" id="val-disk">—</div>
-          <canvas class="sparkline-canvas" data-field="disk_pct" height="28"></canvas>
+          <canvas class="sparkline-canvas" data-field="disk_pct" height="22"></canvas>
+          <p class="sparkline-ctx-label">1h trend</p>
         </div>
 
         <!-- Battery -->
@@ -184,14 +209,16 @@
           <div class="metric-label">Battery</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-battery"></div></div>
           <div class="metric-value" id="val-battery">—</div>
-          <canvas class="sparkline-canvas" data-field="battery_pct" height="28"></canvas>
+          <canvas class="sparkline-canvas" data-field="battery_pct" height="22"></canvas>
+          <p class="sparkline-ctx-label">1h trend</p>
         </div>
 
         <!-- Tokens -->
         <div class="metric-tile" id="tile-tokens">
-          <div class="metric-label">Tokens (est.)</div>
+          <div class="metric-label">LLM tokens (est.)</div>
           <div class="metric-value" id="val-tokens">—</div>
-          <canvas class="sparkline-canvas" data-field="tokens_in" height="28"></canvas>
+          <canvas class="sparkline-canvas" data-field="tokens_in" height="22"></canvas>
+          <p class="sparkline-ctx-label">in · 1h trend</p>
         </div>
 
       </div><!-- /metric-grid -->
