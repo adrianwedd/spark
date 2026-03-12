@@ -449,7 +449,6 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     if dry:
         return None
     import socket
-    import urllib.request
 
     since = time.time() - FRIGATE_WINDOW_S
     url = (
