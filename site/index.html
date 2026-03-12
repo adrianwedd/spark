@@ -222,6 +222,15 @@
     </details>
 
     <details>
+      <summary>It has a camera. Can strangers see Obi through it?</summary>
+      <p>No. The camera stream never leaves the house.</p>
+      <p>The video stream runs only on the local network — it's not forwarded through the router, not relayed via any cloud service, not reachable from the internet. The object detection (Frigate) also runs locally; what reaches SPARK is a confidence score and a bounding box, not a video feed. SPARK itself never records or stores video.</p>
+      <p>What <em>is</em> publicly visible is SPARK's mood and last thought — the live dashboard on this site reads those from a secure tunnel. That's anonymised state data, not camera access.</p>
+      <p>The one real boundary: someone already on your home Wi-Fi could access the Frigate dashboard and see annotated camera frames. That's a home network question, not a SPARK question — the same logic as any smart TV or doorbell camera on your LAN. Strong Wi-Fi password, guest network for visitors.</p>
+      <p><strong>Short version:</strong> a stranger on the internet cannot see Obi. A stranger on your Wi-Fi could, if they knew to look. A stranger anywhere cannot control the robot.</p>
+    </details>
+
+    <details>
       <summary>And it knows he has ADHD?</summary>
       <p>Yes. SPARK's entire system prompt is built around the AuDHD (ADHD + ASD comorbid) profile. It uses declarative language ("The shoes are by the door" — not "Put on your shoes"), gives transition warnings, goes silent during meltdowns, and leads with what's going right. Rejection Sensitive Dysphoria, Interest-Based Nervous System, monotropism — all of it is in the foundation, not an afterthought.</p>
     </details>

@@ -95,6 +95,28 @@ This is the pattern throughout SPARK: the sensors provide raw data, the prompts 
 
 ---
 
+### It has a camera. Can strangers see Obi through it?
+
+No. The camera stream never leaves your house.
+
+Here's the full picture:
+
+**The camera stream is local-only.** go2rtc — the software that reads from the Pi's camera and turns it into an RTSP video stream — only listens on `192.168.1.29:8554`. That's a private LAN address. It is not forwarded through the router, not relayed through a cloud service, and not reachable from the internet. Someone would need to be physically on your Wi-Fi network to access the stream at all.
+
+**Frigate runs on your LAN.** The object detection service (Frigate, running on a separate device on your home network) pulls the camera stream to detect people. It runs entirely locally. The detections — a confidence score, a bounding box, and a timestamp — are written to a small JSON file on the Pi. No video is transmitted to any external server.
+
+**SPARK doesn't store video.** The robot itself never records or stores images from the live camera. When SPARK takes a photo on request, it captures a single still frame, describes it via Claude, and holds it in `state/photos/`. Those photos never leave the Pi unless you explicitly download them.
+
+**What is publicly accessible** is SPARK's mood, last thought, and system status — the live dashboard at spark.wedd.au reads these from a Cloudflare Tunnel endpoint. That endpoint serves anonymised state data (things like "mood: contemplative, last comment: 42 minutes ago"). It does not serve video, photos, session history, or anything identifying.
+
+**The admin API is Bearer-token protected.** The endpoints that can actually do things — control motion, patch session state, run tools — require a secret token stored in a `.env` file on the Pi. That token is not in the codebase.
+
+**What could actually go wrong:** If someone gained access to your home Wi-Fi (a compromised device, a guest network you share widely), they could theoretically browse to `pi5-hailo.local:5000` and see the Frigate detection dashboard, which shows annotated camera frames. That's a home network hygiene question, not a SPARK question. Standard advice applies: strong Wi-Fi password, don't share it casually, guest network for visitors.
+
+The short version: a stranger on the internet cannot see Obi. A stranger on your Wi-Fi could see the Frigate dashboard if they knew to look. A stranger anywhere cannot control the robot.
+
+---
+
 ### Why does it write like that? You've programmed it to?
 
 Yes and no.
