@@ -227,3 +227,50 @@ def test_frigate_reports_event_count():
     with patch("urllib.request.urlopen", return_value=_mock_urlopen(events)):
         result = _fetch_frigate_presence(dry=False)
     assert result["event_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# compute_obi_mode with Frigate data
+# ---------------------------------------------------------------------------
+
+def _fp_present(x_center=0.5, score=0.80, count=1):
+    return {"person_present": True, "event_count": count,
+            "score": score, "x_center": x_center, "speed": 0.0, "velocity_angle": 0.0}
+
+def _fp_absent():
+    return {"person_present": False, "event_count": 0,
+            "score": None, "x_center": None, "speed": None, "velocity_angle": None}
+
+
+def test_obi_mode_calm_from_frigate_without_close_sonar():
+    """Frigate detects person → calm, even if sonar shows person far away."""
+    awareness = {"ambient_sound": {"level": "quiet"}, "sonar_cm": 200,
+                 "frigate": _fp_present()}
+    assert compute_obi_mode(awareness, hour_override=10) == "calm"
+
+
+def test_obi_mode_active_from_frigate_multiple_events():
+    """Multiple Frigate detections in window → active."""
+    awareness = {"ambient_sound": {"level": "quiet"}, "sonar_cm": 200,
+                 "frigate": _fp_present(count=3)}
+    assert compute_obi_mode(awareness, hour_override=10) == "active"
+
+
+def test_obi_mode_not_absent_when_frigate_sees_person_at_night():
+    """Frigate detects person at night → not absent."""
+    awareness = {"ambient_sound": {"level": "silent"}, "sonar_cm": 90,
+                 "frigate": _fp_present()}
+    assert compute_obi_mode(awareness, hour_override=2) != "absent"
+
+
+def test_obi_mode_absent_when_frigate_online_but_no_person_at_night():
+    """Frigate is online, reports no person, nighttime → absent."""
+    awareness = {"ambient_sound": {"level": "silent"}, "sonar_cm": 90,
+                 "frigate": _fp_absent()}
+    assert compute_obi_mode(awareness, hour_override=2) == "absent"
+
+
+def test_obi_mode_sonar_fallback_when_frigate_offline():
+    """No frigate key → original sonar/ambient logic unchanged."""
+    awareness = {"ambient_sound": {"level": "quiet"}, "sonar_cm": 25}
+    assert compute_obi_mode(awareness, hour_override=10) == "calm"

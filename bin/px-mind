@@ -122,20 +122,39 @@ def _daytime_action_hint(hour_override: int | None = None) -> str:
 
 
 def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
-    """Infer Obi's current state from ambient sound + sonar distance + time of day."""
+    """Infer Obi's state from Frigate detections + ambient sound + sonar + time."""
     hour = hour_override if hour_override is not None else dt.datetime.now(AEDT).hour
     ambient_level = (awareness.get("ambient_sound") or {}).get("level", "unknown")
     sonar_cm = awareness.get("sonar_cm")
+    frigate = awareness.get("frigate") or {}
     is_day = OBI_DAY_START <= hour < OBI_DAY_END
-    close = sonar_cm is not None and sonar_cm < 35
+
+    frigate_present = frigate.get("person_present", False)
+    frigate_count   = frigate.get("event_count", 0)
+
+    close      = sonar_cm is not None and sonar_cm < 35
     very_close = sonar_cm is not None and sonar_cm < 20
 
-    if ambient_level == "unknown":
-        return "unknown"
-    if not is_day and ambient_level in ("silent", "quiet") and not close:
-        return "absent"
+    # Fast sonar signal: physically very close + loud
     if very_close and ambient_level == "loud":
         return "possibly-overloaded"
+
+    # Frigate is authoritative when present
+    if frigate_present:
+        if frigate_count >= 3 or ambient_level == "loud":
+            return "active"
+        return "calm"
+
+    # Night + quiet + Frigate online but no detection → absent
+    if not is_day and ambient_level in ("silent", "quiet"):
+        if "frigate" in awareness:   # Frigate replied: no one there
+            return "absent"
+        if not close:                # Frigate offline, trust sonar
+            return "absent"
+
+    # Sonar/ambient fallback (Frigate offline or daytime no-detection)
+    if ambient_level == "unknown":
+        return "unknown"
     if close and is_day:
         return "active" if ambient_level == "loud" else "calm"
     return "calm"
@@ -728,6 +747,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     global _cached_weather, _last_weather_fetch, _time_period_start_mono
 
     sonar_cm = read_sonar(dry)
+    frigate = _fetch_frigate_presence(dry)
     session = load_session()
     history = session.get("history") or []
     now_hour = dt.datetime.now().hour
@@ -793,6 +813,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     awareness = {
         "ts": utc_timestamp(),
         "sonar_cm": round(sonar_cm, 1),
+        "frigate": frigate,
         "someone_nearby": sonar_cm < PROXIMITY_NEAR_CM,
         "time_period": time_period,
         "hour": now_hour,
@@ -863,9 +884,17 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2))
+    if frigate is not None:
+        atomic_write(FRIGATE_FILE, json.dumps(frigate, indent=2))
 
     if transitions:
-        log(f"awareness: transitions={transitions} sonar={sonar_cm:.0f}cm period={time_period}")
+        if frigate is None:
+            frigate_str = "offline"
+        elif frigate.get("person_present"):
+            frigate_str = "person"
+        else:
+            frigate_str = "no-person"
+        log(f"awareness: transitions={transitions} sonar={sonar_cm:.0f}cm frigate={frigate_str} period={time_period}")
 
     return awareness, transitions
 
