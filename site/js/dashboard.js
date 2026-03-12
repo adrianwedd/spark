@@ -94,27 +94,33 @@ window.SparkDashboard = (function () {
       }
     }
 
-    // Last spoken text (what SPARK actually said)
-    _renderInline($('last-spoken-text'), state.last_spoken || 'Nothing spoken yet…');
+    // Last thought — always shown, salience belongs to the thought not the spoken action
+    _renderInline($('dashboard-last-thought'), state.last_thought || 'Nothing on my mind just now…');
 
-    // Salience dots + age: only meaningful when there's actual spoken content
-    const metaRow = $('thought-meta-row');
     const salienceDots = $('thought-salience');
-    const ageEl = $('thought-age');
-    if (state.last_spoken && typeof state.salience === 'number') {
-      if (metaRow) metaRow.classList.remove('hidden');
-      if (salienceDots) {
+    if (salienceDots) {
+      if (typeof state.salience === 'number') {
         const filled = Math.round(state.salience * 5);
         salienceDots.textContent = '●'.repeat(filled) + '○'.repeat(5 - filled);
+      } else {
+        salienceDots.textContent = '';
       }
-      if (ageEl && state.last_spoken_ts) {
-        const mins = Math.round((Date.now() - new Date(state.last_spoken_ts).getTime()) / 60000);
-        ageEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
-      }
+    }
+
+    const ageEl = $('thought-age');
+    if (ageEl && state.ts) {
+      const mins = Math.round((Date.now() - new Date(state.ts).getTime()) / 60000);
+      ageEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
+    }
+
+    // Last spoken — secondary, shown only when something has been voiced
+    const spokenRow = $('last-spoken-row');
+    const spokenEl = $('last-spoken-text');
+    if (state.last_spoken) {
+      if (spokenRow) spokenRow.classList.remove('hidden');
+      if (spokenEl) spokenEl.textContent = state.last_spoken;
     } else {
-      if (metaRow) metaRow.classList.add('hidden');
-      if (salienceDots) salienceDots.textContent = '';
-      if (ageEl) ageEl.textContent = '';
+      if (spokenRow) spokenRow.classList.add('hidden');
     }
 
     // Proximity: number + colour-coded bar (full = close, empty = far; 200 cm = scale max)

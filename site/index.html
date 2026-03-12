@@ -71,11 +71,11 @@
         <p id="last-spoke" class="last-spoke"></p>
       </div>
 
-      <!-- Last Spoken -->
+      <!-- Last Thought + Last Spoken -->
       <div class="presence-thought world-col">
-        <p class="section-eyebrow">Last spoken</p>
-        <blockquote id="last-spoken-text" class="pull-quote">Nothing spoken yet…</blockquote>
-        <div id="thought-meta-row" class="thought-meta hidden">
+        <p class="section-eyebrow">Last thought</p>
+        <blockquote id="dashboard-last-thought" class="pull-quote">Nothing on my mind just now…</blockquote>
+        <div id="thought-meta-row" class="thought-meta">
           <span id="thought-salience" class="salience-dots" aria-label="thought importance"></span>
           <span id="thought-age" class="thought-age"></span>
         </div>
@@ -85,6 +85,10 @@
                   aria-label="thought salience history"></canvas>
           <canvas class="sparkline-canvas" data-field="mood_val" height="20"
                   aria-label="mood history" style="margin-top:0.2rem"></canvas>
+        </div>
+        <div class="last-spoken-row" id="last-spoken-row">
+          <p class="section-eyebrow" style="margin-top:0.9rem">Last spoken</p>
+          <p id="last-spoken-text" class="last-spoken-quote">—</p>
         </div>
       </div>
 

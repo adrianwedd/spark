@@ -239,6 +239,14 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 .salience-dots { letter-spacing: 0.1em; color: var(--warm-accent); }
 
+.last-spoken-quote {
+  font-size: 0.88rem;
+  font-style: italic;
+  color: var(--warm-muted);
+  line-height: 1.5;
+  margin: 0.2rem 0 0;
+}
+
 .thought-salience-trend {
   margin-top: 0.4rem;
   border-top: 1px solid rgba(0,0,0,0.05);
