@@ -93,8 +93,33 @@ class TestPublicStatus:
     def test_has_required_keys(self, public_client):
         resp = public_client.get("/api/v1/public/status")
         data = resp.json()
-        for key in ("persona", "mood", "last_thought", "last_action", "salience", "ts", "listening"):
+        for key in ("persona", "mood", "last_thought", "last_spoken", "last_spoken_ts",
+                    "last_action", "salience", "ts", "listening"):
             assert key in data, f"missing key: {key}"
+
+    def test_last_spoken_skips_wait_and_remember(self, public_client, state_dir):
+        thoughts = [
+            {"ts": "2026-03-13T01:00:00Z", "thought": "Said hello", "mood": "curious", "action": "greet"},
+            {"ts": "2026-03-13T01:01:00Z", "thought": "Silent thought", "mood": "peaceful", "action": "wait"},
+            {"ts": "2026-03-13T01:02:00Z", "thought": "Note to self", "mood": "content", "action": "remember"},
+        ]
+        (state_dir / "thoughts.jsonl").write_text(
+            "\n".join(json.dumps(t) for t in thoughts) + "\n"
+        )
+        resp = public_client.get("/api/v1/public/status")
+        data = resp.json()
+        assert data["last_spoken"] == "Said hello"
+        assert data["last_spoken_ts"] == "2026-03-13T01:00:00Z"
+
+    def test_last_spoken_null_when_only_wait_thoughts(self, public_client, state_dir):
+        thoughts = [
+            {"ts": "2026-03-13T01:00:00Z", "thought": "Waiting…", "action": "wait"},
+        ]
+        (state_dir / "thoughts.jsonl").write_text(json.dumps(thoughts[0]) + "\n")
+        resp = public_client.get("/api/v1/public/status")
+        data = resp.json()
+        assert data["last_spoken"] is None
+        assert data["last_spoken_ts"] is None
 
 
 class TestPublicVitals:
@@ -383,7 +408,7 @@ class TestPublicHistory:
         sample = _api._collect_history_sample(state_dir)
         for field in ("ts", "cpu_pct", "cpu_temp_c", "ram_pct", "disk_pct", "battery_pct",
                       "sonar_cm", "ambient_rms", "weather_temp_c", "wind_kmh", "humidity_pct",
-                      "tokens_in", "tokens_out", "salience"):
+                      "tokens_in", "tokens_out", "salience", "mood_val"):
             assert field in sample, f"missing field: {field}"
 
     def test_collect_sample_weather_fields_from_awareness(self, state_dir, monkeypatch):
@@ -413,6 +438,44 @@ class TestPublicHistory:
         assert sample["weather_temp_c"] is None
         assert sample["wind_kmh"] is None
         assert sample["humidity_pct"] is None
+
+
+class TestPublicThoughts:
+    def test_returns_200_without_auth(self, public_client):
+        resp = public_client.get("/api/v1/public/thoughts")
+        assert resp.status_code == 200
+
+    def test_returns_empty_list_when_no_file(self, public_client, state_dir):
+        data = public_client.get("/api/v1/public/thoughts").json()
+        assert data == []
+
+    def test_returns_recent_thoughts_newest_first(self, public_client, state_dir):
+        thoughts = [
+            {"ts": "2026-03-13T01:00:00Z", "thought": "First", "mood": "peaceful", "action": "comment", "salience": 0.3},
+            {"ts": "2026-03-13T01:01:00Z", "thought": "Second", "mood": "curious",  "action": "comment", "salience": 0.7},
+            {"ts": "2026-03-13T01:02:00Z", "thought": "Third",  "mood": "excited",  "action": "greet",   "salience": 0.9},
+        ]
+        (state_dir / "thoughts.jsonl").write_text(
+            "\n".join(json.dumps(t) for t in thoughts) + "\n"
+        )
+        data = public_client.get("/api/v1/public/thoughts?limit=12").json()
+        assert len(data) == 3
+        assert data[0]["thought"] == "Third"   # newest first
+        assert data[2]["thought"] == "First"
+
+    def test_limit_param_respected(self, public_client, state_dir):
+        thoughts = [{"ts": f"2026-03-13T01:0{i}:00Z", "thought": f"T{i}", "action": "comment"} for i in range(10)]
+        (state_dir / "thoughts.jsonl").write_text("\n".join(json.dumps(t) for t in thoughts) + "\n")
+        data = public_client.get("/api/v1/public/thoughts?limit=3").json()
+        assert len(data) == 3
+
+    def test_thought_fields_present(self, public_client, state_dir):
+        thought = {"ts": "2026-03-13T01:00:00Z", "thought": "Hello", "mood": "calm", "action": "greet", "salience": 0.5}
+        (state_dir / "thoughts.jsonl").write_text(json.dumps(thought) + "\n")
+        data = public_client.get("/api/v1/public/thoughts").json()
+        assert len(data) == 1
+        for key in ("thought", "mood", "ts", "salience", "action"):
+            assert key in data[0], f"missing key: {key}"
 
 
 class TestPublicServices:

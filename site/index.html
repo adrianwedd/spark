@@ -15,12 +15,12 @@
 <body>
 
 <nav id="main-nav">
-  <a class="logo" href="#hero">SPARK <span id="status-dot"></span></a>
+  <a class="logo" href="#home">SPARK <span id="status-dot"></span></a>
   <button class="nav-burger" id="nav-burger" aria-label="Toggle navigation" aria-expanded="false" aria-controls="nav-links">
     <span></span><span></span><span></span>
   </button>
   <ul class="links" id="nav-links">
-    <li><a href="#hero">Home</a></li>
+    <li><a href="#home">Home</a></li>
     <li><a href="#live">Live</a></li>
     <li><a href="#how-it-works">How It Works</a></li>
     <li><a href="#spark-brain">Brain</a></li>
@@ -31,8 +31,8 @@
   </ul>
 </nav>
 
-<!-- ══════════════════════════════════════════════════════ HERO -->
-<section id="hero" data-theme="warm">
+<!-- ══════════════════════════════════════════════════════ HOME -->
+<section id="home" data-theme="warm">
   <div class="container">
     <h1>SPARK</h1>
     <p class="text-lead mt-sm text-muted-warm">
@@ -41,9 +41,13 @@
 
     <div id="mood-bubble" aria-live="polite">…</div>
 
-    <blockquote class="pull-quote" id="last-thought" aria-live="polite">
-      Waiting for SPARK's thoughts…
-    </blockquote>
+    <!-- Recent thoughts carousel -->
+    <div id="thought-carousel" class="thought-carousel" aria-live="polite" aria-label="SPARK's recent thoughts">
+      <div class="carousel-slide active">
+        <blockquote class="carousel-quote">Waiting for SPARK's thoughts…</blockquote>
+      </div>
+    </div>
+    <div id="carousel-dots" class="carousel-dots" role="tablist" aria-label="Thought slides"></div>
 
   </div>
 </section>
@@ -61,13 +65,23 @@
         <div id="mood-pulse" class="pulse-circle pulse-mid" aria-label="SPARK mood">
           <span id="mood-word">…</span>
         </div>
+        <div class="presence-time">
+          <span id="local-time" class="local-time"></span>
+          <span id="time-period-badge" class="period-badge"></span>
+        </div>
         <p id="obi-mode-line" class="obi-mode-text"></p>
+        <p id="last-spoke" class="last-spoke"></p>
+        <div class="wx-metric-row presence-mood-trend">
+          <span class="wx-metric-label">Mood (1h)</span>
+          <canvas class="sparkline-canvas" data-field="mood_val" height="20"
+                  aria-label="mood history"></canvas>
+        </div>
       </div>
 
-      <!-- Last Thought -->
+      <!-- Last Spoken -->
       <div class="presence-thought">
-        <p class="section-eyebrow">Last thought</p>
-        <blockquote id="dashboard-last-thought" class="pull-quote">Nothing on my mind just now…</blockquote>
+        <p class="section-eyebrow">Last spoken</p>
+        <blockquote id="last-spoken-text" class="pull-quote">Nothing spoken yet…</blockquote>
         <div class="thought-meta">
           <span id="thought-salience" class="salience-dots" aria-label="thought importance"></span>
           <span id="thought-age" class="thought-age"></span>
@@ -149,15 +163,6 @@
           <canvas class="sparkline-canvas" data-field="weather_temp_c" width="160" height="22"
                   aria-label="temperature history"></canvas>
         </div>
-      </div>
-
-      <!-- Time context -->
-      <div class="world-time world-col">
-        <div class="world-time-row">
-          <span id="local-time" class="local-time"></span>
-          <span id="time-period-badge" class="period-badge"></span>
-        </div>
-        <p id="last-spoke" class="last-spoke"></p>
       </div>
 
     </div><!-- /band-world -->

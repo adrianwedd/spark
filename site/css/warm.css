@@ -128,7 +128,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 .band-world {
   display: grid;
-  grid-template-columns: 1.4fr 2fr 1.1fr;
+  grid-template-columns: 1fr 1.8fr;
   gap: 1.25rem;
   align-items: start;
   background: rgba(0, 0, 0, 0.03);
@@ -139,6 +139,27 @@ details > *:not(summary) { margin-top: 0.75rem; }
 @media (max-width: 640px) {
   .band-presence,
   .band-world { grid-template-columns: 1fr; }
+}
+
+/* ── Presence Time (moved from world-time) ────────────────────────── */
+
+.presence-time {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+/* ── Presence Mood Sparkline ──────────────────────────────────────── */
+
+.presence-mood-trend {
+  margin-top: 0.5rem;
+  border-top: 1px solid rgba(0,0,0,0.06);
+  padding-top: 0.4rem;
+  border-bottom: none !important;
+  padding-bottom: 0 !important;
 }
 
 /* ── Mood Pulse ───────────────────────────────────────────────── */
@@ -515,3 +536,79 @@ details > *:not(summary) { margin-top: 0.75rem; }
 /* Sparkline canvas */
 .sparkline-canvas { display: block; margin-top: 0.5rem; width: 100%; }
 .sparkline-label  { font-size: 0.7rem; color: var(--warm-muted); margin-top: 0.2rem; }
+
+/* ── Thoughts Carousel (home section) ────────────────────────────── */
+
+.thought-carousel {
+  position: relative;
+  min-height: 6rem;
+  margin-top: 1.5rem;
+}
+
+.carousel-slide {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.8s ease;
+  text-align: center;
+}
+
+.carousel-slide.active {
+  position: relative;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.carousel-mood-badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.6rem;
+  text-transform: lowercase;
+}
+
+.carousel-quote {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: clamp(1rem, 2.5vw, 1.25rem);
+  font-style: italic;
+  line-height: 1.6;
+  color: var(--warm-text);
+  margin: 0 auto;
+  max-width: 36rem;
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.carousel-meta {
+  font-size: 0.75rem;
+  color: var(--warm-muted);
+  margin-top: 0.5rem;
+}
+
+.carousel-dots {
+  display: flex;
+  justify-content: center;
+  gap: 0.4rem;
+  margin-top: 1rem;
+}
+
+.carousel-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0,0,0,0.15);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.3s ease, transform 0.2s ease;
+}
+
+.carousel-dot.active {
+  background: var(--warm-accent);
+  transform: scale(1.3);
+}

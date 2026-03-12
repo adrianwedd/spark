@@ -49,11 +49,53 @@ window.SparkDashboard = (function () {
 
     _drawFavicon(MOOD_FAVICON_COLOR[mood] || '#e8875a');
 
+    // Local time + period badge (moved into presence-mood column)
+    const timeEl = $('local-time');
+    if (timeEl) {
+      timeEl.textContent = new Date().toLocaleTimeString('en-AU', {
+        hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Hobart',
+      });
+    }
+    const badge = $('time-period-badge');
+    if (badge) {
+      badge.classList.remove('period-morning', 'period-afternoon', 'period-evening', 'period-night');
+      if (state.time_period) {
+        badge.classList.add('period-' + state.time_period);
+        badge.textContent = state.time_period;
+      } else {
+        badge.textContent = '';
+      }
+    }
+
     const modeLine = $('obi-mode-line');
     if (modeLine) modeLine.textContent = OBI_MODE_TEXT[state.obi_mode] || '';
 
-    _renderInline($('dashboard-last-thought'), state.last_thought || 'Nothing on my mind just now…');
-    _renderInline($('last-thought'), state.last_thought || 'Waiting for SPARK\'s thoughts…');
+    // "hasn't spoken since [time]" using last_spoken_ts
+    const lastSpoke = $('last-spoke');
+    if (lastSpoke) {
+      if (state.last_spoken_ts) {
+        const spokenAt = new Date(state.last_spoken_ts);
+        const spokenTime = spokenAt.toLocaleTimeString('en-AU', {
+          hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Hobart',
+        });
+        const minsAgo = Math.round((Date.now() - spokenAt.getTime()) / 60000);
+        if (minsAgo < 2) {
+          lastSpoke.textContent = 'just spoke';
+        } else if (minsAgo < 60) {
+          lastSpoke.textContent = 'last spoken ' + minsAgo + ' min ago';
+        } else {
+          lastSpoke.textContent = 'last spoken at ' + spokenTime;
+        }
+      } else if (typeof state.minutes_since_speech === 'number') {
+        const m = Math.round(state.minutes_since_speech);
+        lastSpoke.textContent = m > 120 ? 'hasn\'t spoken in a while' : ('last spoken ' + m + ' min ago');
+      } else {
+        lastSpoke.textContent = '';
+      }
+    }
+
+    // Last spoken text (what SPARK actually said)
+    _renderInline($('last-spoken-text'), state.last_spoken || 'Nothing spoken yet…');
     _renderInline($('mood-bubble'), state.mood || '…');
 
     const salienceDots = $('thought-salience');
@@ -65,9 +107,12 @@ window.SparkDashboard = (function () {
     }
 
     const ageEl = $('thought-age');
-    if (ageEl && state.ts) {
-      const mins = Math.round((Date.now() - new Date(state.ts).getTime()) / 60000);
-      ageEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
+    if (ageEl) {
+      const tsStr = state.last_spoken_ts || state.ts;
+      if (tsStr) {
+        const mins = Math.round((Date.now() - new Date(tsStr).getTime()) / 60000);
+        ageEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
+      }
     }
 
     // Proximity: number + colour-coded bar (full = close, empty = far; 200 cm = scale max)
@@ -153,33 +198,6 @@ window.SparkDashboard = (function () {
       }
     }
 
-    const timeEl = $('local-time');
-    if (timeEl) {
-      timeEl.textContent = new Date().toLocaleTimeString('en-AU', {
-        hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Hobart',
-      });
-    }
-
-    const badge = $('time-period-badge');
-    if (badge) {
-      badge.classList.remove('period-morning', 'period-afternoon', 'period-evening', 'period-night');
-      if (state.time_period) {
-        badge.classList.add('period-' + state.time_period);
-        badge.textContent = state.time_period;
-      } else {
-        badge.textContent = '';
-      }
-    }
-
-    const lastSpoke = $('last-spoke');
-    if (lastSpoke) {
-      if (typeof state.minutes_since_speech === 'number') {
-        const m = Math.round(state.minutes_since_speech);
-        lastSpoke.textContent = m > 30 ? "hasn't spoken recently" : ('Last spoke ' + m + ' min ago');
-      } else {
-        lastSpoke.textContent = '';
-      }
-    }
   }
 
   // ── Machine band ─────────────────────────────────────────────────────────
@@ -277,12 +295,12 @@ window.SparkDashboard = (function () {
   // ── Dynamic favicon ──────────────────────────────────────────────────────
 
   const MOOD_FAVICON_COLOR = {
-    peaceful:      '#7cb87d',   // sage green — restful
-    content:       '#7cb87d',
-    curious:       '#e8875a',   // terracotta — engaged
-    contemplative: '#b8957a',   // earthy — reflective
-    excited:       '#e05c3a',   // bright coral — energetic
-    active:        '#d97706',   // amber — busy
+    peaceful:      '#6aab6b',   // sage green — restful, low-energy positive
+    content:       '#6aab6b',   // same as peaceful
+    contemplative: '#7c6fcf',   // soft indigo — introspective, inner-focused
+    curious:       '#e6a817',   // warm gold — searching, exploratory
+    active:        '#2ea8e0',   // sky blue — busy, dynamic
+    excited:       '#e05c3a',   // coral — bright high-energy
   };
 
   function _drawFavicon(color) {
@@ -329,5 +347,5 @@ window.SparkDashboard = (function () {
   // Draw initial connecting state
   _drawFavicon('#d1c4b8');
 
-  return { renderPresence, renderWorld, renderMachine, renderSparklines, setOnline, setLastUpdated };
+  return { renderPresence, renderWorld, renderMachine, renderSparklines, setOnline, setLastUpdated, MOOD_FAVICON_COLOR };
 })();

@@ -199,15 +199,21 @@ def _collect_history_sample(state_dir: "Path") -> "Dict[str, Any]":
         sample["wind_kmh"] = None
         sample["humidity_pct"] = None
 
-    # Salience from latest thought
+    # Salience + mood_val from latest thought
+    _MOOD_VAL = {"peaceful": 1, "content": 2, "contemplative": 2, "curious": 3, "active": 4, "excited": 5}
     try:
         lines = (state_dir / "thoughts.jsonl").read_text().strip().splitlines()
         last = json.loads(lines[-1]) if lines else {}
         sample["salience"] = last.get("salience")
+        sample["mood_val"] = _MOOD_VAL.get((last.get("mood") or "").lower())
     except Exception:
         sample["salience"] = None
+        sample["mood_val"] = None
 
     return sample
+
+
+_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct")
 
 
 def _history_worker() -> None:
@@ -218,7 +224,14 @@ def _history_worker() -> None:
         _time.sleep(30)
         try:
             sample = _collect_history_sample(_public_state_dir())
+            # Forward-fill fields that change slowly (weather, battery) so sparklines
+            # don't go blank between BOM/battery poll cycles.
             with _history_lock:
+                if _history_buf:
+                    prev = _history_buf[-1]
+                    for f in _FORWARD_FILL_FIELDS:
+                        if sample.get(f) is None and prev.get(f) is not None:
+                            sample[f] = prev[f]
                 _history_buf.append(sample)
         except Exception:
             pass
@@ -317,10 +330,23 @@ async def public_status() -> Dict[str, Any]:
         thoughts_path = state_dir / "thoughts.jsonl"
 
     last = {}
+    last_spoken = None
+    last_spoken_ts = None
     try:
         lines = thoughts_path.read_text().strip().splitlines()
         if lines:
             last = json.loads(lines[-1])
+        # Scan backwards for most recent thought that was actually spoken
+        _silent = {None, "wait", "remember"}
+        for line in reversed(lines):
+            try:
+                t = json.loads(line)
+                if t.get("action") not in _silent:
+                    last_spoken = t.get("thought")
+                    last_spoken_ts = t.get("ts")
+                    break
+            except Exception:
+                continue
     except Exception:
         pass
 
@@ -328,6 +354,8 @@ async def public_status() -> Dict[str, Any]:
         "persona": persona or None,
         "mood": last.get("mood"),
         "last_thought": last.get("thought"),
+        "last_spoken": last_spoken,
+        "last_spoken_ts": last_spoken_ts,
         "last_action": last.get("action"),
         "salience": last.get("salience"),
         "ts": last.get("ts"),
@@ -458,6 +486,35 @@ async def public_history() -> list:
     """Ring buffer of up to 60 vitals readings (~30 min history). No auth."""
     with _history_lock:
         return list(_history_buf)
+
+
+@app.get("/api/v1/public/thoughts")
+async def public_thoughts(limit: int = Query(default=12, ge=1, le=50)) -> list:
+    """Recent SPARK thoughts (newest first). No auth required."""
+    session = load_session()
+    persona = (session.get("persona") or "").strip().lower()
+    state_dir = _public_state_dir()
+    thoughts_path = state_dir / (f"thoughts-{persona}.jsonl" if persona else "thoughts.jsonl")
+    results = []
+    try:
+        lines = thoughts_path.read_text().strip().splitlines()
+        for line in reversed(lines[-50:]):
+            try:
+                t = json.loads(line)
+                results.append({
+                    "thought": t.get("thought"),
+                    "mood": t.get("mood"),
+                    "ts": t.get("ts"),
+                    "salience": t.get("salience"),
+                    "action": t.get("action"),
+                })
+                if len(results) >= limit:
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return results
 
 
 @app.post("/api/v1/pin/verify")

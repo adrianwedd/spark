@@ -92,8 +92,6 @@
   border-color: var(--dark-text);
 }
 
-[data-theme="dark"] .arc-close { fill: var(--dark-accent); }
-
 [data-theme="dark"] .services-strip {
   background: rgba(255,255,255,0.04);
 }
@@ -112,3 +110,7 @@
 [data-theme="dark"] .wx-metric-row { border-bottom-color: rgba(255,255,255,0.06); }
 [data-theme="dark"] .weather-headline { border-bottom-color: rgba(255,255,255,0.07); }
 [data-theme="dark"] .proximity-bar-track { background: rgba(255,255,255,0.1); }
+[data-theme="dark"] .carousel-quote { color: var(--dark-text); }
+[data-theme="dark"] .carousel-meta  { color: var(--dark-muted); }
+[data-theme="dark"] .carousel-dot   { background: rgba(255,255,255,0.2); }
+[data-theme="dark"] .local-time     { color: var(--dark-text); }

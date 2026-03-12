@@ -4,12 +4,16 @@
 (function () {
   'use strict';
 
-  const API         = 'https://spark-api.wedd.au/api/v1/public';
-  const CACHE_KEY   = 'spark_last_known';
-  const HISTORY_KEY = 'spark_history';
-  const HISTORY_MAX = 120;   // 120 × 30s = 60 min local buffer
-  const POLL_MS     = 30_000;
-  const TIMEOUT_MS  = 5_000;
+  const API              = 'https://spark-api.wedd.au/api/v1/public';
+  const CACHE_KEY        = 'spark_last_known';
+  const HISTORY_KEY      = 'spark_history';
+  const HISTORY_MAX      = 120;   // 120 × 30s = 60 min local buffer
+  const POLL_MS          = 30_000;
+  const TIMEOUT_MS       = 5_000;
+  const THOUGHTS_POLL_MS = 5 * 60_000;  // refresh carousel every 5 min
+
+  // mood → numeric value for sparkline charting
+  const MOOD_VAL = { peaceful: 1, content: 2, contemplative: 2, curious: 3, active: 4, excited: 5 };
 
   let state = {};
   let lastSuccessMs = null;
@@ -108,6 +112,7 @@
         wind_kmh:        state.weather?.wind_kmh != null ? state.weather.wind_kmh : null,
         humidity_pct:    state.weather?.humidity_pct != null ? state.weather.humidity_pct : null,
         salience:        state.salience      != null ? state.salience      : null,
+        mood_val:        state.mood ? (MOOD_VAL[(state.mood || '').toLowerCase()] || null) : null,
       });
       try {
         localStorage.setItem(CACHE_KEY, JSON.stringify(
@@ -179,13 +184,102 @@
     } catch (_) {}
   }
 
+  // ── Thoughts carousel ────────────────────────────────────────────────────
+
+  let _carouselTimer = null;
+  let _carouselIdx   = 0;
+
+  async function fetchThoughts() {
+    try {
+      const thoughts = await fetchWithTimeout(API + '/thoughts?limit=12');
+      if (Array.isArray(thoughts) && thoughts.length) _buildCarousel(thoughts);
+    } catch (_) {}
+  }
+
+  function _buildCarousel(thoughts) {
+    const container = document.getElementById('thought-carousel');
+    if (!container) return;
+    while (container.firstChild) container.removeChild(container.firstChild);
+
+    const MOOD_COLOR = SparkDashboard.MOOD_FAVICON_COLOR || {};
+
+    thoughts.forEach((t, i) => {
+      const slide = document.createElement('div');
+      slide.className = 'carousel-slide' + (i === 0 ? ' active' : '');
+
+      if (t.mood) {
+        const badge = document.createElement('span');
+        badge.className = 'carousel-mood-badge';
+        badge.textContent = t.mood;
+        const col = MOOD_COLOR[t.mood.toLowerCase()];
+        if (col) { badge.style.background = col; badge.style.color = '#fff'; }
+        slide.appendChild(badge);
+      }
+
+      const q = document.createElement('blockquote');
+      q.className = 'carousel-quote';
+      q.textContent = t.thought || '';
+      slide.appendChild(q);
+
+      if (t.ts) {
+        const meta = document.createElement('p');
+        meta.className = 'carousel-meta';
+        const d = new Date(t.ts);
+        meta.textContent = d.toLocaleTimeString('en-AU', {
+          hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Hobart',
+        });
+        slide.appendChild(meta);
+      }
+
+      container.appendChild(slide);
+    });
+
+    // Rebuild dots
+    const dots = document.getElementById('carousel-dots');
+    if (dots) {
+      while (dots.firstChild) dots.removeChild(dots.firstChild);
+      thoughts.forEach((_, i) => {
+        const d = document.createElement('button');
+        d.className = 'carousel-dot' + (i === 0 ? ' active' : '');
+        d.setAttribute('aria-label', 'Thought ' + (i + 1));
+        d.addEventListener('click', () => { _carouselIdx = i; _showSlide(i); });
+        dots.appendChild(d);
+      });
+    }
+
+    _carouselIdx = 0;
+    _startCarousel(thoughts.length);
+  }
+
+  function _showSlide(idx) {
+    const container = document.getElementById('thought-carousel');
+    if (!container) return;
+    container.querySelectorAll('.carousel-slide').forEach((s, i) =>
+      s.classList.toggle('active', i === idx));
+    const dots = document.getElementById('carousel-dots');
+    if (dots) dots.querySelectorAll('.carousel-dot').forEach((d, i) =>
+      d.classList.toggle('active', i === idx));
+  }
+
+  function _startCarousel(count) {
+    if (_carouselTimer) clearInterval(_carouselTimer);
+    if (count > 1) {
+      _carouselTimer = setInterval(() => {
+        _carouselIdx = (_carouselIdx + 1) % count;
+        _showSlide(_carouselIdx);
+      }, 7_000);
+    }
+  }
+
   // ── Init ─────────────────────────────────────────────────────────────────
 
   hydrateFromCache();
   prefetchHistory();
   poll();
+  fetchThoughts();
   setInterval(poll, POLL_MS);
   setInterval(tickWaveform, 2_000);
   setInterval(_updateDot, 10_000);
+  setInterval(fetchThoughts, THOUGHTS_POLL_MS);
 
 })();
