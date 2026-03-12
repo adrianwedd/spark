@@ -31,7 +31,7 @@ Each event (relevant fields):
 }
 ```
 
-`after` filters on `end_time`. `box` is normalized 0-1; x_center = box[0] + box[2]/2.
+`after` filters on `end_time`. **`end_time` is `null` for in-progress events** — use `e.get("end_time") or 0` in `max()`. `box` is `[x, y, width, height]` normalized 0-1; x_center = `box[0] + box[2]/2`.
 
 ---
 
@@ -209,8 +209,12 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
             "ts": utc_timestamp(),
         }
 
-    best = max(qualifying, key=lambda e: e["end_time"])
+    # end_time is None for in-progress events — treat as 0 so max() doesn't TypeError
+    best = max(qualifying, key=lambda e: e.get("end_time") or 0)
     box = best["data"].get("box") or []
+    # box format confirmed as [x, y, width, height] (normalized 0-1) per user docs.
+    # x_center = x + width/2. If Frigate ever switches to [xmin,ymin,xmax,ymax],
+    # use (box[0]+box[2])/2 instead — verify against path_data[0][0][0].
     x_center = round(box[0] + box[2] / 2, 3) if len(box) == 4 else None
 
     return {
