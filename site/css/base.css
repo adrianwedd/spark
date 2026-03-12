@@ -76,6 +76,63 @@ nav .links a {
 nav .links a:hover,
 nav .links a.active { color: var(--dark-text); }
 
+nav .nav-github { opacity: 0.6; }
+nav .nav-github:hover { opacity: 1; color: var(--dark-text); }
+
+/* ── Hamburger button (hidden on desktop) ── */
+.nav-burger {
+  display: none;
+  flex-direction: column;
+  justify-content: space-between;
+  width: 24px;
+  height: 18px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  margin-left: auto;
+}
+.nav-burger span {
+  display: block;
+  height: 2px;
+  width: 100%;
+  background: var(--dark-muted);
+  border-radius: 2px;
+  transition: background var(--transition);
+}
+.nav-burger:hover span { background: var(--dark-text); }
+
+/* ── Mobile nav ── */
+@media (max-width: 700px) {
+  .nav-burger { display: flex; }
+
+  nav .links {
+    display: none;
+    position: absolute;
+    top: var(--nav-height);
+    left: 0; right: 0;
+    background: var(--dark-bg);
+    flex-direction: column;
+    gap: 0;
+    margin: 0;
+    padding: 0.5rem 0 1rem;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    z-index: 99;
+  }
+  nav .links li a {
+    display: block;
+    padding: 0.65rem 1.5rem;
+    font-size: 1rem;
+  }
+  nav.nav-open .links {
+    display: flex;
+  }
+  nav.nav-open .nav-burger span:nth-child(1) { transform: translateY(8px) rotate(45deg); }
+  nav.nav-open .nav-burger span:nth-child(2) { opacity: 0; }
+  nav.nav-open .nav-burger span:nth-child(3) { transform: translateY(-8px) rotate(-45deg); }
+  .nav-burger span { transition: transform 0.2s ease, opacity 0.2s ease, background var(--transition); }
+}
+
 /* ── Sections ── */
 section {
   padding: calc(var(--nav-height) + 4rem) 2rem 4rem;
