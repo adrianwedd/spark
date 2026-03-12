@@ -107,6 +107,7 @@
         weather_temp_c:  state.weather?.temp_c  != null ? state.weather.temp_c  : null,
         wind_kmh:        state.weather?.wind_kmh != null ? state.weather.wind_kmh : null,
         humidity_pct:    state.weather?.humidity_pct != null ? state.weather.humidity_pct : null,
+        salience:        state.salience      != null ? state.salience      : null,
       });
       try {
         localStorage.setItem(CACHE_KEY, JSON.stringify(

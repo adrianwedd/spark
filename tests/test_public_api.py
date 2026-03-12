@@ -383,7 +383,7 @@ class TestPublicHistory:
         sample = _api._collect_history_sample(state_dir)
         for field in ("ts", "cpu_pct", "cpu_temp_c", "ram_pct", "disk_pct", "battery_pct",
                       "sonar_cm", "ambient_rms", "weather_temp_c", "wind_kmh", "humidity_pct",
-                      "tokens_in", "tokens_out"):
+                      "tokens_in", "tokens_out", "salience"):
             assert field in sample, f"missing field: {field}"
 
     def test_collect_sample_weather_fields_from_awareness(self, state_dir, monkeypatch):

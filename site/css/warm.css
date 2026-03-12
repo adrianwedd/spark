@@ -211,6 +211,14 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 .salience-dots { letter-spacing: 0.1em; color: var(--warm-accent); }
 
+.thought-salience-trend {
+  margin-top: 0.4rem;
+  border-top: 1px solid rgba(0,0,0,0.05);
+  padding-top: 0.35rem;
+  border-bottom: none !important;
+  padding-bottom: 0 !important;
+}
+
 /* ── Proximity Display ────────────────────────────────────────── */
 
 .presence-proximity {

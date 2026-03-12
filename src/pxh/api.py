@@ -199,6 +199,14 @@ def _collect_history_sample(state_dir: "Path") -> "Dict[str, Any]":
         sample["wind_kmh"] = None
         sample["humidity_pct"] = None
 
+    # Salience from latest thought
+    try:
+        lines = (state_dir / "thoughts.jsonl").read_text().strip().splitlines()
+        last = json.loads(lines[-1]) if lines else {}
+        sample["salience"] = last.get("salience")
+    except Exception:
+        sample["salience"] = None
+
     return sample
 
 
