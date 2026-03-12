@@ -13,7 +13,6 @@
 
   let state = {};
   let lastSuccessMs = null;
-  let _openSparklineTile = null;
 
   // ── localStorage helpers ─────────────────────────────────────────────────
 
@@ -134,6 +133,7 @@
     SparkDashboard.renderPresence(state);
     SparkDashboard.renderWorld(state);
     SparkDashboard.renderMachine(state);
+    SparkDashboard.renderSparklines(loadHistory());
   }
 
   // ── Status dot ───────────────────────────────────────────────────────────
@@ -152,76 +152,6 @@
   function tickWaveform() {
     const canvas = document.getElementById('waveform-canvas');
     if (canvas) SparkCharts.drawWaveform(canvas, state.ambient_rms || 0);
-  }
-
-  // ── Sparklines ───────────────────────────────────────────────────────────
-
-  function _mergeHistory(remote) {
-    const local = loadHistory();
-    const byTs = {};
-    for (const e of [...local, ...remote]) byTs[e.ts] = e;
-    return Object.values(byTs).sort((a, b) => a.ts < b.ts ? -1 : 1);
-  }
-
-  async function openSparkline(tile) {
-    const field = tile.dataset.sparkline;
-    if (!field) return;
-
-    if (_openSparklineTile === tile.id) {
-      _closeSparkline(tile);
-      return;
-    }
-    if (_openSparklineTile) {
-      const prev = document.getElementById(_openSparklineTile);
-      if (prev) _closeSparkline(prev);
-    }
-    _openSparklineTile = tile.id;
-
-    let remote = [];
-    try { remote = await fetchWithTimeout(API + '/history'); } catch (_) {}
-
-    const points = _mergeHistory(remote).slice(-60);
-
-    let wrap = tile.querySelector('.sparkline-wrap');
-    if (!wrap) {
-      wrap = document.createElement('div');
-      wrap.className = 'sparkline-wrap';
-
-      const canvas = document.createElement('canvas');
-      canvas.className = 'sparkline-canvas';
-      canvas.width = (tile.offsetWidth || 160) - 20;
-      canvas.height = 40;
-
-      const lbl = document.createElement('div');
-      lbl.className = 'sparkline-label';
-
-      wrap.appendChild(canvas);
-      wrap.appendChild(lbl);
-      tile.appendChild(wrap);
-    }
-
-    const canvas = wrap.querySelector('canvas');
-    const lbl = wrap.querySelector('.sparkline-label');
-
-    if (points.length < 2) {
-      lbl.textContent = 'no history yet';
-      if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-    } else {
-      SparkCharts.drawSparkline(canvas, points, field);
-      lbl.textContent = 'last ' + Math.round(points.length * 0.5) + ' min';
-    }
-  }
-
-  function _closeSparkline(tile) {
-    const wrap = tile.querySelector('.sparkline-wrap');
-    if (wrap) wrap.parentNode.removeChild(wrap);
-    if (_openSparklineTile === tile.id) _openSparklineTile = null;
-  }
-
-  function initSparklines() {
-    document.querySelectorAll('[data-sparkline]').forEach(tile => {
-      tile.addEventListener('click', () => openSparkline(tile));
-    });
   }
 
   // ── Hydrate from cache (zero-flash on load) ───────────────────────────────
@@ -244,7 +174,6 @@
 
   // ── Init ─────────────────────────────────────────────────────────────────
 
-  initSparklines();
   hydrateFromCache();
   prefetchHistory();
   poll();

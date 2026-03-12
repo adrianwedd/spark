@@ -165,13 +165,27 @@ def _collect_history_sample(state_dir: "Path") -> "Dict[str, Any]":
     except Exception:
         sample["sonar_cm"] = None
 
-    # Ambient RMS from awareness.json
+    # Ambient RMS + weather fields from awareness.json (single read)
     try:
         aw = json.loads((state_dir / "awareness.json").read_text())
+        if not isinstance(aw, dict):
+            aw = {}
         ambient = aw.get("ambient_sound") or {}
-        sample["ambient_rms"] = ambient.get("rms")
+        sample["ambient_rms"] = ambient.get("rms") if isinstance(ambient, dict) else None
+        weather = aw.get("weather")
+        if isinstance(weather, dict):
+            sample["weather_temp_c"] = weather.get("temp_C") or weather.get("temp_c")
+            sample["wind_kmh"] = weather.get("wind_kmh")
+            sample["humidity_pct"] = weather.get("humidity_pct")
+        else:
+            sample["weather_temp_c"] = None
+            sample["wind_kmh"] = None
+            sample["humidity_pct"] = None
     except Exception:
         sample["ambient_rms"] = None
+        sample["weather_temp_c"] = None
+        sample["wind_kmh"] = None
+        sample["humidity_pct"] = None
 
     return sample
 

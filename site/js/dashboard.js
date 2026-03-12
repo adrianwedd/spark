@@ -260,5 +260,16 @@ window.SparkDashboard = (function () {
     if (el) el.textContent = text;
   }
 
-  return { renderPresence, renderWorld, renderMachine, setOnline, setLastUpdated };
+  // ── Sparklines (always-on) ────────────────────────────────────────────────
+
+  function renderSparklines(points) {
+    if (!points || points.length < 2) return;
+    document.querySelectorAll('canvas[data-field]').forEach(canvas => {
+      // Set canvas width from its rendered width so it fills the container
+      if (!canvas.width || canvas.width < 10) canvas.width = canvas.offsetWidth || 160;
+      SparkCharts.drawSparkline(canvas, points, canvas.dataset.field);
+    });
+  }
+
+  return { renderPresence, renderWorld, renderMachine, renderSparklines, setOnline, setLastUpdated };
 })();

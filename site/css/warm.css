@@ -256,6 +256,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
   color: var(--warm-text);
 }
 .weather-summary { color: var(--warm-muted); }
+.weather-sparklines { display: flex; flex-direction: column; gap: 0.25rem; width: 100%; margin-top: 0.5rem; }
 
 /* ── World Band: Time ─────────────────────────────────────────── */
 

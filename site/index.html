@@ -83,6 +83,8 @@
           <span id="frigate-icon" aria-hidden="true">&#x1F464;</span>
           <span id="frigate-confidence" class="frigate-conf"></span>
         </div>
+        <canvas class="sparkline-canvas" data-field="sonar_cm" width="120" height="28"
+                aria-label="sonar history"></canvas>
       </div>
 
     </div><!-- /band-presence -->
@@ -93,8 +95,10 @@
       <!-- Ambient sound -->
       <div class="world-ambient">
         <span id="ambient-level-label" class="ambient-label">—</span>
-        <canvas id="waveform-canvas" width="200" height="40"
+        <canvas id="waveform-canvas" width="200" height="32"
                 aria-label="ambient sound level visualisation"></canvas>
+        <canvas class="sparkline-canvas" data-field="ambient_rms" width="200" height="28"
+                aria-label="noise level history"></canvas>
       </div>
 
       <!-- Weather strip -->
@@ -104,6 +108,14 @@
         <span id="weather-wind"></span>
         <span id="weather-humidity"></span>
         <span id="weather-summary" class="weather-summary"></span>
+        <div class="weather-sparklines">
+          <canvas class="sparkline-canvas" data-field="weather_temp_c" width="160" height="28"
+                  aria-label="temperature history"></canvas>
+          <canvas class="sparkline-canvas" data-field="wind_kmh" width="160" height="28"
+                  aria-label="wind history"></canvas>
+          <canvas class="sparkline-canvas" data-field="humidity_pct" width="160" height="28"
+                  aria-label="humidity history"></canvas>
+        </div>
       </div>
 
       <!-- Time context -->
@@ -120,24 +132,27 @@
       <div class="metric-grid">
 
         <!-- CPU % -->
-        <div class="metric-tile" id="tile-cpu" data-sparkline="cpu_pct">
+        <div class="metric-tile" id="tile-cpu">
           <div class="metric-label">CPU</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-cpu"></div></div>
           <div class="metric-value" id="val-cpu">—</div>
+          <canvas class="sparkline-canvas" data-field="cpu_pct" height="28"></canvas>
         </div>
 
-        <!-- CPU Temp (radial gauge) -->
+        <!-- CPU Temp -->
         <div class="metric-tile" id="tile-temp">
           <div class="metric-label">CPU Temp</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-temp"></div></div>
           <div class="metric-value" id="val-temp">—</div>
+          <canvas class="sparkline-canvas" data-field="cpu_temp_c" height="28"></canvas>
         </div>
 
         <!-- RAM % -->
-        <div class="metric-tile" id="tile-ram" data-sparkline="ram_pct">
+        <div class="metric-tile" id="tile-ram">
           <div class="metric-label">RAM</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-ram"></div></div>
           <div class="metric-value" id="val-ram">—</div>
+          <canvas class="sparkline-canvas" data-field="ram_pct" height="28"></canvas>
         </div>
 
         <!-- Disk % -->
@@ -145,13 +160,15 @@
           <div class="metric-label">Disk</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-disk"></div></div>
           <div class="metric-value" id="val-disk">—</div>
+          <canvas class="sparkline-canvas" data-field="disk_pct" height="28"></canvas>
         </div>
 
         <!-- Battery -->
-        <div class="metric-tile" id="tile-battery" data-sparkline="battery_pct">
+        <div class="metric-tile" id="tile-battery">
           <div class="metric-label">Battery</div>
           <div class="metric-bar-wrap"><div class="metric-bar" id="bar-battery"></div></div>
           <div class="metric-value" id="val-battery">—</div>
+          <canvas class="sparkline-canvas" data-field="battery_pct" height="28"></canvas>
         </div>
 
         <!-- Services -->

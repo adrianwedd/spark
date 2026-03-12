@@ -381,9 +381,28 @@ class TestPublicHistory:
         monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
         from pxh import api as _api
         sample = _api._collect_history_sample(state_dir)
-        for field in ("ts", "cpu_pct", "cpu_temp_c", "ram_pct",
-                      "battery_pct", "sonar_cm", "ambient_rms"):
+        for field in ("ts", "cpu_pct", "cpu_temp_c", "ram_pct", "battery_pct",
+                      "sonar_cm", "ambient_rms", "weather_temp_c", "wind_kmh", "humidity_pct"):
             assert field in sample, f"missing field: {field}"
+
+    def test_collect_sample_weather_fields_from_awareness(self, state_dir, monkeypatch):
+        awareness = {"weather": {"temp_C": 18.5, "wind_kmh": 22, "humidity_pct": 71}}
+        (state_dir / "awareness.json").write_text(json.dumps(awareness))
+        monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
+        from pxh import api as _api
+        sample = _api._collect_history_sample(state_dir)
+        assert sample["weather_temp_c"] == pytest.approx(18.5, abs=0.1)
+        assert sample["wind_kmh"] == 22
+        assert sample["humidity_pct"] == 71
+
+    def test_collect_sample_weather_null_when_absent(self, state_dir, monkeypatch):
+        (state_dir / "awareness.json").write_text(json.dumps({"obi_mode": "calm"}))
+        monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
+        from pxh import api as _api
+        sample = _api._collect_history_sample(state_dir)
+        assert sample["weather_temp_c"] is None
+        assert sample["wind_kmh"] is None
+        assert sample["humidity_pct"] is None
 
 
 class TestPublicServices:
