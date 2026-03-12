@@ -462,7 +462,7 @@ async def public_awareness() -> Dict[str, Any]:
     raw_weather = awareness.get("weather")
     if isinstance(raw_weather, dict):
         weather_out: Any = {
-            "temp_c": raw_weather.get("temp_C"),      # normalise uppercase → lowercase
+            "temp_c": raw_weather.get("temp_c") if raw_weather.get("temp_c") is not None else raw_weather.get("temp_C"),
             "wind_kmh": raw_weather.get("wind_kmh"),
             "humidity_pct": raw_weather.get("humidity_pct"),
             "summary": raw_weather.get("summary"),

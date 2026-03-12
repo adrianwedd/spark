@@ -761,7 +761,7 @@ def battery_warn_comment(pct: int, dry: bool) -> None:
 def fetch_weather(dry: bool) -> dict | None:
     """Get weather via tool-weather. Returns summary dict or None."""
     if dry:
-        return {"temp_C": 20, "summary": "Dry-run: mild and clear."}
+        return {"temp_c": 20, "summary": "Dry-run: mild and clear."}
     try:
         env = os.environ.copy()
         env["PX_DRY"] = "0"  # live fetch — tool-weather skips network on PX_DRY=1
@@ -775,7 +775,7 @@ def fetch_weather(dry: bool) -> dict | None:
                     data = json.loads(line)
                     if data.get("status") == "ok":
                         return {
-                            "temp_C": data.get("temp_C"),
+                            "temp_c": data.get("temp_c"),
                             "wind_kmh": data.get("wind_kmh"),
                             "humidity_pct": data.get("humidity_pct"),
                             "summary": data.get("summary", ""),
@@ -880,7 +880,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         if weather:
             _cached_weather = weather
             _last_weather_fetch = now_mono
-            temp = weather.get("temp_C")
+            temp = weather.get("temp_c")
             log(f"weather refreshed: {temp}°C" if temp is not None else "weather refreshed: (no temp data)")
 
     # Detect transitions
