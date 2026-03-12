@@ -25,7 +25,7 @@ Expand the public dashboard at `spark.wedd.au` from a 4-card stat grid into a ri
 
 ### New Backend Additions
 
-**`GET /api/v1/public/awareness`** — unauthenticated, CORS-enabled. Reads `state/awareness.json` directly and returns a subset safe for public exposure:
+**`GET /api/v1/public/awareness`** — unauthenticated, CORS-enabled. Reads `state/awareness.json` and returns a flattened, normalised subset safe for public exposure. Field projection is explicit — not a raw passthrough:
 
 ```json
 {
@@ -41,7 +41,30 @@ Expand the public dashboard at `spark.wedd.au` from a 4-card stat grid into a ri
 }
 ```
 
-**`GET /api/v1/public/history`** — unauthenticated, CORS-enabled. Returns a JSON array of up to 60 readings from an in-memory ring buffer (`collections.deque`, maxlen=60). A background thread appends one reading every 30s:
+Field mapping from `awareness.json` (all projections made explicit):
+
+| Response field | Source path in awareness.json | Notes |
+|----------------|-------------------------------|-------|
+| `obi_mode` | `awareness["obi_mode"]` | |
+| `person_present` | `awareness["frigate"]["person_present"]` | `false` if frigate key absent |
+| `frigate_score` | `awareness["frigate"]["score"]` | `null` if absent |
+| `ambient_level` | `awareness["ambient_sound"]["level"]` | `null` if absent |
+| `ambient_rms` | `awareness["ambient_sound"]["rms"]` | `null` if absent |
+| `weather.temp_c` | `awareness["weather"]["temp_C"]` | Normalised to lowercase `temp_c` on the way out |
+| `weather.wind_kmh` | `awareness["weather"]["wind_kmh"]` | |
+| `weather.humidity_pct` | `awareness["weather"]["humidity_pct"]` | |
+| `weather.summary` | `awareness["weather"]["summary"]` | |
+| `minutes_since_speech` | `awareness["minutes_since_speech"]` | |
+| `time_period` | `awareness["time_period"]` | |
+| `ts` | `awareness["ts"]` | |
+
+Any field that cannot be read (key missing, file unreadable) returns `null` for that field — not an error.
+
+---
+
+**`GET /api/v1/public/history`** — unauthenticated, CORS-enabled. Returns a JSON array of up to 60 readings from an in-memory ring buffer (`collections.deque`, maxlen=60). A background thread appends one reading every 30s. At 30s intervals, 60 readings = 30 minutes of history.
+
+Sonar is read directly from `state/sonar_live.json` with the same age gate used by `/public/sonar` (age > 60s → `sonar_cm: null`).
 
 ```json
 [
@@ -53,26 +76,54 @@ Expand the public dashboard at `spark.wedd.au` from a 4-card stat grid into a ri
 
 Ring buffer is lost on restart (acceptable — localStorage fills the gap immediately). No persistence needed.
 
-**`GET /api/v1/services`** — promoted from auth-required to public. Returns service health dict `{service_name: status}` for `px-mind`, `px-alive`, `px-wake-listen`, `px-battery-poll`, `px-api-server`. Read-only, no credentials exposed.
+---
+
+**`GET /api/v1/services`** — promoted from auth-required to public. Returns a normalised dict `{service_name: status_string}` for the five core services. The existing auth-required endpoint returns a raw list from `systemctl show`; the public version returns a simplified shape to avoid breaking the existing web UI.
+
+> **Implementation note:** The existing `_MANAGED_SERVICES` set in `api.py` contains four services (`px-alive`, `px-wake-listen`, `px-mind`, `px-api-server`) — `px-battery-poll` is missing. The public endpoint should query all five; add `px-battery-poll` to the query list in the new public handler (or to `_MANAGED_SERVICES` if the authenticated endpoint should also track it).
+
+```json
+{
+  "px-mind": "active",
+  "px-alive": "active",
+  "px-wake-listen": "active",
+  "px-battery-poll": "active",
+  "px-api-server": "active"
+}
+```
+
+Status values: `"active"` / `"activating"` / `"failed"` / `"inactive"` / `"unknown"`. The existing authenticated `/api/v1/services` endpoint is unchanged.
+
+---
 
 ### Frontend Structure
 
-Three new files replace/extend the current `live.js`:
+Three new/rewritten files:
 
 | File | Responsibility |
 |------|---------------|
-| `site/live.js` | Polling orchestrator — parallel fetches, state merge, drives renders |
-| `site/charts.js` | All canvas drawing — sparklines, sonar arc, waveform bars, gauges |
+| `site/live.js` | Polling orchestrator — parallel fetches, state merge, localStorage accumulation, drives renders |
+| `site/charts.js` | All canvas drawing — sparklines, sonar arc, waveform bars, gauge arc |
 | `site/dashboard.js` | DOM update functions — binds data to elements, manages toggle state |
 
-`live.js` polls four endpoints in parallel every 30s with a 5s timeout each:
+**localStorage keys** (both must be named to avoid collision with existing `spark_last_known`):
+
+| Key | Contents |
+|-----|----------|
+| `spark_last_known` | Existing snapshot cache — unchanged |
+| `spark_history` | JSON array of rolling vitals readings (max 120 entries, same shape as `/public/history`) |
+| `spark_machine_open` | `"true"` / `"false"` — persists MACHINE toggle state |
+
+**Polling:** `live.js` fetches five endpoints in parallel every 30s with a 5s timeout each:
 - `/api/v1/public/status`
 - `/api/v1/public/vitals`
-- `/api/v1/public/awareness`
-- `/api/v1/public/sonar` (or sonar absorbed into awareness)
+- `/api/v1/public/awareness` (sonar_cm is **not** fetched separately — awareness endpoint does not include it; sonar comes from `/public/history` for sparklines and from the history ring buffer background thread)
+- `/api/v1/public/history` (polled once on load and on sparkline open, not every 30s)
 - `/api/v1/services`
 
-Results merge into a single `state` object. Each endpoint failure degrades independently — awareness offline doesn't blank vitals. Accumulated readings appended to `localStorage` on every successful vitals+sonar poll.
+> **Sonar in the live display:** real-time `sonar_cm` for the proximity arc in PRESENCE comes from `/api/v1/public/sonar` (existing endpoint, unchanged). `/public/awareness` does not duplicate it. This resolves the sonar endpoint ambiguity — `/public/sonar` is kept, awareness does not absorb it.
+
+Results merge into a single `state` object. Each endpoint failure degrades independently.
 
 ---
 
@@ -84,74 +135,79 @@ Always visible. The dominant "alive" signal.
 
 ### Mood Pulse (left)
 - Large filled circle (~120px diameter) in current theme accent colour
-- Slow CSS `scale` pulse animation; speed maps to arousal from `mood` field:
-  - peaceful/content → 4s cycle
-  - curious/contemplative → 2.5s cycle
-  - excited/active → 1.5s cycle
+- Slow CSS `scale` pulse animation via class swap (never inline `style.animationDuration`):
+
+| CSS class | Cycle | Applied when |
+|-----------|-------|-------------|
+| `pulse-slow` | 4s | mood: peaceful, content |
+| `pulse-mid` | 2.5s | mood: curious, contemplative |
+| `pulse-fast` | 1.5s | mood: excited, active |
+
 - Mood word in large type inside the circle
 - Below: `obi_mode` as a human-readable line:
   - `absent` → "Obi's probably asleep"
   - `calm` → "Obi seems nearby"
   - `active` → "Obi is around"
   - `possibly-overloaded` → "Things seem busy"
-  - `unknown` → omitted
+  - `unknown` → line omitted entirely
 
 ### Last Thought (centre)
 - Existing pull-quote, larger, more vertical breathing room
-- Below the quote: mood word + salience as filled dots (●●●○○, 5-dot scale) + "X min ago"
+- Below the quote: mood word + salience as filled dots (●●●○○, 5-dot scale from `salience` 0–1) + "X min ago"
 - Salience dots encode importance visually without needing to explain the concept
 
 ### Proximity (right)
-- 180° SVG fan arc, top-down view, fills from centre outward by distance:
-  - < 40cm → full fan, warm accent colour
-  - 40–100cm → partial fill, neutral
-  - > 150cm → thin sliver, cool/muted colour
+- 180° SVG fan arc, top-down view. Arc fill is **inversely proportional to distance** — close object = large filled arc, distant object = thin sliver:
+  - `sonar_cm` < 40 → full fan (180°), warm accent colour
+  - 40–100cm → partial fill (~90°), neutral colour
+  - > 150cm → thin sliver (~20°), cool/muted colour
   - Unavailable → empty arc outline only
-- Below arc: Frigate indicator — person icon (filled = detected, hollow = not) + confidence % when detected. Hidden entirely if Frigate is offline/unavailable.
+- Below arc: Frigate indicator — person-icon character (filled = detected, hollow = not) + confidence % when detected. Hidden entirely if `person_present` is `null` (Frigate offline).
 
 ---
 
 ## Section 2: WORLD Band
 
-Always visible. Sits below PRESENCE on a subtly differentiated background.
+Always visible. Sits below PRESENCE on a subtly differentiated background (CSS class `band-world`, not inline style).
 
 ### Ambient Sound (left ~40%)
 - Row of ~40 thin vertical canvas bars spanning the column width
-- Animated every 2s independently of API poll
-- Bar heights generated from current `ambient_rms` value as an organic distribution (seeded random, not real audio samples) — loud RMS → tall jagged bars, silent → nearly flat gentle drift
-- `ambient_level` label to the left: "silent / quiet / moderate / loud"
+- Animated every 2s independently of API poll via `setInterval`
+- Bar heights generated organically from current `ambient_rms` scalar (seeded deterministic random, not real audio samples) — high RMS → tall jagged bars, near-zero → nearly flat gentle drift
+- `ambient_level` label to the left as plain text: "silent / quiet / moderate / loud"
+- See Waveform Honesty Note below
 
 ### Weather Strip (centre ~35%)
-- Single horizontal line: temperature + Unicode weather symbol (☀ ☁ 🌧 ❄) + wind + humidity + one-word summary
-- Hidden entirely if weather data is unavailable (not broken-state placeholder)
+- Single horizontal line: temperature + Unicode weather symbol (☀ ☁ 🌧 ❄ — character literals in HTML/JS, not images or background-image) + wind + humidity + one-word summary
+- Source: `weather` object from `/public/awareness`; `temp_c` field (lowercase, already normalised by the endpoint)
+- Hidden entirely if `weather` is `null` (not a broken-state placeholder)
 
 ### Time Context (right ~25%)
-- Current AEDT time
-- `time_period` as a soft badge: "morning" / "afternoon" / "evening" / "night"
-- "Last spoke X min ago" (from `minutes_since_speech`) — human-readable, not a raw number. Shows "hasn't spoken recently" if > 30 min.
+- Current AEDT time (computed client-side)
+- `time_period` as a soft badge (CSS class swap, not inline style): "morning" / "afternoon" / "evening" / "night"
+- "Last spoke X min ago" from `minutes_since_speech`. Shows "hasn't spoken recently" if > 30 min.
 
 ---
 
 ## Section 3: MACHINE Band
 
-Hidden by default. Revealed by "show internals ↓" toggle. CSS `max-height` transition on expand/collapse. Toggle state persisted in `localStorage`.
+Hidden by default. Revealed by "show internals ↓" toggle. CSS `max-height` transition on expand/collapse. Toggle state persisted in `localStorage` as `spark_machine_open`.
 
 **3×2 grid of metric tiles:**
 
 | Tile | Visual | Sparkline |
 |------|--------|-----------|
-| CPU % | Horizontal bar + value | Click → 30-point sparkline |
-| CPU temp | Radial gauge arc (SVG, 0–85°C); green → amber at 65° → red at 75° | None needed |
-| RAM % | Horizontal bar + value | Click → 30-point sparkline |
-| Disk % | Horizontal bar + value; colour-shifts at 80%/90% | None (changes too slowly) |
-| Battery | Horizontal bar + voltage in small text; ⚡ when charging | Click → 30-point sparkline |
-| Services | Row of named status dots (green/amber/red) for each systemd service | None |
+| CPU % | Horizontal bar + value | Click → 30-point sparkline (30 min) |
+| CPU temp | Radial gauge arc (SVG, 0–85°C); CSS classes `gauge-ok` / `gauge-warn` (≥65°) / `gauge-crit` (≥75°) | None needed |
+| RAM % | Horizontal bar + value | Click → 30-point sparkline (30 min) |
+| Disk % | Horizontal bar + value; CSS class `warn` at ≥80%, `crit` at ≥90% | None (changes too slowly) |
+| Battery | Horizontal bar + voltage in small text; `⚡` character literal when charging | Click → 30-point sparkline (30 min) |
+| Services | Row of named status dots for each service; CSS classes `dot-ok` / `dot-warn` / `dot-err` | None |
 
 **Inline sparkline behaviour:**
-- Clicking an eligible tile appends a `<canvas>` directly below it
-- Fetches `/public/history`, merges with localStorage history (deduped + sorted by ts), draws 30-point time series
-- "last 30 min" label + min/max range shown below chart
-- Clicking again collapses. Only one sparkline open at a time.
+- Clicking an eligible tile fetches `/public/history` and merges with `spark_history` from localStorage (deduplicated by `ts`, sorted ascending). Draws at most 60 points = 30 minutes.
+- Appends a `<canvas>` directly below the tile with a "last 30 min" label + min/max range
+- Clicking again collapses. Only one sparkline open at a time (opening a second collapses the first).
 
 Toggle label flips to "hide internals ↑" when expanded.
 
@@ -160,39 +216,52 @@ Toggle label flips to "hide internals ↑" when expanded.
 ## Data Flow
 
 ```
+On page load:
+  read localStorage spark_last_known → hydrate state immediately (zero-flash)
+  read localStorage spark_history → available for sparklines immediately
+  fire first poll
+
 Every 30s:
-  parallel fetch → /status, /vitals, /awareness, /services  (5s timeout each)
+  parallel fetch (5s timeout each):
+    /public/status    → mood, last_thought, persona, listening
+    /public/vitals    → cpu_pct, cpu_temp_c, ram_pct, disk_pct, battery_pct
+    /public/awareness → obi_mode, person_present, frigate_score, ambient_*, weather, time_period
+    /public/sonar     → sonar_cm (for proximity arc)
+    /services         → service status dict
   merge → state object
-  append vitals+sonar to localStorage ring (keep last 120 entries)
+  append {ts, cpu_pct, cpu_temp_c, ram_pct, battery_pct, sonar_cm, ambient_rms} to spark_history
+    (keep last 120 entries; 120 × 30s = 60 min local buffer)
   render all three bands
 
-Every 2s (independent):
+Every 2s (independent setInterval):
   regenerate waveform bars from last known ambient_rms
 
 On sparkline open:
-  fetch /public/history → merge with localStorage → dedupe → sort → draw canvas
+  fetch /public/history
+  merge with spark_history from localStorage (dedup by ts, sort asc)
+  draw 60-point canvas sparkline
 
-On page load:
-  read localStorage → hydrate state immediately (zero-flash)
-  then first poll fires
+Backend (separate thread, every 30s):
+  read psutil + state/sonar_live.json (age gate: null if > 60s) + state/battery.json
+  append to deque(maxlen=60)
 ```
 
 ---
 
 ## Error Handling & Offline
 
-- Each endpoint degrades independently — awareness offline doesn't blank vitals band
-- PRESENCE band in offline state: hollow (unfilled) pulse circle, greyed thought text, no obi_mode line
-- WORLD band collapses silently if awareness unavailable
-- MACHINE band shows last known values with "X min ago" timestamp
-- Existing "last updated" banner extended to show per-section staleness
-- History endpoint failure → sparkline falls back to localStorage-only data; if localStorage also empty, tile shows "no history yet"
+- Each endpoint degrades independently — awareness offline doesn't blank vitals
+- PRESENCE offline: hollow (unfilled, outline-only) pulse circle, greyed thought text, no obi_mode line
+- WORLD offline: entire band collapses (CSS class `band-hidden`)
+- MACHINE: shows last known values from localStorage with "X min ago" timestamp
+- Existing "last updated" banner extended per-section: each band tracks its own last-successful-ts
+- History endpoint failure → sparkline uses localStorage-only data; if localStorage also empty, tile shows "no history yet" message
 
 ---
 
 ## Waveform Honesty Note
 
-The ambient sound waveform is **not** a real audio waveform — we only have an RMS scalar, not audio samples. The animation generates a plausible organic shape seeded from the RMS value. This is clearly aesthetic, not misleading: we're showing "it's loud/quiet" in a visual way, not claiming to display actual microphone data. No label needed; the `level` text is the authoritative reading.
+The ambient sound waveform is **not** a real audio waveform — the API provides only an RMS scalar, not audio samples. The animation generates a plausible organic bar shape seeded from the RMS value each 2s cycle. This is aesthetic, not misleading: the `ambient_level` text label is the authoritative reading. The visual conveys "loud/quiet" without pretending to show actual microphone data.
 
 ---
 
@@ -200,16 +269,29 @@ The ambient sound waveform is **not** a real audio waveform — we only have an 
 
 | File | Change |
 |------|--------|
-| `src/pxh/api.py` | Add `/public/awareness`, `/public/history` endpoints; make `/services` public; add history background thread |
-| `site/live.js` | Rewrite — add new endpoint polling, localStorage accumulation |
-| `site/charts.js` | New — canvas drawing: sparklines, sonar arc SVG, waveform bars, gauge arc |
-| `site/dashboard.js` | New — DOM update functions, toggle state management |
-| `site/index.html` | Replace `#status` section with three-band layout |
+| `src/pxh/api.py` | Add `/public/awareness` (with explicit field projection + key normalisation), `/public/history` (ring buffer + background thread), new public `/services` (normalised dict shape, separate from existing auth'd endpoint) |
+| `site/live.js` | Rewrite — parallel polling of 5 endpoints, localStorage accumulation under `spark_history` key |
+| `site/charts.js` | New — canvas: sparklines, waveform bars, gauge arc; SVG: proximity arc |
+| `site/dashboard.js` | New — DOM updates, CSS class swaps (never inline styles), toggle state management |
+| `site/index.html` | Replace `#status` section with three-band layout; add `<script>` tags for new files |
 
 ---
 
 ## Testing
 
-- Backend: pytest — `/public/awareness` returns correct subset of awareness.json; `/public/history` returns array; ring buffer maxlen enforced; `/services` accessible without auth
-- Frontend: manual — verify each band renders correctly with live data; verify offline degradation per band; verify sparkline open/close; verify localStorage persistence across page reload; verify dark/warm theme both render correctly
-- CSP: verify no inline styles introduced (all dynamic colour via CSS class swaps)
+**Backend (pytest):**
+- `/public/awareness` returns correct flattened projection; `temp_c` (lowercase) present; `person_present` is `false` (not absent) when frigate key missing from awareness.json; any missing nested key returns `null` for that field, not a 500
+- `/public/history` returns array; maxlen=60 enforced after 61 appends; `sonar_cm` is `null` when sonar_live.json is stale (> 60s)
+- `/services` accessible without auth token; returns dict (not list); values are one of the five defined status strings
+
+**Frontend (manual):**
+- Each band renders correctly with live data in both warm and dark themes
+- Offline degradation: kill px-api-server, verify each band degrades independently
+- Sparkline: open/close on eligible tiles; only one open at a time; "no history yet" when localStorage empty
+- localStorage: `spark_history` accumulates; `spark_machine_open` persists toggle across reload
+- CSP: DevTools console shows zero CSP violations; no inline `style=` attributes set by JS
+
+**Waveform:**
+- Silent RMS (< 200) produces nearly flat bars
+- Loud RMS (> 1500) produces tall varied bars
+- Animation runs at 2s independently of API failures
