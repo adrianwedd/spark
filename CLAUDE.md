@@ -83,17 +83,30 @@ bin/run-wake [--wake-word "hey robot"] [--dry-run]
 ```
 
 `bin/px-wake-listen` uses a priority chain of STT backends:
-- **faster-whisper** (`models/whisper/...faster-whisper-base.en/`) — primary, best AU accent support, anti-hallucination filters
-- **sherpa-onnx Zipformer** (`models/sherpa-onnx-streaming-zipformer-en-2023-06-26/`) — fallback
+- **SenseVoice** (`models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/`) — primary; non-autoregressive, fastest (~5s), handles AU English
+- **faster-whisper** (`models/whisper/...faster-whisper-base.en/`) — fallback; best AU accent support, anti-hallucination filters
+- **sherpa-onnx Zipformer** (`models/sherpa-onnx-streaming-zipformer-en-2023-06-26/`) — second fallback
 - **Vosk** (`models/vosk-model-small-en-us-0.15/`) — wake word grammar detection only (low CPU)
 
-On wake: plays 440 Hz chime, records until 1.5 s silence (max 8 s), transcribes via `_do_transcribe()` priority chain, pipes to voice loop. Supports multi-turn conversation (default 5 turns) with follow-up listening between turns.
+On wake: plays 440 Hz chime, records until `SILENCE_S=3.0 s` of quiet (RMS < 300) or `MAX_RECORD_S=20 s` hard cap, transcribes via `_do_transcribe()` priority chain, pipes to voice loop. Supports multi-turn conversation (default 5 turns) with follow-up listening between turns.
 
 **Whisper anti-hallucination**: `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`. Post-filters: non-ASCII dominant → reject, phantom phrases ("Thank you.", "Thanks for watching.") → reject, repetitive (unique ratio <30%) → reject.
 
 **Persona routing**: session `persona` field checked first, then utterance keywords ("gremlin" or "vixen"). Routes to `tool-chat` / `tool-chat-vixen` (Ollama) for the full conversation — not the Claude voice loop.
 
 Models must be downloaded separately (gitignored). `bpe_model` kwarg is **not** supported by the installed sherpa-onnx — do not add it to `load_stt_model()`.
+
+### Audio Pipeline
+
+Speech output chain: `espeak --stdout` → WAV bytes → `aplay -D pulse` → PulseAudio → HifiBerry DAC (card `sndrpihifiberry`) → robot_hat MAX98357A amp → speaker.
+
+**Critical: root ↔ PulseAudio socket.** PulseAudio runs as user `pi` with its socket at `/run/user/1000/pulse/native`. When `px-perform` or `tool-voice` are called as root (via sudo from px-wake-listen), `aplay -D pulse` cannot find the socket because root's `XDG_RUNTIME_DIR` is `/run/user/0`, not `/run/user/1000`. Both scripts explicitly set `PULSE_SERVER=unix:/run/user/1000/pulse/native` in the aplay subprocess env. Do not remove this — the audio will silently fail. `px-perform` uses `stderr=DEVNULL` for aplay, so failures are not visible in logs without this fix.
+
+**Speaker amp enable:** `robot_hat.enable_speaker()` toggles GPIO 20 HIGH before any audio. Both `tool-voice` and `px-perform` call this. Without it the MAX98357A amp is disabled and nothing is audible even though aplay exits 0.
+
+**PulseAudio holds the DAC exclusively.** Direct `aplay -D robothat` (ALSA bypass) fails with "device busy". Always route through PulseAudio (`-D pulse`).
+
+**px-env** sets `export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"` — this helps when scripts run as pi user but doesn't help root subprocesses. The `PULSE_SERVER` env var in the aplay subprocess call is the reliable fix.
 
 ### Idle-Alive Daemon
 
@@ -118,9 +131,9 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 ```
 
 Three-layer cognitive architecture:
-- **Layer 1 — Awareness** (every 30 s, no LLM): sonar + session + temporal state → `state/awareness.json` + transition detection
+- **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state → `state/awareness.json` + transition detection
 - **Layer 2 — Reflection** (on transition or every 2 min idle): three-tier fallback — Claude CLI (SPARK, internet) → Ollama on M1.local (LAN) → Ollama on Pi localhost (offline). Falls back automatically on any error; each fallback step is logged. Generates thought with mood/action/salience → `state/thoughts.jsonl`
-- **Layer 3 — Expression** (30 s cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions: `wait, greet, comment, remember, look_at, weather_comment, scan`. Photo capture (`tool-describe-scene`) is **on-request only** — not dispatched autonomously. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions: `wait, greet, comment, remember, look_at, weather_comment, scan`. Photo capture (`tool-describe-scene`) is **on-request only** — not dispatched autonomously. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
 The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`) and during quiet mode. Auto-remembers high-salience (>0.7) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
 
