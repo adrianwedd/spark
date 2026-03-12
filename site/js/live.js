@@ -235,9 +235,8 @@
       if (t.mood) {
         const badge = document.createElement('span');
         badge.className = 'carousel-mood-badge';
+        badge.dataset.mood = t.mood.toLowerCase();
         badge.textContent = t.mood;
-        const col = MOOD_COLOR[t.mood.toLowerCase()];
-        if (col) { badge.style.background = col; badge.style.color = '#fff'; }
         meta.appendChild(badge);
       }
 

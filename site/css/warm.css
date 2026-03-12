@@ -254,6 +254,10 @@ details > *:not(summary) { margin-top: 0.75rem; }
   margin-top: 0.2rem;
 }
 
+.section-eyebrow-spaced { margin-top: 0.9rem; }
+.wx-metric-row-spaced   { margin-top: 0.75rem; }
+.wx-metric-row-last     { border-bottom: none; padding-bottom: 0; }
+
 .thought-salience-trend {
   margin-top: 0.4rem;
   border-top: 1px solid rgba(0,0,0,0.05);
@@ -589,9 +593,16 @@ details > *:not(summary) { margin-top: 0.75rem; }
   font-size: 0.7rem;
   font-weight: 700;
   letter-spacing: 0.06em;
-  margin-bottom: 0.9rem;
   text-transform: uppercase;
+  color: #fff;
+  background: var(--warm-accent);  /* fallback */
 }
+.carousel-mood-badge[data-mood="peaceful"],
+.carousel-mood-badge[data-mood="content"]      { background: #6aab6b; }
+.carousel-mood-badge[data-mood="contemplative"] { background: #7c6fcf; }
+.carousel-mood-badge[data-mood="curious"]       { background: #e6a817; }
+.carousel-mood-badge[data-mood="active"]        { background: #2ea8e0; }
+.carousel-mood-badge[data-mood="excited"]       { background: #e05c3a; }
 
 .carousel-quote {
   font-family: 'Playfair Display', Georgia, 'Times New Roman', serif;
