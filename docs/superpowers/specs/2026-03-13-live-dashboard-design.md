@@ -78,9 +78,21 @@ Ring buffer is lost on restart (acceptable — localStorage fills the gap immedi
 
 ---
 
-**`GET /api/v1/services`** — promoted from auth-required to public. Returns a normalised dict `{service_name: status_string}` for the five core services. The existing auth-required endpoint returns a raw list from `systemctl show`; the public version returns a simplified shape to avoid breaking the existing web UI.
+**`GET /api/v1/public/services`** — new unauthenticated endpoint (do **not** modify the existing `GET /api/v1/services` which is auth-required, returns `{"services": [list of dicts]}`, and is consumed by the embedded web UI at `api.py:903`). The new public endpoint returns a simplified normalised dict:
 
-> **Implementation note:** The existing `_MANAGED_SERVICES` set in `api.py` contains four services (`px-alive`, `px-wake-listen`, `px-mind`, `px-api-server`) — `px-battery-poll` is missing. The public endpoint should query all five; add `px-battery-poll` to the query list in the new public handler (or to `_MANAGED_SERVICES` if the authenticated endpoint should also track it).
+```json
+{
+  "px-mind": "active",
+  "px-alive": "active",
+  "px-wake-listen": "active",
+  "px-battery-poll": "active",
+  "px-api-server": "active"
+}
+```
+
+Status values: `"active"` / `"activating"` / `"failed"` / `"inactive"` / `"unknown"`.
+
+> **Implementation note:** The existing `_MANAGED_SERVICES` set contains four services — `px-battery-poll` is missing. The new public handler should query all five explicitly (no need to modify `_MANAGED_SERVICES` unless the authenticated endpoint also needs to track it).
 
 ```json
 {
@@ -98,13 +110,13 @@ Status values: `"active"` / `"activating"` / `"failed"` / `"inactive"` / `"unkno
 
 ### Frontend Structure
 
-Three new/rewritten files:
+Three new/rewritten files (all under `site/js/` to match existing file layout):
 
 | File | Responsibility |
 |------|---------------|
-| `site/live.js` | Polling orchestrator — parallel fetches, state merge, localStorage accumulation, drives renders |
-| `site/charts.js` | All canvas drawing — sparklines, sonar arc, waveform bars, gauge arc |
-| `site/dashboard.js` | DOM update functions — binds data to elements, manages toggle state |
+| `site/js/live.js` | Polling orchestrator — parallel fetches, state merge, localStorage accumulation, drives renders |
+| `site/js/charts.js` | All canvas drawing — sparklines, sonar arc, waveform bars, gauge arc |
+| `site/js/dashboard.js` | DOM update functions — binds data to elements, manages toggle state |
 
 **localStorage keys** (both must be named to avoid collision with existing `spark_last_known`):
 
@@ -117,11 +129,11 @@ Three new/rewritten files:
 **Polling:** `live.js` fetches five endpoints in parallel every 30s with a 5s timeout each:
 - `/api/v1/public/status`
 - `/api/v1/public/vitals`
-- `/api/v1/public/awareness` (sonar_cm is **not** fetched separately — awareness endpoint does not include it; sonar comes from `/public/history` for sparklines and from the history ring buffer background thread)
-- `/api/v1/public/history` (polled once on load and on sparkline open, not every 30s)
-- `/api/v1/services`
+- `/api/v1/public/sonar` — real-time `sonar_cm` for the PRESENCE proximity arc (existing endpoint, unchanged)
+- `/api/v1/public/awareness` — does **not** include `sonar_cm`; that comes from `/public/sonar` above
+- `/api/v1/public/services` — new endpoint (see above)
 
-> **Sonar in the live display:** real-time `sonar_cm` for the proximity arc in PRESENCE comes from `/api/v1/public/sonar` (existing endpoint, unchanged). `/public/awareness` does not duplicate it. This resolves the sonar endpoint ambiguity — `/public/sonar` is kept, awareness does not absorb it.
+`/api/v1/public/history` is fetched separately: once on page load and again when a sparkline is opened. It is not part of the 30s poll cycle.
 
 Results merge into a single `state` object. Each endpoint failure degrades independently.
 
@@ -225,9 +237,9 @@ Every 30s:
   parallel fetch (5s timeout each):
     /public/status    → mood, last_thought, persona, listening
     /public/vitals    → cpu_pct, cpu_temp_c, ram_pct, disk_pct, battery_pct
+    /public/sonar     → sonar_cm (for PRESENCE proximity arc)
     /public/awareness → obi_mode, person_present, frigate_score, ambient_*, weather, time_period
-    /public/sonar     → sonar_cm (for proximity arc)
-    /services         → service status dict
+    /public/services  → service status dict (new endpoint)
   merge → state object
   append {ts, cpu_pct, cpu_temp_c, ram_pct, battery_pct, sonar_cm, ambient_rms} to spark_history
     (keep last 120 entries; 120 × 30s = 60 min local buffer)
@@ -269,11 +281,11 @@ The ambient sound waveform is **not** a real audio waveform — the API provides
 
 | File | Change |
 |------|--------|
-| `src/pxh/api.py` | Add `/public/awareness` (with explicit field projection + key normalisation), `/public/history` (ring buffer + background thread), new public `/services` (normalised dict shape, separate from existing auth'd endpoint) |
-| `site/live.js` | Rewrite — parallel polling of 5 endpoints, localStorage accumulation under `spark_history` key |
-| `site/charts.js` | New — canvas: sparklines, waveform bars, gauge arc; SVG: proximity arc |
-| `site/dashboard.js` | New — DOM updates, CSS class swaps (never inline styles), toggle state management |
-| `site/index.html` | Replace `#status` section with three-band layout; add `<script>` tags for new files |
+| `src/pxh/api.py` | Add `/public/awareness` (explicit field projection + key normalisation), `/public/history` (ring buffer + background thread), `/public/services` (new public endpoint, normalised dict — existing auth'd `/services` unchanged) |
+| `site/js/live.js` | Rewrite — parallel polling of 5 endpoints, localStorage accumulation under `spark_history` key |
+| `site/js/charts.js` | New — canvas: sparklines, waveform bars, gauge arc; SVG: proximity arc |
+| `site/js/dashboard.js` | New — DOM updates, CSS class swaps (never inline styles), toggle state management |
+| `site/index.html` | Replace `#status` section with three-band layout; update `<script>` tags to reference new files |
 
 ---
 
@@ -282,7 +294,7 @@ The ambient sound waveform is **not** a real audio waveform — the API provides
 **Backend (pytest):**
 - `/public/awareness` returns correct flattened projection; `temp_c` (lowercase) present; `person_present` is `false` (not absent) when frigate key missing from awareness.json; any missing nested key returns `null` for that field, not a 500
 - `/public/history` returns array; maxlen=60 enforced after 61 appends; `sonar_cm` is `null` when sonar_live.json is stale (> 60s)
-- `/services` accessible without auth token; returns dict (not list); values are one of the five defined status strings
+- `/public/services` accessible without auth token; returns dict (not list); values are one of the five defined status strings; existing auth'd `/services` still returns `{"services": [list]}` unchanged
 
 **Frontend (manual):**
 - Each band renders correctly with live data in both warm and dark themes
