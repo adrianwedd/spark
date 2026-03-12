@@ -147,7 +147,7 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 
     # Night + quiet + Frigate online but no detection → absent
     if not is_day and ambient_level in ("silent", "quiet"):
-        if "frigate" in awareness:   # Frigate replied: no one there
+        if awareness.get("frigate") is not None:   # Frigate replied: no one there
             return "absent"
         if not close:                # Frigate offline, trust sonar
             return "absent"
@@ -467,8 +467,6 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     """
     if dry:
         return None
-    import socket
-
     since = time.time() - FRIGATE_WINDOW_S
     url = (
         f"{FRIGATE_HOST}/api/events"
