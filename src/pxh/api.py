@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import subprocess
@@ -21,10 +22,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .state import load_session, update_session
+from .time import utc_timestamp
 from .voice_loop import (
     ALLOWED_TOOLS,
     PERSONA_PROMPTS,
@@ -81,6 +84,15 @@ async def _lifespan(application: FastAPI):
 
 
 app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://spark.wedd.au", "http://localhost:8000"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
+_THERMAL_ZONE = Path("/sys/class/thermal/thermal_zone0/temp")
 
 # ---------------------------------------------------------------------------
 # Job registry (async wander)
@@ -162,6 +174,11 @@ def _resolve_dry(requested: Optional[bool]) -> bool:
     return requested
 
 
+def _public_state_dir() -> Path:
+    """Resolve STATE_DIR respecting PX_STATE_DIR override (same as px-mind)."""
+    return Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -169,6 +186,103 @@ def _resolve_dry(requested: Optional[bool]) -> bool:
 @app.get("/api/v1/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Public read-only endpoints (no auth required)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/public/status")
+async def public_status() -> Dict[str, Any]:
+    """Live SPARK status: persona, mood, last thought. No auth required."""
+    session = load_session()
+    persona = (session.get("persona") or "").strip().lower()
+
+    state_dir = _public_state_dir()
+    if persona:
+        thoughts_path = state_dir / f"thoughts-{persona}.jsonl"
+    else:
+        thoughts_path = state_dir / "thoughts.jsonl"
+
+    last = {}
+    try:
+        lines = thoughts_path.read_text().strip().splitlines()
+        if lines:
+            last = json.loads(lines[-1])
+    except Exception:
+        pass
+
+    return {
+        "persona": persona or None,
+        "mood": last.get("mood"),
+        "last_thought": last.get("thought"),
+        "last_action": last.get("action"),
+        "ts": last.get("ts"),
+        "listening": session.get("listening", False),
+    }
+
+
+@app.get("/api/v1/public/vitals")
+async def public_vitals() -> Dict[str, Any]:
+    """System vitals: CPU, RAM, temp, battery, disk. No auth required."""
+    import time as _time
+
+    cpu_pct = None
+    ram_pct = None
+    disk_pct = None
+    try:
+        import psutil
+        cpu_pct = round(psutil.cpu_percent(interval=None), 1)
+        vm = psutil.virtual_memory()
+        ram_pct = round(vm.percent, 1)
+        dk = psutil.disk_usage("/")
+        disk_pct = round(dk.percent, 1)
+    except Exception:
+        pass
+
+    cpu_temp_c = None
+    try:
+        raw = _THERMAL_ZONE.read_text().strip()
+        cpu_temp_c = round(int(raw) / 1000.0, 1)
+    except Exception:
+        pass
+
+    battery_pct = None
+    try:
+        data = json.loads((_public_state_dir() / "battery.json").read_text())
+        battery_pct = data.get("pct")
+    except Exception:
+        pass
+
+    return {
+        "cpu_pct": cpu_pct,
+        "ram_pct": ram_pct,
+        "cpu_temp_c": cpu_temp_c,
+        "battery_pct": battery_pct,
+        "disk_pct": disk_pct,
+        "ts": utc_timestamp(),
+    }
+
+
+@app.get("/api/v1/public/sonar")
+async def public_sonar() -> Dict[str, Any]:
+    """Latest sonar reading from sonar_live.json. No auth required."""
+    import time as _time
+
+    sonar_path = _public_state_dir() / "sonar_live.json"
+    try:
+        data = json.loads(sonar_path.read_text())
+        ts_float = float(data["ts"])
+        age = round(_time.time() - ts_float)
+        if age > 60:
+            return {"sonar_cm": None, "age_seconds": None, "source": "unavailable"}
+        return {
+            "sonar_cm": data["distance_cm"],
+            "age_seconds": age,
+            "source": "sonar_live",
+        }
+    except Exception:
+        return {"sonar_cm": None, "age_seconds": None, "source": "unavailable"}
 
 
 @app.post("/api/v1/pin/verify")
