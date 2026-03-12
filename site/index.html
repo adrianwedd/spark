@@ -47,41 +47,134 @@
   </div>
 </section>
 
-<!-- ══════════════════════════════════════════════════════ LIVE -->
+<!-- ══════════════════════════════════════════════════ LIVE STATUS -->
 <section id="live" data-theme="warm">
   <div class="container">
     <h2>Live Status</h2>
 
-    <div id="offline-banner" class="hidden offline-banner mb-md">
+    <!-- ─── BAND 1: PRESENCE ─────────────────────────────────────── -->
+    <div class="band band-presence" id="band-presence">
+
+      <!-- Mood Pulse -->
+      <div class="presence-mood">
+        <div id="mood-pulse" class="pulse-circle pulse-mid" aria-label="SPARK mood">
+          <span id="mood-word">…</span>
+        </div>
+        <p id="obi-mode-line" class="obi-mode-text"></p>
+      </div>
+
+      <!-- Last Thought -->
+      <div class="presence-thought">
+        <blockquote id="dashboard-last-thought" class="pull-quote">Nothing on my mind just now…</blockquote>
+        <div class="thought-meta">
+          <span id="thought-mood-word" class="thought-mood"></span>
+          <span id="thought-salience" class="salience-dots" aria-label="thought importance"></span>
+          <span id="thought-age" class="thought-age"></span>
+        </div>
+      </div>
+
+      <!-- Proximity Arc -->
+      <div class="presence-proximity">
+        <svg id="sonar-arc" viewBox="0 0 120 65" width="120" height="65"
+             aria-label="proximity sensor" role="img">
+          <!-- drawn by charts.js -->
+        </svg>
+        <div id="frigate-indicator" class="frigate-row hidden">
+          <span id="frigate-icon" aria-hidden="true">&#x1F464;</span>
+          <span id="frigate-confidence" class="frigate-conf"></span>
+        </div>
+      </div>
+
+    </div><!-- /band-presence -->
+
+    <!-- ─── BAND 2: WORLD ─────────────────────────────────────────── -->
+    <div class="band band-world" id="band-world">
+
+      <!-- Ambient sound -->
+      <div class="world-ambient">
+        <span id="ambient-level-label" class="ambient-label">—</span>
+        <canvas id="waveform-canvas" width="200" height="40"
+                aria-label="ambient sound level visualisation"></canvas>
+      </div>
+
+      <!-- Weather strip -->
+      <div class="world-weather" id="world-weather-strip">
+        <span id="weather-temp"></span>
+        <span id="weather-symbol" aria-hidden="true"></span>
+        <span id="weather-wind"></span>
+        <span id="weather-humidity"></span>
+        <span id="weather-summary" class="weather-summary"></span>
+      </div>
+
+      <!-- Time context -->
+      <div class="world-time">
+        <span id="local-time" class="local-time"></span>
+        <span id="time-period-badge" class="period-badge"></span>
+        <p id="last-spoke" class="last-spoke"></p>
+      </div>
+
+    </div><!-- /band-world -->
+
+    <!-- ─── MACHINE TOGGLE ────────────────────────────────────────── -->
+    <div class="band-machine-toggle">
+      <button id="machine-toggle" class="toggle-btn" type="button"
+              aria-expanded="false" aria-controls="band-machine">
+        show internals ↓
+      </button>
+    </div>
+
+    <!-- ─── BAND 3: MACHINE ───────────────────────────────────────── -->
+    <div class="band band-machine" id="band-machine" aria-hidden="true">
+      <div class="metric-grid">
+
+        <!-- CPU % -->
+        <div class="metric-tile" id="tile-cpu" data-sparkline="cpu_pct">
+          <div class="metric-label">CPU</div>
+          <div class="metric-bar-wrap"><div class="metric-bar" id="bar-cpu"></div></div>
+          <div class="metric-value" id="val-cpu">—</div>
+        </div>
+
+        <!-- CPU Temp (radial gauge) -->
+        <div class="metric-tile" id="tile-temp">
+          <div class="metric-label">CPU Temp</div>
+          <svg id="gauge-temp" viewBox="0 0 80 45" width="80" height="45"
+               aria-label="CPU temperature gauge"></svg>
+          <div class="metric-value" id="val-temp">—</div>
+        </div>
+
+        <!-- RAM % -->
+        <div class="metric-tile" id="tile-ram" data-sparkline="ram_pct">
+          <div class="metric-label">RAM</div>
+          <div class="metric-bar-wrap"><div class="metric-bar" id="bar-ram"></div></div>
+          <div class="metric-value" id="val-ram">—</div>
+        </div>
+
+        <!-- Disk % -->
+        <div class="metric-tile" id="tile-disk">
+          <div class="metric-label">Disk</div>
+          <div class="metric-bar-wrap"><div class="metric-bar" id="bar-disk"></div></div>
+          <div class="metric-value" id="val-disk">—</div>
+        </div>
+
+        <!-- Battery -->
+        <div class="metric-tile" id="tile-battery" data-sparkline="battery_pct">
+          <div class="metric-label">Battery</div>
+          <div class="metric-bar-wrap"><div class="metric-bar" id="bar-battery"></div></div>
+          <div class="metric-value" id="val-battery">—</div>
+        </div>
+
+        <!-- Services -->
+        <div class="metric-tile" id="tile-services">
+          <div class="metric-label">Services</div>
+          <div id="services-dots" class="services-dots"></div>
+        </div>
+
+      </div><!-- /metric-grid -->
+    </div><!-- /band-machine -->
+
+    <!-- Offline banner (below all bands) -->
+    <div id="offline-banner" class="hidden offline-banner mt-sm">
       Pi offline — showing data from <span id="offline-ts"></span>
-    </div>
-
-    <div class="stat-grid">
-      <div class="stat-card ok" id="card-cpu">
-        <div class="stat-value" id="cpu-val">—</div>
-        <div class="stat-label">CPU</div>
-      </div>
-      <div class="stat-card ok" id="card-ram">
-        <div class="stat-value" id="ram-val">—</div>
-        <div class="stat-label">RAM</div>
-      </div>
-      <div class="stat-card ok" id="card-batt">
-        <div class="stat-value" id="batt-val">—</div>
-        <div class="stat-label">Battery</div>
-      </div>
-      <div class="stat-card" id="card-sonar">
-        <div class="stat-value" id="sonar-val">—</div>
-        <div class="stat-label">Sonar</div>
-      </div>
-    </div>
-
-    <div class="warm-card mt-sm">
-      <div class="live-label">Last thought</div>
-      <div id="live-thought" class="text-italic">…</div>
-      <div class="live-meta">
-        <span id="live-mood"></span>
-        <span id="live-ts"></span>
-      </div>
     </div>
 
     <p class="text-xs opacity-40 mt-sm text-right" id="last-updated">
@@ -398,6 +491,8 @@ bin/px-api-server [--dry-run]
 
 <script src="js/highlight.min.js"></script>
 <script src="js/init.js"></script>
+<script src="js/charts.js"></script>
+<script src="js/dashboard.js"></script>
 <script src="js/live.js"></script>
 <script src="js/nav.js"></script>
 </body>

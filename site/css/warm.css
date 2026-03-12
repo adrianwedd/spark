@@ -110,3 +110,264 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .stat-card.ok .stat-value   { color: #16a34a; }
 .stat-card.warn .stat-value { color: #d97706; }
 .stat-card.crit .stat-value { color: #dc2626; }
+
+/* ── Live Dashboard — Bands ───────────────────────────────────── */
+
+.band {
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.band-presence {
+  display: grid;
+  grid-template-columns: 1fr 2fr 1fr;
+  gap: 1.5rem;
+  align-items: start;
+}
+
+.band-world {
+  display: grid;
+  grid-template-columns: 2fr 1.75fr 1.25fr;
+  gap: 1rem;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.band-hidden { display: none; }
+
+@media (max-width: 640px) {
+  .band-presence,
+  .band-world { grid-template-columns: 1fr; }
+}
+
+/* ── Mood Pulse ───────────────────────────────────────────────── */
+
+.pulse-circle {
+  width: 120px;
+  height: 120px;
+  border-radius: 50%;
+  background: var(--warm-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #fff;
+  text-align: center;
+}
+
+@keyframes pulse-slow {
+  0%, 100% { transform: scale(1); }
+  50%       { transform: scale(1.06); }
+}
+@keyframes pulse-mid {
+  0%, 100% { transform: scale(1); }
+  50%       { transform: scale(1.1); }
+}
+@keyframes pulse-fast {
+  0%, 100% { transform: scale(1); }
+  50%       { transform: scale(1.15); }
+}
+
+.pulse-slow { animation: pulse-slow 4s ease-in-out infinite; }
+.pulse-mid  { animation: pulse-mid  2.5s ease-in-out infinite; }
+.pulse-fast { animation: pulse-fast 1.5s ease-in-out infinite; }
+
+.pulse-offline {
+  animation: none;
+  background: transparent;
+  border: 3px solid var(--warm-muted);
+  color: var(--warm-muted);
+}
+
+.obi-mode-text {
+  font-size: 0.85rem;
+  color: var(--warm-muted);
+  margin-top: 0.5rem;
+  text-align: center;
+}
+
+/* ── Last Thought ─────────────────────────────────────────────── */
+
+.pull-quote {
+  font-size: 1.15rem;
+  font-style: italic;
+  line-height: 1.6;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  border: none;
+}
+
+.thought-meta {
+  font-size: 0.8rem;
+  color: var(--warm-muted);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.salience-dots { letter-spacing: 0.1em; color: var(--warm-accent); }
+.thought-mood  { font-style: italic; }
+
+/* ── Proximity Arc ────────────────────────────────────────────── */
+
+.presence-proximity {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.frigate-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--warm-muted);
+}
+.frigate-conf { font-size: 0.8rem; }
+
+/* ── World Band: Ambient ───────────────────────────────────────── */
+
+.world-ambient {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.ambient-label {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--warm-muted);
+  white-space: nowrap;
+}
+
+/* ── World Band: Weather ──────────────────────────────────────── */
+
+.world-weather {
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  color: var(--warm-text);
+}
+.weather-summary { color: var(--warm-muted); }
+
+/* ── World Band: Time ─────────────────────────────────────────── */
+
+.world-time { font-size: 0.85rem; text-align: right; }
+.local-time { font-size: 1rem; font-weight: 600; }
+.last-spoke { color: var(--warm-muted); margin: 0.25rem 0 0; font-size: 0.8rem; }
+
+.period-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  margin-left: 0.4rem;
+}
+.period-morning   { background: #fef3c7; color: #92400e; }
+.period-afternoon { background: #dbeafe; color: #1e40af; }
+.period-evening   { background: #ede9fe; color: #4c1d95; }
+.period-night     { background: #1e293b; color: #94a3b8; }
+
+/* ── Machine Band Toggle ─────────────────────────────────────── */
+
+.band-machine-toggle { text-align: center; margin: 0.5rem 0; }
+.toggle-btn {
+  background: none;
+  border: 1px solid var(--warm-muted);
+  border-radius: 999px;
+  padding: 0.3rem 1rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  color: var(--warm-muted);
+  transition: color 0.2s, border-color 0.2s;
+}
+.toggle-btn:hover { color: var(--warm-text); border-color: var(--warm-text); }
+
+.band-machine {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.4s ease;
+}
+.band-machine.open { max-height: 800px; }
+
+/* ── Metric Grid ─────────────────────────────────────────────── */
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  padding: 1rem 0 0.5rem;
+}
+@media (max-width: 640px) {
+  .metric-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+.metric-tile {
+  background: #fff;
+  border-radius: var(--radius);
+  padding: 0.9rem 1rem;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.06);
+  cursor: default;
+}
+.metric-tile[data-sparkline] { cursor: pointer; }
+.metric-tile[data-sparkline]:hover { box-shadow: 0 2px 12px rgba(0,0,0,0.12); }
+
+.metric-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--warm-muted);
+  margin-bottom: 0.5rem;
+}
+.metric-value { font-size: 1.1rem; font-weight: 600; margin-top: 0.4rem; }
+
+.metric-bar-wrap {
+  height: 6px;
+  background: rgba(0,0,0,0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.metric-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--warm-accent);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+.metric-bar.warn { background: #d97706; }
+.metric-bar.crit { background: #dc2626; }
+
+.metric-tile.disk-warn .metric-value { color: #d97706; }
+.metric-tile.disk-crit .metric-value { color: #dc2626; }
+
+.gauge-ok   .gauge-fill { stroke: #16a34a; }
+.gauge-warn .gauge-fill { stroke: #d97706; }
+.gauge-crit .gauge-fill { stroke: #dc2626; }
+
+/* Arc fill colours (proximity arc in SVG) */
+.arc-close { fill: var(--warm-accent); opacity: 0.85; }
+.arc-mid   { fill: #64748b; opacity: 0.55; }
+.arc-far   { fill: #94a3b8; opacity: 0.35; }
+
+/* Services dots */
+.services-dots { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.25rem; }
+.service-dot-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--warm-muted);
+}
+.dot-ok   { color: #16a34a; }
+.dot-warn { color: #d97706; }
+.dot-err  { color: #dc2626; }
+
+/* Sparkline canvas */
+.sparkline-canvas { display: block; margin-top: 0.5rem; width: 100%; }
+.sparkline-label  { font-size: 0.7rem; color: var(--warm-muted); margin-top: 0.2rem; }

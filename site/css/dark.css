@@ -60,3 +60,36 @@
 }
 .roadmap-item.done { color: var(--dark-text); }
 .roadmap-item .check { font-size: 1rem; flex-shrink: 0; }
+
+/* ── Live Dashboard — Dark Theme Overrides ────────────────────── */
+
+[data-theme="dark"] .band-world {
+  background: rgba(255,255,255,0.03);
+}
+
+[data-theme="dark"] .pulse-circle {
+  background: var(--dark-accent);
+  color: var(--dark-bg);
+}
+
+[data-theme="dark"] .metric-tile {
+  background: #1a1d22;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.3);
+}
+
+[data-theme="dark"] .metric-bar-wrap {
+  background: rgba(255,255,255,0.1);
+}
+
+[data-theme="dark"] .metric-bar { background: var(--dark-accent); }
+
+[data-theme="dark"] .toggle-btn {
+  border-color: var(--dark-muted);
+  color: var(--dark-muted);
+}
+[data-theme="dark"] .toggle-btn:hover {
+  color: var(--dark-text);
+  border-color: var(--dark-text);
+}
+
+[data-theme="dark"] .arc-close { fill: var(--dark-accent); }
