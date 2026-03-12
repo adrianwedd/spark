@@ -126,12 +126,12 @@ Three new/rewritten files (all under `site/js/` to match existing file layout):
 | `spark_history` | JSON array of rolling vitals readings (max 120 entries, same shape as `/public/history`) |
 | `spark_machine_open` | `"true"` / `"false"` — persists MACHINE toggle state |
 
-**Polling:** `live.js` fetches five endpoints in parallel every 30s with a 5s timeout each:
-- `/api/v1/public/status`
-- `/api/v1/public/vitals`
-- `/api/v1/public/sonar` — real-time `sonar_cm` for the PRESENCE proximity arc (existing endpoint, unchanged)
-- `/api/v1/public/awareness` — does **not** include `sonar_cm`; that comes from `/public/sonar` above
-- `/api/v1/public/services` — new endpoint (see above)
+**Polling:** `live.js` fetches five endpoints in parallel every 30s with a 5s timeout each. All fetch URLs must be **absolute** (`https://spark-api.wedd.au/api/v1/public/...`) to satisfy the site's Content Security Policy:
+- `https://spark-api.wedd.au/api/v1/public/status`
+- `https://spark-api.wedd.au/api/v1/public/vitals`
+- `https://spark-api.wedd.au/api/v1/public/sonar` — real-time `sonar_cm` for the PRESENCE proximity arc (existing endpoint, unchanged)
+- `https://spark-api.wedd.au/api/v1/public/awareness` — does **not** include `sonar_cm`; that comes from `/public/sonar` above
+- `https://spark-api.wedd.au/api/v1/public/services` — new endpoint (see above)
 
 `/api/v1/public/history` is fetched separately: once on page load and again when a sparkline is opened. It is not part of the 30s poll cycle.
 
@@ -243,19 +243,20 @@ Every 30s:
   merge → state object
   append {ts, cpu_pct, cpu_temp_c, ram_pct, battery_pct, sonar_cm, ambient_rms} to spark_history
     (keep last 120 entries; 120 × 30s = 60 min local buffer)
+    dedup by ts before storing: filter out any entry whose ts already exists in the array
   render all three bands
 
 Every 2s (independent setInterval):
   regenerate waveform bars from last known ambient_rms
 
 On sparkline open:
-  fetch /public/history
+  fetch https://spark-api.wedd.au/api/v1/public/history
   merge with spark_history from localStorage (dedup by ts, sort asc)
   draw 60-point canvas sparkline
 
 Backend (separate thread, every 30s):
   read psutil + state/sonar_live.json (age gate: null if > 60s) + state/battery.json
-  append to deque(maxlen=60)
+  acquire threading.Lock → append to deque(maxlen=60) → release
 ```
 
 ---

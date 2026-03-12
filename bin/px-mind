@@ -826,7 +826,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         if weather:
             _cached_weather = weather
             _last_weather_fetch = now_mono
-            temp = weather.get("temp_c")
+            temp = weather.get("temp_C")
             log(f"weather refreshed: {temp}°C" if temp is not None else "weather refreshed: (no temp data)")
 
     # Detect transitions
