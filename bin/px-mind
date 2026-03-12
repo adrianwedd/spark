@@ -93,6 +93,12 @@ WEATHER_INTERVAL_S     = 900   # refresh weather every 15 min (was 10)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
 REACTIVE_COOLDOWN_S    = 30    # min seconds between reactive responses (was 15)
 AMBIENT_STALE_S        = 60    # ignore ambient_sound.json older than this
+FRIGATE_HOST           = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo.local:5000")
+FRIGATE_CAMERA         = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
+FRIGATE_WINDOW_S       = 90    # look for events in the last 90 seconds
+FRIGATE_MIN_SCORE      = 0.60  # ignore detections below this confidence
+FRIGATE_TIMEOUT_S      = 2     # short timeout — must not stall the awareness loop
+FRIGATE_FILE           = STATE_DIR / "frigate_presence.json"
 AEDT = dt.timezone(dt.timedelta(hours=11))  # Hobart, Tasmania (UTC+11)
 OBI_DAY_START  = 7   # 7am AEDT — Obi's waking hours begin
 OBI_DAY_END    = 20  # 8pm AEDT — Obi's waking hours end
@@ -432,6 +438,65 @@ def read_sonar(dry: bool) -> float:
     except Exception:
         pass
     return 999.0
+
+
+def _fetch_frigate_presence(dry: bool = False) -> dict | None:
+    """Query Frigate for recent person detections. Returns presence dict or None on any error.
+
+    None means Frigate is unreachable — caller falls back to sonar/ambient heuristics.
+    dry=True returns None immediately without any network call.
+    """
+    if dry:
+        return None
+    import socket
+    import urllib.request
+
+    since = time.time() - FRIGATE_WINDOW_S
+    url = (
+        f"{FRIGATE_HOST}/api/events"
+        f"?label=person&camera={FRIGATE_CAMERA}"
+        f"&limit=20&after={since:.3f}"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=FRIGATE_TIMEOUT_S) as resp:
+            events = json.loads(resp.read())
+    except Exception:
+        return None  # network down, mDNS timeout, JSON parse error, etc.
+
+    qualifying = [
+        e for e in events
+        if e.get("data", {}).get("score", 0) >= FRIGATE_MIN_SCORE
+    ]
+
+    if not qualifying:
+        return {
+            "person_present": False,
+            "event_count": 0,
+            "score": None,
+            "x_center": None,
+            "speed": None,
+            "velocity_angle": None,
+            "ts": utc_timestamp(),
+        }
+
+    # end_time is None for in-progress events — treat as 0 so max() doesn't TypeError
+    best = max(qualifying, key=lambda e: e.get("end_time") or 0)
+    box = best["data"].get("box") or []
+    # box format confirmed as [x, y, width, height] (normalized 0-1) per user docs.
+    # x_center = x + width/2. If Frigate ever switches to [xmin,ymin,xmax,ymax],
+    # use (box[0]+box[2])/2 instead — verify against path_data[0][0][0].
+    x_center = round(box[0] + box[2] / 2, 3) if len(box) == 4 else None
+
+    return {
+        "person_present": True,
+        "event_count": len(qualifying),
+        "score": round(best["data"].get("score", 0), 3),
+        "x_center": x_center,
+        "speed": best["data"].get("average_estimated_speed"),
+        "velocity_angle": best["data"].get("velocity_angle"),
+        "ts": utc_timestamp(),
+    }
 
 
 def read_battery() -> dict | None:

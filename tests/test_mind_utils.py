@@ -71,9 +71,38 @@ def _load_mind_helpers():
     return globs
 
 
+import json as _json
+import time as _time
+import urllib.error
+from unittest.mock import MagicMock, patch
+
+
+def _make_frigate_event(score=0.75, x=0.2, y=0.1, w=0.3, h=0.8,
+                        speed=0.0, vel_angle=0.0, end_time=None):
+    return {
+        "end_time": end_time or _time.time() - 5,
+        "data": {
+            "box": [x, y, w, h],
+            "score": score, "top_score": score,
+            "average_estimated_speed": speed,
+            "velocity_angle": vel_angle,
+            "path_data": [[[x + w / 2, y + h / 2], _time.time() - 5]],
+        },
+    }
+
+
+def _mock_urlopen(events):
+    body = _json.dumps(events).encode()
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=MagicMock(read=MagicMock(return_value=body)))
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
 _MIND = _load_mind_helpers()
 _daytime_action_hint = _MIND["_daytime_action_hint"]
 compute_obi_mode = _MIND["compute_obi_mode"]
+_fetch_frigate_presence = _MIND["_fetch_frigate_presence"]
 
 
 # ---------------------------------------------------------------------------
@@ -143,3 +172,58 @@ def test_obi_mode_unknown_no_ambient():
     awareness = {"sonar_cm": 50}
     mode = compute_obi_mode(awareness, hour_override=10)
     assert mode == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# _fetch_frigate_presence
+# ---------------------------------------------------------------------------
+
+
+def test_frigate_returns_presence_when_event_recent():
+    events = [_make_frigate_event(score=0.80, x=0.2, w=0.3)]  # x_center = 0.35
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(events)):
+        result = _fetch_frigate_presence(dry=False)
+    assert result is not None
+    assert result["person_present"] is True
+    assert abs(result["x_center"] - 0.35) < 0.01
+    assert result["score"] == pytest.approx(0.80, abs=0.01)
+
+
+def test_frigate_returns_none_on_connection_error():
+    with patch("urllib.request.urlopen", side_effect=OSError("refused")):
+        result = _fetch_frigate_presence(dry=False)
+    assert result is None
+
+
+def test_frigate_returns_none_on_timeout():
+    import socket
+    with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
+        result = _fetch_frigate_presence(dry=False)
+    assert result is None
+
+
+def test_frigate_empty_events_no_person():
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen([])):
+        result = _fetch_frigate_presence(dry=False)
+    assert result is not None
+    assert result["person_present"] is False
+
+
+def test_frigate_dry_run_skips_network():
+    with patch("urllib.request.urlopen", side_effect=AssertionError("must not call")):
+        result = _fetch_frigate_presence(dry=True)
+    assert result is None
+
+
+def test_frigate_filters_low_confidence():
+    events = [_make_frigate_event(score=0.45)]
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(events)):
+        result = _fetch_frigate_presence(dry=False)
+    assert result["person_present"] is False
+
+
+def test_frigate_reports_event_count():
+    events = [_make_frigate_event(score=0.80), _make_frigate_event(score=0.75)]
+    with patch("urllib.request.urlopen", return_value=_mock_urlopen(events)):
+        result = _fetch_frigate_presence(dry=False)
+    assert result["event_count"] == 2
