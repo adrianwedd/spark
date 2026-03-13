@@ -88,7 +88,7 @@ app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://spark.wedd.au", "http://spark.wedd.au", "https://spark-api.wedd.au", "http://localhost:8000"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
