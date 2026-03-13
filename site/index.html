@@ -4,7 +4,15 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src https://spark-api.wedd.au;">
+    content="default-src 'self'; script-src 'self' https://www.googletagmanager.com 'unsafe-inline'; style-src 'self' https://fonts.googleapis.com; img-src 'self' data: https://www.googletagmanager.com; font-src 'self' https://fonts.gstatic.com; connect-src https://spark-api.wedd.au https://www.google-analytics.com https://analytics.google.com https://www.googletagmanager.com;">
+  <!-- Google Analytics -->
+  <script async src="https://www.googletagmanager.com/gtag/js?id=G-BJD5ZFHRLV"></script>
+  <script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag(){dataLayer.push(arguments);}
+    gtag('js', new Date());
+    gtag('config', 'G-BJD5ZFHRLV');
+  </script>
   <title>SPARK — a robot with an inner life</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -61,8 +69,9 @@
     <!-- ─── BAND 1: PRESENCE ─────────────────────────────────────── -->
     <div class="band band-presence" id="band-presence">
 
-      <!-- Mood Pulse -->
-      <div class="presence-mood world-col">
+      <!-- Mood card -->
+      <div class="presence-card presence-card-mood">
+        <p class="card-eyebrow">Mood</p>
         <div id="mood-pulse" class="pulse-circle pulse-mid" aria-label="SPARK mood">
           <span id="mood-word">…</span>
         </div>
@@ -70,38 +79,39 @@
           <span id="local-time" class="local-time"></span>
           <span id="time-period-badge" class="period-badge"></span>
         </div>
+        <div class="presence-sparklines">
+          <div class="wx-metric-row">
+            <span class="wx-metric-label">Mood (1h)</span>
+            <canvas class="sparkline-canvas" data-field="mood_val" height="20"
+                    aria-label="mood history"></canvas>
+          </div>
+          <div class="wx-metric-row wx-metric-row-last">
+            <span class="wx-metric-label">Salience (1h)</span>
+            <canvas class="sparkline-canvas" data-field="salience" height="20"
+                    aria-label="thought salience history"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- State card (obi-mode + last-spoke) -->
+      <div class="presence-card presence-card-state">
+        <p class="card-eyebrow">State</p>
         <p id="obi-mode-line" class="obi-mode-text"></p>
         <p id="last-spoke" class="last-spoke"></p>
       </div>
 
-      <!-- Last Thought + Last Spoken -->
-      <div class="presence-thought world-col">
-        <p class="section-eyebrow">Last thought</p>
-        <blockquote id="dashboard-last-thought" class="pull-quote">Nothing on my mind just now…</blockquote>
-        <div id="thought-meta-row" class="thought-meta">
-          <span id="thought-salience" class="salience-dots" aria-label="thought importance"></span>
-          <span id="thought-age" class="thought-age"></span>
+      <!-- Last spoken — speech bubble card -->
+      <div class="presence-card presence-card-speech" id="speech-bubble-card">
+        <p class="card-eyebrow">Last spoken</p>
+        <div class="speech-bubble">
+          <p id="last-spoken-text" class="speech-bubble-text">—</p>
         </div>
-        <div class="last-spoken-row" id="last-spoken-row">
-          <p class="section-eyebrow section-eyebrow-spaced">Last spoken</p>
-          <p id="last-spoken-text" class="last-spoken-quote">—</p>
-          <p id="last-spoken-age" class="last-spoken-age"></p>
-        </div>
-        <div class="wx-metric-row thought-salience-trend wx-metric-row-spaced">
-          <span class="wx-metric-label">Salience (1h)</span>
-          <canvas class="sparkline-canvas" data-field="salience" height="20"
-                  aria-label="thought salience history"></canvas>
-        </div>
-        <div class="wx-metric-row wx-metric-row-last">
-          <span class="wx-metric-label">Mood (1h)</span>
-          <canvas class="sparkline-canvas" data-field="mood_val" height="20"
-                  aria-label="mood history"></canvas>
-        </div>
+        <p id="last-spoken-age" class="last-spoken-age"></p>
       </div>
 
-      <!-- Proximity -->
-      <div class="presence-proximity world-col">
-        <p class="section-eyebrow">Proximity</p>
+      <!-- Proximity card -->
+      <div class="presence-card presence-card-proximity">
+        <p class="card-eyebrow">Proximity</p>
         <div class="proximity-display">
           <div class="proximity-reading">
             <span id="proximity-cm" class="proximity-cm">—</span>
@@ -114,17 +124,19 @@
                   aria-label="sonar history (1h)"></canvas>
           <p class="sparkline-ctx-label">1h trend</p>
         </div>
-        <!-- Frigate detections list -->
-        <div id="detections-panel" class="detections-panel hidden">
-          <p class="section-eyebrow section-eyebrow-spaced">Detected</p>
-          <ul id="detections-list" class="detections-list"></ul>
-        </div>
+      </div>
 
-        <!-- Who's home (Home Assistant) -->
-        <div id="ha-presence-panel" class="ha-presence-panel hidden">
-          <p class="section-eyebrow section-eyebrow-spaced">Who's home</p>
-          <ul id="ha-presence-list" class="ha-presence-list"></ul>
-        </div>
+      <!-- Detections card -->
+      <div class="presence-card presence-card-detections" id="detections-panel">
+        <p class="card-eyebrow">Detected</p>
+        <ul id="detections-list" class="detections-list"></ul>
+        <p class="detections-empty" id="detections-empty">Nothing detected</p>
+      </div>
+
+      <!-- Who's home card -->
+      <div class="presence-card presence-card-home" id="ha-presence-panel">
+        <p class="card-eyebrow">Who's home</p>
+        <ul id="ha-presence-list" class="ha-presence-list"></ul>
       </div>
 
     </div><!-- /band-presence -->
@@ -132,17 +144,17 @@
     <!-- ─── BAND 2: WORLD ─────────────────────────────────────────── -->
     <div class="band band-world" id="band-world">
 
-      <!-- Sound strip -->
-      <div class="world-ambient-strip">
-        <div class="world-ambient-head">
-          <span class="section-eyebrow">Sound</span>
-          <span id="ambient-level-label" class="ambient-level">—</span>
+      <!-- Sound + Noise cards -->
+      <div class="sound-noise-row">
+        <div class="wx-card wx-card-sound">
+          <div class="wx-card-label">Sound level</div>
+          <div class="wx-card-val" id="ambient-level-label">—</div>
+          <canvas id="waveform-canvas" width="200" height="32"
+                  aria-label="ambient sound level visualisation"></canvas>
         </div>
-        <canvas id="waveform-canvas" width="200" height="32"
-                aria-label="ambient sound level visualisation"></canvas>
-        <div class="wx-metric-row">
-          <span class="wx-metric-label">Noise level (1h)</span>
-          <canvas class="sparkline-canvas" data-field="ambient_rms" width="200" height="22"
+        <div class="wx-card wx-card-noise">
+          <div class="wx-card-label">Noise level (1h)</div>
+          <canvas class="sparkline-canvas" data-field="ambient_rms" width="200" height="40"
                   aria-label="noise level history"></canvas>
         </div>
       </div>

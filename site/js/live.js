@@ -212,12 +212,7 @@
       const slide = document.createElement('div');
       slide.className = 'carousel-slide' + (i === 0 ? ' active' : '');
 
-      const q = document.createElement('blockquote');
-      q.className = 'carousel-quote';
-      q.textContent = t.thought || '';
-      slide.appendChild(q);
-
-      // Meta row: time · mood badge · salience dots
+      // Meta row ABOVE quote: time · mood badge · salience dots
       const meta = document.createElement('p');
       meta.className = 'carousel-meta';
 
@@ -240,12 +235,20 @@
       if (typeof t.salience === 'number') {
         const dots = document.createElement('span');
         dots.className = 'carousel-salience';
-        const filled = Math.round(t.salience * 5);
-        dots.textContent = '●'.repeat(filled) + '○'.repeat(5 - filled);
+        const tenths = Math.round(t.salience * 10);  // 0–10
+        const full = Math.floor(tenths / 2);
+        const half = tenths % 2;
+        const empty = 5 - full - half;
+        dots.textContent = '●'.repeat(full) + (half ? '◐' : '') + '○'.repeat(empty);
         meta.appendChild(dots);
       }
 
       slide.appendChild(meta);
+
+      const q = document.createElement('blockquote');
+      q.className = 'carousel-quote';
+      q.textContent = t.thought || '';
+      slide.appendChild(q);
       container.appendChild(slide);
     });
 

@@ -101,38 +101,20 @@ window.SparkDashboard = (function () {
       }
     }
 
-    // Last thought — always shown, salience belongs to the thought not the spoken action
-    _renderInline($('dashboard-last-thought'), state.last_thought || 'Nothing on my mind just now…');
-
-    const salienceDots = $('thought-salience');
-    if (salienceDots) {
-      if (typeof state.salience === 'number') {
-        const filled = Math.round(state.salience * 5);
-        salienceDots.textContent = '●'.repeat(filled) + '○'.repeat(5 - filled);
-      } else {
-        salienceDots.textContent = '';
-      }
-    }
-
-    const ageEl = $('thought-age');
-    if (ageEl && state.ts) {
-      const mins = Math.round((Date.now() - new Date(state.ts).getTime()) / 60000);
-      ageEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
-    }
-
-    // Last spoken — secondary, shown only when something has been voiced
-    const spokenRow = $('last-spoken-row');
-    const spokenEl = $('last-spoken-text');
+    // Speech bubble card — last spoken
+    const spokenEl    = $('last-spoken-text');
     const spokenAgeEl = $('last-spoken-age');
-    if (state.last_spoken) {
-      if (spokenRow) spokenRow.classList.remove('hidden');
-      if (spokenEl) spokenEl.textContent = state.last_spoken;
-      if (spokenAgeEl && state.last_spoken_ts) {
+    if (spokenEl) spokenEl.textContent = state.last_spoken || '—';
+    if (spokenAgeEl) {
+      if (state.last_spoken_ts) {
         const mins = Math.round((Date.now() - new Date(state.last_spoken_ts).getTime()) / 60000);
-        spokenAgeEl.textContent = mins <= 1 ? 'just now' : ('last spoken ' + mins + ' min ago');
+        spokenAgeEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
+      } else if (typeof state.minutes_since_speech === 'number') {
+        const m = Math.round(state.minutes_since_speech);
+        spokenAgeEl.textContent = m > 120 ? 'a while ago' : (m + ' min ago');
+      } else {
+        spokenAgeEl.textContent = '';
       }
-    } else {
-      if (spokenRow) spokenRow.classList.add('hidden');
     }
 
     // Proximity: number + colour-coded bar (full = close, empty = far; 200 cm = scale max)
@@ -152,16 +134,16 @@ window.SparkDashboard = (function () {
       }
     }
 
-    // Frigate detections list (all labels)
-    const detectionsPanel = $('detections-panel');
+    // Detections card (always visible, show empty state when nothing detected)
     const detectionsList  = $('detections-list');
-    if (detectionsPanel && detectionsList) {
+    const detectionsEmpty = $('detections-empty');
+    if (detectionsList) {
       const dets = Array.isArray(state.detections) ? state.detections : [];
+      while (detectionsList.firstChild) detectionsList.removeChild(detectionsList.firstChild);
       if (dets.length === 0) {
-        detectionsPanel.classList.add('hidden');
+        if (detectionsEmpty) detectionsEmpty.style.display = '';
       } else {
-        detectionsPanel.classList.remove('hidden');
-        while (detectionsList.firstChild) detectionsList.removeChild(detectionsList.firstChild);
+        if (detectionsEmpty) detectionsEmpty.style.display = 'none';
         dets.forEach(d => {
           const li = document.createElement('li');
           li.className = 'detection-item';
@@ -186,17 +168,19 @@ window.SparkDashboard = (function () {
       }
     }
 
-    // Who's home (Home Assistant)
-    const haPanel = $('ha-presence-panel');
-    const haList  = $('ha-presence-list');
-    if (haPanel && haList) {
+    // Who's home card (always visible)
+    const haList = $('ha-presence-list');
+    if (haList) {
       const ha = state.ha_presence;
-      if (!ha || !Array.isArray(ha.people) || ha.people.length === 0) {
-        haPanel.classList.add('hidden');
+      while (haList.firstChild) haList.removeChild(haList.firstChild);
+      const people = (ha && Array.isArray(ha.people)) ? ha.people : [];
+      if (people.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'ha-person-item ha-person-unknown';
+        li.textContent = 'No data';
+        haList.appendChild(li);
       } else {
-        haPanel.classList.remove('hidden');
-        while (haList.firstChild) haList.removeChild(haList.firstChild);
-        ha.people.forEach(p => {
+        people.forEach(p => {
           const li = document.createElement('li');
           li.className = 'ha-person-item';
           const dot = document.createElement('span');

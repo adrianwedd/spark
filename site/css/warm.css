@@ -121,10 +121,14 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 .band-presence {
   display: grid;
-  grid-template-columns: 1fr 2fr 1fr;
-  gap: 1rem;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.85rem;
   align-items: start;
-  background: rgba(0,0,0,0.03);
+  background: transparent;
+}
+
+@media (max-width: 900px) {
+  .band-presence { grid-template-columns: repeat(2, 1fr); }
 }
 
 .band-world {
@@ -140,7 +144,98 @@ details > *:not(summary) { margin-top: 0.75rem; }
   .band-presence { grid-template-columns: 1fr; }
 }
 
-/* ── Presence columns ─────────────────────────────────────────────── */
+/* ── Presence cards ───────────────────────────────────────────────── */
+
+.presence-card {
+  background: #fff;
+  border-radius: 14px;
+  padding: 1.1rem 1.2rem 1rem;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-height: 0;
+}
+
+.card-eyebrow {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--warm-muted);
+  margin: 0 0 0.25rem;
+  opacity: 0.7;
+}
+
+.presence-card-mood {
+  align-items: center;
+  text-align: center;
+}
+
+.presence-sparklines {
+  width: 100%;
+  margin-top: 0.4rem;
+}
+
+.presence-card-state {
+  justify-content: center;
+}
+
+.presence-card-proximity {}
+
+.presence-card-detections {}
+
+.presence-card-home {}
+
+/* ── Speech Bubble card ───────────────────────────────────────────── */
+
+.presence-card-speech {
+  position: relative;
+}
+
+.speech-bubble {
+  background: var(--warm-bg, #fdf8f0);
+  border: 2px solid var(--warm-accent);
+  border-radius: 18px 18px 18px 4px;
+  padding: 0.75rem 1rem;
+  position: relative;
+  margin: 0.1rem 0 0.5rem;
+}
+
+.speech-bubble::before {
+  content: '';
+  position: absolute;
+  bottom: -14px;
+  left: 14px;
+  border: 7px solid transparent;
+  border-top-color: var(--warm-accent);
+}
+
+.speech-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -10px;
+  left: 16px;
+  border: 5px solid transparent;
+  border-top-color: var(--warm-bg, #fdf8f0);
+}
+
+.speech-bubble-text {
+  font-style: italic;
+  font-size: 0.9rem;
+  color: var(--warm-text);
+  line-height: 1.55;
+  margin: 0;
+}
+
+.presence-card-mood .presence-mood {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+/* ── Presence layout helpers ────────────────────────────────────── */
 
 .presence-mood {
   display: flex;
@@ -332,8 +427,18 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .frigate-conf  { font-size: 0.78rem; opacity: 0.7; }
 
 /* ── Detections list (Frigate all-objects) ───────────────────── */
-.detections-panel,
-.ha-presence-panel { margin-top: 0.5rem; }
+.detections-empty {
+  font-size: 0.78rem;
+  color: var(--warm-muted);
+  font-style: italic;
+  margin: 0.25rem 0 0;
+}
+
+.ha-person-unknown {
+  font-size: 0.78rem;
+  color: var(--warm-muted);
+  font-style: italic;
+}
 
 .detections-list,
 .ha-presence-list {
@@ -441,6 +546,40 @@ details > *:not(summary) { margin-top: 0.75rem; }
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+/* ── World Band: Sound + noise cards (side by side) ──────────────── */
+
+.wx-card-sound,
+.wx-card-noise {
+  flex: 1;
+}
+
+.wx-card-sound {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* Put sound + noise in a row inside band-world */
+.band-world > .wx-card-sound,
+.band-world > .wx-card-noise {
+  display: inline-flex;
+}
+
+/* Wrap sound + noise together — auto via adjacent sibling order; use a row wrapper */
+.band-world {
+  /* Sound + noise as first two children side-by-side */
+}
+
+.band-world .sound-noise-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+@media (max-width: 480px) {
+  .band-world .sound-noise-row { grid-template-columns: 1fr; }
 }
 
 /* ── World Band: Weather card grid ────────────────────────────── */
@@ -640,22 +779,56 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .sparkline-canvas { display: block; margin-top: 0.5rem; width: 100%; }
 .sparkline-label  { font-size: 0.7rem; color: var(--warm-muted); margin-top: 0.2rem; }
 
-/* ── Thoughts Carousel (home section) ────────────────────────────── */
+/* ── Thoughts Carousel — thought bubble ──────────────────────────── */
 
 .thought-carousel {
   position: relative;
-  height: 22rem;
   margin-top: 2.5rem;
-  overflow: hidden;
+  /* Extra bottom space for the bubble tail circles + nav dots */
+  padding-bottom: 3.5rem;
+  min-height: 18rem;
 }
 
+/* Thought bubble container */
 .carousel-slide {
   position: absolute;
   top: 0; left: 0; right: 0;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.9s ease;
-  text-align: left;
+  transition: opacity 0.7s ease;
+  /* Thought-bubble shape */
+  background: #fff;
+  border-radius: 32px;
+  padding: 1.75rem 2rem 1.5rem;
+  box-shadow:
+    0 4px 24px rgba(0,0,0,0.07),
+    0 1px 6px rgba(0,0,0,0.04);
+}
+
+/* Bubble tail — two stacked circles above-left, classic thought bubble */
+.carousel-slide::before,
+.carousel-slide::after {
+  content: '';
+  position: absolute;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+
+/* Larger inner circle */
+.carousel-slide::before {
+  width: 22px;
+  height: 22px;
+  bottom: -30px;
+  left: 36px;
+}
+
+/* Smaller outer circle */
+.carousel-slide::after {
+  width: 12px;
+  height: 12px;
+  bottom: -46px;
+  left: 28px;
 }
 
 .carousel-slide.active {
@@ -700,12 +873,12 @@ details > *:not(summary) { margin-top: 0.75rem; }
   gap: 0.6rem;
   font-size: 0.78rem;
   color: var(--warm-muted);
-  margin-top: 0.85rem;
+  margin: 0 0 0.75rem;
   letter-spacing: 0.03em;
 }
 
 .carousel-salience {
-  letter-spacing: 0.08em;
+  letter-spacing: 0.05em;
   color: var(--warm-accent);
   font-size: 0.72rem;
 }
