@@ -411,7 +411,11 @@ window.SparkDashboard = (function () {
     document.querySelectorAll('canvas[data-field]').forEach(canvas => {
       // Set canvas width from its rendered width so it fills the container
       if (!canvas.width || canvas.width < 10) canvas.width = canvas.offsetWidth || 160;
-      SparkCharts.drawSparkline(canvas, points, canvas.dataset.field);
+      if (canvas.dataset.field === 'mood_val') {
+        SparkCharts.drawMoodStrip(canvas, points);
+      } else {
+        SparkCharts.drawSparkline(canvas, points, canvas.dataset.field);
+      }
     });
   }
 

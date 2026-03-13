@@ -115,6 +115,7 @@
         humidity_pct:    state.weather?.humidity_pct != null ? state.weather.humidity_pct : null,
         salience:        state.salience      != null ? state.salience      : null,
         mood_val:        state.mood ? (MOOD_VAL[(state.mood || '').toLowerCase()] || null) : null,
+        mood:            state.mood ? state.mood.toLowerCase() : null,
         wifi_dbm:        state.wifi_dbm      != null ? state.wifi_dbm      : null,
         rain_24h_mm:     state.weather?.rain_24h_mm != null ? state.weather.rain_24h_mm : null,
       });

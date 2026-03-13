@@ -71,5 +71,33 @@ window.SparkCharts = (function () {
     ctx.fillText(maxV.toFixed(0), 2, 9);
   }
 
-  return { drawWaveform, drawSparkline };
+  // ── Mood colour strip ─────────────────────────────────────────────────────
+  const _MOOD_COLOR = {
+    peaceful:      '#6aab6b',
+    content:       '#6aab6b',
+    contemplative: '#7c6fcf',
+    curious:       '#e6a817',
+    active:        '#2ea8e0',
+    excited:       '#e05c3a',
+  };
+
+  function drawMoodStrip(canvas, points) {
+    if (!canvas || !points || points.length < 1) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    const n = points.length;
+    const segW = W / n;
+    const gap = segW > 4 ? 1 : 0;
+
+    points.forEach((p, i) => {
+      const color = _MOOD_COLOR[(p.mood || '').toLowerCase()];
+      if (!color) return;  // null/unknown — leave blank
+      ctx.fillStyle = color;
+      ctx.fillRect(i * segW + gap, 0, Math.max(1, segW - gap), H);
+    });
+  }
+
+  return { drawWaveform, drawSparkline, drawMoodStrip };
 })();

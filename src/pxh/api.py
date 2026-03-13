@@ -509,7 +509,7 @@ async def public_awareness() -> Dict[str, Any]:
     if isinstance(raw_ha, dict):
         safe_people = [
             {"name": p.get("name"), "state": p.get("state"), "home": p.get("home")}
-            for p in raw_ha.get("people", [])
+            for p in (raw_ha.get("people") or [])
             if isinstance(p, dict)
         ]
         ha_presence: Any = {"people": safe_people}

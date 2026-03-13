@@ -158,10 +158,13 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
     ha_someone_home = False
     ha = awareness.get("ha_presence")
     if isinstance(ha, dict) and isinstance(ha.get("people"), list):
-        if any(p.get("home") for p in ha["people"]):
-            ha_someone_home = True   # HA confirms someone home — skip absent returns
-        else:
-            return "absent"
+        people = ha["people"]
+        if people:  # only trust HA when it has at least one tracked person
+            if any(p.get("home") for p in people):
+                ha_someone_home = True   # HA confirms someone home — skip absent returns
+            else:
+                return "absent"
+        # empty list → HA may have a config issue; fall through to other signals
 
     # Fast sonar signal: physically very close + loud
     if very_close and ambient_level == "loud":
