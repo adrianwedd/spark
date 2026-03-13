@@ -242,17 +242,6 @@ details > *:not(summary) { margin-top: 0.75rem; }
   margin: 0;
 }
 
-/* ── Presence layout helpers ────────────────────────────────────── */
-
-.presence-time {
-  display: flex;
-  align-items: center;
-  gap: 0.35rem;
-  margin-top: 0.6rem;
-  flex-wrap: nowrap;
-  white-space: nowrap;
-}
-
 /* ── Mood Pulse ───────────────────────────────────────────────── */
 
 .pulse-circle {
@@ -570,18 +559,6 @@ details > *:not(summary) { margin-top: 0.75rem; }
   font-weight: 600;
 }
 
-.local-time { font-size: 0.9rem; font-weight: 600; }
-
-.period-badge {
-  display: inline-block;
-  padding: 0.1rem 0.45rem;
-  border-radius: 999px;
-  font-size: 0.72rem;
-}
-.period-morning   { background: #fef3c7; color: #92400e; }
-.period-afternoon { background: #dbeafe; color: #1e40af; }
-.period-evening   { background: #ede9fe; color: #4c1d95; }
-.period-night     { background: #1e293b; color: #94a3b8; }
 
 /* ── Machine Band Toggle ─────────────────────────────────────── */
 

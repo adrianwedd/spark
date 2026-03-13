@@ -40,24 +40,6 @@ window.SparkDashboard = (function () {
 
     _drawFavicon(moodColor);
 
-    // Local time + period badge (moved into presence-mood column)
-    const timeEl = $('local-time');
-    if (timeEl) {
-      timeEl.textContent = new Date().toLocaleTimeString('en-AU', {
-        hour: '2-digit', minute: '2-digit', timeZone: 'Australia/Hobart',
-      });
-    }
-    const badge = $('time-period-badge');
-    if (badge) {
-      badge.classList.remove('period-morning', 'period-afternoon', 'period-evening', 'period-night');
-      if (state.time_period) {
-        badge.classList.add('period-' + state.time_period);
-        badge.textContent = state.time_period;
-      } else {
-        badge.textContent = '';
-      }
-    }
-
     // State card — obi-mode badge
     const obiBadge = $('obi-mode-badge');
     if (obiBadge) {
