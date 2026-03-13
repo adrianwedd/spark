@@ -200,6 +200,7 @@ window.SparkDashboard = (function () {
         weatherStrip.classList.remove('hidden');
         const w = state.weather;
 
+        // Temp card
         const temp = $('weather-temp');
         if (temp) temp.textContent = w.temp_c != null ? (w.temp_c + '°C') : '—';
         const sym = $('weather-symbol');
@@ -213,21 +214,17 @@ window.SparkDashboard = (function () {
           sumEl.textContent = desc.trim().replace(/\.$/, '');
         }
 
-        // Wind speed + direction label
+        // Wind card: show full description "SW at 17 km/h, gusting to 26 km/h"
         const wind = $('weather-wind');
-        if (wind) wind.textContent = w.wind_kmh != null ? (w.wind_kmh + ' km/h') : '—';
-
-        // Wind detail sentence (direction + speed + optional gust)
-        const windDetail = $('weather-wind-detail');
-        if (windDetail) {
+        if (wind) {
           if (w.wind_dir || w.wind_kmh != null) {
             const dir = w.wind_dir || '';
             const spd = w.wind_kmh != null ? w.wind_kmh + ' km/h' : '';
             let line = dir && spd ? dir + ' at ' + spd : (dir || spd);
             if (w.gust_kmh != null) line += ', gusting to ' + w.gust_kmh + ' km/h';
-            windDetail.textContent = line;
+            wind.textContent = line;
           } else {
-            windDetail.textContent = '';
+            wind.textContent = '—';
           }
         }
 
@@ -236,7 +233,6 @@ window.SparkDashboard = (function () {
 
         const rain = $('weather-rain');
         if (rain) {
-          // BOM rain_trace can be a number, "0", "Tce" (trace), or null
           const r = w.rain_24h_mm;
           if (r == null) {
             rain.textContent = '—';

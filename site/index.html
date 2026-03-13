@@ -126,8 +126,8 @@
     <!-- ─── BAND 2: WORLD ─────────────────────────────────────────── -->
     <div class="band band-world" id="band-world">
 
-      <!-- Ambient sound -->
-      <div class="world-ambient world-col">
+      <!-- Sound strip -->
+      <div class="world-ambient-strip">
         <div class="world-ambient-head">
           <span class="section-eyebrow">Sound</span>
           <span id="ambient-level-label" class="ambient-level">—</span>
@@ -141,43 +141,39 @@
         </div>
       </div>
 
-      <!-- Weather -->
-      <div class="world-weather world-col" id="world-weather-strip">
-        <div class="wx-metric-row">
-          <div class="wx-metric-head">
-            <span class="wx-metric-label">Temp</span>
-            <span class="wx-metric-val" id="weather-temp"></span>
-            <span id="weather-symbol" class="weather-symbol" aria-hidden="true"></span>
-          </div>
-          <canvas class="sparkline-canvas" data-field="weather_temp_c" width="160" height="22"
+      <!-- Weather cards 2×2 -->
+      <div class="wx-card-grid" id="world-weather-strip">
+
+        <div class="wx-card">
+          <div class="wx-card-label">Temp <span id="weather-symbol" aria-hidden="true"></span></div>
+          <div class="wx-card-val" id="weather-temp">—</div>
+          <canvas class="sparkline-canvas" data-field="weather_temp_c" height="22"
                   aria-label="temperature history"></canvas>
-          <span id="weather-summary" class="weather-summary"></span>
+          <p class="weather-summary" id="weather-summary"></p>
         </div>
-        <div class="wx-metric-row">
-          <div class="wx-metric-head">
-            <span class="wx-metric-label">Wind</span>
-            <span class="wx-metric-val" id="weather-wind"></span>
-          </div>
-          <canvas class="sparkline-canvas" data-field="wind_kmh" width="160" height="22"
+
+        <div class="wx-card">
+          <div class="wx-card-label">Wind</div>
+          <div class="wx-card-val" id="weather-wind">—</div>
+          <canvas class="sparkline-canvas" data-field="wind_kmh" height="22"
                   aria-label="wind history"></canvas>
         </div>
-        <div class="wx-metric-row">
-          <div class="wx-metric-head">
-            <span class="wx-metric-label">Humidity</span>
-            <span class="wx-metric-val" id="weather-humidity"></span>
-          </div>
-          <canvas class="sparkline-canvas" data-field="humidity_pct" width="160" height="22"
+
+        <div class="wx-card">
+          <div class="wx-card-label">Humidity</div>
+          <div class="wx-card-val" id="weather-humidity">—</div>
+          <canvas class="sparkline-canvas" data-field="humidity_pct" height="22"
                   aria-label="humidity history"></canvas>
         </div>
-        <div class="wx-metric-row">
-          <div class="wx-metric-head">
-            <span class="wx-metric-label">Rain (24h)</span>
-            <span class="wx-metric-val" id="weather-rain"></span>
-          </div>
-          <canvas class="sparkline-canvas" data-field="rain_24h_mm" width="160" height="22"
+
+        <div class="wx-card">
+          <div class="wx-card-label">Rain (24h)</div>
+          <div class="wx-card-val" id="weather-rain">—</div>
+          <canvas class="sparkline-canvas" data-field="rain_24h_mm" height="22"
                   aria-label="rain history"></canvas>
         </div>
-      </div>
+
+      </div><!-- /wx-card-grid -->
 
     </div><!-- /band-world -->
 
