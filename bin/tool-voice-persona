@@ -125,8 +125,9 @@ def rephrase_via_ollama(text: str, persona: str) -> str:
             if rephrased and len(rephrased) > 10:
                 return rephrased[:2000]
             return text  # fallback if rephrasing failed
-    except Exception:
-        return text  # Ollama down, pass through original
+    except Exception as exc:
+        log_event("voice_persona", {"status": "ollama_down", "error": str(exc)})
+        return text  # Ollama down — speaks Claude's polite text in persona voice
 
 
 def main() -> int:

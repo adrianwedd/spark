@@ -156,7 +156,7 @@ bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 
 ### Jailbroken Chat Personas
 
-Two jailbroken chat personas via Ollama (qwen3.5:0.8b on M1.local), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
+Two jailbroken chat personas via Ollama (qwen3:1.7b on M1.local; px-mind uses qwen3.5:0.8b), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
 
 | Persona | Tool | Voice | Character |
 |---------|------|-------|-----------|

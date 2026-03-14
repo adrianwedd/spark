@@ -160,15 +160,15 @@ def release_px(px) -> None:
         pass
 
 
-def safe_distance() -> float:
-    """Open Picarx briefly just to read sonar, then release."""
+def safe_distance() -> float | None:
+    """Open Picarx briefly just to read sonar, then release. None on failure."""
     px = None
     try:
         px = make_px()
         d = px.get_distance()
-        return float(d) if d and d > 0 else 999.0
+        return float(d) if d and d > 0 else None
     except Exception:
-        return 999.0
+        return None
     finally:
         if px is not None:
             release_px(px)
@@ -283,11 +283,11 @@ def idle_loop(args) -> None:
             release_px(px)
             px = None
 
+    _yield_requested = False
+
     def _on_yield(sig, _frame):
-        log("SIGUSR1: tool needs GPIO — stopping so it can run")
-        drop_px()
-        stop_face_detection()  # release camera before exit
-        sys.exit(0)
+        nonlocal _yield_requested
+        _yield_requested = True
 
     signal.signal(signal.SIGUSR1, _on_yield)
 
@@ -295,6 +295,13 @@ def idle_loop(args) -> None:
 
     try:
         while True:
+            # Check yield flag — clean exit between iterations (not mid-I2C)
+            if _yield_requested:
+                log("SIGUSR1: tool needs GPIO — stopping so it can run")
+                drop_px()
+                stop_face_detection()
+                sys.exit(0)
+
             now = time.monotonic()
 
             # Skip all hardware if in I2C backoff period
@@ -313,16 +320,16 @@ def idle_loop(args) -> None:
                     next_prox = now + PROX_CHECK_S
                     try:
                         d = get_px().get_distance()
-                        dist = float(d) if d and d > 0 else 999.0
+                        dist = float(d) if d and d > 0 else None
                     except Exception:
-                        dist = 999.0
+                        dist = None
                     try:
                         SONAR_LIVE_FILE.write_text(
                             json.dumps({"ts": time.time(), "distance_cm": dist})
                         )
                     except Exception:
                         pass
-                    if dist < PROX_THRESH:
+                    if dist is not None and dist < PROX_THRESH:
                         if prox_near_since is None:
                             prox_near_since = now
                         elif now - prox_near_since >= PROX_HOLD_S:

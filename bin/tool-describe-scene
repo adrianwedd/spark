@@ -94,9 +94,9 @@ FALLBACK_DESCRIPTION = "I couldn't see anything right now."
 CLAUDE_TIMEOUT = 45
 
 # claude CLI may not be on PATH when launched from systemd — find it explicitly
-CLAUDE_BIN = (shutil.which("claude")
-              or "/home/pi/.local/bin/claude"
-              or "claude")
+CLAUDE_BIN = (os.environ.get("PX_CLAUDE_BIN")
+              or shutil.which("claude")
+              or "/home/pi/.local/bin/claude")
 
 
 def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:

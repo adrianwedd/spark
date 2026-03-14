@@ -666,14 +666,14 @@ def classify_time_period(hour: int) -> str:
     return "night"
 
 
-def read_sonar(dry: bool) -> float:
-    """Get sonar distance. Returns cm or 999.0 on failure.
+def read_sonar(dry: bool) -> float | None:
+    """Get sonar distance in cm, or None if sensor is unavailable/broken.
 
     Prefers px-alive's live sonar file (updated every 5s, no servo movement).
     Falls back to tool-sonar subprocess only if the file is stale/missing.
     """
     if dry:
-        return 999.0
+        return None
     # Read px-alive's shared sonar file — avoids killing px-alive for a distance reading
     state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
     sonar_live = state_dir / "sonar_live.json"
@@ -681,7 +681,8 @@ def read_sonar(dry: bool) -> float:
         data = json.loads(sonar_live.read_text())
         age = time.time() - float(data.get("ts", 0))
         if age < 15:
-            return float(data.get("distance_cm", 999.0))
+            val = data.get("distance_cm")
+            return float(val) if val is not None else None
     except Exception:
         pass
     # Fallback: px-alive is dead/stale — use tool-sonar (will not cause a yield_alive conflict)
@@ -694,10 +695,11 @@ def read_sonar(dry: bool) -> float:
         )
         if result.returncode == 0:
             payload = json.loads(result.stdout.strip().splitlines()[-1])
-            return float(payload.get("closest_cm", 999.0))
+            val = payload.get("closest_cm")
+            return float(val) if val is not None else None
     except Exception:
         pass
-    return 999.0
+    return None
 
 
 def _fetch_frigate_presence(dry: bool = False) -> dict | None:
@@ -1167,13 +1169,14 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             temp = weather.get("temp_c")
             log(f"weather refreshed: {temp}°C" if temp is not None else "weather refreshed: (no temp data)")
 
-    # Detect transitions
+    # Detect transitions (only when both readings are valid)
     transitions = []
-    prev_sonar = prev.get("sonar_cm", 999.0)
-    if prev_sonar > PROXIMITY_FAR_CM and sonar_cm < PROXIMITY_NEAR_CM:
-        transitions.append("someone_appeared")
-    elif prev_sonar < PROXIMITY_NEAR_CM and sonar_cm > PROXIMITY_FAR_CM:
-        transitions.append("someone_left")
+    prev_sonar = prev.get("sonar_cm")
+    if prev_sonar is not None and sonar_cm is not None:
+        if prev_sonar > PROXIMITY_FAR_CM and sonar_cm < PROXIMITY_NEAR_CM:
+            transitions.append("someone_appeared")
+        elif prev_sonar < PROXIMITY_NEAR_CM and sonar_cm > PROXIMITY_FAR_CM:
+            transitions.append("someone_left")
     if prev.get("time_period") and prev["time_period"] != time_period:
         transitions.append("time_period_changed")
         _time_period_start_mono = now_mono
@@ -1210,9 +1213,9 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
 
     awareness = {
         "ts": utc_timestamp(),
-        "sonar_cm": round(sonar_cm, 1),
+        "sonar_cm": round(sonar_cm, 1) if sonar_cm is not None else None,
         "frigate": frigate,
-        "someone_nearby": sonar_cm < PROXIMITY_NEAR_CM,
+        "someone_nearby": sonar_cm is not None and sonar_cm < PROXIMITY_NEAR_CM,
         "time_period": time_period,
         "hour": now_hour,
         "minutes_since_interaction": round(mins_interaction, 1),
@@ -1296,7 +1299,8 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             frigate_str = "person"
         else:
             frigate_str = "no-person"
-        log(f"awareness: transitions={transitions} sonar={sonar_cm:.0f}cm frigate={frigate_str} period={time_period}")
+        sonar_str = f"{sonar_cm:.0f}" if sonar_cm is not None else "??"
+        log(f"awareness: transitions={transitions} sonar={sonar_str}cm frigate={frigate_str} period={time_period}")
 
     return awareness, transitions
 
@@ -1323,18 +1327,19 @@ def append_thought(thought: dict, persona: str = "") -> None:
     """Append thought to persona-scoped thoughts file and trim to THOUGHTS_LIMIT."""
     thoughts_file = thoughts_file_for_persona(persona)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with thoughts_file.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(thought) + "\n")
-
-    # Trim if too long
-    try:
-        lines = thoughts_file.read_text(encoding="utf-8").strip().splitlines()
-        if len(lines) > THOUGHTS_LIMIT:
-            thoughts_file.write_text(
-                "\n".join(lines[-THOUGHTS_LIMIT:]) + "\n", encoding="utf-8"
-            )
-    except Exception:
-        pass
+    lock = FileLock(str(thoughts_file) + ".lock", timeout=10)
+    with lock:
+        with thoughts_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(thought) + "\n")
+        # Trim if too long
+        try:
+            lines = thoughts_file.read_text(encoding="utf-8").strip().splitlines()
+            if len(lines) > THOUGHTS_LIMIT:
+                thoughts_file.write_text(
+                    "\n".join(lines[-THOUGHTS_LIMIT:]) + "\n", encoding="utf-8"
+                )
+        except Exception:
+            log(f"thoughts trim failed for {thoughts_file}")
 
 
 def auto_remember(thought: dict, persona: str = "") -> None:

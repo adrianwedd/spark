@@ -546,10 +546,12 @@ def _stop_alive() -> int | None:
         log(f"pausing px-alive (pid={pid}) for voice turn")
         try:
             # px-alive runs as root; use sudo kill so pi user can signal it
-            subprocess.run(["sudo", "-n", "kill", str(pid)], check=False, capture_output=True)
+            r = subprocess.run(["sudo", "-n", "kill", str(pid)], check=False, capture_output=True)
+            if r.returncode != 0:
+                log(f"_stop_alive: sudo kill failed (rc={r.returncode}): {r.stderr.decode(errors='replace').strip()}")
             time.sleep(2.0)  # wait for Picarx.close() to release GPIO
-        except Exception:
-            pass
+        except Exception as exc:
+            log(f"_stop_alive: exception: {exc}")
     return pid
 
 
@@ -558,11 +560,14 @@ def _restart_alive() -> None:
     alive_script = PROJECT_ROOT / "bin" / "px-alive"
     if alive_script.exists():
         log("restarting px-alive")
-        subprocess.Popen(
-            ["sudo", "-n", str(alive_script)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        try:
+            subprocess.Popen(
+                ["sudo", "-n", str(alive_script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except Exception as exc:
+            log(f"_restart_alive: failed to spawn: {exc}")
 
 
 
