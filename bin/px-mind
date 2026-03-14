@@ -1475,8 +1475,10 @@ def call_ollama(prompt: str, system: str,
         data=payload,
         headers={"Content-Type": "application/json"},
     )
+    # Local Pi models need longer on cold start (~24s load + generation)
+    _timeout = 90 if _host == LOCAL_OLLAMA_HOST else 30
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=_timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.URLError as exc:
         return {"error": f"ollama unreachable ({_host}): {exc}"}
