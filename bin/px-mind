@@ -833,7 +833,8 @@ def read_battery() -> dict | None:
         age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
         if age_s > 180:
             return None
-        return {"pct": int(data["pct"]), "volts": float(data["volts"])}
+        return {"pct": int(data["pct"]), "volts": float(data["volts"]),
+                "charging": bool(data.get("charging", False))}
     except Exception:
         return None
 
@@ -1223,6 +1224,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "period_duration_min": round(period_duration_min, 1),
         "battery_pct": battery["pct"] if battery else session.get("battery_pct"),
         "battery_volts": battery["volts"] if battery else None,
+        "battery_charging": battery["charging"] if battery else False,
         "listening": session.get("listening", False),
         "persona": session.get("persona"),
         "transitions": transitions,

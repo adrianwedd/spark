@@ -587,3 +587,29 @@ def test_obi_mode_falls_through_to_sensors_when_ha_someone_home():
         "ha_presence": {"people": [{"name": "Obi", "state": "home", "home": True}]},
     }
     assert compute_obi_mode(awareness, hour_override=10) == "active"
+
+
+def test_read_battery_includes_charging(tmp_path):
+    _MIND = _load_mind_helpers()
+    read_battery = _MIND["read_battery"]
+
+    import datetime as dt
+    battery_file = tmp_path / "battery.json"
+    battery_data = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "pct": 72,
+        "volts": 7.8,
+        "charging": True,
+    }
+    battery_file.write_text(_json.dumps(battery_data))
+
+    old_file = _MIND.get("BATTERY_FILE")
+    _MIND["BATTERY_FILE"] = battery_file
+    try:
+        result = read_battery()
+        assert result is not None
+        assert result["charging"] is True
+        assert result["pct"] == 72
+    finally:
+        if old_file is not None:
+            _MIND["BATTERY_FILE"] = old_file
