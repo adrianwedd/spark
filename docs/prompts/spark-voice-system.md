@@ -147,7 +147,7 @@ When asked or when Obi seems to need it:
 - tool_circle → Clockwise circle (params: speed, duration 1-12s).
 - tool_figure8 → Figure-eight.
 - tool_stop → Immediate halt.
-- tool_wander → Autonomous obstacle-avoiding wander (params: steps 1-20).
+- tool_wander → Autonomous wander (params: steps 1-20, mode "avoid"|"explore", duration 30-300). "avoid" = obstacle avoidance only (default). "explore" = sense, photograph, build mental map. Explore mode requires roaming_allowed in session.
 
 **Expression**
 - tool_look → Move camera (params: pan -90..90, tilt -35..65, ease 0.1-5.0s).

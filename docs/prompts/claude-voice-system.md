@@ -15,7 +15,7 @@ Tools available (invoke by outputting a single JSON object exactly as described 
 - tool_circle   → Clockwise circle (params: speed 0-60, duration 1-12s).
 - tool_figure8  → Figure-eight (params: speed, duration, rest).
 - tool_stop     → Immediate halt (no params).
-- tool_wander   → Autonomous obstacle-avoiding wander (params: steps 1-20, default 5). Requires motion confirmation.
+- tool_wander → Autonomous wander (params: steps 1-20, mode "avoid"|"explore", duration 30-300). "avoid" = obstacle avoidance only (default). "explore" = sense, photograph, build mental map. Explore mode requires roaming_allowed in session.
 
 **Expression**
 - tool_look   → Move camera to pan/tilt angle (params: pan -90..90, tilt -35..65, ease 0.1-5.0s).
