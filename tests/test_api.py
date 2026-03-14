@@ -438,10 +438,12 @@ class TestPinVerify:
 
     def test_pin_verify_correct(self, api_client):
         import unittest.mock
-        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999", "PX_API_TOKEN": "test-token-abc123"}):
             resp = api_client.post("/api/v1/pin/verify", json={"pin": "9999"})
         assert resp.status_code == 200
-        assert resp.json() == {"verified": True}
+        data = resp.json()
+        assert data["verified"] is True
+        assert data["token"] == "test-token-abc123"
 
     def test_pin_verify_wrong(self, api_client):
         import unittest.mock

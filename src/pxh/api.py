@@ -853,7 +853,10 @@ async def verify_pin(body: PinRequest) -> JSONResponse:
         with _pin_lock:
             _pin_attempts = 0
             _pin_lockout_until = 0.0
-        return JSONResponse(status_code=200, content={"verified": True})
+        return JSONResponse(status_code=200, content={
+            "verified": True,
+            "token": os.environ.get("PX_API_TOKEN", ""),
+        })
     else:
         with _pin_lock:
             _pin_attempts += 1
@@ -1269,6 +1272,18 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
 </style>
 </head>
 <body>
+<div id="auth-gate" style="position:fixed;inset:0;background:var(--bg);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:24px">
+  <div style="font-size:48px">&#x1F916;</div>
+  <div style="font-size:22px;font-weight:800">SPARK</div>
+  <div style="font-size:13px;color:var(--muted)">Enter your PIN to continue.</div>
+  <form onsubmit="subPin();return false" style="display:contents">
+  <input id="pin-inp" type="password" inputmode="numeric" maxlength="8" placeholder="PIN"
+    style="font-size:28px;letter-spacing:.3em;text-align:center;background:var(--surface2);border:2px solid var(--surface2);border-radius:var(--radius);padding:14px 20px;width:180px;color:var(--text);font-family:inherit;outline:none"
+    onfocus="this.style.borderColor=\'var(--spark)\'" onblur="this.style.borderColor=\'var(--surface2)\'" autofocus>
+  <button class="btn btn-spark" style="width:180px" type="submit">Unlock</button>
+  </form>
+  <div id="pin-err" style="color:var(--danger);font-size:13px;display:none">Wrong PIN &#x2014; try again</div>
+</div>
 <div id="app">
   <div id="panel-chat"    class="tab-panel active">
     <div id="av-bar" style="padding:12px 16px 8px;display:flex;align-items:center;gap:12px;background:var(--surface);border-bottom:1px solid var(--surface2);flex-shrink:0">
@@ -1374,20 +1389,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
     </div>
   </div>
   <div id="panel-admin"   class="tab-panel">
-    <div id="pin-gate" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 24px;gap:16px">
-      <div style="font-size:48px">&#x1F527;</div>
-      <div style="font-size:20px;font-weight:800">Adrian&apos;s Panel</div>
-      <div style="font-size:14px;color:var(--muted);text-align:center">Enter your PIN to continue.</div>
-      <form onsubmit="subPin();return false" style="display:contents">
-      <input id="pin-inp" type="password" inputmode="numeric" maxlength="8" placeholder="PIN"
-        style="font-size:28px;letter-spacing:.3em;text-align:center;background:var(--surface2);border:2px solid var(--surface2);border-radius:var(--radius);padding:14px 20px;width:180px;color:var(--text);font-family:inherit;outline:none"
-        onfocus="this.style.borderColor='var(--spark)'" onblur="this.style.borderColor='var(--surface2)'"
-        onkeydown="if(event.key==='Enter')subPin()">
-      <button class="btn btn-spark" style="width:180px" type="submit">Unlock</button>
-      </form>
-      <div id="pin-err" style="color:var(--danger);font-size:13px;display:none">Wrong PIN &mdash; try again</div>
-    </div>
-    <div id="admin-body" style="display:none;flex-direction:column;height:100%">
+    <div id="admin-body" style="display:flex;flex-direction:column;height:100%">
       <div style="display:flex;background:var(--surface);border-bottom:1px solid var(--surface2);flex-shrink:0">
         <button class="atab-btn active" id="at-svc"      onclick="swA('svc')">&#x2699;&#xFE0F; Services</button>
         <button class="atab-btn"        id="at-tools"    onclick="swA('tools')">&#x1F6E0; Tools</button>
@@ -1448,24 +1450,17 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
   <button class="tab-btn"        id="tab-spark"   onclick="sw('spark')"><span class="ti">&#x1F916;</span>SPARK</button>
   <button class="tab-btn"        id="tab-admin"   onclick="sw('admin')"><span class="ti">&#x1F527;&#x1F512;</span>Adrian</button>
 </nav>
-<input type="hidden" id="tok" value="__SPARK_TOKEN__">
 <script>
-const tok=()=>document.getElementById('tok').value;
+let _apiToken='';const tok=()=>_apiToken;
 const api=(path,opts={})=>fetch(path,{headers:{'Authorization':'Bearer '+tok(),'Content-Type':'application/json',...(opts.headers||{})}, ...opts}).then(r=>r.json());
 let _pinOk=false;
-function showPin(){
-  if(_pinOk)return;
-  document.getElementById('pin-gate').style.display='flex';
-  document.getElementById('admin-body').style.display='none';
-}
 async function subPin(){
   const pin=document.getElementById('pin-inp').value;
   try{
     const r=await fetch('/api/v1/pin/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin})}).then(x=>x.json());
     if(r.verified){
-      _pinOk=true;
-      document.getElementById('pin-gate').style.display='none';
-      document.getElementById('admin-body').style.display='flex';
+      _apiToken=r.token||'';_pinOk=true;
+      document.getElementById('auth-gate').style.display='none';
       loadSvcs();loadParental();initTools();
     } else {
       document.getElementById('pin-err').style.display='block';
@@ -1632,7 +1627,6 @@ function sw(name){
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   document.getElementById('tab-'+name).classList.add('active');
-  if(name==='admin')showPin();
   if(name==='spark')pollFace();
 }
 </script>
@@ -1670,7 +1664,6 @@ async def favicon():
 
 @app.get("/", response_class=HTMLResponse)
 async def web_ui():
-    """Serve the SPARK web dashboard. Token injected server-side — no paste required."""
-    token = os.environ.get("PX_API_TOKEN", "")
-    html = _HTML_UI.replace("__SPARK_TOKEN__", token)
+    """Serve the SPARK web dashboard. Token is NOT in page source — issued via PIN verify."""
+    html = _HTML_UI.replace("__SPARK_TOKEN__", "")
     return HTMLResponse(content=html)
