@@ -132,7 +132,7 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer cognitive architecture:
 - **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state → `state/awareness.json` + transition detection
-- **Layer 2 — Reflection** (on transition or every 2 min idle): three-tier fallback — Claude CLI (SPARK, internet) → Ollama on M1.local (LAN) → Ollama on Pi localhost (offline). Falls back automatically on any error; each fallback step is logged. Generates thought with mood/action/salience → `state/thoughts.jsonl`
+- **Layer 2 — Reflection** (on transition or every 2 min idle): SPARK persona uses Claude CLI; other personas (GREMLIN, VIXEN) use Ollama `deepseek-r1:1.5b` on M1.local. Falls back automatically on error; each fallback step is logged. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`
 - **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions: `wait, greet, comment, remember, look_at, weather_comment, scan`. Photo capture (`tool-describe-scene`) is **on-request only** — not dispatched autonomously. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
 The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`) and during quiet mode. Auto-remembers high-salience (>0.7) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
@@ -156,7 +156,7 @@ bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 
 ### Jailbroken Chat Personas
 
-Two jailbroken chat personas via Ollama (qwen3:1.7b on M1.local; px-mind uses qwen3.5:0.8b), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
+Two jailbroken chat personas via Ollama (qwen3:1.7b on M1.local; px-mind reflection uses deepseek-r1:1.5b on M1.local for non-SPARK personas), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
 
 | Persona | Tool | Voice | Character |
 |---------|------|-------|-----------|
