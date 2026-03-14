@@ -57,10 +57,13 @@ _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 _RATE_WINDOW_S = 600      # 10-minute sliding window
 _RATE_MAX_MSGS = 10       # messages per window per IP
+_RATE_PRUNE_EVERY = 100   # prune stale IPs every N calls
+_rate_limit_calls = 0
 
 
 def _check_rate_limit(ip: str) -> bool:
     """Return True if request is allowed, False if rate-limited."""
+    global _rate_limit_calls
     now = _time.monotonic()
     with _rate_limit_lock:
         _rate_limit_store[ip] = [
@@ -70,7 +73,23 @@ def _check_rate_limit(ip: str) -> bool:
         if len(_rate_limit_store[ip]) >= _RATE_MAX_MSGS:
             return False
         _rate_limit_store[ip].append(now)
+        # Periodically prune IPs with no recent activity to bound memory
+        _rate_limit_calls += 1
+        if _rate_limit_calls >= _RATE_PRUNE_EVERY:
+            _rate_limit_calls = 0
+            stale = [k for k, v in _rate_limit_store.items()
+                     if not v or now - v[-1] > _RATE_WINDOW_S]
+            for k in stale:
+                del _rate_limit_store[k]
         return True
+
+
+def _get_client_ip(request: "Request") -> str:
+    """Extract client IP, respecting X-Forwarded-For behind a reverse proxy."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def _strip_control_chars(s: str) -> str:
@@ -147,6 +166,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     _load_token()
+    _start_history_worker()
     yield
 
 
@@ -325,13 +345,15 @@ def _history_worker() -> None:
                             sample[f] = prev[f]
                 _history_buf.append(sample)
         except Exception:
-            pass
+            logging.getLogger("pxh.api.history").warning(
+                "history sample failed", exc_info=True,
+            )
 
 
-_history_thread = threading.Thread(
-    target=_history_worker, daemon=True, name="history-worker"
-)
-_history_thread.start()
+def _start_history_worker() -> None:
+    """Start the history worker thread. Called from lifespan, not at import."""
+    t = threading.Thread(target=_history_worker, daemon=True, name="history-worker")
+    t.start()
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +797,7 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
 async def public_chat(req: PublicChatRequest, request: Request):
     """Lightweight public chat with SPARK. Rate-limited, no auth required."""
     t_start = _time.monotonic()
-    client_ip = (request.client.host if request.client else "unknown")
+    client_ip = _get_client_ip(request)
     ip_hash = _hashlib.sha256(client_ip.encode()).hexdigest()[:12]
 
     if not _check_rate_limit(client_ip):

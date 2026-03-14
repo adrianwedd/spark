@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -8,6 +9,8 @@ from typing import Any, Mapping
 from filelock import FileLock
 
 from .time import utc_timestamp
+
+_log = logging.getLogger("pxh.logging")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -48,4 +51,4 @@ def log_event(name: str, payload: Mapping[str, Any]) -> None:
                 half = len(lines) // 2
                 log_path.write_text("\n".join(lines[half:]) + "\n", encoding="utf-8")
         except Exception:
-            pass
+            _log.warning("log rotation failed for %s", log_path, exc_info=True)

@@ -11,12 +11,15 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from filelock import FileLock
 
 from .time import utc_timestamp
+
+_log = logging.getLogger("pxh.token_log")
 
 
 def _est(text: str) -> int:
@@ -46,4 +49,4 @@ def log_usage(input_text: str, output_text: str) -> None:
             existing["ts"] = utc_timestamp()
             usage_file.write_text(json.dumps(existing))
     except Exception:
-        pass  # never crash the caller over token accounting
+        _log.warning("token accounting failed", exc_info=True)

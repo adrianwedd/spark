@@ -321,7 +321,7 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
                 if last_mood:
                     context_sections.append(f"Current mood: {last_mood}")
         except Exception:
-            pass
+            print("[voice-loop] failed to read thoughts for prompt context", file=sys.stderr)
 
     context_block = "\n".join(context_sections)
 
@@ -701,7 +701,7 @@ def supervisor_loop(args: argparse.Namespace) -> None:
                 from .token_log import log_usage
                 log_usage(prompt, stdout)
             except Exception:
-                pass
+                print("[voice-loop] token logging failed", file=sys.stderr)
 
         if args.auto_log:
             log_event(

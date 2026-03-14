@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -10,7 +12,24 @@ from filelock import FileLock
 from .logging import log_event
 from .time import utc_timestamp
 
+_log = logging.getLogger("pxh.state")
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content to path atomically via temp file + os.replace."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 STATE_DIR = PROJECT_ROOT / "state"
 DEFAULT_SESSION_PATH = STATE_DIR / "session.json"
 TEMPLATE_PATH = STATE_DIR / "session.template.json"
@@ -58,9 +77,9 @@ def ensure_session() -> Path:
     with FileLock(lock_path):
         if not path.exists():
             if TEMPLATE_PATH.exists():
-                path.write_text(TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+                _atomic_write(path, TEMPLATE_PATH.read_text(encoding="utf-8"))
             else:
-                path.write_text(json.dumps(default_state(), indent=2) + "\n", encoding="utf-8")
+                _atomic_write(path, json.dumps(default_state(), indent=2) + "\n")
     return path
 
 
@@ -71,9 +90,9 @@ def load_session() -> Dict[str, Any]:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            # Fallback to default if file is corrupted.
+            _log.warning("session.json corrupt — resetting to defaults: %s", path)
             data = default_state()
-            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            _atomic_write(path, json.dumps(data, indent=2) + "\n")
             return data
 
 
@@ -81,7 +100,7 @@ def save_session(data: Dict[str, Any]) -> None:
     path = ensure_session()
     lock_path = str(path) + ".lock"
     with FileLock(lock_path):
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        _atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
 def update_session(
@@ -109,5 +128,5 @@ def update_session(
             if len(history) > history_limit:
                 data["history"] = history[-history_limit:]
 
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        _atomic_write(path, json.dumps(data, indent=2) + "\n")
         return data
