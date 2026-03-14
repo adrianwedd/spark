@@ -482,3 +482,106 @@ class TestPinVerify:
             resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
         assert resp.status_code == 429
         assert resp.json()["verified"] is False
+
+
+class TestPublicChat:
+    """Tests for /api/v1/public/chat — no auth required."""
+
+    def _mock_claude(self, reply: str):
+        """Return a patch target that makes _call_claude_public return reply."""
+        import asyncio as _asyncio
+
+        async def _fake(*_a, **_kw):
+            return reply
+
+        return unittest.mock.patch("pxh.api._call_claude_public", side_effect=_fake)
+
+    def test_happy_path(self, api_client):
+        with self._mock_claude("Hello there!"):
+            resp = api_client.post(
+                "/api/v1/public/chat",
+                json={"message": "Hi SPARK", "history": []},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["reply"] == "Hello there!"
+
+    def test_no_auth_required(self, api_client):
+        """Public chat must work without a Bearer token."""
+        with self._mock_claude("Hi!"):
+            resp = api_client.post(
+                "/api/v1/public/chat",
+                json={"message": "Hello", "history": []},
+            )
+        assert resp.status_code == 200
+
+    def test_empty_message_rejected(self, api_client):
+        resp = api_client.post(
+            "/api/v1/public/chat",
+            json={"message": "", "history": []},
+        )
+        assert resp.status_code == 400
+
+    def test_message_too_long_rejected(self, api_client):
+        resp = api_client.post(
+            "/api/v1/public/chat",
+            json={"message": "x" * 2001, "history": []},
+        )
+        assert resp.status_code == 400
+
+    def test_subprocess_error_returns_500(self, api_client):
+        import asyncio as _asyncio
+
+        async def _raise(*_a, **_kw):
+            raise RuntimeError("claude exited 1: some error")
+
+        with unittest.mock.patch("pxh.api._call_claude_public", side_effect=_raise):
+            resp = api_client.post(
+                "/api/v1/public/chat",
+                json={"message": "Hi", "history": []},
+            )
+        assert resp.status_code == 500
+
+    def test_timeout_returns_504(self, api_client):
+        import asyncio as _asyncio
+
+        async def _timeout(*_a, **_kw):
+            raise _asyncio.TimeoutError()
+
+        with unittest.mock.patch("pxh.api._call_claude_public", side_effect=_timeout):
+            resp = api_client.post(
+                "/api/v1/public/chat",
+                json={"message": "Hi", "history": []},
+            )
+        assert resp.status_code == 504
+
+    def test_make_clean_env_strips_claude_vars(self):
+        """_make_clean_env must remove all CLAUDE* and DISABLE_CLAUDE_CODE_PROTECTIONS."""
+        from pxh.api import _make_clean_env
+        dirty = {
+            "CLAUDECODE": "1",
+            "CLAUDE_CODE_ENTRYPOINT": "cli",
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+            "DISABLE_CLAUDE_CODE_PROTECTIONS": "1",
+            "PATH": "/usr/bin",
+            "HOME": "/home/pi",
+        }
+        with unittest.mock.patch.dict(os.environ, dirty, clear=True):
+            clean = _make_clean_env()
+        assert "CLAUDECODE" not in clean
+        assert "CLAUDE_CODE_ENTRYPOINT" not in clean
+        assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in clean
+        assert "DISABLE_CLAUDE_CODE_PROTECTIONS" not in clean
+        assert clean["PATH"] == "/usr/bin"
+        assert clean["HOME"] == "/home/pi"
+
+    def test_rate_limit_returns_429(self, api_client):
+        """After exhausting the per-IP rate limit, further requests get 429."""
+        from pxh import api as _api
+
+        # Patch rate limiter to always deny
+        with unittest.mock.patch.object(_api, "_check_rate_limit", return_value=False):
+            resp = api_client.post(
+                "/api/v1/public/chat",
+                json={"message": "Hi", "history": []},
+            )
+        assert resp.status_code == 429

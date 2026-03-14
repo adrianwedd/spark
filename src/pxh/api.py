@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import secrets
+import shutil
 import subprocess
 import threading
 import uuid
@@ -653,21 +655,34 @@ _PUBLIC_CHAT_SYSTEM_PROMPT = (
 _PUBLIC_CHAT_TIMEOUT_S = 15.0
 
 
-_CLAUDE_BIN = "/home/pi/.local/bin/claude"
+_CLAUDE_BIN = (
+    os.environ.get("PX_CLAUDE_BIN")
+    or shutil.which("claude")
+    or "/home/pi/.local/bin/claude"
+)
+_PUBLIC_CHAT_EXECUTOR = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=2)
+_public_chat_log = logging.getLogger("pxh.api.public_chat")
+
+# Strip all CLAUDE* env vars so nested Claude CLI invocations are permitted
+_CLAUDE_ENV_STRIP_PREFIXES = ("CLAUDE", "DISABLE_CLAUDE_CODE_PROTECTIONS")
+
+
+def _make_clean_env() -> dict:
+    return {
+        k: v for k, v in os.environ.items()
+        if not any(k.startswith(p) for p in _CLAUDE_ENV_STRIP_PREFIXES)
+    }
 
 
 async def _call_claude_public(prompt: str) -> str:
-    """Run Claude CLI in a thread pool and return the reply text."""
-    import asyncio as _asyncio
-    import subprocess as _sp
-    loop = _asyncio.get_running_loop()
+    """Run Claude CLI in a bounded thread pool and return the reply text."""
+    loop = asyncio.get_running_loop()
 
     def _run() -> str:
-        env = os.environ.copy()
-        # Unset Claude Code session vars so nested invocation is permitted
-        env.pop("CLAUDECODE", None)
-        env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-        result = _sp.run(
+        # subprocess timeout is 1s shorter than asyncio so the thread always
+        # resolves before asyncio.wait_for cancels, avoiding orphaned threads.
+        sp_timeout = max(1, int(_PUBLIC_CHAT_TIMEOUT_S) - 1)
+        result = subprocess.run(
             [
                 _CLAUDE_BIN, "-p",
                 "--allowedTools", "",
@@ -677,29 +692,29 @@ async def _call_claude_public(prompt: str) -> str:
             ],
             input=prompt.encode(),
             capture_output=True,
-            timeout=int(_PUBLIC_CHAT_TIMEOUT_S) + 2,
-            env=env,
+            timeout=sp_timeout,
+            env=_make_clean_env(),
         )
         if result.returncode != 0:
-            raise RuntimeError(
-                f"claude exited {result.returncode}: {result.stderr.decode()[:200]}"
-            )
+            stderr = result.stderr.decode(errors="replace")[:400]
+            raise RuntimeError(f"claude exited {result.returncode}: {stderr}")
         return result.stdout.decode().strip()
 
-    return await loop.run_in_executor(None, _run)
+    return await loop.run_in_executor(_PUBLIC_CHAT_EXECUTOR, _run)
 
 
 def _build_public_context() -> str:
     """Public-safe context: mood word, AEDT time, weather (read-only)."""
     import datetime
     import json as _j
+    _log = logging.getLogger("pxh.api.public_context")
     lines = []
     try:
         from zoneinfo import ZoneInfo
         aedt = datetime.datetime.now(ZoneInfo("Australia/Hobart"))
         lines.append(f"Current time (AEDT): {aedt.strftime('%H:%M, %A')}")
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("time context unavailable: %s", exc)
     try:
         thoughts_path = _public_state_dir() / "thoughts-spark.jsonl"
         if thoughts_path.exists():
@@ -707,8 +722,8 @@ def _build_public_context() -> str:
             mood = _j.loads(last).get("mood", "")
             if mood:
                 lines.append(f"SPARK's current mood: {mood}")
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("mood context unavailable: %s", exc)
     try:
         awareness_path = _public_state_dir() / "awareness.json"
         if awareness_path.exists():
@@ -718,8 +733,8 @@ def _build_public_context() -> str:
             cond = wx.get("conditions") or wx.get("description")
             if temp is not None:
                 lines.append(f"Weather: {temp}°C" + (f", {cond}" if cond else ""))
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.debug("weather context unavailable: %s", exc)
     return "\n".join(lines)
 
 
@@ -737,8 +752,8 @@ def _log_chat_public(*, ip_hash: str, turns: int, status: str, latency_ms: int) 
     try:
         with open(log_path, "a") as f:
             f.write(_j.dumps(entry) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        _public_chat_log.warning("_log_chat_public failed: %s", exc)
 
 
 from fastapi.exceptions import RequestValidationError
@@ -781,7 +796,7 @@ async def public_chat(req: PublicChatRequest, request: Request):
             _call_claude_public(prompt),
             timeout=_PUBLIC_CHAT_TIMEOUT_S,
         )
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
         latency_ms = int((_time.monotonic() - t_start) * 1000)
         _log_chat_public(ip_hash=ip_hash, turns=len(req.history),
                          status="timeout", latency_ms=latency_ms)
@@ -789,8 +804,9 @@ async def public_chat(req: PublicChatRequest, request: Request):
             status_code=504,
             content={"error": "Something went quiet on my end. Try again?"},
         )
-    except Exception:
+    except Exception as exc:
         latency_ms = int((_time.monotonic() - t_start) * 1000)
+        _public_chat_log.error("public_chat failed: %s", exc, exc_info=True)
         _log_chat_public(ip_hash=ip_hash, turns=len(req.history),
                          status="error", latency_ms=latency_ms)
         return JSONResponse(

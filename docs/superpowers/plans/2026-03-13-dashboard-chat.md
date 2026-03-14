@@ -70,7 +70,9 @@
 
 
   @pytest.fixture()
-  def client(isolated_project):
+  def client(isolated_project, monkeypatch):
+      # PX_API_TOKEN must be set before app lifespan runs _load_token()
+      monkeypatch.setenv("PX_API_TOKEN", "test-token-for-public-chat")
       from pxh.api import app
       from pxh import api as api_mod
       if hasattr(api_mod, '_rate_limit_store'):
@@ -134,6 +136,28 @@
                           json={"message": "Hi", "history": []})
       assert r.status_code == 200
       assert "went quiet" in r.json()["reply"].lower()
+
+
+  def test_claude_timeout_returns_504(client):
+      import asyncio
+      async def _slow(*_a, **_kw):
+          raise asyncio.TimeoutError()
+      with patch("pxh.api._call_claude_public", side_effect=asyncio.TimeoutError()):
+          r = client.post("/api/v1/public/chat",
+                          json={"message": "Hi", "history": []})
+      assert r.status_code == 504
+
+
+  def test_cors_preflight(client):
+      r = client.options(
+          "/api/v1/public/chat",
+          headers={
+              "Origin": "https://spark.wedd.au",
+              "Access-Control-Request-Method": "POST",
+          },
+      )
+      assert r.status_code in (200, 204)
+      assert "access-control-allow-origin" in r.headers
   ```
 
 - [ ] **Step 2: Run tests to confirm they fail**
@@ -173,10 +197,24 @@
           return True
   ```
 
-  Add Pydantic models (after existing model definitions in the file):
+  Add Pydantic models (after existing model definitions in the file).
+  **Note:** `api.py` already has `from pydantic import BaseModel, Field` at the top.
+  Extend that import line to add `field_validator` — do not add a duplicate import:
 
   ```python
+  # Change the existing pydantic import line to:
   from pydantic import BaseModel, Field, field_validator
+  ```
+
+  Then add the models:
+
+  ```python
+
+  import re as _re
+
+  def _strip_control_chars(s: str) -> str:
+      """Strip ASCII control characters (0x00–0x1F except \t and \n)."""
+      return _re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', s)
 
   class ChatHistoryItem(BaseModel):
       role: str = Field(..., max_length=10)
@@ -189,6 +227,11 @@
               raise ValueError("role must be 'user' or 'spark'")
           return v
 
+      @field_validator("text")
+      @classmethod
+      def text_strip_controls(cls, v: str) -> str:
+          return _strip_control_chars(v)
+
   class PublicChatRequest(BaseModel):
       message: str = Field(..., min_length=1, max_length=500)
       history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
@@ -196,12 +239,13 @@
       @field_validator("message")
       @classmethod
       def message_must_not_be_blank(cls, v: str) -> str:
+          v = _strip_control_chars(v)
           if not v.strip():
               raise ValueError("message must not be blank")
           return v.strip()
   ```
 
-- [ ] **Step 4: Run validation tests**
+- [ ] **Step 4: Run validation tests (expect failures — endpoint not yet added)**
 
   ```bash
   python -m pytest tests/test_public_chat.py::test_message_too_long_returns_400 \
@@ -211,7 +255,8 @@
     -v
   ```
 
-  Expected: 4 PASS
+  Expected: **4 FAIL** — each test should get 404 (endpoint not added until Task 3 Step 4).
+  If you see 4 FAIL with "404 Not Found" the models are wired correctly; proceed.
 
 - [ ] **Step 5: Commit**
 
@@ -273,6 +318,10 @@
               capture_output=True,
               timeout=int(_PUBLIC_CHAT_TIMEOUT_S) + 2,
           )
+          if result.returncode != 0:
+              raise RuntimeError(
+                  f"claude exited {result.returncode}: {result.stderr.decode()[:200]}"
+              )
           return result.stdout.decode().strip()
 
       return await loop.run_in_executor(None, _run)
@@ -292,7 +341,7 @@
       except Exception:
           pass
       try:
-          thoughts_path = Path(STATE_DIR) / "thoughts-spark.jsonl"
+          thoughts_path = _public_state_dir() / "thoughts-spark.jsonl"
           if thoughts_path.exists():
               last = thoughts_path.read_text().strip().splitlines()[-1]
               mood = _j.loads(last).get("mood", "")
@@ -301,7 +350,7 @@
       except Exception:
           pass
       try:
-          awareness_path = Path(STATE_DIR) / "awareness.json"
+          awareness_path = _public_state_dir() / "awareness.json"
           if awareness_path.exists():
               aw = _j.loads(awareness_path.read_text())
               wx = aw.get("weather") or {}
@@ -316,7 +365,7 @@
 
   def _log_chat_public(*, ip_hash: str, turns: int, status: str, latency_ms: int) -> None:
       import datetime, json as _j
-      log_path = Path(LOG_DIR) / "tool-chat-public.log"
+      log_path = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs")) / "tool-chat-public.log"
       entry = {
           "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
           "ip_hash": ip_hash,
@@ -331,7 +380,18 @@
           pass
   ```
 
-- [ ] **Step 4: Add the endpoint**
+- [ ] **Step 4: Add the validation error handler + endpoint**
+
+  FastAPI/Pydantic returns 422 on validation failure by default. The spec requires 400.
+  Add this handler **before** the endpoint (once per file — skip if already present):
+
+  ```python
+  from fastapi.exceptions import RequestValidationError
+
+  @app.exception_handler(RequestValidationError)
+  async def _validation_error_handler(request: Request, exc: RequestValidationError):
+      return JSONResponse(status_code=400, content={"error": str(exc.errors()[0]["msg"])})
+  ```
 
   ```python
   @app.post("/api/v1/public/chat")
@@ -747,14 +807,14 @@ All DOM mutation uses `textContent` and safe DOM methods — no `innerHTML`.
 
     // ── Mood colour ──────────────────────────────────────────────
     function updateBubbleColor() {
-      var color = (window.SparkDashboard && window.SparkDashboard.MOOD_FAVICON_COLOR)
-        ? window.SparkDashboard.MOOD_FAVICON_COLOR : null;
+      // MOOD_FAVICON_COLOR is a {mood: color} map — look up by currentMoodWord
+      var colorMap = (window.SparkDashboard && window.SparkDashboard.MOOD_FAVICON_COLOR) || {};
+      var word = (window.SparkDashboard && window.SparkDashboard.currentMoodWord) || '';
+      var color = colorMap[word] || null;
       if (color) {
         bubble.style.setProperty('--chat-bubble-color', color);
         panel.style.setProperty('--chat-bubble-color', color);
       }
-      var word = (window.SparkDashboard && window.SparkDashboard.currentMoodWord)
-        ? window.SparkDashboard.currentMoodWord : '';
       if (moodWord) moodWord.textContent = word;
     }
 
@@ -901,7 +961,9 @@ All DOM mutation uses `textContent` and safe DOM methods — no `innerHTML`.
       if (e.key === 'Escape' && !panel.hidden) closePanel();
     });
     document.addEventListener('click', function (e) {
-      if (!panel.hidden && !panel.contains(e.target) && e.target !== bubble) closePanel();
+      // Use .contains() not identity check — clicking the SVG inside the bubble
+      // sets e.target to the SVG child, not the button itself
+      if (!panel.hidden && !panel.contains(e.target) && !bubble.contains(e.target)) closePanel();
     });
 
     panel.addEventListener('keydown', trapFocus);
@@ -944,21 +1006,26 @@ All DOM mutation uses `textContent` and safe DOM methods — no `innerHTML`.
   grep -n "MOOD_FAVICON_COLOR" site/js/dashboard.js
   ```
 
-- [ ] **Step 2: Expose currentMoodWord alongside MOOD_FAVICON_COLOR**
+- [ ] **Step 2: Expose currentMoodWord and dispatch state event inside renderPresence()**
 
-  In the same block where `SparkDashboard.MOOD_FAVICON_COLOR` is assigned, add:
+  `renderPresence(state)` is the function called on every poll cycle (line 24 of dashboard.js).
+  `MOOD_FAVICON_COLOR` is a `const` at module scope — do NOT add `currentMoodWord` there.
+
+  Inside `renderPresence(state)`, after the existing `const mood = (state.mood || '').toLowerCase();` line, add:
 
   ```javascript
-  SparkDashboard.currentMoodWord = (state.mood || '').toLowerCase();
+  // Expose for chat.js bubble colour sync
+  SparkDashboard.currentMoodWord = mood;
   ```
 
-  Then dispatch the custom event immediately after:
+  Then at the **end** of `renderPresence(state)` (after all DOM updates, before the closing `}`), add:
 
   ```javascript
   document.dispatchEvent(new CustomEvent('spark-state-updated'));
   ```
 
-  Note: only add the `dispatchEvent` call if it isn't already there.
+  Note: only add the `dispatchEvent` call if it isn't already there. Placing it inside
+  `renderPresence()` ensures the event fires on every state poll, not just once at page load.
 
 - [ ] **Step 3: Run full test suite**
 
