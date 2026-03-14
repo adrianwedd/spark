@@ -18,11 +18,28 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write content to path atomically via temp file + os.replace."""
+    """Write content to path atomically via temp file + os.replace.
+
+    Preserves original file's ownership and sets mode 0o644 so that
+    cross-user writers (root px-alive, pi px-mind) don't lock each other out.
+    """
+    # Capture original ownership before replacing
+    try:
+        st = path.stat()
+        orig_uid, orig_gid = st.st_uid, st.st_gid
+    except FileNotFoundError:
+        orig_uid, orig_gid = None, None
+
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
+        os.chmod(tmp, 0o644)
+        if orig_uid is not None:
+            try:
+                os.chown(tmp, orig_uid, orig_gid)
+            except OSError:
+                pass  # non-root can't chown — mode 0o644 is sufficient
         os.replace(tmp, path)
     except BaseException:
         try:
