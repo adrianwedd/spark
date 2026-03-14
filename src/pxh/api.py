@@ -373,9 +373,10 @@ class SessionPatch(BaseModel):
     spark_quiet_mode: Optional[bool] = None
     mode: Optional[str] = None
     persona: Optional[str] = None  # "vixen", "gremlin", "spark", or "claude" (clears persona)
+    roaming_allowed: Optional[bool] = None
 
 
-PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode"}
+PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode", "roaming_allowed"}
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 
 
