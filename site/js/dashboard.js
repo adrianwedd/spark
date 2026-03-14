@@ -395,8 +395,9 @@ window.SparkDashboard = (function () {
   function renderSparklines(points) {
     if (!points || points.length < 2) return;
     document.querySelectorAll('canvas[data-field]').forEach(canvas => {
-      // Set canvas width from its rendered width so it fills the container
-      if (!canvas.width || canvas.width < 10) canvas.width = canvas.offsetWidth || 160;
+      // Always re-measure canvas pixel width from CSS layout (handles resize/orientation)
+      var cssW = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 160;
+      if (cssW > 10) canvas.width = cssW;
       if (canvas.dataset.field === 'mood_val') {
         SparkCharts.drawMoodStrip(canvas, points);
       } else {

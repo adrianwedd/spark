@@ -22,6 +22,7 @@ html { scroll-behavior: smooth; }
 body {
   font-family: system-ui, -apple-system, sans-serif;
   line-height: 1.6;
+  overflow-x: hidden;
 }
 
 /* ── Nav ── */
@@ -137,14 +138,18 @@ nav .nav-github:hover { opacity: 1; color: var(--dark-text); }
 section {
   padding: calc(var(--nav-height) + 4rem) 2rem 4rem;
   min-height: 100vh;
+  overflow-x: hidden;
 }
 section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); }
+@media (max-width: 480px) {
+  section { padding-left: 0.75rem; padding-right: 0.75rem; }
+}
 
 /* ── Accessibility ── */
 :focus-visible { outline: 2px solid var(--warm-accent); outline-offset: 3px; }
 
 /* ── Utility ── */
-.container { max-width: 900px; margin: 0 auto; }
+.container { max-width: 900px; margin: 0 auto; padding: 0 1rem; overflow-x: hidden; }
 .null-value::after { content: "—"; opacity: 0.4; }
 .hidden { display: none; }
 

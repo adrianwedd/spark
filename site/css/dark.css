@@ -30,12 +30,22 @@
   overflow-x: auto;
   line-height: 1.5;
   border: 1px solid rgba(74, 222, 128, 0.15);
+  max-width: 100%;
+}
+@media (max-width: 640px) {
+  [data-theme="dark"] pre.arch { font-size: 0.6rem; padding: 1rem; }
 }
 
 /* Code blocks (highlight.js) */
 [data-theme="dark"] pre code.hljs {
   border-radius: 8px;
   font-size: 0.8rem;
+  overflow-x: auto;
+  max-width: 100%;
+}
+[data-theme="dark"] pre {
+  max-width: 100%;
+  overflow-x: auto;
 }
 
 /* Tool collapse */

@@ -168,7 +168,11 @@
 
   function tickWaveform() {
     const canvas = document.getElementById('waveform-canvas');
-    if (canvas) SparkCharts.drawWaveform(canvas, state.ambient_rms || 0);
+    if (!canvas) return;
+    // Re-measure width from CSS layout on each tick (handles resize/orientation)
+    var cssW = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 160;
+    if (cssW > 10) canvas.width = cssW;
+    SparkCharts.drawWaveform(canvas, state.ambient_rms || 0);
   }
 
   // ── Hydrate from cache (zero-flash on load) ───────────────────────────────

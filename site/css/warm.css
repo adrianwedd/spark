@@ -66,7 +66,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .fun-facts    { margin-left: 1.25rem; line-height: 2; }
 
 /* Mood table */
-.mood-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.mood-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; table-layout: fixed; word-wrap: break-word; }
 .mood-table-header th { text-align: left; padding: 0.5rem; color: var(--warm-muted); border-bottom: 1px solid rgba(0,0,0,0.08); }
 .mood-table td { padding: 0.5rem; }
 
@@ -102,6 +102,9 @@ details > *:not(summary) { margin-top: 0.75rem; }
 
 @media (max-width: 640px) {
   .band-presence { grid-template-columns: 1fr; }
+  .carousel-slide { padding: 1.25rem 1rem 1rem; border-radius: 20px; }
+  .band { padding: 1rem; }
+  .presence-card { padding: 0.9rem 1rem 0.8rem; }
 }
 
 /* ── Presence cards ───────────────────────────────────────────────── */
@@ -675,7 +678,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .dot-err  { color: #dc2626; }
 
 /* Sparkline canvas */
-.sparkline-canvas { display: block; margin-top: 0.5rem; width: 100%; }
+.sparkline-canvas { display: block; margin-top: 0.5rem; width: 100%; max-width: 100%; }
 .sparkline-label  { font-size: 0.7rem; color: var(--warm-muted); margin-top: 0.2rem; }
 
 /* ── Thoughts Carousel — thought bubble ──────────────────────────── */
