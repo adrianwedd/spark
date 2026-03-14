@@ -289,7 +289,7 @@ REACTIVE_TEMPLATES = {
 
 # Ollama config (same host as tool-chat)
 OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
-MODEL             = os.environ.get("PX_MIND_MODEL", "deepseek-r1:1.5b")
+MODEL             = os.environ.get("PX_MIND_MODEL", "qwen3.5:0.8b")
 LOCAL_OLLAMA_HOST = os.environ.get("PX_MIND_LOCAL_OLLAMA_HOST", "http://localhost:11434")
 LOCAL_MODEL       = os.environ.get("PX_MIND_LOCAL_MODEL", "deepseek-r1:1.5b")
 TEMPERATURE  = 1.3   # high for variety — small models need more randomness
