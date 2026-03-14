@@ -300,7 +300,7 @@ MAX_TOKENS   = 200
 #   "auto"   (default) — Claude for SPARK persona, Ollama for GREMLIN/VIXEN/default
 #   "claude" — always use Claude Haiku regardless of persona
 #   "ollama" — always use Ollama (for testing or when claude is unavailable)
-MIND_BACKEND = os.environ.get("PX_MIND_BACKEND", "auto")
+MIND_BACKEND = os.environ.get("PX_MIND_BACKEND", "claude")
 CLAUDE_MODEL = os.environ.get("PX_MIND_CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
 VALID_MOODS   = {"curious", "content", "alert", "playful", "contemplative", "bored",
