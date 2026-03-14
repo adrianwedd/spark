@@ -20,9 +20,14 @@ import datetime as dt
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
@@ -38,6 +43,23 @@ TURN_S         = 0.7
 
 # Angles to sweep for direction choice (pan servo)
 SWEEP_ANGLES   = [-50, -25, 0, 25, 50]
+
+EXPLORE_STEP_TIMEOUT   = 30
+PHOTO_COOLDOWN_S       = 30
+DAILY_VISION_CAP       = 50
+VISION_FAIL_MAX        = 3
+STUCK_THRESHOLD        = 3
+BATTERY_STALE_S        = 60
+FLUSH_INTERVAL         = 10
+TURN_K                 = 1.0
+
+STATE_DIR  = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+BIN_DIR    = PROJECT_ROOT / "bin"
+
+FRIGATE_HOST   = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo:5000")
+FRIGATE_CAMERA = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
+
+FALLBACK_DESCRIPTION = "I couldn't see anything right now."
 
 
 def log(msg: str) -> None:
@@ -68,7 +90,7 @@ def sweep_distances(px) -> dict[int, float]:
         px.set_cam_pan_angle(angle)
         time.sleep(0.15)  # settle
         readings[angle] = read_dist(px)
-        log(f"  sweep angle={angle:+d}° dist={readings[angle]:.0f}cm")
+        log(f"  sweep angle={angle:+d}\u00b0 dist={readings[angle]:.0f}cm")
     px.set_cam_pan_angle(0)  # return to center
     return readings
 
@@ -109,16 +131,275 @@ def speak(text: str) -> None:
         pass
 
 
+_sigterm_flag = threading.Event()
+
+def _handle_sigterm(signum, frame):
+    _sigterm_flag.set()
+
+
+def _read_session() -> dict:
+    session_path = Path(os.environ.get("PX_SESSION_PATH", STATE_DIR / "session.json"))
+    try:
+        return json.loads(session_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _read_battery() -> dict | None:
+    battery_path = STATE_DIR / "battery.json"
+    try:
+        data = json.loads(battery_path.read_text(encoding="utf-8"))
+        ts = dt.datetime.fromisoformat(data["ts"].replace("Z", "+00:00"))
+        age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
+        if age_s > BATTERY_STALE_S:
+            return None
+        return {"pct": int(data["pct"]), "volts": float(data["volts"]),
+                "charging": bool(data.get("charging", False))}
+    except Exception:
+        return None
+
+
+def _check_abort(session: dict, battery: dict | None, stuck_count: int,
+                 start_time: float, duration: int) -> str | None:
+    if _sigterm_flag.is_set():
+        return "terminated"
+    if not session.get("roaming_allowed", False):
+        return "roaming disabled"
+    if not session.get("confirm_motion_allowed", False):
+        return "motion not allowed"
+    if session.get("wheels_on_blocks", False):
+        return "wheels on blocks"
+    if session.get("listening", False):
+        return "someone is talking"
+    if battery is None:
+        return "battery data stale or missing"
+    if battery.get("charging", False):
+        return "battery charging"
+    if battery["pct"] <= 20:
+        return "battery low"
+    if stuck_count >= STUCK_THRESHOLD:
+        return "stuck (3 blocked sweeps)"
+    if time.time() - start_time >= duration:
+        return "time limit reached"
+    return None
+
+
+def _read_sonar(px) -> float | None:
+    try:
+        d = px.get_distance()
+        if d is None or d < 0:
+            return None
+        return float(d)
+    except Exception:
+        return None
+
+
+def _sweep_sonar(px) -> dict[int, float | None]:
+    readings = {}
+    for angle in SWEEP_ANGLES:
+        px.set_cam_pan_angle(angle)
+        time.sleep(0.15)
+        readings[angle] = _read_sonar(px)
+        dist_str = f"{readings[angle]:.0f}" if readings[angle] is not None else "None"
+        log(f"  sweep angle={angle:+d}deg dist={dist_str}cm")
+    px.set_cam_pan_angle(0)
+    return readings
+
+
+def _query_frigate() -> list[dict] | None:
+    url = f"{FRIGATE_HOST}/api/events?cameras={FRIGATE_CAMERA}&limit=5&min_score=0.5"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            events = json.loads(resp.read().decode())
+        detections = []
+        seen = set()
+        for evt in events:
+            label = evt.get("label", "unknown")
+            score = evt.get("top_score") or evt.get("score", 0)
+            if label not in seen:
+                detections.append({"label": label, "score": round(float(score), 2)})
+                seen.add(label)
+        return detections
+    except Exception:
+        return None
+
+
+def _write_exploring_state(active: bool, pid: int | None = None,
+                            started: str | None = None) -> None:
+    data = {"active": active}
+    if pid is not None:
+        data["pid"] = pid
+    if started is not None:
+        data["started"] = started
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "exploring.json"
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def _load_exploration_meta() -> dict:
+    path = STATE_DIR / "exploration_meta.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_exploration_meta(meta: dict) -> None:
+    path = STATE_DIR / "exploration_meta.json"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+
+
+def _heading_label(accumulator: float) -> str:
+    a = ((accumulator + 180) % 360) - 180
+    if a < -135:
+        return "behind-left"
+    elif a < -45:
+        return "left"
+    elif a <= 45:
+        return "ahead"
+    elif a <= 135:
+        return "right"
+    else:
+        return "behind-right"
+
+
+def _extract_landmark(description: str) -> str:
+    if not description or description == FALLBACK_DESCRIPTION:
+        return ""
+    first = description.split(".")[0].strip()
+    words = first.split()
+    if words and words[0].lower() in ("a", "an", "the"):
+        words = words[1:]
+    return " ".join(words[:6])
+
+
+def _flush_nav_entries(entries: list[dict], explore_id: str) -> None:
+    if not entries:
+        return
+    from filelock import FileLock
+    path = STATE_DIR / "exploration.jsonl"
+    lock = FileLock(str(path) + ".lock", timeout=5)
+    try:
+        with lock:
+            existing = []
+            if path.exists():
+                existing = [ln for ln in path.read_text(encoding="utf-8").strip().splitlines() if ln.strip()]
+            existing.extend(json.dumps(e) for e in entries)
+            if len(existing) > 100:
+                existing = existing[-100:]
+            fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write("\n".join(existing) + "\n")
+                os.replace(tmp, str(path))
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+    except Exception as exc:
+        log(f"flush_nav_entries error: {exc}")
+
+
+def _write_observation(entry: dict) -> None:
+    from filelock import FileLock
+    path = STATE_DIR / "exploration.jsonl"
+    lock = FileLock(str(path) + ".lock", timeout=5)
+    try:
+        with lock:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        log(f"write_observation error: {exc}")
+
+
+def _call_describe_scene(dry: bool) -> dict:
+    env = os.environ.copy()
+    env["PX_DRY"] = "1" if dry else "0"
+    try:
+        result = subprocess.run(
+            [str(BIN_DIR / "tool-describe-scene")],
+            capture_output=True, text=True, check=False,
+            env=env, timeout=60,
+        )
+        lines = result.stdout.strip().splitlines()
+        if lines:
+            return json.loads(lines[-1])
+    except Exception as exc:
+        log(f"describe_scene error: {exc}")
+    return {"status": "error", "description": FALLBACK_DESCRIPTION}
+
+
+def _auto_remember(text: str) -> None:
+    from filelock import FileLock
+    notes_path = STATE_DIR / "notes.jsonl"
+    lock = FileLock(str(notes_path) + ".lock", timeout=5)
+    try:
+        with lock:
+            notes_path.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "note": text[:500],
+                "source": "exploration",
+            }
+            with notes_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        log(f"auto_remember error: {exc}")
+
+
+def _check_daily_vision_cap(meta: dict) -> bool:
+    today = dt.date.today().isoformat()
+    if meta.get("daily_vision_date") != today:
+        return True
+    return meta.get("daily_vision_calls", 0) < DAILY_VISION_CAP
+
+
+def _increment_vision_count(meta: dict) -> dict:
+    today = dt.date.today().isoformat()
+    if meta.get("daily_vision_date") != today:
+        meta["daily_vision_date"] = today
+        meta["daily_vision_calls"] = 1
+    else:
+        meta["daily_vision_calls"] = meta.get("daily_vision_calls", 0) + 1
+    return meta
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Autonomous wander loop")
     parser.add_argument("--steps",    type=int,   default=int(os.environ.get("PX_WANDER_STEPS", "5")))
     parser.add_argument("--dry-run",  action="store_true")
     parser.add_argument("--quiet",    action="store_true", help="Don't speak while wandering")
+    parser.add_argument("--mode",     type=str,   default="avoid", choices=["avoid", "explore"])
+    parser.add_argument("--duration", type=int,   default=180, help="Explore mode duration in seconds")
     args = parser.parse_args(argv)
 
+    mode   = args.mode
     steps  = int(clamp(args.steps, 1, 20))
     dry    = args.dry_run
     quiet  = args.quiet or os.environ.get("PX_WANDER_QUIET", "0") != "0"
+    duration = int(clamp(args.duration, 30, 300)) if mode == "explore" else 0
 
     px = None
 
@@ -131,80 +412,360 @@ def main(argv: list[str]) -> int:
             print(json.dumps({"status": "error", "error": str(exc)}))
             return 1
 
-    log(f"wander start steps={steps} dry={dry}")
-
     obstacles_avoided = 0
     steps_driven      = 0
 
     try:
-        for step in range(steps):
-            log(f"step {step + 1}/{steps}")
+        if mode == "avoid":
+            log(f"wander start steps={steps} dry={dry}")
 
-            if dry:
-                log("dry: forward 1.2s")
-                time.sleep(0.1)
-                steps_driven += 1
-                continue
+            for step in range(steps):
+                log(f"step {step + 1}/{steps}")
 
-            # Sweep to find best direction
-            readings = sweep_distances(px)
-            best_angle, best_dist = best_direction(readings)
-            forward_dist = readings.get(0, 999.0)
+                if dry:
+                    log("dry: forward 1.2s")
+                    time.sleep(0.1)
+                    steps_driven += 1
+                    continue
 
-            log(f"best_angle={best_angle:+d}° best_dist={best_dist:.0f}cm forward={forward_dist:.0f}cm")
+                # Sweep to find best direction
+                readings = sweep_distances(px)
+                best_angle, best_dist = best_direction(readings)
+                forward_dist = readings.get(0, 999.0)
 
-            if forward_dist < OBSTACLE_CM:
-                # Something ahead — turn toward best clearance
-                obstacles_avoided += 1
-                if best_dist < OBSTACLE_CM:
-                    # Blocked in all directions — back up a little then turn
-                    log("blocked all around — reversing")
-                    if not quiet:
-                        speak("Hmm, I'm stuck. Backing up.")
-                    px.backward(FORWARD_SPEED)
-                    time.sleep(0.6)
-                    px.stop()
-                    turn = 30 if best_angle >= 0 else -30
-                    px.set_dir_servo_angle(turn)
-                    px.forward(TURN_SPEED)
-                    time.sleep(TURN_S)
-                    px.stop()
-                    px.set_dir_servo_angle(0)
+                log(f"best_angle={best_angle:+d}\u00b0 best_dist={best_dist:.0f}cm forward={forward_dist:.0f}cm")
+
+                if forward_dist < OBSTACLE_CM:
+                    # Something ahead — turn toward best clearance
+                    obstacles_avoided += 1
+                    if best_dist < OBSTACLE_CM:
+                        # Blocked in all directions — back up a little then turn
+                        log("blocked all around — reversing")
+                        if not quiet:
+                            speak("Hmm, I'm stuck. Backing up.")
+                        px.backward(FORWARD_SPEED)
+                        time.sleep(0.6)
+                        px.stop()
+                        turn = 30 if best_angle >= 0 else -30
+                        px.set_dir_servo_angle(turn)
+                        px.forward(TURN_SPEED)
+                        time.sleep(TURN_S)
+                        px.stop()
+                        px.set_dir_servo_angle(0)
+                    else:
+                        log(f"obstacle ahead — turning toward {best_angle:+d}\u00b0")
+                        if not quiet:
+                            msg = "Something's in the way, going " + ("left" if best_angle < 0 else "right") + "."
+                            speak(msg)
+                        # Steer toward best direction
+                        steer = clamp(best_angle, -35, 35)
+                        px.set_dir_servo_angle(steer)
+                        px.forward(TURN_SPEED)
+                        time.sleep(TURN_S)
+                        px.stop()
+                        px.set_dir_servo_angle(0)
                 else:
-                    log(f"obstacle ahead — turning toward {best_angle:+d}°")
-                    if not quiet:
-                        msg = "Something's in the way, going " + ("left" if best_angle < 0 else "right") + "."
-                        speak(msg)
-                    # Steer toward best direction
-                    steer = clamp(best_angle, -35, 35)
-                    px.set_dir_servo_angle(steer)
-                    px.forward(TURN_SPEED)
-                    time.sleep(TURN_S)
-                    px.stop()
+                    # Path is clear — drive forward
+                    log(f"clear ahead ({forward_dist:.0f}cm) — forward")
+                    if not quiet and step == 0:
+                        speak("Exploring!")
+                    steps_driven += 1
                     px.set_dir_servo_angle(0)
-            else:
-                # Path is clear — drive forward
-                log(f"clear ahead ({forward_dist:.0f}cm) — forward")
-                if not quiet and step == 0:
-                    speak("Exploring!")
-                steps_driven += 1
-                px.set_dir_servo_angle(0)
-                px.forward(FORWARD_SPEED)
-                time.sleep(FORWARD_S)
-                px.stop()
+                    px.forward(FORWARD_SPEED)
+                    time.sleep(FORWARD_S)
+                    px.stop()
 
-        result = {
-            "status": "ok",
-            "steps": steps,
-            "steps_driven": steps_driven,
-            "obstacles_avoided": obstacles_avoided,
-            "dry": dry,
-        }
-        log(f"wander complete driven={steps_driven} avoided={obstacles_avoided}")
-        if not dry and not quiet and obstacles_avoided == 0:
-            speak("All done!")
-        print(json.dumps(result))
-        return 0
+            result = {
+                "status": "ok",
+                "steps": steps,
+                "steps_driven": steps_driven,
+                "obstacles_avoided": obstacles_avoided,
+                "dry": dry,
+            }
+            log(f"wander complete driven={steps_driven} avoided={obstacles_avoided}")
+            if not dry and not quiet and obstacles_avoided == 0:
+                speak("All done!")
+            print(json.dumps(result))
+            return 0
+
+        elif mode == "explore":
+            signal.signal(signal.SIGTERM, _handle_sigterm)
+            explore_id = f"e-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            start_time = time.time()
+            _write_exploring_state(True, pid=os.getpid(),
+                                    started=dt.datetime.now(dt.timezone.utc).isoformat())
+
+            meta = _load_exploration_meta()
+            meta["last_explore_ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
+            meta["total_explorations"] = meta.get("total_explorations", 0) + 1
+            _save_exploration_meta(meta)
+
+            log(f"explore start id={explore_id} duration={duration}s")
+            if not quiet:
+                speak("Time to explore!")
+
+            nav_buffer = []
+            observations = []
+            steps_completed = 0
+            stuck_count = 0
+            turn_accumulator = 0.0
+            last_photo_time = 0.0
+            last_photo_heading = None
+            seen_labels = set()
+            frigate_available = True
+            frigate_warned = False
+            vision_fail_streak = 0
+            photos_disabled = False
+            abort_reason = None
+
+            try:
+                while True:
+                    step_start = time.time()
+
+                    # Abort check (FIRST)
+                    session = _read_session()
+                    battery = _read_battery()
+                    abort_reason = _check_abort(session, battery, stuck_count,
+                                                start_time, duration)
+                    if abort_reason:
+                        log(f"explore abort: {abort_reason}")
+                        break
+
+                    steps_completed += 1
+                    log(f"explore step {steps_completed} heading={_heading_label(turn_accumulator)}")
+
+                    if dry:
+                        log("dry: explore step (simulated)")
+                        nav_entry = {
+                            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            "type": "nav",
+                            "explore_id": explore_id,
+                            "heading_estimate": _heading_label(turn_accumulator),
+                            "sonar_readings": {str(a): 200.0 for a in SWEEP_ANGLES},
+                            "sonar_reliable": True,
+                            "action": "forward",
+                            "steps_from_start": steps_completed,
+                            "frigate_labels": [],
+                        }
+                        nav_buffer.append(nav_entry)
+                        if len(nav_buffer) >= FLUSH_INTERVAL:
+                            _flush_nav_entries(nav_buffer, explore_id)
+                            nav_buffer.clear()
+                        time.sleep(0.1)
+                        continue
+
+                    # Sonar sweep
+                    readings = _sweep_sonar(px)
+                    sonar_reliable = all(v is not None for v in readings.values())
+
+                    if all(v is None for v in readings.values()):
+                        log("explore abort: all sonar readings None (sensor failure)")
+                        abort_reason = "sonar sensor failure"
+                        break
+
+                    # Navigate
+                    valid = {k: v for k, v in readings.items() if v is not None}
+                    nav_action = "forward"
+                    if not valid:
+                        stuck_count += 1
+                        nav_action = "stuck"
+                    else:
+                        best_angle = max(valid, key=valid.get)
+                        best_dist = valid[best_angle]
+                        forward_dist = valid.get(0, 0)
+
+                        if forward_dist is not None and forward_dist < OBSTACLE_CM:
+                            obstacles_avoided += 1
+                            if best_dist < OBSTACLE_CM:
+                                stuck_count += 1
+                                nav_action = "reverse"
+                                px.backward(FORWARD_SPEED)
+                                time.sleep(0.6)
+                                px.stop()
+                                turn = 30 if best_angle >= 0 else -30
+                                px.set_dir_servo_angle(turn)
+                                px.forward(TURN_SPEED)
+                                time.sleep(TURN_S)
+                                px.stop()
+                                px.set_dir_servo_angle(0)
+                                turn_accumulator += turn * TURN_K
+                            else:
+                                stuck_count = 0
+                                nav_action = "turned"
+                                steer = clamp(best_angle, -35, 35)
+                                px.set_dir_servo_angle(steer)
+                                px.forward(TURN_SPEED)
+                                time.sleep(TURN_S)
+                                px.stop()
+                                px.set_dir_servo_angle(0)
+                                turn_accumulator += steer * TURN_K
+                        else:
+                            stuck_count = 0
+                            nav_action = "forward"
+                            px.set_dir_servo_angle(0)
+                            px.forward(FORWARD_SPEED)
+                            time.sleep(FORWARD_S)
+                            px.stop()
+                        steps_driven += 1
+
+                    # Frigate query
+                    frigate_labels = []
+                    if frigate_available:
+                        detections = _query_frigate()
+                        if detections is None:
+                            if not frigate_warned:
+                                log("explore: Frigate offline — sonar-only navigation")
+                                if not quiet:
+                                    speak("My object detection is offline. I'll explore by sonar.")
+                                frigate_warned = True
+                            frigate_available = False
+                        else:
+                            frigate_labels = [d["label"] for d in detections]
+
+                    # Navigation log entry
+                    sonar_log = {str(k): v for k, v in readings.items()}
+                    nav_entry = {
+                        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "type": "nav",
+                        "explore_id": explore_id,
+                        "heading_estimate": _heading_label(turn_accumulator),
+                        "sonar_readings": sonar_log,
+                        "sonar_reliable": sonar_reliable,
+                        "action": nav_action,
+                        "steps_from_start": steps_completed,
+                        "frigate_labels": frigate_labels,
+                    }
+                    nav_buffer.append(nav_entry)
+                    if len(nav_buffer) >= FLUSH_INTERVAL:
+                        _flush_nav_entries(nav_buffer, explore_id)
+                        nav_buffer.clear()
+
+                    # Curiosity trigger (photo)
+                    now = time.time()
+                    current_heading = _heading_label(turn_accumulator)
+                    should_photo = False
+                    photo_reason = ""
+
+                    if not photos_disabled and not dry:
+                        meta = _load_exploration_meta()
+                        if not _check_daily_vision_cap(meta):
+                            if not photos_disabled:
+                                log("explore: daily vision cap reached — photos disabled")
+                                photos_disabled = True
+                        elif (now - last_photo_time) >= PHOTO_COOLDOWN_S:
+                            new_labels = set(frigate_labels) - seen_labels
+                            if new_labels:
+                                should_photo = True
+                                photo_reason = f"new label: {', '.join(new_labels)}"
+
+                            if not should_photo:
+                                forward_r = readings.get(0)
+                                if (forward_r is not None and forward_r < 100
+                                        and current_heading != last_photo_heading):
+                                    should_photo = True
+                                    photo_reason = f"object at {forward_r:.0f}cm, heading {current_heading}"
+
+                            if not should_photo and last_photo_heading is not None:
+                                if current_heading != last_photo_heading:
+                                    should_photo = True
+                                    photo_reason = f"new heading: {current_heading}"
+
+                    if should_photo:
+                        log(f"explore: photo trigger — {photo_reason}")
+                        scene = _call_describe_scene(dry)
+                        desc = scene.get("description", FALLBACK_DESCRIPTION)
+                        vision_failed = (desc == FALLBACK_DESCRIPTION)
+
+                        if vision_failed:
+                            vision_fail_streak += 1
+                            if vision_fail_streak >= VISION_FAIL_MAX:
+                                log("explore: 3 consecutive vision failures — photos disabled")
+                                photos_disabled = True
+                        else:
+                            vision_fail_streak = 0
+                            last_photo_time = now
+                            last_photo_heading = current_heading
+                            seen_labels.update(frigate_labels)
+
+                            meta = _load_exploration_meta()
+                            meta = _increment_vision_count(meta)
+                            _save_exploration_meta(meta)
+
+                        landmark = _extract_landmark(desc) if not vision_failed else ""
+                        interesting = False
+                        if not vision_failed:
+                            if "person" in frigate_labels:
+                                interesting = True
+                            else:
+                                prev_descs = " ".join(o.get("description", "") for o in observations)
+                                desc_words = set(desc.lower().split()[:10])
+                                prev_words = set(prev_descs.lower().split())
+                                if len(desc_words - prev_words) > 3:
+                                    interesting = True
+
+                        obs_entry = {
+                            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            "type": "observation",
+                            "explore_id": explore_id,
+                            "heading_estimate": current_heading,
+                            "sonar_cm": readings.get(0),
+                            "frigate_labels": frigate_labels,
+                            "description": desc,
+                            "landmark": landmark,
+                            "interesting": interesting,
+                            "vision_failed": vision_failed,
+                            "steps_from_start": steps_completed,
+                        }
+                        _write_observation(obs_entry)
+                        observations.append(obs_entry)
+
+                        if not vision_failed and not quiet:
+                            speak(desc[:200])
+
+                        if interesting and not vision_failed:
+                            _auto_remember(f"While exploring ({current_heading}): {desc[:300]}")
+
+                    elapsed = time.time() - step_start
+                    if elapsed > EXPLORE_STEP_TIMEOUT:
+                        log(f"explore: step took {elapsed:.1f}s (>{EXPLORE_STEP_TIMEOUT}s) — continuing")
+
+                    time.sleep(0.2)
+
+            except KeyboardInterrupt:
+                abort_reason = "keyboard interrupt"
+                log("explore: keyboard interrupt")
+
+            # Flush remaining nav entries
+            _flush_nav_entries(nav_buffer, explore_id)
+
+            if abort_reason and not quiet and abort_reason != "time limit reached":
+                speak(abort_reason)
+
+            interesting_count = sum(1 for o in observations if o.get("interesting"))
+
+            # Update meta with final counts
+            meta = _load_exploration_meta()
+            meta["total_observations"] = meta.get("total_observations", 0) + len(observations)
+            _save_exploration_meta(meta)
+
+            result = {
+                "status": "ok",
+                "mode": "explore",
+                "explore_id": explore_id,
+                "steps_completed": steps_completed,
+                "steps_driven": steps_driven,
+                "obstacles_avoided": obstacles_avoided,
+                "observations": len(observations),
+                "interesting": interesting_count,
+                "frigate_available": frigate_available,
+                "abort_reason": abort_reason,
+                "dry": dry,
+            }
+            log(f"explore complete: {json.dumps(result)}")
+            if not quiet and abort_reason == "time limit reached":
+                speak("All done exploring!")
+            print(json.dumps(result))
+            return 0
 
     except KeyboardInterrupt:
         log("aborted")
@@ -214,6 +775,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 1
     finally:
+        _write_exploring_state(False)
         if px is not None:
             try:
                 px.stop()
@@ -222,7 +784,14 @@ def main(argv: list[str]) -> int:
                 px.set_cam_tilt_angle(0)
                 px.close()
             except Exception:
-                pass
+                log("motor cleanup failed — attempting I2C fallback")
+                try:
+                    import smbus2
+                    bus = smbus2.SMBus(1)
+                    bus.write_byte_data(0x40, 0xFD, 0x10)  # ALL_LED_OFF
+                    bus.close()
+                except Exception:
+                    log("I2C fallback also failed")
 
 
 if __name__ == "__main__":
