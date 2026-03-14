@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest.mock
 from pathlib import Path
@@ -489,8 +490,6 @@ class TestPublicChat:
 
     def _mock_claude(self, reply: str):
         """Return a patch target that makes _call_claude_public return reply."""
-        import asyncio as _asyncio
-
         async def _fake(*_a, **_kw):
             return reply
 
@@ -522,15 +521,19 @@ class TestPublicChat:
         assert resp.status_code == 400
 
     def test_message_too_long_rejected(self, api_client):
+        # Derive limit from model so the test catches boundary changes automatically
+        from pxh.api import PublicChatRequest
+        max_len = next(
+            m.max_length for m in PublicChatRequest.model_fields["message"].metadata
+            if hasattr(m, "max_length")
+        )
         resp = api_client.post(
             "/api/v1/public/chat",
-            json={"message": "x" * 2001, "history": []},
+            json={"message": "x" * (max_len + 1), "history": []},
         )
         assert resp.status_code == 400
 
     def test_subprocess_error_returns_500(self, api_client):
-        import asyncio as _asyncio
-
         async def _raise(*_a, **_kw):
             raise RuntimeError("claude exited 1: some error")
 
@@ -541,7 +544,7 @@ class TestPublicChat:
             )
         assert resp.status_code == 500
 
-    def test_timeout_returns_504(self, api_client):
+    def test_asyncio_timeout_returns_504(self, api_client):
         import asyncio as _asyncio
 
         async def _timeout(*_a, **_kw):
@@ -554,14 +557,27 @@ class TestPublicChat:
             )
         assert resp.status_code == 504
 
+    def test_subprocess_timeout_returns_504(self, api_client):
+        """subprocess.TimeoutExpired is the normal production timeout path (14s < 15s asyncio)."""
+        async def _timeout(*_a, **_kw):
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=14)
+
+        with unittest.mock.patch("pxh.api._call_claude_public", side_effect=_timeout):
+            resp = api_client.post(
+                "/api/v1/public/chat",
+                json={"message": "Hi", "history": []},
+            )
+        assert resp.status_code == 504
+
     def test_make_clean_env_strips_claude_vars(self):
-        """_make_clean_env must remove all CLAUDE* and DISABLE_CLAUDE_CODE_PROTECTIONS."""
+        """_make_clean_env strips CC session vars but preserves CLAUDE_API_KEY and safe vars."""
         from pxh.api import _make_clean_env
         dirty = {
             "CLAUDECODE": "1",
             "CLAUDE_CODE_ENTRYPOINT": "cli",
             "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
             "DISABLE_CLAUDE_CODE_PROTECTIONS": "1",
+            "CLAUDE_API_KEY": "sk-ant-test",
             "PATH": "/usr/bin",
             "HOME": "/home/pi",
         }
@@ -571,6 +587,8 @@ class TestPublicChat:
         assert "CLAUDE_CODE_ENTRYPOINT" not in clean
         assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in clean
         assert "DISABLE_CLAUDE_CODE_PROTECTIONS" not in clean
+        # API key must survive — used for non-OAuth authentication
+        assert clean.get("CLAUDE_API_KEY") == "sk-ant-test"
         assert clean["PATH"] == "/usr/bin"
         assert clean["HOME"] == "/home/pi"
 

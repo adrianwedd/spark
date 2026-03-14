@@ -655,16 +655,24 @@ _PUBLIC_CHAT_SYSTEM_PROMPT = (
 _PUBLIC_CHAT_TIMEOUT_S = 15.0
 
 
-_CLAUDE_BIN = (
-    os.environ.get("PX_CLAUDE_BIN")
-    or shutil.which("claude")
-    or "/home/pi/.local/bin/claude"
-)
-_PUBLIC_CHAT_EXECUTOR = __import__("concurrent.futures", fromlist=["ThreadPoolExecutor"]).ThreadPoolExecutor(max_workers=2)
+from concurrent.futures import ThreadPoolExecutor
+
+_PUBLIC_CHAT_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _public_chat_log = logging.getLogger("pxh.api.public_chat")
 
-# Strip all CLAUDE* env vars so nested Claude CLI invocations are permitted
-_CLAUDE_ENV_STRIP_PREFIXES = ("CLAUDE", "DISABLE_CLAUDE_CODE_PROTECTIONS")
+# Strip Claude Code session vars but NOT CLAUDE_API_KEY (used with OAuth).
+# Narrower prefixes: "CLAUDE_CODE" covers CLAUDE_CODE_ENTRYPOINT,
+# CLAUDE_CODE_ENABLE_TELEMETRY, etc. "CLAUDECODE" catches the bare flag.
+_CLAUDE_ENV_STRIP_PREFIXES = ("CLAUDE_CODE", "CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")
+
+
+def _get_claude_bin() -> str:
+    """Resolve Claude binary path at call time so PX_CLAUDE_BIN can be set after import."""
+    return (
+        os.environ.get("PX_CLAUDE_BIN")
+        or shutil.which("claude")
+        or "/home/pi/.local/bin/claude"
+    )
 
 
 def _make_clean_env() -> dict:
@@ -684,7 +692,7 @@ async def _call_claude_public(prompt: str) -> str:
         sp_timeout = max(1, int(_PUBLIC_CHAT_TIMEOUT_S) - 1)
         result = subprocess.run(
             [
-                _CLAUDE_BIN, "-p",
+                _get_claude_bin(), "-p",
                 "--allowedTools", "",
                 "--no-session-persistence",
                 "--output-format", "text",
@@ -767,7 +775,6 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
 @app.post("/api/v1/public/chat")
 async def public_chat(req: PublicChatRequest, request: Request):
     """Lightweight public chat with SPARK. Rate-limited, no auth required."""
-    import asyncio
     t_start = _time.monotonic()
     client_ip = (request.client.host if request.client else "unknown")
     ip_hash = _hashlib.sha256(client_ip.encode()).hexdigest()[:12]
@@ -815,6 +822,7 @@ async def public_chat(req: PublicChatRequest, request: Request):
         )
 
     if not reply.strip():
+        _public_chat_log.warning("public_chat: empty stdout from claude (exit 0), ip=%s", ip_hash)
         reply = "I'm here — I just went quiet for a moment. Try again?"
 
     latency_ms = int((_time.monotonic() - t_start) * 1000)
