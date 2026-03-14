@@ -108,12 +108,24 @@ prev_volts: float | None = None
 was_charging: bool = False
 # How many consecutive readings confirm current trend
 charge_streak: int = 0
+warmup_remaining: int = 2  # skip first N readings for ADC to settle after restart
 
 while True:
     try:
         volts = round(get_battery_voltage(), 2)
         pct   = volts_to_pct(volts)
         ts    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Warmup: skip first readings (ADC noise on cold start causes false transitions)
+        if warmup_remaining > 0:
+            warmup_remaining -= 1
+            prev_volts = volts
+            # Still write state (with charging=False) so file stays fresh
+            data = {"ts": ts, "volts": volts, "pct": pct, "charging": False}
+            TMP.write_text(json.dumps(data))
+            TMP.rename(OUT)
+            time.sleep(POLL_S)
+            continue
 
         # Detect charging state
         charging = was_charging  # default: maintain previous state

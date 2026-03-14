@@ -1846,6 +1846,16 @@ def expression(thought: dict, dry: bool) -> None:
         log(f"expression: suppressed {action} — obi_mode=absent (night, Obi likely asleep)")
         return
 
+    # Gate on charging: suppress servo-related actions when plugged in
+    try:
+        _batt = json.loads(BATTERY_FILE.read_text(encoding="utf-8"))
+        _charging = bool(_batt.get("charging", False))
+    except Exception:
+        _charging = False
+    if _charging and action in ("scan", "look_at", "explore"):
+        log(f"expression: suppressed {action} — battery charging")
+        return
+
     text = thought.get("thought", "")
     env = os.environ.copy()
     env["PX_DRY"] = "1" if dry else "0"

@@ -59,6 +59,7 @@ STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
 SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
+BATTERY_FILE    = STATE_DIR / "battery.json"
 FRIGATE_FILE = STATE_DIR / "frigate_presence.json"
 FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
 MOOD_CHECK_S = 10    # how often to read mood file
@@ -107,6 +108,15 @@ def ease(px, from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration:
         px.set_cam_tilt_angle(int(round(from_tilt + (to_tilt - from_tilt) * t)))
         if i < steps:
             time.sleep(duration / steps)
+
+
+def _is_charging() -> bool:
+    """Check battery.json — True if robot is charging."""
+    try:
+        data = json.loads(BATTERY_FILE.read_text(encoding="utf-8"))
+        return bool(data.get("charging", False))
+    except Exception:
+        return False
 
 
 def read_session_persona() -> str:
@@ -314,6 +324,11 @@ def idle_loop(args) -> None:
                 if now >= next_mood_check:
                     next_mood_check = now + MOOD_CHECK_S
                     cur_mood_behavior = read_mood()
+
+                # --- Charging check: freeze all servo motion while on charger ---
+                if _is_charging():
+                    time.sleep(2)
+                    continue
 
                 # --- Proximity check (every PROX_CHECK_S — not every loop tick) ---
                 if PROX_THRESH > 0 and now >= next_prox:
