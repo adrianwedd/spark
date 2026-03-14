@@ -1490,17 +1490,25 @@ def call_ollama(prompt: str, system: str,
 
 TMUX_SESSION = "px-claude"
 _tmux_ready = False
+_tmux_timeout_count = 0
+
+
+def _tmux_run(args: list, **kwargs) -> subprocess.CompletedProcess:
+    """Run a tmux command, catching FileNotFoundError if tmux is missing."""
+    try:
+        return subprocess.run(args, capture_output=True, **kwargs)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, returncode=127,
+                                           stdout=b"", stderr=b"tmux not found")
 
 
 def _tmux_ensure_session() -> bool:
     """Ensure a persistent Claude session is running in tmux. Returns True if ready."""
-    global _tmux_ready
-    import subprocess, shutil
+    global _tmux_ready, _tmux_timeout_count
+    import shutil
 
     if _tmux_ready:
-        # Quick check: is the session still alive?
-        r = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
-                           capture_output=True)
+        r = _tmux_run(["tmux", "has-session", "-t", TMUX_SESSION])
         if r.returncode == 0:
             return True
         _tmux_ready = False
@@ -1513,31 +1521,22 @@ def _tmux_ensure_session() -> bool:
     if not claude_bin:
         return False
 
-    # Kill stale session if any
-    subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION],
-                   capture_output=True)
+    _tmux_run(["tmux", "kill-session", "-t", TMUX_SESSION])
 
-    # Build env without Claude Code nesting vars
-    env_str = " ".join(
-        f"unset {k};" for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
-    )
+    env_str = " ".join(f"unset {k};" for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"))
     cmd = f"{env_str} {claude_bin} --model {CLAUDE_MODEL}"
 
-    subprocess.run(["tmux", "new-session", "-d", "-s", TMUX_SESSION,
-                     "-x", "200", "-y", "50"], capture_output=True)
-    subprocess.run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"],
-                   capture_output=True)
+    _tmux_run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50"])
+    _tmux_run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
 
-    # Wait for the ❯ prompt (up to 30s)
     for _ in range(30):
         time.sleep(1)
-        pane = subprocess.run(
-            ["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"],
-            capture_output=True, text=True,
-        ).stdout
-        if "❯" in pane:
+        pane = _tmux_run(["tmux", "capture-pane", "-t", TMUX_SESSION, "-p"],
+                         text=True).stdout or ""
+        if "\u276f" in pane:  # ❯
             _tmux_ready = True
-            log(f"tmux claude session ready (pid={TMUX_SESSION})")
+            _tmux_timeout_count = 0
+            log(f"tmux claude session ready")
             return True
 
     log("tmux claude session failed to start in 30s")
@@ -1546,93 +1545,114 @@ def _tmux_ensure_session() -> bool:
 
 def _tmux_capture() -> str:
     """Capture current tmux pane content."""
-    import subprocess
-    return subprocess.run(
-        ["tmux", "capture-pane", "-t", TMUX_SESSION, "-p", "-S", "-200"],
-        capture_output=True, text=True,
-    ).stdout
+    return (_tmux_run(["tmux", "capture-pane", "-t", TMUX_SESSION,
+                       "-p", "-S", "-200"], text=True).stdout or "")
+
+
+def _extract_json_from_pane(text: str) -> str | None:
+    """Try to extract a JSON object from raw pane text using JSONDecoder."""
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1 and idx < len(text):
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict) and "thought" in obj:
+                return json.dumps(obj)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        idx = text.find("{", idx + 1)
+    return None
 
 
 def call_claude_haiku(prompt: str, system: str) -> dict:
-    """Call Claude via persistent tmux session. ~3s vs ~55s for CLI cold start."""
-    import subprocess
+    """Call Claude via persistent tmux session. ~10-25s vs ~55s for CLI cold start."""
+    global _tmux_ready, _tmux_timeout_count
 
     if not _tmux_ensure_session():
         return {"error": "tmux claude session not available"}
 
-    # Inject system prompt as context prefix (tmux session has no --system-prompt)
     full_prompt = f"[System: {system}]\n\n{prompt}"
 
-    # Write prompt to a file, then tell Claude to read it
-    prompt_file = STATE_DIR / ".claude_prompt.tmp"
+    # Use tempfile for security (restrictive perms) and concurrency safety
+    fd, tmp_path = tempfile.mkstemp(dir=str(STATE_DIR), prefix=".claude_prompt_",
+                                     suffix=".tmp")
+    prompt_file = Path(tmp_path)
     try:
-        prompt_file.write_text(full_prompt, encoding="utf-8")
+        with os.fdopen(fd, "w") as f:
+            f.write(full_prompt)
     except Exception as exc:
         return {"error": f"prompt write failed: {exc}"}
 
-    # Use a unique marker so we can find our prompt in the pane
-    marker = f"PXM-{int(time.time())}"
+    marker = f"PXM-{int(time.time())}-{os.getpid()}"
     instruction = f"[{marker}] Read {prompt_file} and follow the instructions inside it. Output ONLY the JSON."
-    subprocess.run(
-        ["tmux", "send-keys", "-t", TMUX_SESSION, instruction, "Enter"],
-        capture_output=True,
-    )
-
-    # Poll for response: scan pane for our marker, then capture response after it
-    for tick in range(60):  # max 60s
-        time.sleep(1)
-        pane = _tmux_capture()
-        lines = pane.strip().splitlines()
-
-        # Find our marker line, then scan forward for response
-        marker_idx = None
-        for i, line in enumerate(lines):
-            if marker in line:
-                marker_idx = i
-                break
-        if marker_idx is None:
-            continue  # prompt not yet visible
-
-        # Scan lines after the marker for ● response content
-        response_lines = []
-        found_final_prompt = False
-        for line in lines[marker_idx + 1:]:
-            stripped = line.strip()
-            # Skip tool use, decorations, status bar
-            if stripped.startswith("⎿") or stripped.startswith("───"):
-                continue
-            if stripped.startswith("●"):
-                text = stripped.lstrip("●").strip()
-                # Skip tool invocations: Read(...), Write(...), Bash(...)
-                if "(" in text and text.endswith(")"):
-                    continue
-                # Skip progress indicators: "Tinkering… (2s)"
-                if "…" in text:
-                    continue
-                if text:
-                    response_lines.append(text)
-                continue
-            # Continuation lines (multi-line JSON)
-            if response_lines and stripped and not stripped.startswith("❯") and not stripped.startswith("⚡"):
-                response_lines.append(stripped)
-            # New ❯ prompt = response complete
-            if stripped.startswith("❯") and response_lines:
-                found_final_prompt = True
-                break
-
-        if found_final_prompt and response_lines:
-            try:
-                prompt_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-            resp = "\n".join(response_lines)
-            log(f"tmux response captured ({tick+1}s, {len(response_lines)} lines)")
-            return {"response": resp}
+    _tmux_run(["tmux", "send-keys", "-t", TMUX_SESSION, instruction, "Enter"])
 
     try:
-        prompt_file.unlink(missing_ok=True)
-    except Exception:
-        pass
+        for tick in range(60):
+            time.sleep(1)
+            pane = _tmux_capture()
+            lines = pane.strip().splitlines()
+
+            marker_idx = None
+            for i, line in enumerate(lines):
+                if marker in line:
+                    marker_idx = i
+                    break
+            if marker_idx is None:
+                continue
+
+            # Check for completion: ❯ prompt after our marker
+            after_marker = "\n".join(lines[marker_idx + 1:])
+            # Must have at least one ❯ after our prompt (= response complete)
+            if "\u276f" not in after_marker:
+                continue
+
+            # Try JSON extraction from raw pane text (robust, ignores ● formatting)
+            json_str = _extract_json_from_pane(after_marker)
+            if json_str:
+                _tmux_timeout_count = 0
+                log(f"tmux response captured ({tick+1}s)")
+                return {"response": json_str}
+
+            # Fallback: collect ● lines and continuation lines
+            response_lines = []
+            found_final_prompt = False
+            for line in lines[marker_idx + 1:]:
+                stripped = line.strip()
+                if stripped.startswith("\u23bf") or stripped.startswith("\u2500"):
+                    continue  # ⎿ and ─
+                if stripped.startswith("\u25cf"):  # ●
+                    text = stripped.lstrip("\u25cf").strip()
+                    if "(" in text and text.endswith(")"):
+                        continue
+                    if "\u2026" in text:
+                        continue  # …
+                    if text:
+                        response_lines.append(text)
+                    continue
+                if response_lines and stripped and not stripped.startswith("\u276f") and not stripped.startswith("\u26a1"):
+                    response_lines.append(stripped)
+                if stripped.startswith("\u276f") and response_lines:
+                    found_final_prompt = True
+                    break
+
+            if found_final_prompt and response_lines:
+                _tmux_timeout_count = 0
+                resp = "\n".join(response_lines)
+                log(f"tmux response captured ({tick+1}s, {len(response_lines)} lines)")
+                return {"response": resp}
+    finally:
+        try:
+            prompt_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # Timeout — reset session after 2 consecutive timeouts
+    _tmux_timeout_count += 1
+    if _tmux_timeout_count >= 2:
+        log("tmux: 2 consecutive timeouts — resetting session")
+        _tmux_ready = False
+        _tmux_timeout_count = 0
     return {"error": "tmux claude response timeout (60s)"}
 
 

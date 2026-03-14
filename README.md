@@ -83,7 +83,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 | `run-voice-loop-ollama` | Ollama (via `codex-ollama`) | Default |
 
 **Cognitive Loop (`px-mind`)** — The subconscious. Runs continuously in the background:
-- **Layer 1 — Awareness** (every 30s, no LLM): sonar + session state + time of day. Detects transitions.
+- **Layer 1 — Awareness** (every 60s, no LLM): sonar + session state + time of day. Detects transitions.
 - **Layer 2 — Reflection** (on transition or every 2min): Claude Haiku via persistent tmux session (SPARK persona) or Ollama deepseek-r1:1.5b on M1.local (others). Generates a thought with mood, suggested action, and salience score.
 - **Layer 3 — Expression** (30s cooldown): dispatches to tools — speak, look around, remember something important. Photo capture (`tool-describe-scene`) is on-request only, not autonomous.
 
