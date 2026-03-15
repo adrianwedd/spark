@@ -474,23 +474,39 @@ class TestDeviceControl:
         resp = api_client.post("/api/v1/device/reboot")
         assert resp.status_code == 401
 
-    def test_device_reboot_requires_confirm(self, api_client, auth_headers):
+    def test_device_reboot_returns_nonce(self, api_client, auth_headers):
+        """Step 1: POST /device/reboot returns a nonce for confirmation."""
         resp = api_client.post("/api/v1/device/reboot", headers=auth_headers)
-        assert resp.status_code == 400
-        assert resp.json()["error"] == "confirm: true required"
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "confirm_required"
+        assert "nonce" in data
+        assert data["action"] == "reboot"
+        assert data["expires_in"] == 30
 
-    def test_device_shutdown_requires_confirm(self, api_client, auth_headers):
+    def test_device_shutdown_returns_nonce(self, api_client, auth_headers):
+        """Step 1: POST /device/shutdown returns a nonce for confirmation."""
         resp = api_client.post("/api/v1/device/shutdown", headers=auth_headers,
                                json={"confirm": False})
-        assert resp.status_code == 400
-        assert resp.json()["error"] == "confirm: true required"
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "confirm_required"
+        assert "nonce" in data
+        assert data["action"] == "shutdown"
 
     def test_device_reboot_mocked(self, api_client, auth_headers):
+        """Two-step: get nonce then confirm executes reboot."""
         from unittest.mock import patch, MagicMock
+        # Step 1: get nonce
+        resp = api_client.post("/api/v1/device/reboot", headers=auth_headers,
+                               json={"confirm": True})
+        assert resp.status_code == 200
+        nonce = resp.json()["nonce"]
+        # Step 2: confirm with nonce
         mock_proc = MagicMock()
         with patch("pxh.api.subprocess.Popen", return_value=mock_proc) as mock_popen:
-            resp = api_client.post("/api/v1/device/reboot", headers=auth_headers,
-                                   json={"confirm": True})
+            resp = api_client.post("/api/v1/device/confirm", headers=auth_headers,
+                                   json={"nonce": nonce})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
@@ -498,22 +514,57 @@ class TestDeviceControl:
         mock_popen.assert_called_once_with(["sudo", "/usr/bin/systemctl", "reboot"])
 
     def test_device_shutdown_mocked(self, api_client, auth_headers):
+        """Two-step: get nonce then confirm executes shutdown."""
         from unittest.mock import patch, MagicMock
+        # Step 1: get nonce
+        resp = api_client.post("/api/v1/device/shutdown", headers=auth_headers,
+                               json={"confirm": True})
+        assert resp.status_code == 200
+        nonce = resp.json()["nonce"]
+        # Step 2: confirm with nonce
         mock_proc = MagicMock()
         with patch("pxh.api.subprocess.Popen", return_value=mock_proc) as mock_popen:
-            resp = api_client.post("/api/v1/device/shutdown", headers=auth_headers,
-                                   json={"confirm": True})
+            resp = api_client.post("/api/v1/device/confirm", headers=auth_headers,
+                                   json={"nonce": nonce})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
         assert data["action"] == "shutdown"
         mock_popen.assert_called_once_with(["sudo", "/sbin/shutdown", "-h", "now"])
 
+    def test_device_confirm_invalid_nonce(self, api_client, auth_headers):
+        """Confirm with bad nonce is rejected."""
+        resp = api_client.post("/api/v1/device/confirm", headers=auth_headers,
+                               json={"nonce": "bogus-nonce"})
+        assert resp.status_code == 400
+        assert "invalid or expired" in resp.json()["error"]
+
+    def test_device_confirm_nonce_single_use(self, api_client, auth_headers):
+        """Nonce can only be used once."""
+        from unittest.mock import patch, MagicMock
+        # Get nonce
+        resp = api_client.post("/api/v1/device/reboot", headers=auth_headers)
+        nonce = resp.json()["nonce"]
+        # Use it
+        with patch("pxh.api.subprocess.Popen", return_value=MagicMock()):
+            resp = api_client.post("/api/v1/device/confirm", headers=auth_headers,
+                                   json={"nonce": nonce})
+        assert resp.status_code == 200
+        # Replay: should fail
+        resp = api_client.post("/api/v1/device/confirm", headers=auth_headers,
+                               json={"nonce": nonce})
+        assert resp.status_code == 400
+
     def test_device_reboot_popen_error(self, api_client, auth_headers):
         from unittest.mock import patch
+        # Get nonce
+        resp = api_client.post("/api/v1/device/reboot", headers=auth_headers,
+                               json={"confirm": True})
+        nonce = resp.json()["nonce"]
+        # Confirm — but Popen fails
         with patch("pxh.api.subprocess.Popen", side_effect=OSError("no such file")):
-            resp = api_client.post("/api/v1/device/reboot", headers=auth_headers,
-                                   json={"confirm": True})
+            resp = api_client.post("/api/v1/device/confirm", headers=auth_headers,
+                                   json={"nonce": nonce})
         assert resp.status_code == 500
         assert resp.json()["status"] == "error"
 
@@ -684,7 +735,11 @@ class TestPinVerify:
             assert api._pin_state_path().exists()
             saved = json.loads(api._pin_state_path().read_text())
             assert saved["attempts"] >= 5
-            assert saved["lockout_until"] > _t.time()
+            # lockout_until is now an ISO timestamp string
+            from datetime import datetime, timezone
+            assert saved["lockout_until"] is not None
+            lockout_dt = datetime.fromisoformat(saved["lockout_until"])
+            assert lockout_dt > datetime.now(timezone.utc)
 
             # Simulate restart: reset in-memory state, then reload from file
             api._pin_attempts = 0
@@ -713,6 +768,7 @@ class TestPinVerify:
             # Simulate time passing: clear lockout but keep cumulative attempts (5)
             with api._pin_lock:
                 api._pin_lockout_until = 0.0
+                api._save_pin_state()  # persist the cleared lockout to file
 
             # 5 more failures (cumulative = 10): should trigger 30-minute lockout
             for _ in range(5):
@@ -736,13 +792,12 @@ class TestPinVerify:
             saved = json.loads(api._pin_state_path().read_text())
             assert saved["attempts"] == 3
 
-            # Correct PIN resets everything
+            # Correct PIN resets everything and deletes lockout file
             resp = api_client.post("/api/v1/pin/verify", json={"pin": "9999"})
             assert resp.json()["verified"] is True
 
-            saved = json.loads(api._pin_state_path().read_text())
-            assert saved["attempts"] == 0
-            assert saved["lockout_until"] == 0.0
+            # Lockout file is deleted on successful PIN
+            assert not api._pin_state_path().exists()
 
 
 class TestPublicChat:

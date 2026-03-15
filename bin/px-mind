@@ -1574,6 +1574,8 @@ _last_calendar_fetch: float = 0.0
 _last_spoken_text: str = ""
 _mood_history: list[str] = []
 _last_reactive_phrases: dict = {}  # key="transition:persona", value=recent phrase list (max 3)
+_consecutive_reflection_failures: int = 0
+_reflection_offline_spoken: bool = False
 
 # Mood momentum: running (valence, arousal) blend
 _mood_v: float = 0.4   # start at "content"
@@ -1852,6 +1854,9 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
                 awareness["recent_exploration"] = recent_obs
     except Exception:
         pass
+
+    # Track reflection backend health in awareness for dashboard visibility
+    awareness["reflection_status"] = "offline" if _consecutive_reflection_failures >= 3 else "healthy"
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2))
@@ -2382,12 +2387,28 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         elif quality == "good":
             context_parts.append(f"Adrian got {hours} hours of sleep — well rested.")
 
-    # Calendar awareness
+    # Calendar awareness (HA calendar)
     cal_events = awareness.get("ha_calendar")
     if cal_events:
         cal_ctx = _format_calendar_context(cal_events)
         if cal_ctx:
             context_parts.append(cal_ctx)
+
+    # Calendar awareness (Obi's Google Calendar)
+    gws_cal = awareness.get("calendar")
+    if gws_cal:
+        cal_parts = []
+        if gws_cal.get("current_event"):
+            cal_parts.append(f"Right now: {gws_cal['current_event']}")
+            detail = gws_cal.get("current_event_detail", {})
+            desc = detail.get("description", "")
+            if desc:
+                cal_parts.append(f"  Context: {desc[:150]}")
+        if gws_cal.get("next_event"):
+            mins = gws_cal.get("minutes_until_next", "?")
+            cal_parts.append(f"Coming up in {mins} min: {gws_cal['next_event']}")
+        if cal_parts:
+            context_parts.append("Obi's schedule:\n" + "\n".join(cal_parts))
 
     # Routine signals (meds, water)
     routine_ctx = _format_routine_context(awareness.get("ha_routines"))
@@ -2590,6 +2611,25 @@ def expression(thought: dict, dry: bool) -> None:
         _obi_mode = "unknown"
     if _obi_mode == "absent" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — obi_mode=absent (night, Obi likely asleep)")
+        return
+    if _obi_mode == "at-school" and action in ABSENT_GATED_ACTIONS:
+        log(f"expression: suppressed {action} — Obi at school (calendar)")
+        return
+    if _obi_mode == "at-mums" and action in ABSENT_GATED_ACTIONS:
+        log(f"expression: suppressed {action} — Obi at Mum's (calendar)")
+        return
+
+    # Calendar-driven mode shifts
+    _cal = _aw.get("calendar", {}) if isinstance(_aw, dict) else {}
+    _current_event = (_cal.get("current_event") or "").lower()
+    if "decompress" in _current_event and action in ("greet", "comment", "scan", "calendar_check"):
+        log(f"expression: suppressed {action} — after-school decompress (low-demand mode)")
+        return
+    if "quiet time" in _current_event:
+        log(f"expression: suppressed {action} — quiet time (calendar)")
+        return
+    if "bedtime" in _current_event and action not in ("wait", "remember"):
+        log(f"expression: suppressed {action} — bedtime routine (calm mode)")
         return
 
     # Suppress speech when Adrian is on a call or mic is active
@@ -2944,8 +2984,8 @@ def mind_loop(args) -> None:
     last_expression_mono = 0.0
     last_reactive_mono = 0.0
     last_battery_warn_mono = 0.0
+    global _consecutive_reflection_failures, _reflection_offline_spoken
     consecutive_critical = 0          # require 2 consecutive critical readings before shutdown
-    consecutive_reflection_failures = 0
     REFLECTION_FAIL_WARN_THRESHOLD = 3  # warn after 3 consecutive failures
 
     # Exponential backoff: reflection interval grows during extended idle periods.
@@ -3030,16 +3070,20 @@ def mind_loop(args) -> None:
             last_reflection_mono = now
 
             if thought is None:
-                consecutive_reflection_failures += 1
-                if consecutive_reflection_failures == REFLECTION_FAIL_WARN_THRESHOLD:
-                    log(f"reflection: {consecutive_reflection_failures} consecutive failures — speaking warning")
+                _consecutive_reflection_failures += 1
+                if _consecutive_reflection_failures >= REFLECTION_FAIL_WARN_THRESHOLD and not _reflection_offline_spoken:
+                    log(f"reflection: {_consecutive_reflection_failures} consecutive failures — speaking warning")
+                    _reflection_offline_spoken = True
                     env = os.environ.copy()
                     env["PX_DRY"] = "1" if args.dry_run else "0"
-                    env["PX_TEXT"] = "I'm having trouble thinking right now. All my language backends seem to be down."
+                    env["PX_TEXT"] = "My thinking is offline — all reflection backends are unreachable."
                     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                                    capture_output=True, check=False, timeout=20)
             else:
-                consecutive_reflection_failures = 0
+                _consecutive_reflection_failures = 0
+                if _reflection_offline_spoken:
+                    log("reflection: backends recovered — resetting offline flag")
+                    _reflection_offline_spoken = False
 
             if thought and thought.get("action", "wait") != "wait":
                 # Layer 3: Expression (with cooldown)

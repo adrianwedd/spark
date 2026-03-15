@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -156,10 +157,14 @@ def watchdog_thread_func(heartbeat_q: queue.Queue, timeout: float) -> None:
                     "status": "stale",
                     "age_seconds": stale_time,
                     "threshold_seconds": timeout,
-                    "message": "Watchdog timeout exceeded. Forcing process exit.",
+                    "message": "Watchdog timeout exceeded. Sending SIGTERM for clean shutdown.",
                 },
             )
-            # Use os._exit for an immediate, hard exit that bypasses finally blocks.
+            # Send SIGTERM to trigger Python's normal shutdown path, allowing
+            # FileLock release and atexit handlers to run.
+            os.kill(os.getpid(), signal.SIGTERM)
+            # Grace period: if SIGTERM doesn't terminate within 5s, force exit.
+            time.sleep(5)
             os._exit(1)
         time.sleep(timeout / 4)
 

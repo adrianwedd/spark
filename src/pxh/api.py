@@ -140,24 +140,36 @@ _API_TOKEN: Optional[str] = None
 
 _session_tokens: dict[str, float] = {}  # token → expiry_ts (monotonic)
 _SESSION_TOKEN_TTL = 4 * 3600  # 4 hours
+_SESSION_TOKEN_MAX = 20  # max concurrent sessions
 
 
 def _create_session_token() -> str:
-    token = secrets.token_urlsafe(32)
-    _session_tokens[token] = _time.monotonic() + _SESSION_TOKEN_TTL
-    # Prune expired tokens
+    # Prune expired tokens first
     now = _time.monotonic()
     expired = [k for k, v in _session_tokens.items() if v < now]
     for k in expired:
         del _session_tokens[k]
+    # Reject if at capacity (force old sessions to expire naturally)
+    if len(_session_tokens) >= _SESSION_TOKEN_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail="too many active sessions — try again later",
+        )
+    token = secrets.token_hex(32)
+    _session_tokens[token] = now + _SESSION_TOKEN_TTL
     return token
 
 
 def _is_valid_session_token(token: str) -> bool:
+    # Sweep expired on each check
+    now = _time.monotonic()
+    expired = [k for k, v in _session_tokens.items() if v < now]
+    for k in expired:
+        del _session_tokens[k]
     expiry = _session_tokens.get(token)
     if expiry is None:
         return False
-    if _time.monotonic() > expiry:
+    if now > expiry:
         del _session_tokens[token]
         return False
     return True
@@ -912,11 +924,24 @@ async def public_chat(req: PublicChatRequest, request: Request):
 async def verify_pin(body: PinRequest) -> JSONResponse:
     """Verify the admin PIN. Public endpoint — no Bearer token required."""
     global _pin_attempts, _pin_lockout_until
-    import time as _time
     now = _time.monotonic()
+
+    # Fast path: in-memory lockout check
     with _pin_lock:
         if now < _pin_lockout_until:
             return JSONResponse(status_code=429, content={"verified": False, "error": "too many attempts"})
+
+    # File-based lockout check (survives restarts)
+    from datetime import datetime, timezone
+    try:
+        data = json.loads(_pin_state_path().read_text())
+        lockout_iso = data.get("lockout_until")
+        if lockout_iso:
+            lockout_dt = datetime.fromisoformat(lockout_iso)
+            if datetime.now(timezone.utc) < lockout_dt:
+                return JSONResponse(status_code=429, content={"verified": False, "error": "too many attempts"})
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        pass
 
     submitted = body.pin.strip()
     if not submitted:
@@ -932,6 +957,11 @@ async def verify_pin(body: PinRequest) -> JSONResponse:
             _pin_attempts = 0
             _pin_lockout_until = 0.0
             _save_pin_state()
+        # Delete lockout file on success
+        try:
+            _pin_state_path().unlink(missing_ok=True)
+        except OSError:
+            pass
         return JSONResponse(status_code=200, content={
             "verified": True,
             "token": _create_session_token(),
@@ -1278,6 +1308,11 @@ _DEVICE_ACTIONS: dict[str, list[str]] = {
     "shutdown": ["sudo", "/sbin/shutdown", "-h", "now"],
 }
 
+# Two-step device action confirmation (Issue #93)
+_pending_device_actions: dict[str, tuple[str, float]] = {}  # nonce → (action, expiry_mono)
+_PENDING_DEVICE_MAX = 5
+_PENDING_DEVICE_TTL = 30  # seconds
+
 _pin_lock = threading.Lock()
 _pin_attempts = 0
 _pin_lockout_until = 0.0
@@ -1288,41 +1323,58 @@ _PIN_ESCALATION_THRESHOLD = 10
 
 
 def _pin_state_path() -> Path:
-    """Path to the persistent PIN-attempt state file."""
-    return _public_state_dir() / "pin_attempts.json"
+    """Path to the persistent PIN-attempt/lockout state file."""
+    return _public_state_dir() / "pin_lockout.json"
 
 
 def _load_pin_state() -> None:
-    """Load PIN lockout state from disk (called at startup)."""
+    """Load PIN lockout state from disk (called at startup).
+
+    Uses UTC ISO timestamps so the lockout survives API restarts.
+    """
     global _pin_attempts, _pin_lockout_until
+    from datetime import datetime, timezone
     try:
         data = json.loads(_pin_state_path().read_text())
         _pin_attempts = int(data.get("attempts", 0))
-        lockout_ts = float(data.get("lockout_until", 0.0))
-        # lockout_until is stored as epoch seconds; convert to monotonic offset
-        if lockout_ts > 0:
-            import time as _t
-            remaining = lockout_ts - _t.time()
-            _pin_lockout_until = _t.monotonic() + remaining if remaining > 0 else 0.0
+        lockout_iso = data.get("lockout_until")
+        if lockout_iso:
+            lockout_dt = datetime.fromisoformat(lockout_iso)
+            remaining = (lockout_dt - datetime.now(timezone.utc)).total_seconds()
+            _pin_lockout_until = _time.monotonic() + remaining if remaining > 0 else 0.0
         else:
             _pin_lockout_until = 0.0
     except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
         _pin_attempts = 0
         _pin_lockout_until = 0.0
+    # Also try migrating the old pin_attempts.json if it exists
+    old_path = _public_state_dir() / "pin_attempts.json"
+    if old_path.exists() and not _pin_state_path().exists():
+        try:
+            old_data = json.loads(old_path.read_text())
+            _pin_attempts = int(old_data.get("attempts", 0))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
 
 
 def _save_pin_state() -> None:
-    """Persist PIN lockout state to disk (atomic write). Must be called under _pin_lock."""
-    import time as _t
+    """Persist PIN lockout state to disk (atomic write). Must be called under _pin_lock.
+
+    Stores lockout_until as a UTC ISO 8601 timestamp so it survives restarts.
+    """
+    from datetime import datetime, timezone, timedelta
     import tempfile
     if _pin_lockout_until > 0:
-        remaining = _pin_lockout_until - _t.monotonic()
-        lockout_epoch = _t.time() + remaining if remaining > 0 else 0.0
+        remaining = _pin_lockout_until - _time.monotonic()
+        if remaining > 0:
+            lockout_iso = (datetime.now(timezone.utc) + timedelta(seconds=remaining)).isoformat()
+        else:
+            lockout_iso = None
     else:
-        lockout_epoch = 0.0
+        lockout_iso = None
     data = {
         "attempts": _pin_attempts,
-        "lockout_until": lockout_epoch,
+        "lockout_until": lockout_iso,
         "last_attempt_ts": utc_timestamp(),
     }
     path = _pin_state_path()
@@ -1344,18 +1396,73 @@ class DeviceActionRequest(BaseModel):
     confirm: bool = False
 
 
-@app.post("/api/v1/device/{action}", dependencies=[Depends(_verify_token)])
-async def device_control(action: str, body: DeviceActionRequest = DeviceActionRequest()) -> JSONResponse:
-    """Reboot or shut down the host device. Action: reboot | shutdown."""
+class DeviceConfirmRequest(BaseModel):
+    nonce: str = Field(min_length=1, max_length=64)
+
+
+def _clean_pending_device_actions() -> None:
+    """Remove expired pending device action nonces."""
+    now = _time.monotonic()
+    expired = [k for k, (_, exp) in _pending_device_actions.items() if now > exp]
+    for k in expired:
+        del _pending_device_actions[k]
+
+
+# IMPORTANT: /confirm must be registered BEFORE /{action} so FastAPI doesn't
+# match "confirm" as a path parameter.
+@app.post("/api/v1/device/confirm", dependencies=[Depends(_verify_token)])
+async def device_confirm(body: DeviceConfirmRequest) -> JSONResponse:
+    """Confirm a pending device action using the nonce from step 1."""
+    _clean_pending_device_actions()
+    entry = _pending_device_actions.pop(body.nonce, None)
+    if entry is None:
+        return JSONResponse(status_code=400, content={
+            "status": "error",
+            "error": "invalid or expired nonce",
+        })
+    action, expiry = entry
+    if _time.monotonic() > expiry:
+        return JSONResponse(status_code=400, content={
+            "status": "error",
+            "error": "nonce expired",
+        })
     if action not in _DEVICE_ACTIONS:
-        raise HTTPException(status_code=400, detail=f"unknown action: {action}")
-    if not body.confirm:
-        return JSONResponse(status_code=400, content={"error": "confirm: true required"})
+        return JSONResponse(status_code=400, content={
+            "status": "error",
+            "error": f"unknown action: {action}",
+        })
     try:
         subprocess.Popen(_DEVICE_ACTIONS[action])
     except Exception as exc:
         return JSONResponse(status_code=500, content={"status": "error", "error": str(exc)})
     return JSONResponse(status_code=200, content={"status": "ok", "action": action})
+
+
+@app.post("/api/v1/device/{action}", dependencies=[Depends(_verify_token)])
+async def device_control(action: str, body: DeviceActionRequest = DeviceActionRequest()) -> JSONResponse:
+    """Request a device reboot or shutdown. Returns a nonce that must be confirmed.
+
+    Step 1: POST /api/v1/device/reboot → returns nonce
+    Step 2: POST /api/v1/device/confirm with {"nonce": "..."} → executes
+    """
+    if action not in _DEVICE_ACTIONS:
+        raise HTTPException(status_code=400, detail=f"unknown action: {action}")
+    # Clean expired nonces
+    _clean_pending_device_actions()
+    # Cap pending actions
+    if len(_pending_device_actions) >= _PENDING_DEVICE_MAX:
+        return JSONResponse(status_code=429, content={
+            "status": "error",
+            "error": "too many pending device actions — wait for them to expire",
+        })
+    nonce = secrets.token_urlsafe(16)
+    _pending_device_actions[nonce] = (action, _time.monotonic() + _PENDING_DEVICE_TTL)
+    return JSONResponse(status_code=200, content={
+        "status": "confirm_required",
+        "nonce": nonce,
+        "action": action,
+        "expires_in": _PENDING_DEVICE_TTL,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1663,7 +1770,7 @@ async function loadSvcs(){
   } catch(e){}
 }
 async function svcAct(svc,act){if((act==='stop'||act==='restart')&&!confirm('Really '+act+' '+svc+'?'))return;try{await api('/api/v1/services/'+svc+'/'+act,{method:'POST',body:JSON.stringify({confirm:true})});}catch(e){}setTimeout(loadSvcs,1500);}
-async function confirmDev(act){if(confirm('Really '+act+' the Pi?'))try{await api('/api/v1/device/'+act,{method:'POST',body:JSON.stringify({confirm:true})});}catch(e){}}
+async function confirmDev(act){if(!confirm('Really '+act+' the Pi?'))return;try{const r=await api('/api/v1/device/'+act,{method:'POST',body:JSON.stringify({confirm:true})});if(r.status==='confirm_required'&&r.nonce){if(confirm('Confirm '+act+'? This cannot be undone.')){await api('/api/v1/device/confirm',{method:'POST',body:JSON.stringify({nonce:r.nonce})});}}}catch(e){}}
 async function loadParental(){
   try{
     const s=await api('/api/v1/session');
