@@ -17,10 +17,12 @@ Run with: bin/px-post [--dry-run]
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import difflib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
@@ -68,6 +70,77 @@ def is_duplicate(thought: str, recent_posts: list[str]) -> bool:
         if ratio >= SIMILARITY_THRESHOLD:
             return True
     return False
+
+
+CURSOR_FILE = STATE_DIR / "px-post-cursor.json"
+
+
+def _load_cursor() -> dict:
+    try:
+        return json.loads(CURSOR_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        log(f"cursor reset (fresh start): {exc}")
+        return {"offset": 0, "inode": 0}
+
+
+def _save_cursor(offset: int, inode: int) -> None:
+    data = {"file": "thoughts-spark.jsonl", "offset": offset, "inode": inode,
+            "last_poll_ts": dt.datetime.now(dt.timezone.utc).isoformat()}
+    try:
+        # Atomic write
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, str(CURSOR_FILE))
+    except Exception as exc:
+        log(f"cursor write failed: {exc}")
+
+
+def poll_new_thoughts(thoughts_file: Path) -> list[dict]:
+    """Read new complete lines from thoughts file since last cursor position."""
+    cursor = _load_cursor()
+    try:
+        st = thoughts_file.stat()
+    except FileNotFoundError:
+        return []
+
+    # Inode change -> file replaced, reset
+    if st.st_ino != cursor.get("inode", 0):
+        log("cursor: inode changed — resetting to 0")
+        cursor["offset"] = 0
+    # File shrunk -> trimmed, reset
+    elif st.st_size < cursor.get("offset", 0):
+        log("cursor: file shrunk — resetting to 0")
+        cursor["offset"] = 0
+
+    with thoughts_file.open("rb") as f:
+        f.seek(cursor["offset"])
+        raw = f.read()
+
+    # Only process complete lines (ending in \n)
+    last_nl = raw.rfind(b"\n")
+    if last_nl == -1:
+        return []  # no complete lines
+    processable = raw[:last_nl + 1]
+    new_offset = cursor["offset"] + len(processable)
+
+    entries = []
+    for line in processable.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            log(f"corrupt line skipped: {line[:100]}")
+            continue
+        if not REQUIRED_FIELDS.issubset(entry.keys()):
+            log(f"malformed entry skipped: {list(entry.keys())}")
+            continue
+        entries.append(entry)
+
+    _save_cursor(new_offset, st.st_ino)
+    return entries
 
 
 def main() -> None:

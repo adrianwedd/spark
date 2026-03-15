@@ -1,6 +1,7 @@
 """Tests for px-post qualification and deduplication logic."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -45,6 +46,20 @@ def _load_post_helpers():
 _POST = _load_post_helpers()
 qualifies = _POST["qualifies"]
 is_duplicate = _POST["is_duplicate"]
+poll_new_thoughts = _POST["poll_new_thoughts"]
+
+
+def _make_line(thought="hello", salience=0.8, action="comment"):
+    """Build a valid JSONL line (with trailing newline)."""
+    return json.dumps({"thought": thought, "salience": salience, "action": action}) + "\n"
+
+
+def _patch_state_dir(mod_globals, tmp_path):
+    """Point the module's STATE_DIR and CURSOR_FILE at tmp_path."""
+    import importlib
+    # _POST dict holds the globals of the exec'd module; mutate in place.
+    _POST["STATE_DIR"] = tmp_path
+    _POST["CURSOR_FILE"] = tmp_path / "px-post-cursor.json"
 
 
 # ---------------------------------------------------------------------------
@@ -104,3 +119,119 @@ def test_dedup_different_thought():
 def test_dedup_empty_recent():
     """No recent posts means nothing is a duplicate."""
     assert is_duplicate("any thought", []) is False
+
+
+# ---------------------------------------------------------------------------
+# poll_new_thoughts() — cursor system
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=False)
+def _cursor_env(tmp_path):
+    """Redirect STATE_DIR for cursor tests; restore after."""
+    orig_state = _POST["STATE_DIR"]
+    orig_cursor = _POST["CURSOR_FILE"]
+    _POST["STATE_DIR"] = tmp_path
+    _POST["CURSOR_FILE"] = tmp_path / "px-post-cursor.json"
+    yield tmp_path
+    _POST["STATE_DIR"] = orig_state
+    _POST["CURSOR_FILE"] = orig_cursor
+
+
+def test_file_offset_cursor(_cursor_env):
+    """Poll reads new entries and advances cursor; second poll returns only new."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    tf.write_text(_make_line("a") + _make_line("b") + _make_line("c"))
+
+    results = poll_new_thoughts(tf)
+    assert len(results) == 3
+    assert [r["thought"] for r in results] == ["a", "b", "c"]
+
+    # Append 2 more lines
+    with tf.open("a") as f:
+        f.write(_make_line("d") + _make_line("e"))
+
+    results2 = poll_new_thoughts(tf)
+    assert len(results2) == 2
+    assert [r["thought"] for r in results2] == ["d", "e"]
+
+
+def test_file_shrink_resets_cursor(_cursor_env):
+    """Truncated file resets cursor to 0 and re-reads from start."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    tf.write_text(_make_line("a") + _make_line("b") + _make_line("c"))
+
+    poll_new_thoughts(tf)  # advance cursor
+
+    # Truncate to shorter content
+    tf.write_text(_make_line("x"))
+    results = poll_new_thoughts(tf)
+    assert len(results) == 1
+    assert results[0]["thought"] == "x"
+
+
+def test_cursor_inode_change(_cursor_env):
+    """Deleting and recreating the file (new inode) resets cursor."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    tf.write_text(_make_line("a") + _make_line("b"))
+
+    poll_new_thoughts(tf)  # advance cursor
+
+    # Delete and recreate (different inode)
+    tf.unlink()
+    tf.write_text(_make_line("new"))
+
+    results = poll_new_thoughts(tf)
+    assert len(results) == 1
+    assert results[0]["thought"] == "new"
+
+
+def test_cursor_corrupt_resets(_cursor_env):
+    """Corrupt cursor file causes reset to offset 0 without crashing."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    tf.write_text(_make_line("a"))
+
+    # Write garbage to cursor file
+    cursor_f = tmp / "px-post-cursor.json"
+    cursor_f.write_text("{{{not json at all!!!")
+
+    results = poll_new_thoughts(tf)
+    assert len(results) == 1
+    assert results[0]["thought"] == "a"
+
+
+def test_partial_line_not_consumed(_cursor_env):
+    """Incomplete line (no trailing newline) is not returned."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    complete = _make_line("complete")
+    partial = json.dumps({"thought": "partial", "salience": 0.8, "action": "comment"})
+    # partial has no trailing \n
+    tf.write_text(complete + partial)
+
+    results = poll_new_thoughts(tf)
+    assert len(results) == 1
+    assert results[0]["thought"] == "complete"
+
+    # Now finish the partial line
+    with tf.open("a") as f:
+        f.write("\n")
+
+    results2 = poll_new_thoughts(tf)
+    assert len(results2) == 1
+    assert results2[0]["thought"] == "partial"
+
+
+def test_corrupt_jsonl_skipped(_cursor_env):
+    """Corrupt JSONL line is skipped; valid lines on both sides are returned."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    tf.write_text(_make_line("good1") + "NOT VALID JSON\n" + _make_line("good2"))
+
+    results = poll_new_thoughts(tf)
+    assert len(results) == 2
+    assert [r["thought"] for r in results] == ["good1", "good2"]
