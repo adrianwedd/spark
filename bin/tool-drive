@@ -21,6 +21,7 @@ PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 PX_DRIVE = Path(os.environ.get("PX_DRIVE_CMD", PROJECT_ROOT / "bin/px-drive"))
 
 
+# Duplicated from pxh.utils — bin scripts run outside venv
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 

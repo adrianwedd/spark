@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from pxh.utils import clamp
+
 from .logging import log_event
 from .state import load_session, update_session, ensure_session
 from .time import utc_timestamp
@@ -135,10 +137,6 @@ PERSONA_VOICE_ENV = {
 
 class VoiceLoopError(Exception):
     """Domain-specific errors."""
-
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, value))
 
 
 def watchdog_thread_func(heartbeat_q: queue.Queue, timeout: float) -> None:

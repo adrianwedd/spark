@@ -55,6 +55,7 @@ from pxh.logging import log_event
 from pxh.state import load_session, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
+from pxh.voice_loop import PERSONA_VOICE_ENV
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
 BIN_DIR      = PROJECT_ROOT / "bin"
@@ -210,27 +211,8 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
         return "active" if ambient_level == "loud" else "calm"
     return "calm"
 
-# Persona voice settings (mirrored from voice_loop.py PERSONA_VOICE_ENV)
-PERSONA_VOICE_ENV = {
-    "vixen": {
-        "PX_PERSONA": "vixen",
-        "PX_VOICE_VARIANT": "en+f4",
-        "PX_VOICE_PITCH": "72",
-        "PX_VOICE_RATE": "135",
-    },
-    "gremlin": {
-        "PX_PERSONA": "gremlin",
-        "PX_VOICE_VARIANT": "en+croak",
-        "PX_VOICE_PITCH": "20",
-        "PX_VOICE_RATE": "180",
-    },
-    "spark": {
-        "PX_PERSONA": "spark",
-        "PX_VOICE_VARIANT": "en-gb",
-        "PX_VOICE_PITCH": "95",
-        "PX_VOICE_RATE": "100",
-    },
-}
+
+# PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
 
 # Reactive response templates (bypass LLM for instant reaction).
 # List values → reactive_response() picks one at random with recency filter.

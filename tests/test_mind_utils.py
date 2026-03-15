@@ -22,7 +22,8 @@ def _load_mind_helpers():
 
     import datetime as _dt
 
-    stub_keys = ("pxh", "pxh.state", "pxh.logging", "pxh.time", "pxh.token_log")
+    stub_keys = ("pxh", "pxh.state", "pxh.logging", "pxh.time", "pxh.token_log",
+                  "pxh.voice_loop")
     saved_modules = {k: sys.modules.get(k) for k in stub_keys}
 
     # Stub out hardware/network imports only for the duration of exec
@@ -37,12 +38,22 @@ def _load_mind_helpers():
     stubs_time.utc_timestamp = lambda: _dt.datetime.now(_dt.timezone.utc).isoformat()
     stubs_token_log = types.ModuleType("pxh.token_log")
     stubs_token_log.log_usage = lambda *a, **kw: None
+    stubs_voice_loop = types.ModuleType("pxh.voice_loop")
+    stubs_voice_loop.PERSONA_VOICE_ENV = {
+        "vixen": {"PX_PERSONA": "vixen", "PX_VOICE_VARIANT": "en+f4",
+                  "PX_VOICE_PITCH": "72", "PX_VOICE_RATE": "135"},
+        "gremlin": {"PX_PERSONA": "gremlin", "PX_VOICE_VARIANT": "en+croak",
+                    "PX_VOICE_PITCH": "20", "PX_VOICE_RATE": "180"},
+        "spark": {"PX_PERSONA": "spark", "PX_VOICE_VARIANT": "en-gb",
+                  "PX_VOICE_PITCH": "95", "PX_VOICE_RATE": "100"},
+    }
 
     sys.modules["pxh"] = stubs_pxh
     sys.modules["pxh.state"] = stubs_state
     sys.modules["pxh.logging"] = stubs_logging
     sys.modules["pxh.time"] = stubs_time
     sys.modules["pxh.token_log"] = stubs_token_log
+    sys.modules["pxh.voice_loop"] = stubs_voice_loop
 
     env_patch = {
         "PROJECT_ROOT": str(PROJECT_ROOT),

@@ -15,7 +15,8 @@ def _load_mind():
     py_src = src[start:end]
 
     import datetime as _dt
-    stub_keys = ("pxh", "pxh.state", "pxh.logging", "pxh.time", "pxh.token_log")
+    stub_keys = ("pxh", "pxh.state", "pxh.logging", "pxh.time", "pxh.token_log",
+                  "pxh.voice_loop")
     saved = {k: sys.modules.get(k) for k in stub_keys}
 
     stub_pxh   = types.ModuleType("pxh")
@@ -29,10 +30,20 @@ def _load_mind():
     stub_time.utc_timestamp = lambda: _dt.datetime.now(_dt.timezone.utc).isoformat()
     stub_token_log = types.ModuleType("pxh.token_log")
     stub_token_log.log_usage = lambda *a, **kw: None
+    stub_voice_loop = types.ModuleType("pxh.voice_loop")
+    stub_voice_loop.PERSONA_VOICE_ENV = {
+        "vixen": {"PX_PERSONA": "vixen", "PX_VOICE_VARIANT": "en+f4",
+                  "PX_VOICE_PITCH": "72", "PX_VOICE_RATE": "135"},
+        "gremlin": {"PX_PERSONA": "gremlin", "PX_VOICE_VARIANT": "en+croak",
+                    "PX_VOICE_PITCH": "20", "PX_VOICE_RATE": "180"},
+        "spark": {"PX_PERSONA": "spark", "PX_VOICE_VARIANT": "en-gb",
+                  "PX_VOICE_PITCH": "95", "PX_VOICE_RATE": "100"},
+    }
 
     for k, m in [("pxh", stub_pxh), ("pxh.state", stub_state),
                  ("pxh.logging", stub_log), ("pxh.time", stub_time),
-                 ("pxh.token_log", stub_token_log)]:
+                 ("pxh.token_log", stub_token_log),
+                 ("pxh.voice_loop", stub_voice_loop)]:
         sys.modules[k] = m
 
     env_patch = {
