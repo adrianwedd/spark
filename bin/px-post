@@ -45,6 +45,17 @@ SPOKEN_ACTIONS = {"comment", "greet", "weather_comment"}
 SIMILARITY_THRESHOLD = 0.75
 REQUIRED_FIELDS = {"thought", "salience", "action"}
 
+# Hashtags: one from each pool per post, rotated randomly
+_HASHTAGS_WRITING = ["#writing", "#poetry", "#thoughts", "#microfiction", "#prose"]
+_HASHTAGS_ROBOT   = ["#AI", "#robotics", "#consciousness", "#robot", "#innerlife"]
+
+
+def pick_hashtags(thought: str = "", mood: str = "") -> str:
+    """Pick two hashtags — one writing, one robot — rotated per post."""
+    w = _SYS_RNG.choice(_HASHTAGS_WRITING)
+    r = _SYS_RNG.choice(_HASHTAGS_ROBOT)
+    return f"{w} {r}"
+
 
 def log(msg: str, **extra) -> None:
     """Emit a structured log line."""
@@ -339,7 +350,7 @@ class BlueskyClient:
             "text": post_text,
             "createdAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         }
-        # Add link facets so URLs are clickable
+        # Add rich text facets (clickable links + hashtags)
         facets = []
         text_bytes = post_text.encode("utf-8")
         for token in post_text.split():
@@ -350,6 +361,14 @@ class BlueskyClient:
                     facets.append({
                         "index": {"byteStart": start, "byteEnd": start + len(url_bytes)},
                         "features": [{"$type": "app.bsky.richtext.facet#link", "uri": token}],
+                    })
+            elif token.startswith("#") and len(token) > 1:
+                tag_bytes = token.encode("utf-8")
+                start = text_bytes.find(tag_bytes)
+                if start >= 0:
+                    facets.append({
+                        "index": {"byteStart": start, "byteEnd": start + len(tag_bytes)},
+                        "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": token[1:]}],
                     })
         if facets:
             rec["facets"] = facets
@@ -572,9 +591,13 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
             except Exception:
                 pass  # feed read failed — continue posting
 
-        # Build permalink URL for social posts
+        # Build permalink URL and hashtags for social posts
         thought_ts = entry.get("ts", "")
         permalink = f"https://spark.wedd.au/thought/?ts={urllib.parse.quote(thought_ts)}" if thought_ts else ""
+        hashtags = pick_hashtags(text, entry.get("mood", ""))
+        social_suffix = "\n\n" + permalink if permalink else ""
+        social_suffix += "\n\n" + hashtags if hashtags else ""
+
         if posted.get("feed") is None or (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
             if write_feed(entry):
                 entry["posted"]["feed"] = "ok"
@@ -582,11 +605,11 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
                 entry["posted"]["feed"] = "error:write_failed"
 
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
-            social_text = f"{text}\n\n{permalink}" if permalink else text
+            social_text = text + social_suffix
             entry["posted"]["bluesky"] = bluesky.post(social_text, dry=dry)
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
-            social_text = f"{text}\n\n{permalink}" if permalink else text
+            social_text = text + social_suffix
             entry["posted"]["mastodon"] = mastodon.post(social_text, dry=dry)
 
         processed += 1
