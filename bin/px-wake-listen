@@ -155,8 +155,8 @@ def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000
     try:
         from robot_hat import enable_speaker
         enable_speaker()
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"enable_speaker failed: {exc}")
     try:
         import math, wave as wv, tempfile
         all_samples: list[int] = []
@@ -592,7 +592,7 @@ def _alive_pid() -> int | None:
     """Return px-alive PID if running, else None."""
     try:
         pid = int(PID_FILE.parent.joinpath("px-alive.pid").read_text().strip())
-    except Exception:
+    except (FileNotFoundError, ValueError, OSError):
         return None
     # Use /proc to check existence — os.kill(pid, 0) raises PermissionError for
     # root-owned processes when running as pi, which we must not treat as "dead".
@@ -636,8 +636,8 @@ def flush_stream(stream, chunks: int = 15) -> None:
     for _ in range(chunks):
         try:
             stream.read(CHUNK, exception_on_overflow=False)
-        except Exception:
-            break
+        except OSError:
+            break  # stream closed or device unavailable
 
 
 def record_utterance(stream, max_s: float, silence_s: float) -> bytes:
@@ -933,13 +933,13 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                             "ts": _utc_ts(), "rms": avg_rms, "level": level,
                         }), encoding="utf-8")
                         _tmp.rename(AMBIENT_FILE)
-                    except Exception:
-                        pass
+                    except (OSError, TypeError) as exc:
+                        log(f"ambient file write failed: {exc}")
                     _ambient_rms_sum = 0
                     _ambient_rms_count = 0
                     _ambient_last_write = _now_mono
-            except Exception:
-                pass
+            except Exception as exc:
+                log(f"ambient RMS calc unexpected: {exc}")
 
             if wake_rec.AcceptWaveform(resampled_data):
                 result = json.loads(wake_rec.Result())
@@ -960,8 +960,8 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                     try:
                         from robot_hat import enable_speaker
                         enable_speaker()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log(f"enable_speaker failed: {exc}")
                     # Chime in background while we start recording
                     threading.Thread(target=play_chime, args=(args.aplay_device,), daemon=True).start()
                     # Periodic heartbeat: soft tick every 5s so user knows we're listening/thinking
@@ -985,8 +985,8 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                                 "event": "wake_transcript",
                                 "text": text_out[:500],
                             })
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log(f"session history update failed: {exc}")
 
                     # Check session for persistent persona (set via API)
                     from pxh.state import load_session as _load_session
@@ -1088,23 +1088,24 @@ def main(argv) -> int:
     try:
         from robot_hat import enable_speaker
         enable_speaker()
-    except Exception:
+    except Exception as exc:
+        log(f"enable_speaker (direct) failed: {exc}")
         try:
             subprocess.run(
                 ["/usr/bin/python3", "-c",
                  "from robot_hat import enable_speaker; enable_speaker()"],
                 capture_output=True, timeout=3,
             )
-        except Exception:
-            pass
+        except Exception as exc2:
+            log(f"enable_speaker (subprocess) failed: {exc2}")
     log(f"personas available: {', '.join(persona_names)} (say name after wake word)")
 
     def _shutdown(sig, _frame):
         log(f"signal {sig} — stopping")
         try:
             PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except OSError:
+            pass  # expected during cleanup
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -1178,8 +1179,8 @@ def main(argv) -> int:
         pa = pyaudio.PyAudio()
         os.dup2(_saved_stderr, 2)
         os.close(_saved_stderr)
-    except Exception:
-        pa = pyaudio.PyAudio()
+    except (OSError, AttributeError):
+        pa = pyaudio.PyAudio()  # fallback without stderr suppression
     try:
         listen_loop(pa, model, args, stt, whisper, sensevoice)
     except KeyboardInterrupt:

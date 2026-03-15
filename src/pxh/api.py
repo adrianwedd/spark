@@ -264,8 +264,10 @@ def _read_wifi_dbm() -> Optional[int]:
             if "wlan" in line:
                 parts = line.split()
                 return int(float(parts[3].rstrip(".")))
-    except Exception:
-        pass
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        pass  # expected on non-Linux or missing wlan
+    except Exception as exc:
+        logging.getLogger("pxh.api").debug("wifi read unexpected: %s", exc)
     return None
 
 
@@ -291,7 +293,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         sample["cpu_pct"] = round(_psutil.cpu_percent(interval=None), 1)
         sample["ram_pct"] = round(_psutil.virtual_memory().percent, 1)
         sample["disk_pct"] = round(_psutil.disk_usage("/").percent, 1)
-    except Exception:
+    except (ImportError, OSError):
         sample["cpu_pct"] = None
         sample["ram_pct"] = None
         sample["disk_pct"] = None
@@ -300,14 +302,14 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
     try:
         raw = _THERMAL_ZONE.read_text().strip()
         sample["cpu_temp_c"] = round(int(raw) / 1000.0, 1)
-    except Exception:
+    except (FileNotFoundError, OSError, ValueError):
         sample["cpu_temp_c"] = None
 
     # Battery
     try:
         bdata = json.loads((state_dir / "battery.json").read_text())
         sample["battery_pct"] = bdata.get("pct")
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         sample["battery_pct"] = None
 
     # Sonar — age gate: null if > 60s
@@ -315,7 +317,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         sdata = json.loads((state_dir / "sonar_live.json").read_text())
         age = _time.time() - float(sdata["ts"])
         sample["sonar_cm"] = sdata["distance_cm"] if age <= 60 else None
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
         sample["sonar_cm"] = None
 
     # Token usage (cumulative since last restart)
@@ -323,7 +325,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         tdata = json.loads((state_dir / "token_usage.json").read_text())
         sample["tokens_in"] = tdata.get("input_tokens", 0)
         sample["tokens_out"] = tdata.get("output_tokens", 0)
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         sample["tokens_in"] = None
         sample["tokens_out"] = None
 
@@ -346,7 +348,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
             sample["wind_kmh"] = None
             sample["humidity_pct"] = None
             sample["rain_24h_mm"] = None
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         sample["ambient_rms"] = None
         sample["weather_temp_c"] = None
         sample["wind_kmh"] = None
@@ -360,7 +362,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         last = json.loads(lines[-1]) if lines else {}
         sample["salience"] = last.get("salience")
         sample["mood_val"] = _MOOD_VAL.get((last.get("mood") or "").lower())
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         sample["salience"] = None
         sample["mood_val"] = None
 
@@ -508,10 +510,10 @@ async def public_status() -> Dict[str, Any]:
                     last_spoken = t.get("thought")
                     last_spoken_ts = t.get("ts")
                     break
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 continue
-    except Exception:
-        pass
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass  # expected on missing/corrupt thoughts file
 
     return {
         "persona": persona or None,
@@ -541,14 +543,14 @@ async def public_vitals() -> Dict[str, Any]:
         ram_pct = round(vm.percent, 1)
         dk = psutil.disk_usage("/")
         disk_pct = round(dk.percent, 1)
-    except Exception:
+    except (ImportError, OSError):
         pass
 
     cpu_temp_c = None
     try:
         raw = _THERMAL_ZONE.read_text().strip()
         cpu_temp_c = round(int(raw) / 1000.0, 1)
-    except Exception:
+    except (FileNotFoundError, OSError, ValueError):
         pass
 
     battery_pct = None
@@ -557,7 +559,7 @@ async def public_vitals() -> Dict[str, Any]:
         data = json.loads((_public_state_dir() / "battery.json").read_text())
         battery_pct = data.get("pct")
         battery_charging = bool(data.get("charging", False))
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
 
     tokens_in = tokens_out = None
@@ -565,7 +567,7 @@ async def public_vitals() -> Dict[str, Any]:
         tdata = json.loads((_public_state_dir() / "token_usage.json").read_text())
         tokens_in = tdata.get("input_tokens", 0)
         tokens_out = tdata.get("output_tokens", 0)
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
 
     wifi_dbm = _read_wifi_dbm()
@@ -601,7 +603,7 @@ async def public_sonar() -> Dict[str, Any]:
             "age_seconds": age,
             "source": "sonar_live",
         }
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
         return {"sonar_cm": None, "age_seconds": None, "source": "unavailable"}
 
 
@@ -611,7 +613,7 @@ async def public_awareness() -> Dict[str, Any]:
     try:
         parsed = json.loads((_public_state_dir() / "awareness.json").read_text())
         awareness = parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         awareness = {}
 
     # frigate: absent/None → Frigate offline → person_present=None (hidden in UI)
@@ -694,10 +696,10 @@ async def public_thoughts(limit: int = Query(default=12, ge=1, le=50)) -> list:
                 })
                 if len(results) >= limit:
                     break
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 continue
-    except Exception:
-        pass
+    except (FileNotFoundError, OSError):
+        pass  # expected on missing thoughts file
     return results
 
 
@@ -1172,7 +1174,7 @@ def _get_public_service_status(service: str) -> tuple:
         if state not in _PUBLIC_SERVICE_STATES:
             state = "unknown"
         return (service, state)
-    except Exception:
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
         return (service, "unknown")
 
 
@@ -1330,7 +1332,8 @@ def _save_pin_state() -> None:
         with os.fdopen(tmp_fd, "w") as f:
             json.dump(data, f)
         os.replace(tmp_path, str(path))
-    except Exception:
+    except Exception as exc:
+        logging.getLogger("pxh.api").warning("pin state write failed: %s", exc)
         try:
             os.unlink(tmp_path)
         except OSError:
