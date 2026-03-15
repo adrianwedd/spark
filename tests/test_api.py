@@ -25,6 +25,7 @@ def api_client(isolated_project, monkeypatch):
     monkeypatch.setenv("PX_VOICE_DEVICE", "null")
     monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
     monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
     monkeypatch.setenv("PROJECT_ROOT", str(ROOT))
 
     from pxh import api
@@ -447,9 +448,18 @@ class TestPinVerify:
         import pxh.api as api
         api._pin_attempts = 0
         api._pin_lockout_until = 0.0
+        # Remove persisted state file if present
+        try:
+            api._pin_state_path().unlink(missing_ok=True)
+        except Exception:
+            pass
         yield
         api._pin_attempts = 0
         api._pin_lockout_until = 0.0
+        try:
+            api._pin_state_path().unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def test_pin_verify_correct(self, api_client):
         import unittest.mock
@@ -458,7 +468,45 @@ class TestPinVerify:
         assert resp.status_code == 200
         data = resp.json()
         assert data["verified"] is True
-        assert data["token"] == "test-token-abc123"
+        assert "token" in data
+        # Session token must NOT be the raw API token
+        assert data["token"] != "test-token-abc123"
+
+    def test_pin_returns_session_token_not_api_token(self, api_client):
+        """Returned token must be a short-lived session token, not PX_API_TOKEN."""
+        import unittest.mock
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "1234", "PX_API_TOKEN": "test-token-abc123"}):
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "1234"})
+        data = resp.json()
+        assert data["verified"] is True
+        assert data["token"] != "test-token-abc123"
+        assert len(data["token"]) > 20  # urlsafe token is ~43 chars
+
+    def test_session_token_works_for_auth(self, api_client):
+        """Session token from PIN verify should authenticate subsequent requests."""
+        import unittest.mock
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "5555", "PX_API_TOKEN": "test-token-abc123"}):
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "5555"})
+        session_token = resp.json()["token"]
+        # Use session token to hit an authenticated endpoint
+        resp2 = api_client.get("/api/v1/tools", headers={"Authorization": f"Bearer {session_token}"})
+        assert resp2.status_code == 200
+        assert "tools" in resp2.json()
+
+    def test_session_token_expires(self, api_client):
+        """Session token should be rejected after TTL expires."""
+        import unittest.mock
+        import pxh.api as api
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "7777", "PX_API_TOKEN": "test-token-abc123"}):
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "7777"})
+        session_token = resp.json()["token"]
+        # Verify it works now
+        resp2 = api_client.get("/api/v1/tools", headers={"Authorization": f"Bearer {session_token}"})
+        assert resp2.status_code == 200
+        # Expire the token by setting its expiry to the past
+        api._session_tokens[session_token] = 0.0
+        resp3 = api_client.get("/api/v1/tools", headers={"Authorization": f"Bearer {session_token}"})
+        assert resp3.status_code == 401
 
     def test_pin_verify_wrong(self, api_client):
         import unittest.mock
@@ -500,6 +548,85 @@ class TestPinVerify:
             resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
         assert resp.status_code == 429
         assert resp.json()["verified"] is False
+
+    def test_pin_lockout_persists_across_restart(self, api_client):
+        """PIN lockout state survives a simulated restart (reload from file)."""
+        import pxh.api as api
+        import time as _t
+
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
+            # Accumulate 5 failures to trigger lockout
+            for _ in range(5):
+                resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+                assert resp.status_code == 200
+
+            # Confirm lockout is active
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+            assert resp.status_code == 429
+
+            # Verify state file was written
+            assert api._pin_state_path().exists()
+            saved = json.loads(api._pin_state_path().read_text())
+            assert saved["attempts"] >= 5
+            assert saved["lockout_until"] > _t.time()
+
+            # Simulate restart: reset in-memory state, then reload from file
+            api._pin_attempts = 0
+            api._pin_lockout_until = 0.0
+            api._load_pin_state()
+
+            # Lockout should still be active after "restart"
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+            assert resp.status_code == 429
+
+    def test_pin_escalating_lockout(self, api_client):
+        """5 failures -> 5 min lockout; 10 cumulative failures -> 30 min lockout."""
+        import pxh.api as api
+        import time as _t
+
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
+            # 5 failures: should trigger 5-minute (300s) lockout
+            for _ in range(5):
+                api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+
+            with api._pin_lock:
+                lockout_remaining = api._pin_lockout_until - _t.monotonic()
+                assert lockout_remaining > 250, f"Expected ~300s lockout, got {lockout_remaining}"
+                assert lockout_remaining <= 300
+
+            # Simulate time passing: clear lockout but keep cumulative attempts (5)
+            with api._pin_lock:
+                api._pin_lockout_until = 0.0
+
+            # 5 more failures (cumulative = 10): should trigger 30-minute lockout
+            for _ in range(5):
+                api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+
+            with api._pin_lock:
+                lockout_remaining = api._pin_lockout_until - _t.monotonic()
+                assert lockout_remaining > 1750, f"Expected ~1800s lockout, got {lockout_remaining}"
+                assert lockout_remaining <= 1800
+
+    def test_pin_success_resets_persistent_state(self, api_client):
+        """Successful PIN verify resets both memory and file."""
+        import pxh.api as api
+
+        with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
+            # Accumulate some failures
+            for _ in range(3):
+                api_client.post("/api/v1/pin/verify", json={"pin": "0000"})
+
+            assert api._pin_state_path().exists()
+            saved = json.loads(api._pin_state_path().read_text())
+            assert saved["attempts"] == 3
+
+            # Correct PIN resets everything
+            resp = api_client.post("/api/v1/pin/verify", json={"pin": "9999"})
+            assert resp.json()["verified"] is True
+
+            saved = json.loads(api._pin_state_path().read_text())
+            assert saved["attempts"] == 0
+            assert saved["lockout_until"] == 0.0
 
 
 class TestPublicChat:

@@ -133,6 +133,34 @@ class PublicChatRequest(BaseModel):
 
 _API_TOKEN: Optional[str] = None
 
+# ---------------------------------------------------------------------------
+# Short-lived session tokens (issued by PIN verify, expire after 4 h)
+# ---------------------------------------------------------------------------
+
+_session_tokens: dict[str, float] = {}  # token → expiry_ts (monotonic)
+_SESSION_TOKEN_TTL = 4 * 3600  # 4 hours
+
+
+def _create_session_token() -> str:
+    token = secrets.token_urlsafe(32)
+    _session_tokens[token] = _time.monotonic() + _SESSION_TOKEN_TTL
+    # Prune expired tokens
+    now = _time.monotonic()
+    expired = [k for k, v in _session_tokens.items() if v < now]
+    for k in expired:
+        del _session_tokens[k]
+    return token
+
+
+def _is_valid_session_token(token: str) -> bool:
+    expiry = _session_tokens.get(token)
+    if expiry is None:
+        return False
+    if _time.monotonic() > expiry:
+        del _session_tokens[token]
+        return False
+    return True
+
 
 def _load_token() -> str:
     """Load PX_API_TOKEN from environment. Hard-fail if missing."""
@@ -152,8 +180,11 @@ def _verify_token(request: Request) -> None:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     provided = auth[7:]
-    if _API_TOKEN is None or not secrets.compare_digest(provided, _API_TOKEN):
-        raise HTTPException(status_code=401, detail="invalid token")
+    if _API_TOKEN is not None and secrets.compare_digest(provided, _API_TOKEN):
+        return
+    if _is_valid_session_token(provided):
+        return
+    raise HTTPException(status_code=401, detail="invalid token")
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +197,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     _load_token()
+    _load_pin_state()
     _start_history_worker()
     yield
 
@@ -889,16 +921,19 @@ async def verify_pin(body: PinRequest) -> JSONResponse:
         with _pin_lock:
             _pin_attempts = 0
             _pin_lockout_until = 0.0
+            _save_pin_state()
         return JSONResponse(status_code=200, content={
             "verified": True,
-            "token": os.environ.get("PX_API_TOKEN", ""),
+            "token": _create_session_token(),
         })
     else:
         with _pin_lock:
             _pin_attempts += 1
-            if _pin_attempts >= _PIN_MAX_ATTEMPTS:
+            if _pin_attempts >= _PIN_ESCALATION_THRESHOLD and _pin_attempts % _PIN_MAX_ATTEMPTS == 0:
+                _pin_lockout_until = _time.monotonic() + _PIN_ESCALATED_SECONDS
+            elif _pin_attempts % _PIN_MAX_ATTEMPTS == 0:
                 _pin_lockout_until = _time.monotonic() + _PIN_LOCKOUT_SECONDS
-                _pin_attempts = 0
+            _save_pin_state()
         return JSONResponse(status_code=200, content={"verified": False})
 
 
@@ -1220,7 +1255,61 @@ _pin_lock = threading.Lock()
 _pin_attempts = 0
 _pin_lockout_until = 0.0
 _PIN_MAX_ATTEMPTS = 5
-_PIN_LOCKOUT_SECONDS = 30
+_PIN_LOCKOUT_SECONDS = 300       # 5 minutes after 5 failures
+_PIN_ESCALATED_SECONDS = 1800    # 30 minutes after 10 cumulative failures
+_PIN_ESCALATION_THRESHOLD = 10
+
+
+def _pin_state_path() -> Path:
+    """Path to the persistent PIN-attempt state file."""
+    return _public_state_dir() / "pin_attempts.json"
+
+
+def _load_pin_state() -> None:
+    """Load PIN lockout state from disk (called at startup)."""
+    global _pin_attempts, _pin_lockout_until
+    try:
+        data = json.loads(_pin_state_path().read_text())
+        _pin_attempts = int(data.get("attempts", 0))
+        lockout_ts = float(data.get("lockout_until", 0.0))
+        # lockout_until is stored as epoch seconds; convert to monotonic offset
+        if lockout_ts > 0:
+            import time as _t
+            remaining = lockout_ts - _t.time()
+            _pin_lockout_until = _t.monotonic() + remaining if remaining > 0 else 0.0
+        else:
+            _pin_lockout_until = 0.0
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        _pin_attempts = 0
+        _pin_lockout_until = 0.0
+
+
+def _save_pin_state() -> None:
+    """Persist PIN lockout state to disk (atomic write). Must be called under _pin_lock."""
+    import time as _t
+    import tempfile
+    if _pin_lockout_until > 0:
+        remaining = _pin_lockout_until - _t.monotonic()
+        lockout_epoch = _t.time() + remaining if remaining > 0 else 0.0
+    else:
+        lockout_epoch = 0.0
+    data = {
+        "attempts": _pin_attempts,
+        "lockout_until": lockout_epoch,
+        "last_attempt_ts": utc_timestamp(),
+    }
+    path = _pin_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 class DeviceActionRequest(BaseModel):
