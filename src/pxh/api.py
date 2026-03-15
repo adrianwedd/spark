@@ -661,6 +661,16 @@ async def public_thoughts(limit: int = Query(default=12, ge=1, le=50)) -> list:
     return results
 
 
+@app.get("/api/v1/public/feed")
+async def public_feed():
+    """SPARK's public thought feed. No auth required."""
+    feed_path = _public_state_dir() / "feed.json"
+    try:
+        return json.loads(feed_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"updated": None, "posts": []}
+
+
 # ---------------------------------------------------------------------------
 # Public chat — Claude subprocess helper + endpoint
 # ---------------------------------------------------------------------------

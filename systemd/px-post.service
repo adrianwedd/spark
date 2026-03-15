@@ -1,0 +1,12 @@
+[Unit]
+Description=SPARK social posting daemon
+After=network-online.target px-mind.service
+
+[Service]
+ExecStart=/home/pi/picar-x-hacking/bin/px-post
+User=pi
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
