@@ -709,12 +709,12 @@ def test_qa_rejected_not_posted_on_next_flush(_cursor_env):
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
 def test_repost_guard_after_corruption(_cursor_env):
-    """Thought already in feed.json — queue entry marked ok for all destinations without re-sending."""
+    """Thought already in feed.json — feed marked ok, social still posted."""
     tmp = _cursor_env
     thought_text = "The sky is particularly beautiful this evening"
 
     # Pre-populate feed.json with the thought
-    feed = {"posts": [{"thought": thought_text, "mood": "calm", "ts": "", "posted_ts": ""}]}
+    feed = {"posts": [{"thought": thought_text, "mood": "calm", "ts": "2026-03-15T10:00:00+11:00", "posted_ts": ""}]}
     (tmp / "feed.json").write_text(json.dumps(feed))
 
     # Queue the same thought (simulating corruption recovery)
@@ -728,16 +728,18 @@ def test_repost_guard_after_corruption(_cursor_env):
     queue_file.write_text(json.dumps(entry) + "\n")
 
     bsky = MagicMock()
+    bsky.post.return_value = "ok"
     masto = MagicMock()
+    masto.post.return_value = "ok"
 
     result = flush_queue(bsky, masto, dry=True)
     assert result["processed"] == 1
 
-    # Neither client should have been called
-    bsky.post.assert_not_called()
-    masto.post.assert_not_called()
+    # Social clients SHOULD be called (thought is in feed, needs social posting)
+    bsky.post.assert_called_once()
+    masto.post.assert_called_once()
 
-    # All destinations should be marked "ok"
+    # Feed should be marked ok, social should be posted
     saved = json.loads(queue_file.read_text().strip())
     assert saved["posted"]["feed"] == "ok"
     assert saved["posted"]["bluesky"] == "ok"

@@ -518,13 +518,11 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         if not pending_destinations and entry.get("qa_result") is not None:
             continue
 
-        # Repost guard: if thought is already in feed, mark all as posted
+        # Repost guard: if thought is already in feed, mark feed as done but NOT social
         if _is_in_feed(entry.get("thought", ""), feed_posts):
             entry["qa_result"] = entry.get("qa_result") or "pass"
-            entry["posted"] = {k: v or "ok" for k, v in posted.items()}
-            log(f"repost guard: {entry.get('id')} already in feed — skipping")
-            processed += 1
-            break
+            entry["posted"]["feed"] = "ok"
+            # Don't mark bluesky/mastodon — they still need posting
 
         # QA gate (if not already done)
         if entry.get("qa_result") is None:
