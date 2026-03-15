@@ -1452,6 +1452,8 @@ _cached_weather: dict | None = None
 _last_weather_fetch: float = 0.0
 _cached_ha: dict | None = None
 _last_ha_fetch: float = 0.0
+_cached_ha_calendar: list | None = None
+_last_ha_calendar_fetch: float = 0.0
 _cached_calendar: list[dict] | None = None
 _last_calendar_fetch: float = 0.0
 _last_spoken_text: str = ""
@@ -1468,6 +1470,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     """Layer 1: gather perception, detect transitions, enrich context."""
     global _cached_weather, _last_weather_fetch, _time_period_start_mono
     global _cached_ha, _last_ha_fetch
+    global _cached_ha_calendar, _last_ha_calendar_fetch
     global _cached_calendar, _last_calendar_fetch
 
     sonar_cm = read_sonar(dry)
