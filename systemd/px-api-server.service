@@ -8,10 +8,12 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/picar-x-hacking
 Environment=HOME=/home/pi
-ExecStartPre=/bin/sleep 2
+ExecStartPre=/bin/bash -c 'for i in 1 2 3 4 5 6 7 8 9 10; do ss -tlnp | grep -q :8420 || exit 0; sleep 1; done; echo "port 8420 still busy after 10s" >&2; exit 1'
 ExecStart=/home/pi/picar-x-hacking/bin/px-api-server
+ExecStop=/bin/kill -TERM $MAINPID
+TimeoutStopSec=15
 Restart=always
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
