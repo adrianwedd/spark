@@ -118,6 +118,12 @@ HA_TIMEOUT_S           = 3
 HA_INTERVAL_S          = 300   # refresh HA presence every 5 min
 # Person entities to track (unknown = no device; state values: home/away/unknown/<zone>)
 HA_PEOPLE              = ["person.adrian", "person.obi", "person.maya", "person.laura"]
+HA_CALENDARS           = [
+    "calendar.obiwedd_gmail_com",   # Obi
+    "calendar.calendar",            # Family/Adrian
+]
+HA_CALENDAR_INTERVAL_S = 300   # refresh every 5 min
+HA_CALENDAR_HORIZON_H  = 8    # look ahead 8 hours
 AEDT = dt.timezone(dt.timedelta(hours=11))  # Hobart, Tasmania (UTC+11)
 OBI_DAY_START  = 7   # 7am AEDT — Obi's waking hours begin
 OBI_DAY_END    = 20  # 8pm AEDT — Obi's waking hours end
@@ -875,6 +881,108 @@ def _fetch_ha_presence(dry: bool = False) -> dict | None:
             pass
 
     return result if result["people"] else None
+
+
+def _parse_calendar_events(raw: list, cal_id: str, now: dt.datetime) -> list[dict]:
+    """Parse HA calendar JSON into [{title, starts_in_mins, location, calendar}].
+
+    Handles both dateTime (timed) and date (all-day) event formats.
+    Filters out events whose end time is before *now*.
+    """
+    events = []
+    for ev in raw:
+        summary = ev.get("summary", "(no title)")
+        location = ev.get("location") or None
+
+        # Parse start time
+        start_raw = ev.get("start", {})
+        if "dateTime" in start_raw:
+            start = dt.datetime.fromisoformat(start_raw["dateTime"])
+        elif "date" in start_raw:
+            start = dt.datetime.strptime(start_raw["date"], "%Y-%m-%d").replace(tzinfo=now.tzinfo)
+        else:
+            continue
+
+        # Parse end time
+        end_raw = ev.get("end", {})
+        if "dateTime" in end_raw:
+            end = dt.datetime.fromisoformat(end_raw["dateTime"])
+        elif "date" in end_raw:
+            end = dt.datetime.strptime(end_raw["date"], "%Y-%m-%d").replace(tzinfo=now.tzinfo)
+        else:
+            continue
+
+        # Filter out events that have already ended
+        if end <= now:
+            continue
+
+        starts_in_mins = int((start - now).total_seconds() / 60)
+
+        events.append({
+            "title": summary,
+            "starts_in_mins": starts_in_mins,
+            "location": location,
+            "calendar": cal_id,
+        })
+    return events
+
+
+def _fetch_ha_calendar(dry: bool = False) -> list[dict] | None:
+    """Query Home Assistant calendars for upcoming events.
+
+    Returns sorted list of event dicts or None on error / dry / no token.
+    """
+    if dry or not HA_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    end = now + dt.timedelta(hours=HA_CALENDAR_HORIZON_H)
+    start_iso = now.isoformat()
+    end_iso = end.isoformat()
+
+    all_events: list[dict] = []
+
+    for cal_id in HA_CALENDARS:
+        try:
+            url = f"{HA_HOST}/api/calendars/{cal_id}?start={start_iso}&end={end_iso}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as r:
+                raw = json.loads(r.read())
+            if isinstance(raw, list):
+                all_events.extend(_parse_calendar_events(raw, cal_id, now))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise
+            # Per-calendar failure — skip, continue
+        except Exception:
+            pass
+
+    if not all_events:
+        return None
+
+    all_events.sort(key=lambda e: e["starts_in_mins"])
+    return all_events
+
+
+def _format_calendar_context(events: list[dict]) -> str:
+    """Format top 3 calendar events for the reflection prompt."""
+    if not events:
+        return ""
+    lines = []
+    for ev in events[:3]:
+        mins = ev["starts_in_mins"]
+        title = ev["title"]
+        loc_part = f" at {ev['location']}" if ev.get("location") else ""
+
+        if mins < 0:
+            lines.append(f"Happening now: {title}{loc_part} (started {abs(mins)} minutes ago)")
+        elif mins < 60:
+            lines.append(f"Coming up: {title}{loc_part} in {mins} minutes")
+        else:
+            hours = mins // 60
+            lines.append(f"Later: {title}{loc_part} in {hours} hours")
+    return "\n".join(lines)
 
 
 def read_battery() -> dict | None:

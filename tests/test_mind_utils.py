@@ -108,6 +108,9 @@ _daytime_action_hint = _MIND["_daytime_action_hint"]
 compute_obi_mode = _MIND["compute_obi_mode"]
 _fetch_frigate_presence = _MIND["_fetch_frigate_presence"]
 _fetch_ha_presence = _MIND["_fetch_ha_presence"]
+_parse_calendar_events = _MIND["_parse_calendar_events"]
+_fetch_ha_calendar = _MIND["_fetch_ha_calendar"]
+_format_calendar_context = _MIND["_format_calendar_context"]
 filter_battery = _MIND["filter_battery"]
 _battery_history = _MIND["_battery_history"]
 _BATTERY_MAX_DROP = _MIND["BATTERY_MAX_DROP_PER_TICK"]
@@ -518,6 +521,181 @@ def test_ha_presence_auth_failure_raises():
             with patch("urllib.request.urlopen", side_effect=_side_effect):
                 _fetch_ha_presence(dry=False)
     assert exc_info.value.code == 401
+
+
+# ---------------------------------------------------------------------------
+# _parse_calendar_events / _fetch_ha_calendar / _format_calendar_context
+# ---------------------------------------------------------------------------
+
+import datetime as _dt_cal
+
+
+def test_parse_ha_calendar_events():
+    """Timed event 45 minutes in the future is parsed correctly."""
+    now = _dt_cal.datetime(2026, 3, 15, 14, 15, 0,
+                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+    raw = [{
+        "summary": "Swimming",
+        "start": {"dateTime": "2026-03-15T15:00:00+11:00"},
+        "end": {"dateTime": "2026-03-15T16:00:00+11:00"},
+        "location": "Hobart Aquatic Centre",
+    }]
+    events = _parse_calendar_events(raw, "calendar.test", now)
+    assert len(events) == 1
+    assert events[0]["title"] == "Swimming"
+    assert events[0]["starts_in_mins"] == 45
+    assert events[0]["location"] == "Hobart Aquatic Centre"
+    assert events[0]["calendar"] == "calendar.test"
+
+
+def test_parse_ha_calendar_all_day_event():
+    """All-day events use 'date' not 'dateTime' and are parsed correctly."""
+    now = _dt_cal.datetime(2026, 3, 15, 10, 0, 0,
+                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+    raw = [{
+        "summary": "School",
+        "start": {"date": "2026-03-15"},
+        "end": {"date": "2026-03-16"},
+    }]
+    events = _parse_calendar_events(raw, "calendar.test", now)
+    assert len(events) == 1
+    assert events[0]["title"] == "School"
+    # All-day event starting at midnight — starts_in_mins should be negative (already started)
+    assert events[0]["starts_in_mins"] < 0
+    assert events[0]["location"] is None
+
+
+def test_parse_ha_calendar_past_event_filtered():
+    """Events whose end time is before now are excluded."""
+    now = _dt_cal.datetime(2026, 3, 15, 17, 0, 0,
+                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+    raw = [{
+        "summary": "Old Meeting",
+        "start": {"dateTime": "2026-03-15T14:00:00+11:00"},
+        "end": {"dateTime": "2026-03-15T15:00:00+11:00"},
+    }]
+    events = _parse_calendar_events(raw, "calendar.test", now)
+    assert len(events) == 0
+
+
+def test_parse_ha_calendar_empty():
+    """Empty list returns empty list."""
+    now = _dt_cal.datetime(2026, 3, 15, 10, 0, 0,
+                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+    events = _parse_calendar_events([], "calendar.test", now)
+    assert events == []
+
+
+def test_format_next_event_for_prompt():
+    """Upcoming event within 60 mins formats as 'Coming up: ...'."""
+    events = [{"title": "Swimming", "starts_in_mins": 45,
+               "location": "Hobart Aquatic Centre", "calendar": "calendar.test"}]
+    text = _format_calendar_context(events)
+    assert "Coming up: Swimming at Hobart Aquatic Centre in 45 minutes" in text
+
+
+def test_format_next_event_happening_now():
+    """Event with negative starts_in_mins formats as 'Happening now: ...'."""
+    events = [{"title": "Swimming", "starts_in_mins": -10,
+               "location": None, "calendar": "calendar.test"}]
+    text = _format_calendar_context(events)
+    assert "Happening now: Swimming (started 10 minutes ago)" in text
+
+
+def test_format_calendar_later_event():
+    """Event >= 60 mins away formats as 'Later: ... in N hours'."""
+    events = [{"title": "Dinner", "starts_in_mins": 180,
+               "location": "Home", "calendar": "calendar.test"}]
+    text = _format_calendar_context(events)
+    assert "Later: Dinner at Home in 3 hours" in text
+
+
+def test_format_calendar_empty():
+    """Empty events list returns empty string."""
+    assert _format_calendar_context([]) == ""
+
+
+def test_fetch_ha_calendar_dry_returns_none():
+    with _ha_ctx():
+        result = _fetch_ha_calendar(dry=True)
+    assert result is None
+
+
+def test_fetch_ha_calendar_no_token_returns_none():
+    with _ha_ctx(token=""):
+        result = _fetch_ha_calendar(dry=False)
+    assert result is None
+
+
+def test_fetch_ha_calendar_returns_sorted_events():
+    """Events from multiple calendars are merged and sorted by starts_in_mins."""
+    now = _dt_cal.datetime.now(_dt_cal.timezone.utc)
+    soon = now + _dt_cal.timedelta(minutes=30)
+    later = now + _dt_cal.timedelta(hours=2)
+
+    cal1_events = [{
+        "summary": "Later Event",
+        "start": {"dateTime": later.isoformat()},
+        "end": {"dateTime": (later + _dt_cal.timedelta(hours=1)).isoformat()},
+    }]
+    cal2_events = [{
+        "summary": "Soon Event",
+        "start": {"dateTime": soon.isoformat()},
+        "end": {"dateTime": (soon + _dt_cal.timedelta(hours=1)).isoformat()},
+    }]
+
+    def _side_effect(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "obiwedd" in url:
+            body = cal1_events
+        elif "calendar.calendar" in url:
+            body = cal2_events
+        else:
+            raise OSError(f"No mock for {url}")
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(
+            return_value=MagicMock(read=MagicMock(return_value=_json.dumps(body).encode()))
+        )
+        cm.__exit__ = MagicMock(return_value=False)
+        return cm
+
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_side_effect):
+            result = _fetch_ha_calendar(dry=False)
+    assert result is not None
+    assert len(result) == 2
+    assert result[0]["title"] == "Soon Event"
+    assert result[1]["title"] == "Later Event"
+    assert result[0]["starts_in_mins"] < result[1]["starts_in_mins"]
+
+
+def test_fetch_ha_calendar_per_calendar_failure_continues():
+    """Error on one calendar does not block others."""
+    now = _dt_cal.datetime.now(_dt_cal.timezone.utc)
+    soon = now + _dt_cal.timedelta(minutes=15)
+    cal2_events = [{
+        "summary": "Good Event",
+        "start": {"dateTime": soon.isoformat()},
+        "end": {"dateTime": (soon + _dt_cal.timedelta(hours=1)).isoformat()},
+    }]
+
+    def _side_effect(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "obiwedd" in url:
+            raise OSError("calendar offline")
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(
+            return_value=MagicMock(read=MagicMock(return_value=_json.dumps(cal2_events).encode()))
+        )
+        cm.__exit__ = MagicMock(return_value=False)
+        return cm
+
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_side_effect):
+            result = _fetch_ha_calendar(dry=False)
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["title"] == "Good Event"
 
 
 # ---------------------------------------------------------------------------
