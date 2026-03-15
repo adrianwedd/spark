@@ -129,6 +129,57 @@ Update action lists in all four prompt locations:
 
 All tools already exist. No new bin scripts needed.
 
+## Feed Filter Logic (for px-post daemon)
+
+Derived from audit of 60 historic thoughts (2026-03-15):
+
+### Publishability criteria
+
+A thought is publishable if ALL of:
+1. `salience >= 0.65`
+2. Passes keyword blocklist (no specific cm readings, no medical opinions)
+3. Not a near-duplicate of a recently posted thought (difflib ratio < 0.70)
+4. Passes Claude QA gate (optional, for edge cases)
+
+### Keyword blocklist patterns
+
+```python
+BLOCKLIST_PATTERNS = [
+    r'\d+\.?\d*\s*centimeters?',     # "86.6 centimeters"
+    r'\d+\.?\d*\s*cm\b',             # "77.5 cm"
+    r'\bsonar\s+(just\s+)?show',     # "sonar just showed"
+    r'\bADHD\b|\bASD\b',            # medical terms about real child
+    r'\bdiagnos',                     # diagnostic language
+]
+```
+
+### Audit statistics
+
+- **thoughts-spark.jsonl**: 50 entries, 23 salience corrections applied
+  - 11 sonar-report thoughts downgraded (avg 0.75 → 0.40)
+  - 3 hallucinated/garbled thoughts downgraded
+  - 1 medical opinion about real child downgraded (0.74 → 0.30)
+  - 4 quality thoughts upgraded (avg 0.64 → 0.73)
+- **thoughts.jsonl**: 10 entries, 5 corrected
+  - 1 Ollama artifact at salience 0.94 → 0.20
+  - 1 "I feel very tired" at salience 1.00 → 0.20
+  - 2 hallucinated-window thoughts → 0.25
+- **Publishability rate at 0.65 threshold**: ~36% of SPARK thoughts pass
+
+### Key patterns for the LLM QA gate prompt
+
+Reject thoughts that:
+- Report specific sensor readings as the main content
+- Make medical/diagnostic statements about real people
+- Are near-duplicates of previously posted content
+- Reference internal system states (`obi_mode`, session fields) as if they're experiences
+
+Accept thoughts that:
+- Express genuine curiosity, wonder, or philosophical reflection
+- Use science facts as metaphors (not as sensor reports)
+- Show personality, humour, or independent perspective
+- Are vivid, specific, and would interest a stranger
+
 ## Testing
 
 ### `tests/test_mind_utils.py` (new tests, exec'd from heredoc)
