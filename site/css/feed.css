@@ -47,25 +47,60 @@ body {
 .feed-list {
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 2rem;
 }
 
-/* ── Feed card (in list) ────────────────────────── */
+/* ── Thought bubble (feed cards + individual page) ── */
 
-.feed-card {
+.feed-card,
+.thought-bubble {
+  position: relative;
   background: #fff;
-  border-radius: var(--radius);
-  padding: 1.5rem 1.75rem;
-  box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+  border-radius: 32px;
+  padding: 1.75rem 2rem 1.5rem;
+  box-shadow:
+    0 4px 24px rgba(0,0,0,0.07),
+    0 1px 6px rgba(0,0,0,0.04);
   text-decoration: none;
   color: inherit;
   display: block;
   transition: box-shadow var(--transition), transform var(--transition);
+  margin-bottom: 1rem;
+}
+
+/* Bubble tail — two stacked circles, classic thought bubble */
+.feed-card::before,
+.feed-card::after,
+.thought-bubble::before,
+.thought-bubble::after {
+  content: '';
+  position: absolute;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+
+/* Larger circle */
+.feed-card::before,
+.thought-bubble::before {
+  width: 18px;
+  height: 18px;
+  bottom: -24px;
+  left: 32px;
+}
+
+/* Smaller circle */
+.feed-card::after,
+.thought-bubble::after {
+  width: 10px;
+  height: 10px;
+  bottom: -38px;
+  left: 24px;
 }
 
 .feed-card:hover {
-  box-shadow: 0 4px 20px rgba(0,0,0,0.10);
-  transform: translateY(-1px);
+  box-shadow: 0 6px 28px rgba(0,0,0,0.12);
+  transform: translateY(-2px);
 }
 
 .feed-card-quote {
@@ -116,12 +151,9 @@ body {
 
 /* ── Full thought page ──────────────────────────── */
 
-.thought-card-full {
-  background: #fff;
-  border-radius: 24px;
+.thought-bubble {
   padding: 2.5rem 2.25rem;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.08);
-  margin-bottom: 2rem;
+  margin-bottom: 3rem;
 }
 
 .thought-quote-full {
@@ -141,21 +173,42 @@ body {
   color: var(--warm-muted);
 }
 
-/* ── Navigation ─────────────────────────────────── */
+/* ── CTA buttons ────────────────────────────────── */
 
-.thought-nav {
-  margin-top: 1.5rem;
-}
-
-.back-link {
-  color: var(--warm-accent);
-  text-decoration: none;
+.cta-button {
+  display: inline-block;
+  padding: 0.6rem 1.4rem;
+  border-radius: 999px;
   font-size: 0.9rem;
   font-weight: 600;
+  text-decoration: none;
+  transition: all var(--transition);
+  background: var(--warm-accent);
+  color: #fff;
 }
 
-.back-link:hover {
-  text-decoration: underline;
+.cta-button:hover {
+  opacity: 0.85;
+  transform: translateY(-1px);
+}
+
+.cta-secondary {
+  background: transparent;
+  color: var(--warm-accent);
+  border: 2px solid var(--warm-accent);
+}
+
+.cta-secondary:hover {
+  background: var(--warm-accent);
+  color: #fff;
+}
+
+/* ── Top navigation (thought page) ──────────────── */
+
+.thought-nav-top {
+  display: flex;
+  gap: 0.75rem;
+  margin-bottom: 2rem;
 }
 
 /* ── States ─────────────────────────────────────── */
@@ -168,27 +221,40 @@ body {
   font-size: 1rem;
 }
 
-.feed-empty a {
-  color: var(--warm-accent);
+.feed-empty .cta-button {
+  margin-top: 1rem;
 }
 
 /* ── Footer ─────────────────────────────────────── */
 
 .feed-footer {
-  padding: 2rem 0;
+  padding: 2.5rem 0;
   text-align: center;
   font-size: 0.85rem;
   color: var(--warm-muted);
   border-top: 1px solid rgba(0,0,0,0.06);
 }
 
-.feed-footer a {
-  color: var(--warm-accent);
-  text-decoration: none;
+.footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem 1.5rem;
+  margin-bottom: 1rem;
 }
 
-.feed-footer a:hover {
+.footer-links a {
+  color: var(--warm-accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.footer-links a:hover {
   text-decoration: underline;
+}
+
+.feed-footer p {
+  margin: 0;
 }
 
 /* ── Nav active link ────────────────────────────── */
@@ -200,12 +266,39 @@ body {
 /* ── Responsive ─────────────────────────────────── */
 
 @media (max-width: 600px) {
-  .thought-card-full {
+  .thought-bubble {
     padding: 1.75rem 1.25rem;
-    border-radius: 16px;
+    border-radius: 24px;
+    margin-bottom: 2.5rem;
   }
 
   .feed-card {
     padding: 1.25rem 1rem;
+    border-radius: 24px;
+  }
+
+  /* Smaller bubble tails on mobile */
+  .feed-card::before,
+  .thought-bubble::before {
+    width: 14px;
+    height: 14px;
+    bottom: -20px;
+    left: 24px;
+  }
+
+  .feed-card::after,
+  .thought-bubble::after {
+    width: 8px;
+    height: 8px;
+    bottom: -32px;
+    left: 18px;
+  }
+
+  .thought-nav-top {
+    flex-direction: column;
+  }
+
+  .cta-button {
+    text-align: center;
   }
 }
