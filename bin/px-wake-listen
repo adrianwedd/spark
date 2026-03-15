@@ -56,7 +56,23 @@ _END_PHRASE_RE = _re.compile(
 )
 
 DEFAULT_MODEL = str(PROJECT_ROOT / "models" / "vosk-model-small-en-us-0.15")
-DEFAULT_WAKE  = "hey robot"
+
+# Auto-detect wake phrase from session persona when PX_WAKE_WORD is not explicitly set.
+# "hey spark" for SPARK mode; "hey robot" otherwise.
+_px_wake_word_env = os.environ.get("PX_WAKE_WORD", "")
+if _px_wake_word_env:
+    DEFAULT_WAKE = _px_wake_word_env
+else:
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "src"))
+        from pxh.state import load_session as _init_load_session
+        _init_persona = (_init_load_session().get("persona") or "").lower().strip()
+        if _init_persona == "spark":
+            DEFAULT_WAKE = "hey spark"
+        else:
+            DEFAULT_WAKE = "hey robot"
+    except Exception:
+        DEFAULT_WAKE = "hey robot"
 
 # Persona config: prompt file, voice settings, and fallback chat tool
 PERSONAS = {
@@ -460,12 +476,19 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     )
     segs = list(segments)
     text = " ".join(s.text.strip() for s in segs).strip()
-    # Reject word-salad hallucinations via avg_logprob — real speech scores > -1.0
+    # Confidence metrics logging (#46)
     if segs:
         avg_logprob = sum(s.avg_logprob for s in segs) / len(segs)
+        total_words = len(text.split()) if text else 0
+        duration_s = len(audio_bytes) / (MIC_RATE * 2)  # 16-bit mono
+        word_rate = total_words / duration_s if duration_s > 0 else 0.0
+        log(f"stt: faster-whisper words={total_words} logprob={avg_logprob:.2f} rate={word_rate:.1f}w/s dur={duration_s:.1f}s")
         if avg_logprob < -1.0:
+            log(f"stt: low confidence (logprob={avg_logprob:.2f}) — rejecting as hallucination")
             log(f"whisper hallucination (word salad avg_logprob={avg_logprob:.2f}): {text!r}")
             return ""
+        if word_rate > 5.0 and total_words >= 6:
+            log(f"stt: high word rate ({word_rate:.1f}w/s) — possible hallucination")
     # Strip non-ASCII chars (curly quotes, em-dashes are OK; CJK blocks are hallucination)
     ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
     if text != ascii_text:
@@ -478,7 +501,8 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     # Reject common Whisper phantom outputs on near-silence
     PHANTOM_PHRASES = {
         "thank you", "thank you.", "thanks for watching", "thanks for watching.",
-        "you", "the", "bye", "bye.", "so", "i'm sorry",
+        "you", "the", "the.", "a", "and", "is",
+        "bye", "bye.", "so", "i'm sorry",
         "subscribe", "like and subscribe",
     }
     if text.lower().strip(".!? ") in PHANTOM_PHRASES:
@@ -548,6 +572,12 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     # Strip SenseVoice special tags: <|HAPPY|>, <|NEUTRAL|>, <|Speech|>, etc.
     text = _SENSEVOICE_TAG_RE.sub("", text).strip()
 
+    # Confidence metrics logging (#46) — SenseVoice has no logprob, log word count + duration
+    total_words = len(text.split()) if text else 0
+    duration_s = len(audio_bytes) / (MIC_RATE * 2)  # 16-bit mono
+    word_rate = total_words / duration_s if duration_s > 0 else 0.0
+    log(f"stt: sensevoice words={total_words} rate={word_rate:.1f}w/s dur={duration_s:.1f}s")
+
     # Non-ASCII dominant → hallucination (CJK leaking through)
     ascii_text = text.encode("ascii", "ignore").decode("ascii").strip()
     if text != ascii_text:
@@ -560,11 +590,18 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     # Phantom phrase rejection
     PHANTOM_PHRASES = {
         "thank you", "thank you.", "thanks for watching", "thanks for watching.",
-        "you", "the", "bye", "bye.", "so", "i'm sorry",
+        "you", "the", "the.", "a", "and", "is",
+        "bye", "bye.", "so", "i'm sorry",
         "subscribe", "like and subscribe",
     }
     if text.lower().strip(".!? ") in PHANTOM_PHRASES:
         log(f"sensevoice hallucination (phantom): {text!r}")
+        return ""
+
+    # Reject ultra-short transcripts (< 3 words) — likely hallucination on
+    # silence or ambient noise (#105)
+    if len(text.strip().split()) < 3:
+        log(f"sensevoice hallucination (too short, {len(text.strip().split())} words): {text!r}")
         return ""
 
     # Repetitive text rejection
@@ -944,7 +981,10 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
             if wake_rec.AcceptWaveform(resampled_data):
                 result = json.loads(wake_rec.Result())
                 text = result.get("text", "")
-                if text and text != "[unk]":
+                # Reject single-word partials — too many false positives
+                # from ambient noise (#104).  Wake phrases are 2+ words
+                # ("hey robot", "hey spark", etc.), so a lone "hey" is noise.
+                if text and text != "[unk]" and len(text.strip().split()) >= 2:
                     _is_wake = any(p in text for p in all_wake_phrases if p != "[unk]")
                     if _is_wake:
                         log(f"vosk heard: {text!r}")
@@ -954,7 +994,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                             log(f"vosk heard: {text!r}")
                             _vosk_partial_last_log = _now_partial
 
-                if any(p in text for p in all_wake_phrases if p != "[unk]"):
+                if any(p in text for p in all_wake_phrases if p != "[unk]") and len(text.strip().split()) >= 2:
                     log(f"wake word detected: {text!r}")
                     # Pre-enable speaker amp so it's warm before chime audio arrives
                     try:
@@ -1056,7 +1096,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
 def main(argv) -> int:
     parser = argparse.ArgumentParser(description="Wake-word listener daemon")
     parser.add_argument("--wake-word",     default=DEFAULT_WAKE,
-                        help="Wake phrase to listen for (default: 'hey robot')")
+                        help="Wake phrase to listen for (default: auto-detect from session persona; 'hey spark' for SPARK, else 'hey robot')")
     parser.add_argument("--model-dir",     default=DEFAULT_MODEL,
                         help="Path to Vosk model directory (wake word grammar)")
     parser.add_argument("--stt-model-dir", default=DEFAULT_STT_MODEL,
