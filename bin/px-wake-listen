@@ -21,7 +21,6 @@ import argparse
 import datetime as dt
 import json
 import os
-import audioop
 import signal
 import struct
 import subprocess
@@ -272,9 +271,70 @@ def start_periodic_beep(device: str = "", interval_s: float = 5.0) -> threading.
     return stop
 
 
+def _ratecv(data: bytes, width: int, nchannels: int, inrate: int, outrate: int, state):
+    """Pure-Python replacement for audioop.ratecv (removed in Python 3.13).
+
+    Performs linear-interpolation resampling of 16-bit PCM audio.
+    Accepts and returns a state tuple for streaming/stateful resampling,
+    matching the audioop.ratecv(data, width, nchannels, inrate, outrate, state)
+    signature.
+    """
+    if width != 2:
+        raise ValueError(f"only 16-bit (width=2) supported, got {width}")
+
+    from math import gcd
+    d = gcd(inrate, outrate)
+    inrate //= d
+    outrate //= d
+
+    n_samples = len(data) // 2
+    samples = struct.unpack(f"<{n_samples}h", data)
+
+    # State: (prev_i, d_offset, prev_sample) — where d_offset tracks the
+    # fractional position within the linear interpolation between input samples.
+    if state is None:
+        prev_i = 0
+        d_offset = -outrate  # trigger reading the first sample immediately
+        prev_sample = 0
+    else:
+        prev_i, d_offset, prev_sample = state
+
+    out = []
+    idx = 0
+    cur_sample = prev_sample
+
+    while True:
+        while d_offset < 0:
+            if idx >= n_samples:
+                # Return state so next chunk continues seamlessly
+                new_state = (prev_i, d_offset, cur_sample)
+                return struct.pack(f"<{len(out)}h", *out), new_state
+            prev_sample = cur_sample
+            cur_sample = samples[idx]
+            idx += 1
+            d_offset += outrate
+
+        # Linear interpolation
+        if outrate == 0:
+            val = cur_sample
+        else:
+            val = (prev_sample * d_offset + cur_sample * (outrate - d_offset)) // outrate
+        # Clamp to int16 range
+        if val > 32767:
+            val = 32767
+        elif val < -32768:
+            val = -32768
+        out.append(val)
+        d_offset -= inrate
+
+    # Unreachable, but satisfy type checkers
+    new_state = (prev_i, d_offset, cur_sample)
+    return struct.pack(f"<{len(out)}h", *out), new_state
+
+
 def resample(data: bytes, state=None):
     """Downsample 44100 Hz 16-bit mono PCM to 16000 Hz. Returns (resampled_bytes, new_state)."""
-    resampled, new_state = audioop.ratecv(data, 2, 1, MIC_RATE, VOSK_RATE, state)
+    resampled, new_state = _ratecv(data, 2, 1, MIC_RATE, VOSK_RATE, state)
     return resampled, new_state
 
 
@@ -340,7 +400,7 @@ def load_stt_model(model_dir: str):
 def transcribe_sherpa(stt, audio_bytes: bytes) -> str:
     """Transcribe 44100 Hz PCM using sherpa-onnx Zipformer (resamples to 16kHz internally)."""
     import numpy as np
-    resampled, _ = audioop.ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    resampled, _ = _ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
     samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
     # Append 0.5 s silence tail to flush final tokens through the decoder
     tail = np.zeros(int(VOSK_RATE * 0.5), dtype=np.float32)
@@ -387,7 +447,7 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     - vad_filter=False: don't clip utterance-start (we already gate on RMS onset)
     """
     import numpy as np
-    resampled, _ = audioop.ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    resampled, _ = _ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
     samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
     segments, _info = whisper.transcribe(
         samples,
@@ -477,7 +537,7 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     the same anti-hallucination filters as Whisper.
     """
     import numpy as np
-    resampled, _ = audioop.ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    resampled, _ = _ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
     samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
 
     stream = sv.create_stream()
@@ -829,7 +889,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
     all_wake_phrases = [wake_phrase] + [p for p in _extra_wake if p != wake_phrase] + ["[unk]"]
     grammar = json.dumps(all_wake_phrases)
     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
-    resample_state = None  # audioop.ratecv state for wake recognizer
+    resample_state = None  # _ratecv state for wake recognizer
 
     stream = pa.open(
         format=pyaudio.paInt16,
@@ -858,7 +918,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
 
             # Track ambient sound level (rolling RMS)
             try:
-                chunk_rms = audioop.rms(data, 2)
+                chunk_rms = rms(data)
                 _ambient_rms_sum += chunk_rms
                 _ambient_rms_count += 1
                 _now_mono = time.monotonic()
