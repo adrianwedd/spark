@@ -129,7 +129,15 @@ HA_CALENDARS           = [
     "calendar.calendar",            # Family/Adrian
 ]
 HA_CALENDAR_INTERVAL_S = 300   # refresh every 5 min
+HA_SLEEP_INTERVAL_S    = 3600  # refresh sleep data every hour (doesn't change intraday)
 HA_CALENDAR_HORIZON_H  = 8    # look ahead 8 hours
+HA_CONTEXT_ENTITIES = {
+    "adrian_on_call": "binary_sensor.macbook_air_camera_in_use",
+    "adrian_mic_active": "binary_sensor.macbook_air_audio_input_in_use",
+    "office_light": "light.office_light",
+    "media_player": "media_player.shack_speakers",
+}
+HA_CONTEXT_INTERVAL_S  = 60   # refresh every 60 s (call detection needs to be snappy)
 AEDT = dt.timezone(dt.timedelta(hours=11))  # Hobart, Tasmania (UTC+11)
 OBI_DAY_START  = 7   # 7am AEDT — Obi's waking hours begin
 OBI_DAY_END    = 20  # 8pm AEDT — Obi's waking hours end
@@ -878,6 +886,28 @@ def _fetch_ha_presence(dry: bool = False) -> dict | None:
     return result if result["people"] else None
 
 
+def _fetch_ha_sleep(dry: bool = False) -> dict | None:
+    """Fetch Adrian's sleep data from HA Pixel Watch. Returns None if unavailable."""
+    if dry or not HA_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
+    try:
+        req = urllib.request.Request(f"{HA_HOST}/api/states/sensor.sleep", headers=headers)
+        with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as r:
+            data = json.loads(r.read())
+        total_s = float(data["state"])
+        if total_s <= 0:
+            return None  # sensor not active or no data
+        hours = round(total_s / 3600, 1)
+        quality = "good" if hours >= 7 else "ok" if hours >= 5.5 else "poor"
+        return {"sleep_hours": hours, "sleep_quality": quality}
+    except (urllib.error.HTTPError, urllib.error.URLError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+    except Exception as exc:
+        log(f"ha_sleep fetch unexpected error: {exc}")
+        return None
+
+
 def _parse_calendar_events(raw: list, cal_id: str, now: dt.datetime) -> list[dict]:
     """Parse HA calendar JSON into [{title, starts_in_mins, location, calendar}].
 
@@ -958,6 +988,102 @@ def _fetch_ha_calendar(dry: bool = False) -> list[dict] | None:
 
     all_events.sort(key=lambda e: e["starts_in_mins"])
     return all_events
+
+
+def _fetch_ha_routines(dry: bool = False) -> dict | None:
+    """Query Home Assistant for daily routine signals (meds, water).
+
+    Returns {"meds_taken": bool, "water_mins_ago": int} or None on error.
+    """
+    if dry or not HA_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
+    result: dict = {}
+    # Meds toggle
+    try:
+        req = urllib.request.Request(
+            f"{HA_HOST}/api/states/input_boolean.meds_toggle", headers=headers)
+        with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as s:
+            data = json.loads(s.read())
+        result["meds_taken"] = data["state"] == "on"
+    except Exception:
+        pass
+    # Water button — derive minutes since last press
+    try:
+        req = urllib.request.Request(
+            f"{HA_HOST}/api/states/input_button.drank_water", headers=headers)
+        with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as s:
+            data = json.loads(s.read())
+        last_changed = dt.datetime.fromisoformat(data["last_changed"].replace("Z", "+00:00"))
+        mins_ago = (dt.datetime.now(dt.timezone.utc) - last_changed).total_seconds() / 60
+        result["water_mins_ago"] = round(mins_ago)
+    except Exception:
+        pass
+    return result if result else None
+
+
+def _format_routine_context(routines: dict | None) -> str:
+    """Format routine signals for the reflection prompt."""
+    if not routines:
+        return ""
+    parts = []
+    if routines.get("meds_taken") is False:
+        parts.append("Obi hasn't taken his meds today")
+    elif routines.get("meds_taken") is True:
+        parts.append("Obi has taken his meds today")
+    water = routines.get("water_mins_ago")
+    if water is not None:
+        if water > 120:
+            parts.append(f"Obi last drank water {water // 60} hours ago — he might be thirsty")
+        elif water > 60:
+            parts.append("Obi drank water about an hour ago")
+    if parts:
+        return "Routine status: " + ". ".join(parts)
+    return ""
+
+
+def _fetch_ha_context(dry: bool = False) -> dict | None:
+    """Query HA for office context: call detection, office light, media player.
+
+    Returns dict with boolean/string keys or None on error / dry / no token.
+    """
+    if dry or not HA_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
+    result: dict = {}
+    for key, entity_id in HA_CONTEXT_ENTITIES.items():
+        try:
+            req = urllib.request.Request(
+                f"{HA_HOST}/api/states/{entity_id}", headers=headers)
+            with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as r:
+                data = json.loads(r.read())
+            if key == "media_player":
+                result["media_playing"] = data["state"] == "playing"
+                result["media_title"] = data.get("attributes", {}).get("media_title", "")
+            else:
+                result[key] = data["state"] == "on"
+        except Exception:
+            pass
+    return result if result else None
+
+
+def _format_ha_context(ctx: dict | None) -> str:
+    """Format HA context signals for the reflection prompt."""
+    if not ctx:
+        return ""
+    parts = []
+    if ctx.get("adrian_on_call"):
+        parts.append("Adrian is on a video call — be quiet or whisper")
+    elif ctx.get("adrian_mic_active"):
+        parts.append("Adrian's microphone is active — be quiet")
+    if ctx.get("office_light"):
+        parts.append("Office light is on — Adrian is likely working")
+    if ctx.get("media_playing"):
+        title = ctx.get("media_title", "")
+        parts.append(f"Music playing: {title}" if title else "Music is playing")
+    if parts:
+        return "Household context: " + ". ".join(parts)
+    return ""
 
 
 def _format_calendar_context(events: list[dict]) -> str:
@@ -1436,6 +1562,13 @@ _cached_ha: dict | None = None
 _last_ha_fetch: float = 0.0
 _cached_ha_calendar: list | None = None
 _last_ha_calendar_fetch: float = 0.0
+_cached_ha_sleep: dict | None = None
+_last_ha_sleep_fetch: float = 0.0
+_cached_ha_routines: dict | None = None
+_last_ha_routines_fetch: float = 0.0
+HA_ROUTINES_INTERVAL_S = 300  # 5 min
+_cached_ha_context: dict | None = None
+_last_ha_context_fetch: float = 0.0
 _cached_calendar: list[dict] | None = None
 _last_calendar_fetch: float = 0.0
 _last_spoken_text: str = ""
@@ -1453,6 +1586,9 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     global _cached_weather, _last_weather_fetch, _time_period_start_mono
     global _cached_ha, _last_ha_fetch
     global _cached_ha_calendar, _last_ha_calendar_fetch
+    global _cached_ha_sleep, _last_ha_sleep_fetch
+    global _cached_ha_routines, _last_ha_routines_fetch
+    global _cached_ha_context, _last_ha_context_fetch
     global _cached_calendar, _last_calendar_fetch
 
     sonar_cm = read_sonar(dry)
@@ -1496,6 +1632,40 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         except Exception as exc:
             log(f"ha_calendar: fetch failed: {exc}")
         _last_ha_calendar_fetch = now_mono
+
+    # Refresh HA sleep data periodically (hourly — doesn't change intraday)
+    if (now_mono - _last_ha_sleep_fetch) > HA_SLEEP_INTERVAL_S:
+        try:
+            sleep = _fetch_ha_sleep(dry)
+            if sleep is not None:
+                _cached_ha_sleep = sleep
+            else:
+                _cached_ha_sleep = None  # sensor returned 0 or unavailable
+        except Exception:
+            pass  # network error — keep existing cache
+        _last_ha_sleep_fetch = now_mono
+
+    # Refresh HA routines (meds, water) periodically
+    if (now_mono - _last_ha_routines_fetch) > HA_ROUTINES_INTERVAL_S:
+        try:
+            routines = _fetch_ha_routines(dry)
+            if routines is not None:
+                _cached_ha_routines = routines
+        except Exception as exc:
+            log(f"ha_routines: fetch failed: {exc}")
+        _last_ha_routines_fetch = now_mono
+
+    # Refresh HA context (call detection, office light, media) frequently
+    if (now_mono - _last_ha_context_fetch) > HA_CONTEXT_INTERVAL_S:
+        try:
+            ha_ctx = _fetch_ha_context(dry)
+            if ha_ctx is not None:
+                _cached_ha_context = ha_ctx
+            else:
+                _cached_ha_context = None  # sensors all unavailable — clear cache
+        except Exception as exc:
+            log(f"ha_context: fetch failed: {exc}")
+        _last_ha_context_fetch = now_mono
 
     # Refresh weather periodically
     if (now_mono - _last_weather_fetch) > WEATHER_INTERVAL_S:
@@ -1598,6 +1768,18 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         upcoming = [e for e in _cached_ha_calendar if e["starts_in_mins"] >= -30]
         if upcoming:
             awareness["next_event"] = upcoming[0]
+
+    # Enrich with HA sleep data
+    if _cached_ha_sleep:
+        awareness["ha_sleep"] = _cached_ha_sleep
+
+    # Enrich with HA routines (meds, water)
+    if _cached_ha_routines:
+        awareness["ha_routines"] = _cached_ha_routines
+
+    # Enrich with HA context (call detection, office light, media)
+    if _cached_ha_context:
+        awareness["ha_context"] = _cached_ha_context
 
     # Enrich with ambient sound level (written by px-wake-listen)
     try:
@@ -2188,12 +2370,34 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         if parts:
             context_parts.append(f"Who's home (from Home Assistant): {'; '.join(parts)}")
 
+    # Sleep quality (from Pixel Watch via HA)
+    sleep = awareness.get("ha_sleep")
+    if sleep:
+        hours = sleep["sleep_hours"]
+        quality = sleep["sleep_quality"]
+        if quality == "poor":
+            context_parts.append(f"Adrian only got {hours} hours of sleep last night — he might be tired. Be gentle.")
+        elif quality == "ok":
+            context_parts.append(f"Adrian got {hours} hours of sleep — decent but not great.")
+        elif quality == "good":
+            context_parts.append(f"Adrian got {hours} hours of sleep — well rested.")
+
     # Calendar awareness
     cal_events = awareness.get("ha_calendar")
     if cal_events:
         cal_ctx = _format_calendar_context(cal_events)
         if cal_ctx:
             context_parts.append(cal_ctx)
+
+    # Routine signals (meds, water)
+    routine_ctx = _format_routine_context(awareness.get("ha_routines"))
+    if routine_ctx:
+        context_parts.append(routine_ctx)
+
+    # Household context signals (call detection, office light, media)
+    ha_ctx_text = _format_ha_context(awareness.get("ha_context"))
+    if ha_ctx_text:
+        context_parts.append(ha_ctx_text)
 
     # Inject topic seed, or free-will prompt if no seed was drawn
     if topic_seed is None:
@@ -2378,6 +2582,7 @@ def expression(thought: dict, dry: bool) -> None:
         return
 
     # Gate speech on obi_mode: at night when Obi is absent, suppress non-essential actions
+    _aw = {}
     try:
         _aw = json.loads(AWARENESS_FILE.read_text(encoding="utf-8"))
         _obi_mode = _aw.get("obi_mode", "unknown")
@@ -2386,6 +2591,14 @@ def expression(thought: dict, dry: bool) -> None:
     if _obi_mode == "absent" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — obi_mode=absent (night, Obi likely asleep)")
         return
+
+    # Suppress speech when Adrian is on a call or mic is active
+    ha_ctx = _aw.get("ha_context") or {}
+    if ha_ctx.get("adrian_on_call") or ha_ctx.get("adrian_mic_active"):
+        if action in ("greet", "comment", "weather_comment", "play_sound",
+                       "time_check", "calendar_check", "photograph"):
+            log(f"expression: suppressed {action} — Adrian on call/mic active")
+            return
 
     # Gate on charging: suppress servo-related actions when plugged in
     try:

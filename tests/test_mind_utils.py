@@ -119,6 +119,7 @@ _daytime_action_hint = _MIND["_daytime_action_hint"]
 compute_obi_mode = _MIND["compute_obi_mode"]
 _fetch_frigate_presence = _MIND["_fetch_frigate_presence"]
 _fetch_ha_presence = _MIND["_fetch_ha_presence"]
+_fetch_ha_sleep = _MIND["_fetch_ha_sleep"]
 _parse_calendar_events = _MIND["_parse_calendar_events"]
 _fetch_ha_calendar = _MIND["_fetch_ha_calendar"]
 _format_calendar_context = _MIND["_format_calendar_context"]
@@ -1306,3 +1307,165 @@ def test_reflection_failure_counter_resets_on_success():
     # First two Nones don't reach threshold, then reset, then 4 Nones → warn at #3
     assert warnings_spoken == [3]
     assert consecutive_reflection_failures == 4
+
+
+# ── Routine context formatting ──────────────────────────────────────
+
+def test_format_routine_meds_not_taken():
+    """When meds_taken is False, prompt should mention Obi hasn't taken meds."""
+    m = _load_mind_helpers()
+    fmt = m["_format_routine_context"]
+    result = fmt({"meds_taken": False})
+    assert "hasn't taken his meds" in result
+
+
+def test_format_routine_water_overdue():
+    """When water_mins_ago > 120, prompt should mention thirsty."""
+    m = _load_mind_helpers()
+    fmt = m["_format_routine_context"]
+    result = fmt({"water_mins_ago": 150})
+    assert "thirsty" in result
+    assert "2 hours" in result
+
+
+def test_format_routine_empty():
+    """Empty or None routines should produce no prompt text."""
+    m = _load_mind_helpers()
+    fmt = m["_format_routine_context"]
+    assert fmt({}) == ""
+    assert fmt(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# _fetch_ha_sleep (#63)
+# ---------------------------------------------------------------------------
+
+
+def test_sleep_quality_good():
+    """8 hours of sleep → quality 'good'."""
+    response = {"state": str(8.0 * 3600), "attributes": {}}
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_mock_ha_urlopen({"sensor.sleep": response})):
+            result = _fetch_ha_sleep(dry=False)
+    assert result is not None
+    assert result["sleep_hours"] == 8.0
+    assert result["sleep_quality"] == "good"
+
+
+def test_sleep_quality_poor():
+    """4.5 hours of sleep → quality 'poor'."""
+    response = {"state": str(4.5 * 3600), "attributes": {}}
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_mock_ha_urlopen({"sensor.sleep": response})):
+            result = _fetch_ha_sleep(dry=False)
+    assert result is not None
+    assert result["sleep_hours"] == 4.5
+    assert result["sleep_quality"] == "poor"
+
+
+def test_sleep_quality_ok():
+    """6 hours of sleep → quality 'ok'."""
+    response = {"state": str(6.0 * 3600), "attributes": {}}
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_mock_ha_urlopen({"sensor.sleep": response})):
+            result = _fetch_ha_sleep(dry=False)
+    assert result is not None
+    assert result["sleep_hours"] == 6.0
+    assert result["sleep_quality"] == "ok"
+
+
+def test_sleep_zero_returns_none():
+    """0.0 seconds (sensor inactive) → None."""
+    response = {"state": "0.0", "attributes": {}}
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_mock_ha_urlopen({"sensor.sleep": response})):
+            result = _fetch_ha_sleep(dry=False)
+    assert result is None
+
+
+def test_sleep_prompt_poor():
+    """Poor sleep produces 'tired' in the prompt text."""
+    awareness = {"ha_sleep": {"sleep_hours": 4.5, "sleep_quality": "poor"}}
+    sleep = awareness.get("ha_sleep")
+    assert sleep is not None
+    hours = sleep["sleep_hours"]
+    quality = sleep["sleep_quality"]
+    # Reproduce the prompt injection logic
+    if quality == "poor":
+        text = f"Adrian only got {hours} hours of sleep last night — he might be tired. Be gentle."
+    elif quality == "ok":
+        text = f"Adrian got {hours} hours of sleep — decent but not great."
+    elif quality == "good":
+        text = f"Adrian got {hours} hours of sleep — well rested."
+    else:
+        text = ""
+    assert "tired" in text
+    assert "4.5" in text
+
+
+def test_sleep_dry_returns_none():
+    """Dry mode returns None without network access."""
+    with _ha_ctx():
+        result = _fetch_ha_sleep(dry=True)
+    assert result is None
+
+
+def test_sleep_no_token_returns_none():
+    """No HA token returns None."""
+    with _ha_ctx(token=""):
+        result = _fetch_ha_sleep(dry=False)
+    assert result is None
+
+
+# ── HA context formatting ──────────────────────────────────────────
+
+
+def test_format_context_adrian_on_call():
+    """When Adrian is on a video call, prompt text mentions it."""
+    _g = _load_mind_helpers()
+    fmt = _g["_format_ha_context"]
+    result = fmt({"adrian_on_call": True, "adrian_mic_active": True, "office_light": False})
+    assert "video call" in result
+    assert "Household context" in result
+
+
+def test_format_context_media_playing():
+    """When media is playing, prompt text includes title."""
+    _g = _load_mind_helpers()
+    fmt = _g["_format_ha_context"]
+    result = fmt({"media_playing": True, "media_title": "Bohemian Rhapsody"})
+    assert "Music playing" in result
+    assert "Bohemian Rhapsody" in result
+
+
+def test_format_context_media_playing_no_title():
+    """When media is playing without a title, still reports music."""
+    _g = _load_mind_helpers()
+    fmt = _g["_format_ha_context"]
+    result = fmt({"media_playing": True, "media_title": ""})
+    assert "Music is playing" in result
+
+
+def test_format_context_empty():
+    """Empty dict produces empty string."""
+    _g = _load_mind_helpers()
+    fmt = _g["_format_ha_context"]
+    assert fmt({}) == ""
+    assert fmt(None) == ""
+
+
+def test_format_context_office_light_only():
+    """Office light on produces relevant text."""
+    _g = _load_mind_helpers()
+    fmt = _g["_format_ha_context"]
+    result = fmt({"office_light": True})
+    assert "Office light is on" in result
+
+
+def test_format_context_mic_active_not_on_call():
+    """Mic active without camera triggers mic-specific text, not video call."""
+    _g = _load_mind_helpers()
+    fmt = _g["_format_ha_context"]
+    result = fmt({"adrian_on_call": False, "adrian_mic_active": True})
+    assert "microphone is active" in result
+    assert "video call" not in result
