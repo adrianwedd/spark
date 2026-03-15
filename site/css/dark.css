@@ -123,3 +123,29 @@
 [data-theme="dark"] .carousel-quote { color: var(--dark-text); }
 [data-theme="dark"] .carousel-meta  { color: var(--dark-muted); }
 [data-theme="dark"] .carousel-dot   { background: rgba(255,255,255,0.2); }
+
+/* ── Site footer (dark theme) ─────────────────── */
+.site-footer {
+  padding: 2.5rem 1.25rem;
+  text-align: center;
+  font-size: 0.85rem;
+  background: var(--dark-bg);
+  border-top: 1px solid rgba(255,255,255,0.08);
+}
+.site-footer-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.5rem 1.5rem;
+  margin-bottom: 1rem;
+}
+.site-footer-links a {
+  color: var(--dark-accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+.site-footer-links a:hover { text-decoration: underline; }
+.site-footer-credit {
+  margin: 0;
+  color: var(--dark-muted);
+}

@@ -173,42 +173,26 @@ body {
   color: var(--warm-muted);
 }
 
-/* ── CTA buttons ────────────────────────────────── */
+/* ── Breadcrumb (thought page) ──────────────────── */
 
-.cta-button {
-  display: inline-block;
-  padding: 0.6rem 1.4rem;
-  border-radius: 999px;
-  font-size: 0.9rem;
-  font-weight: 600;
-  text-decoration: none;
-  transition: all var(--transition);
-  background: var(--warm-accent);
-  color: #fff;
+.breadcrumb {
+  margin-bottom: 1.5rem;
+  font-size: 0.85rem;
+  color: var(--warm-muted);
 }
 
-.cta-button:hover {
-  opacity: 0.85;
-  transform: translateY(-1px);
-}
-
-.cta-secondary {
-  background: transparent;
+.breadcrumb a {
   color: var(--warm-accent);
-  border: 2px solid var(--warm-accent);
+  text-decoration: none;
 }
 
-.cta-secondary:hover {
-  background: var(--warm-accent);
-  color: #fff;
+.breadcrumb a:hover {
+  text-decoration: underline;
 }
 
-/* ── Top navigation (thought page) ──────────────── */
-
-.thought-nav-top {
-  display: flex;
-  gap: 0.75rem;
-  margin-bottom: 2rem;
+.breadcrumb-sep {
+  margin: 0 0.4rem;
+  opacity: 0.4;
 }
 
 /* ── States ─────────────────────────────────────── */
@@ -294,11 +278,4 @@ body {
     left: 18px;
   }
 
-  .thought-nav-top {
-    flex-direction: column;
-  }
-
-  .cta-button {
-    text-align: center;
-  }
 }
