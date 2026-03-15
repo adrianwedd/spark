@@ -603,8 +603,8 @@ def test_per_destination_retry(_cursor_env):
     bsky.post.return_value = "ok"
     masto = MagicMock()
 
-    count = flush_queue(bsky, masto, dry=True)
-    assert count == 1
+    result = flush_queue(bsky, masto, dry=True)
+    assert result["processed"] == 1
 
     # Bluesky was retried
     bsky.post.assert_called_once()
@@ -637,13 +637,51 @@ def test_flush_max_one_per_cycle(_cursor_env):
     masto = MagicMock()
     masto.post.return_value = "ok"
 
-    count = flush_queue(bsky, masto, dry=True)
-    assert count == 1
+    result = flush_queue(bsky, masto, dry=True)
+    assert result["processed"] == 1
 
     # Only 1 entry should have been touched
     saved = [json.loads(l) for l in queue_file.read_text().strip().splitlines()]
     posted_count = sum(1 for e in saved if e["posted"]["feed"] == "ok")
     assert posted_count == 1
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_rejected_not_posted_on_next_flush(_cursor_env):
+    """QA-rejected thought is never posted on subsequent flush cycles."""
+    tmp = _cursor_env
+    entry = _make_queue_entry(
+        thought="Boring sonar reading 42cm",
+        posted={"feed": None, "bluesky": None, "mastodon": None},
+        qa_result=None,
+        entry_id="post-reject-001",
+    )
+    queue_file = tmp / "post_queue.jsonl"
+    queue_file.write_text(json.dumps(entry) + "\n")
+
+    bsky = MagicMock()
+    bsky.post.return_value = "ok"
+    masto = MagicMock()
+    masto.post.return_value = "ok"
+
+    # First flush: QA returns "NO" -> rejected
+    with patch.object(_post_subprocess, "run", return_value=_mock_run_result("NO")):
+        result1 = flush_queue(bsky, masto, dry=False)
+    assert result1["rejected"] is True
+
+    # Verify destinations are marked "skipped"
+    saved = json.loads(queue_file.read_text().strip())
+    assert saved["posted"]["feed"] == "skipped"
+    assert saved["posted"]["bluesky"] == "skipped"
+    assert saved["posted"]["mastodon"] == "skipped"
+
+    # Second flush: should NOT post anything
+    bsky.post.reset_mock()
+    masto.post.reset_mock()
+    result2 = flush_queue(bsky, masto, dry=False)
+    assert result2["processed"] == 0
+    bsky.post.assert_not_called()
+    masto.post.assert_not_called()
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
@@ -669,8 +707,8 @@ def test_repost_guard_after_corruption(_cursor_env):
     bsky = MagicMock()
     masto = MagicMock()
 
-    count = flush_queue(bsky, masto, dry=True)
-    assert count == 1
+    result = flush_queue(bsky, masto, dry=True)
+    assert result["processed"] == 1
 
     # Neither client should have been called
     bsky.post.assert_not_called()

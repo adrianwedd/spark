@@ -428,8 +428,11 @@ def queue_thought(entry: dict) -> None:
         "posted": {"feed": None, "bluesky": None, "mastodon": None},
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with QUEUE_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(queue_entry) + "\n")
+    try:
+        with QUEUE_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(queue_entry) + "\n")
+    except OSError as exc:
+        log(f"queue_thought failed: {exc}")
 
 
 def _load_queue() -> list[dict]:
@@ -474,8 +477,8 @@ def _is_in_feed(thought_text: str, feed_posts: list[dict]) -> bool:
     return False
 
 
-def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool) -> int:
-    """Process one pending queue entry. Returns count processed (0 or 1)."""
+def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool) -> dict:
+    """Process one pending queue entry. Returns dict with processed/posted/rejected counts."""
     entries = _load_queue()
     if not entries:
         return 0
@@ -489,6 +492,8 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         pass
 
     processed = 0
+    was_posted = False
+    was_rejected = False
     for entry in entries:
         # Skip fully posted entries
         posted = entry.get("posted", {})
@@ -512,12 +517,15 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
                 continue  # error/timeout, skip to next cycle
             entry["qa_result"] = qa
             if qa in ("rejected", "ambiguous"):
+                # Mark all destinations as skipped — rejected thoughts must never post
+                entry["posted"] = {k: v or "skipped" for k, v in entry.get("posted", {}).items()}
                 log_event("post_rejected", {
                     "id": entry.get("id"), "thought": entry["thought"][:100],
                     "qa_result": qa, "mood": entry.get("mood"),
                     "salience": entry.get("salience"),
                 })
                 processed += 1
+                was_rejected = True
                 break
 
         # Post to each pending destination
@@ -535,10 +543,11 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
             entry["posted"]["mastodon"] = mastodon.post(text, dry=dry)
 
         processed += 1
+        was_posted = True
         break  # max 1 per flush cycle
 
     _save_queue(entries)
-    return processed
+    return {"processed": processed, "posted": was_posted, "rejected": was_rejected}
 
 
 STATUS_FILE = STATE_DIR / "px-post-status.json"
@@ -670,16 +679,12 @@ def main(argv: list[str]) -> int:
         # Flush cycle
         now = time.monotonic()
         if now - last_flush >= args.flush_interval:
-            processed = flush_queue(bluesky, mastodon, dry)
-            if processed > 0:
-                # Count results
-                queue = _load_queue()
-                for e in queue:
-                    if e.get("qa_result") in ("rejected", "ambiguous"):
-                        total_rejected += 1
-                    elif all(v == "ok" for v in e.get("posted", {}).values() if v is not None):
-                        total_posted += 1
-                        last_post_ts = e.get("queued_ts")
+            result = flush_queue(bluesky, mastodon, dry)
+            if result.get("posted"):
+                total_posted += 1
+                last_post_ts = dt.datetime.now(dt.timezone.utc).isoformat()
+            if result.get("rejected"):
+                total_rejected += 1
 
             write_health_status(
                 queue_depth=len(_load_queue()),
