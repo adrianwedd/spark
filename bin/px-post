@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -530,6 +531,9 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
 
         # Post to each pending destination
         text = entry["thought"]
+        # Build permalink URL for social posts
+        thought_ts = entry.get("ts", "")
+        permalink = f"https://spark.wedd.au/thought/?ts={urllib.parse.quote(thought_ts)}" if thought_ts else ""
         if posted.get("feed") is None or (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
             if write_feed(entry):
                 entry["posted"]["feed"] = "ok"
@@ -537,10 +541,12 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
                 entry["posted"]["feed"] = "error:write_failed"
 
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
-            entry["posted"]["bluesky"] = bluesky.post(text, dry=dry)
+            social_text = f"{text}\n\n{permalink}" if permalink else text
+            entry["posted"]["bluesky"] = bluesky.post(social_text, dry=dry)
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
-            entry["posted"]["mastodon"] = mastodon.post(text, dry=dry)
+            social_text = f"{text}\n\n{permalink}" if permalink else text
+            entry["posted"]["mastodon"] = mastodon.post(social_text, dry=dry)
 
         processed += 1
         was_posted = True
