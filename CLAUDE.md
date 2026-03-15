@@ -39,8 +39,8 @@ Test environment variables (set automatically via `conftest.py` `isolated_projec
 ### Python Library (`src/pxh/`)
 
 - **`state.py`** — Thread-safe session management via `FileLock`. Key functions: `load_session()`, `save_session()`, `update_session()`, `ensure_session()`. **Important**: `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant.
-- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. Watchdog thread (default 30 s) calls `os._exit(1)` on stall; only active in voice input mode.
-- **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe.
+- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. Watchdog thread (default 30 s) sends SIGTERM + 5 s grace period (instead of `os._exit(1)`) on stall; only active in voice input mode.
+- **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe. PIN rate limiting uses file-based lockout (`state/pin_lockout.json`) that persists across API restarts. PIN verify returns short-lived session tokens (4h TTL) instead of the raw Bearer token. Device reboot/shutdown requires two-step nonce confirmation.
 - **`logging.py`** — Structured JSON log emission to `logs/tool-<event>.log`.
 - **`time.py`** — UTC timestamp helper (`datetime.now(timezone.utc)`, not deprecated `utcnow`).
 - **`patch_login.py`** — Monkey-patches `os.getlogin()` to handle systemd environments (no /dev/tty). Also installed globally as `~/.local/lib/python3.11/site-packages/usercustomize.py`.
@@ -131,24 +131,26 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 ```
 
 Three-layer cognitive architecture:
-- **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state → `state/awareness.json` + transition detection
-- **Layer 2 — Reflection** (on transition or every 2 min idle): SPARK persona uses Claude Haiku via persistent tmux session (`px-claude` — avoids 14s CLI cold start per call); other personas (GREMLIN, VIXEN) use Ollama `deepseek-r1:1.5b` on M1.local. Falls back to Ollama on Claude error. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`
-- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions (14): `wait, greet, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check`. Charging-gated actions (require battery) are blocked when on charger. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+- **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state + calendar + multi-camera Frigate → `state/awareness.json` + transition detection. Fetches Obi's Google Calendar every 5 min via `gws` CLI; queries all Frigate cameras (picar_x, picamera, driveway_camera, garden_camera) for per-camera person/object presence with room names.
+- **Layer 2 — Reflection** (on transition or every 2 min idle): SPARK persona uses Claude Haiku via persistent tmux session (`px-claude` — avoids 14s CLI cold start per call); other personas (GREMLIN, VIXEN) use Ollama `deepseek-r1:1.5b` on M1.local. Falls back to Ollama on Claude error. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt.
+- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions (14): `wait, greet, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check`. Charging-gated actions (require battery) are blocked when on charger. Expression gating: suppresses speech during school hours, Mum's custody time, quiet time, bedtime, and decompress periods (all calendar-driven). Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+
+`compute_obi_mode()` returns calendar-authoritative states (`at-school`, `at-mums`) when calendar events match, falling back to ambient heuristics otherwise.
 
 The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`) and during quiet mode. Auto-remembers high-salience (>0.7) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
 
-Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escalating warnings at ≤30/20/15% and triggers emergency shutdown at ≤10% (6 beeps → speech → `sudo shutdown -h now`).
+Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escalating warnings at ≤30/20/15% and triggers emergency shutdown at ≤10% (6 beeps → speech → `sudo shutdown -h now`). Battery glitch filter: requires time-gapped confirmations (90 s between first glitch and acceptance), charging guard, and voltage sanity check.
 
 State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.json`, `state/mood.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
 
 ### Social Posting (px-post)
 
 `bin/px-post` daemon watches `state/thoughts-spark.jsonl` for qualifying thoughts (salience >= 0.7 OR spoken action), runs a Claude QA gate, and posts to three destinations:
-- `state/feed.json` — served at `GET /api/v1/public/feed` and on spark.wedd.au
-- Bluesky (AT Protocol) — credentials via `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD`
+- `state/feed.json` — served at `GET /api/v1/public/feed` and on [spark.wedd.au/feed/](https://spark.wedd.au/feed/) (thought feed page with individual permalinks at `/thought/?ts=`)
+- Bluesky (AT Protocol) — live at [sparkrobot.bsky.social](https://bsky.app/profile/sparkrobot.bsky.social); credentials via `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD`
 - Mastodon (REST API) — credentials via `PX_MASTODON_INSTANCE` + `PX_MASTODON_TOKEN`
 
-Per-destination retry, flock single-instance guard, 5-minute flush cycle. Backfill mode: `bin/px-post --backfill`.
+Per-destination retry, flock single-instance guard, 5-minute flush cycle. Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
 
 ### REST API
 
@@ -208,16 +210,17 @@ Requires `OLLAMA_HOST=0.0.0.0 ollama serve` on M1.
 
 ### Systemd Services
 
-Six services run at boot:
+Seven services run at boot:
 
 | Service | Script | User | Restart |
 |---------|--------|------|---------|
-| `px-alive` | `bin/px-alive` | root | always, 10 s |
+| `px-alive` | `bin/px-alive` | root | always, 10 s (StartLimitIntervalSec=0) |
 | `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10 s |
 | `px-battery-poll` | `bin/px-battery-poll` | root | always, 10 s |
 | `px-mind` | `bin/px-mind` | pi | always, 10 s |
 | `px-post` | `bin/px-post` | pi | always, 30 s |
 | `px-api-server` | `bin/px-api-server` | pi | always, 2 s |
+| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10 s |
 
 ## Safety Model
 
@@ -228,11 +231,13 @@ Six services run at boot:
 
 ## Security
 
-- PIN-based auth with session tokens (4h TTL)
-- Persistent PIN lockout (escalating: 5 failures → 5 min, 10 → 30 min)
-- Confirmation gates on device reboot/shutdown and safety-critical session fields
+- **PIN auth with session tokens**: `POST /api/v1/pin/verify` returns a short-lived session token (4h TTL) instead of the raw Bearer token. The Bearer token (`PX_API_TOKEN`) is never exposed to the browser.
+- **File-based PIN lockout** (`state/pin_lockout.json`): persists across API restarts. Escalating: 5 failures → 5 min lockout, 10 → 30 min.
+- **Two-step device confirmation**: `POST /device/{action}` (reboot/shutdown) returns a nonce; must confirm with `POST /device/confirm` within 60 s.
+- Confirmation gates on safety-critical session fields (`confirm_motion_allowed`, etc.) require `confirm: true`.
 - Security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
 - Rate limiting on public chat (10 msg/10min per IP)
+- API server port-free check via `ss` polling replaces previous sleep hack for reliable startup
 
 ## Adding a New Tool
 
@@ -271,6 +276,8 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_STATE_DIR` | Override state directory (used by tests) |
 | `PX_FRIGATE_HOST` | Frigate API base URL (default: `http://pi5-hailo.local:5000`) |
 | `PX_FRIGATE_CAMERA` | Frigate camera name (default: `picar_x`) |
+| `PX_FRIGATE_CAMERAS` | Comma-separated Frigate camera names for multi-camera presence (default: `picar_x,picamera,driveway_camera,garden_camera`) |
+| `PX_CALENDAR_ID` | Google Calendar ID for Obi's schedule (default: `obiwedd@gmail.com`) |
 | `PX_ADMIN_PIN` | Dashboard PIN for authentication |
 | `PX_MIND_CLAUDE_MODEL` | Claude model for SPARK reflection (default: `claude-haiku-4-5-20251001`) |
 | `PX_CLAUDE_BIN` | Override Claude CLI binary path |
