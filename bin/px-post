@@ -195,6 +195,53 @@ def poll_new_thoughts(thoughts_file: Path) -> list[dict]:
     return entries
 
 
+FEED_FILE = STATE_DIR / "feed.json"
+FEED_LIMIT = 100
+
+
+def truncate_at_word(text: str, max_len: int) -> str:
+    """Truncate text at the last word boundary before max_len, append ellipsis."""
+    if len(text) <= max_len:
+        return text
+    # Find last space before max_len - 1 (leaving room for …)
+    cut_point = text[:max_len - 1].rfind(" ")
+    if cut_point <= 0:
+        cut_point = max_len - 1  # no spaces, hard cut
+    return text[:cut_point] + "\u2026"
+
+
+def write_feed(thought: dict) -> bool:
+    """Append thought to feed.json. Returns True on success."""
+    try:
+        existing = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {"posts": []}
+    except (json.JSONDecodeError, OSError):
+        existing = {"posts": []}
+
+    post = {
+        "ts": thought.get("ts", ""),
+        "thought": thought["thought"],
+        "mood": thought.get("mood", ""),
+        "posted_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    existing["posts"].append(post)
+    existing["posts"] = existing["posts"][-FEED_LIMIT:]
+    existing["updated"] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(existing, f, indent=2)
+        os.replace(tmp, str(FEED_FILE))
+        return True
+    except Exception as exc:
+        log(f"feed.json write failed: {exc}")
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Social posting daemon")
     parser.add_argument("--dry-run", action="store_true", help="Skip actual posting")

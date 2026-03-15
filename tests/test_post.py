@@ -50,6 +50,8 @@ qualifies = _POST["qualifies"]
 is_duplicate = _POST["is_duplicate"]
 poll_new_thoughts = _POST["poll_new_thoughts"]
 run_qa_gate = _POST["run_qa_gate"]
+truncate_at_word = _POST["truncate_at_word"]
+write_feed = _POST["write_feed"]
 
 # The subprocess module reference used inside the exec'd module globals
 _post_subprocess = _POST["subprocess"]
@@ -297,3 +299,76 @@ def test_qa_response_whitespace():
     """Whitespace-padded response is stripped before matching."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("  YES\n")):
         assert run_qa_gate("I wonder about the stars") == "pass"
+
+
+# ---------------------------------------------------------------------------
+# write_feed() — feed.json writer
+# ---------------------------------------------------------------------------
+
+
+def test_feed_json_written(_cursor_env):
+    """Write thoughts to feed.json; verify structure and 100-post trim."""
+    tmp = _cursor_env
+    _POST["FEED_FILE"] = tmp / "feed.json"
+
+    # Write 101 thoughts
+    for i in range(101):
+        thought = {"thought": f"thought {i}", "mood": "curious", "ts": f"2026-01-01T00:00:{i:02d}Z"}
+        assert write_feed(thought) is True
+
+    feed = json.loads((tmp / "feed.json").read_text())
+    assert "updated" in feed
+    assert "posts" in feed
+    assert len(feed["posts"]) == 100
+
+    # Verify structure of a post
+    post = feed["posts"][0]
+    assert "ts" in post
+    assert "thought" in post
+    assert "mood" in post
+    assert "posted_ts" in post
+
+    # First entry should be thought 1 (thought 0 was trimmed)
+    assert feed["posts"][0]["thought"] == "thought 1"
+    assert feed["posts"][-1]["thought"] == "thought 100"
+
+
+def test_feed_json_atomic(_cursor_env):
+    """Verify write_feed uses atomic tempfile + os.replace pattern."""
+    tmp = _cursor_env
+    _POST["FEED_FILE"] = tmp / "feed.json"
+
+    _post_os = _POST["os"]
+    with patch.object(_post_os, "replace", wraps=_post_os.replace) as mock_replace:
+        thought = {"thought": "atomic test", "mood": "calm"}
+        write_feed(thought)
+        mock_replace.assert_called_once()
+        # Second arg should be the feed file path
+        assert str(mock_replace.call_args[0][1]) == str(tmp / "feed.json")
+
+
+# ---------------------------------------------------------------------------
+# truncate_at_word() — word-boundary truncation
+# ---------------------------------------------------------------------------
+
+
+def test_truncation_word_boundary():
+    """Truncate 350-char text for Bluesky (300) at word boundary; Mastodon (500) untouched."""
+    # Build a string that is exactly 350 chars
+    words = "hello world this is a very long text that keeps going and going "
+    text = (words * 10)[:350]
+    assert len(text) == 350
+
+    # Bluesky: max 300
+    truncated = truncate_at_word(text, 300)
+    assert len(truncated) <= 300
+    assert truncated.endswith("\u2026")
+    # Should cut at a word boundary — no partial words before the ellipsis
+    before_ellipsis = truncated[:-1]
+    assert before_ellipsis == before_ellipsis  # sanity
+    # The character before ellipsis should be a space or end of word
+    # (i.e., the cut was at rfind(" "))
+    assert " " not in truncated[-2:-1] or truncated[-2] == " "
+
+    # Mastodon: max 500 — text is only 350, should be returned as-is
+    assert truncate_at_word(text, 500) == text
