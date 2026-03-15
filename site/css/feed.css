@@ -241,11 +241,6 @@ body {
   margin: 0;
 }
 
-/* ── Nav active link ────────────────────────────── */
-
-.links a.active {
-  color: var(--warm-accent);
-}
 
 /* ── Responsive ─────────────────────────────────── */
 

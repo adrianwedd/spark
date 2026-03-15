@@ -28,8 +28,14 @@
 
 <nav id="main-nav" aria-label="Main navigation">
   <a class="logo" href="/">SPARK <span id="status-dot"></span></a>
+  <button class="nav-burger" id="nav-burger" aria-label="Toggle navigation" aria-expanded="false" aria-controls="nav-links">
+    <span></span><span></span><span></span>
+  </button>
   <ul class="links" id="nav-links">
     <li><a href="/">Home</a></li>
+    <li><a href="/#live">Live</a></li>
+    <li><a href="/#how-it-works">How It Works</a></li>
+    <li><a href="/#faq">FAQ</a></li>
     <li><a href="/feed/" class="active">Feed</a></li>
     <li><a href="https://bsky.app/profile/sparkrobot.bsky.social" target="_blank" rel="noopener noreferrer">Bluesky</a></li>
     <li><a href="https://github.com/adrianwedd/spark" target="_blank" rel="noopener noreferrer" class="nav-github">GitHub ↗</a></li>
@@ -65,6 +71,7 @@
   </div>
 </footer>
 
+<script src="../js/nav.js"></script>
 <script src="../js/feed.js"></script>
 </body>
 </html>
