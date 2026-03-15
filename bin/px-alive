@@ -150,7 +150,7 @@ def read_session_persona() -> str:
     try:
         data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
         return str(data.get("persona", "")).lower().strip()
-    except Exception:
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return ""
 
 
@@ -180,6 +180,18 @@ def spark_greet(dry: bool) -> None:
 
 def make_px():
     # os.getlogin() patched globally via usercustomize.py for systemd
+    #
+    # NOTE (issue #44 — servo shudder on restart after yield_alive):
+    # Picarx.__init__() calls reset_mcu() which toggles GPIO5 LOW->HIGH,
+    # resetting the robot_hat MCU.  This causes all PCA9685 PWM channels to
+    # glitch briefly before the MCU re-initialises, producing a visible servo
+    # shudder (snap-to-center then drift to target).  There is no software
+    # workaround: reset_mcu is hard-coded in the upstream picarx library
+    # (system site-packages) and the PCA9685 registers are wiped by the MCU
+    # reset before we can read them.  The persistent-handle pattern (get_px /
+    # drop_px) already minimises how often this happens -- it only occurs on
+    # I2C error recovery or after yield_alive restart.  Closed as won't-fix:
+    # hardware limitation.
     from picarx import Picarx
     return Picarx()
 
@@ -203,7 +215,10 @@ def safe_distance() -> float | None:
         px = make_px()
         d = px.get_distance()
         return float(d) if d and d > 0 else None
-    except Exception:
+    except OSError:
+        return None
+    except Exception as exc:
+        log(f"safe_distance unexpected: {exc}")
         return None
     finally:
         if px is not None:
@@ -239,8 +254,8 @@ def start_face_detection(retries: int = 2) -> bool:
             try:
                 from vilib import Vilib
                 Vilib.camera_close()
-            except Exception:
-                pass
+            except Exception as exc2:
+                log(f"camera close during retry failed: {exc2}")
             if attempt < retries:
                 time.sleep(3)
     log("face detection unavailable — falling back to random gaze")
@@ -252,8 +267,8 @@ def stop_face_detection() -> None:
     try:
         from vilib import Vilib
         Vilib.camera_close()
-    except Exception:
-        pass
+    except Exception as exc:
+        log(f"stop_face_detection cleanup failed: {exc}")
 
 
 def get_face() -> tuple[int, int] | None:
@@ -265,8 +280,10 @@ def get_face() -> tuple[int, int] | None:
             x = Vilib.detect_obj_parameter.get("human_x", FACE_FRAME_W // 2)
             y = Vilib.detect_obj_parameter.get("human_y", FACE_FRAME_H // 2)
             return (int(x), int(y))
-    except Exception:
-        pass
+    except (ImportError, OSError):
+        pass  # expected if vilib unavailable
+    except Exception as exc:
+        log(f"get_face unexpected: {exc}")
     return None
 
 
@@ -278,8 +295,10 @@ def read_mood() -> dict:
             mood = data.get("mood", "content")
             behavior = MOOD_BEHAVIOR.get(mood, MOOD_BEHAVIOR["content"])
             return behavior
-    except Exception:
-        pass
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass  # expected on missing/corrupt mood file
+    except Exception as exc:
+        log(f"read_mood unexpected: {exc}")
     return MOOD_BEHAVIOR["content"]
 
 
@@ -362,7 +381,10 @@ def idle_loop(args) -> None:
                     try:
                         d = get_px().get_distance()
                         dist = float(d) if d and d > 0 else None
-                    except Exception:
+                    except OSError:
+                        dist = None
+                    except Exception as exc:
+                        log(f"sonar read unexpected: {exc}")
                         dist = None
                     try:
                         SONAR_LIVE_FILE.write_text(
@@ -381,7 +403,7 @@ def idle_loop(args) -> None:
                                     _age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(_fp_ts)).total_seconds()
                                     if _age > FRIGATE_STALE_S:
                                         _fp = None
-                            except Exception:
+                            except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
                                 _fp = None
                             target_pan = _pan_from_frigate(_fp)
                             log(f"proximity react: {dist:.1f}cm — facing pan={target_pan}")
@@ -509,8 +531,8 @@ def main(argv) -> int:
     _existing_pid = None
     try:
         _existing_pid = int(PID_FILE.read_text().strip())
-    except Exception:
-        pass
+    except (FileNotFoundError, ValueError, OSError):
+        pass  # expected on first run or corrupt PID file
     if _existing_pid and _existing_pid != os.getpid() and os.path.isdir(f"/proc/{_existing_pid}"):
         log(f"another px-alive (pid={_existing_pid}) already running — exiting")
         return 0
@@ -526,16 +548,16 @@ def main(argv) -> int:
                 if exp_pid and Path(f"/proc/{exp_pid}").is_dir():
                     log("exploration active (PID %d) — exiting cleanly" % exp_pid)
                     sys.exit(0)
-    except Exception:
-        pass
+    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        pass  # expected on missing/corrupt exploring.json
 
     def _safe_unlink_pid() -> None:
         """Only delete the PID file if it still contains our own PID."""
         try:
             if int(PID_FILE.read_text().strip()) == os.getpid():
                 PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except (FileNotFoundError, ValueError, OSError):
+            pass  # expected during cleanup
 
     log(f"starting pid={os.getpid()} dry={args.dry_run}")
 

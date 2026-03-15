@@ -645,7 +645,19 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return tool, sanitized
 
 
+_last_tool_execution = 0.0
+
+
 def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool) -> Tuple[int, str, str]:
+    global _last_tool_execution
+    # Brief cooldown between consecutive tool calls to allow GPIO/I2C handles
+    # to be fully released by the previous tool subprocess.  500 ms is enough
+    # for lgpio file descriptors to close and the PCA9685 bus to settle.
+    # Fixes: https://github.com/.../issues/43
+    elapsed = time.monotonic() - _last_tool_execution
+    if elapsed < 0.5:
+        time.sleep(0.5 - elapsed)
+
     command_path = TOOL_COMMANDS[tool]
     if not command_path.exists():
         raise VoiceLoopError(f"tool command missing: {command_path}")
@@ -672,6 +684,7 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool) -> Tu
         check=False,
         env=env,
     )
+    _last_tool_execution = time.monotonic()
     return result.returncode, result.stdout, result.stderr
 
 
