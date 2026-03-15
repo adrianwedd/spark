@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Uses venv python — no GPIO needed.
+exec python - "$@" <<'PY'
+"""Social posting daemon: watches thoughts and posts qualifying ones.
+
+Monitors state/thoughts.jsonl for high-salience or spoken-action thoughts,
+deduplicates against recent posts, and queues them for social media.
+
+Run with: bin/px-post [--dry-run]
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
+LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+MIN_SALIENCE = float(os.environ.get("PX_POST_MIN_SALIENCE", "0.7"))
+SPOKEN_ACTIONS = {"comment", "greet", "weather_comment"}
+SIMILARITY_THRESHOLD = 0.75
+REQUIRED_FIELDS = {"thought", "salience", "action"}
+
+
+def log(msg: str, **extra) -> None:
+    """Emit a structured log line."""
+    import datetime as dt
+    entry = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "src": "px-post",
+        "msg": msg,
+        **extra,
+    }
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "tool-post.log", "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def qualifies(entry: dict) -> bool:
+    """Return True if this thought entry qualifies for posting."""
+    if not REQUIRED_FIELDS.issubset(entry.keys()):
+        return False
+    if entry.get("salience", 0) >= MIN_SALIENCE:
+        return True
+    if entry.get("action") in SPOKEN_ACTIONS:
+        return True
+    return False
+
+
+def is_duplicate(thought: str, recent_posts: list[str]) -> bool:
+    """Return True if thought is too similar to a recent post."""
+    for prev in recent_posts:
+        ratio = difflib.SequenceMatcher(None, thought, prev).ratio()
+        if ratio >= SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Social posting daemon")
+    parser.add_argument("--dry-run", action="store_true", help="Skip actual posting")
+    args = parser.parse_args()
+
+    dry = args.dry_run or os.environ.get("PX_DRY") == "1"
+    log("px-post starting", dry=dry)
+
+    # Placeholder main loop — future tasks will add watching + posting logic
+    print(json.dumps({"status": "ok", "dry": dry}))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
