@@ -67,6 +67,11 @@ AWARENESS_FILE = STATE_DIR / "awareness.json"
 MOOD_FILE      = STATE_DIR / "mood.json"
 AMBIENT_FILE   = STATE_DIR / "ambient_sound.json"
 
+# Calendar integration
+GWS            = Path("/home/pi/.cargo/bin/gws")
+CALENDAR_ID    = os.environ.get("PX_CALENDAR_ID", "obiwedd@gmail.com")
+CALENDAR_INTERVAL_S = 300  # refresh calendar every 5 min
+
 
 def notes_file_for_persona(persona: str):
     """Persona-scoped notes path — prevents cross-persona memory contamination."""
@@ -147,12 +152,20 @@ def _daytime_action_hint(hour_override: int | None = None) -> str:
 
 
 def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
-    """Infer Obi's state from HA presence + Frigate detections + ambient sound + sonar + time."""
+    """Infer Obi's state from calendar + HA presence + Frigate + ambient sound + sonar + time."""
     hour = hour_override if hour_override is not None else dt.datetime.now(AEDT).hour
     ambient_level = (awareness.get("ambient_sound") or {}).get("level", "unknown")
     sonar_cm = awareness.get("sonar_cm")
     frigate = awareness.get("frigate") or {}
     is_day = OBI_DAY_START <= hour < OBI_DAY_END
+
+    # Calendar-based signals: authoritative when present
+    cal = awareness.get("calendar") or {}
+    current_event = (cal.get("current_event") or "").lower()
+    if "school" in current_event:
+        return "at-school"
+    if "mum" in current_event and "place" in current_event:
+        return "at-mums"
 
     frigate_present = frigate.get("person_present", False)
     frigate_count   = frigate.get("event_count", 0)
@@ -1292,6 +1305,90 @@ def fetch_weather(dry: bool) -> dict | None:
     return None
 
 
+def fetch_calendar_events() -> list[dict]:
+    """Fetch today's events from Obi's calendar via gws. Returns list of event dicts."""
+    if not GWS.exists():
+        return []
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        # Fetch from now to end of day (AEDT)
+        local_now = now.astimezone(AEDT)
+        end_of_day = local_now.replace(hour=23, minute=59, second=59)
+        params = {
+            "calendarId": CALENDAR_ID,
+            "timeMin": now.isoformat(),
+            "timeMax": end_of_day.astimezone(dt.timezone.utc).isoformat(),
+            "maxResults": 5,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+        result = subprocess.run(
+            [str(GWS), "calendar", "events", "list",
+             "--params", json.dumps(params)],
+            capture_output=True, text=True, timeout=15,
+        )
+        data = json.loads(result.stdout)
+        items = data.get("items", [])
+        events = []
+        for item in items[:5]:
+            start = item.get("start", {})
+            end = item.get("end", {})
+            events.append({
+                "summary": item.get("summary", ""),
+                "start": start.get("dateTime") or start.get("date", ""),
+                "end": end.get("dateTime") or end.get("date", ""),
+                "all_day": "date" in start and "dateTime" not in start,
+                "description": (item.get("description") or "")[:200],
+            })
+        return events
+    except Exception:
+        return []
+
+
+def calendar_context(events: list[dict]) -> dict:
+    """Derive current and next event from calendar events list."""
+    if not events:
+        return {}
+    now = dt.datetime.now(dt.timezone.utc)
+    current = None
+    upcoming = None
+    for evt in events:
+        start_str = evt.get("start", "")
+        end_str = evt.get("end", "")
+        if not start_str:
+            continue
+        try:
+            if evt.get("all_day"):
+                # All-day events: treat as active for the whole day
+                if not current:
+                    current = evt
+                continue
+            start_dt = dt.datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+            end_dt = dt.datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+            if start_dt <= now < end_dt:
+                current = evt  # timed event takes priority over all-day
+            elif start_dt > now and not upcoming:
+                upcoming = evt
+        except (ValueError, TypeError):
+            continue
+    ctx = {}
+    if current:
+        ctx["current_event"] = current["summary"]
+        ctx["current_event_detail"] = current
+    if upcoming:
+        ctx["next_event"] = upcoming["summary"]
+        ctx["next_event_detail"] = upcoming
+        # Minutes until next event
+        try:
+            next_start = dt.datetime.fromisoformat(
+                upcoming["start"].replace("Z", "+00:00"))
+            ctx["minutes_until_next"] = round(
+                (next_start - now).total_seconds() / 60, 0)
+        except (ValueError, TypeError):
+            pass
+    return ctx
+
+
 def load_notes(n: int = 5, persona: str = "") -> list[str]:
     """Read last N notes from persona-scoped long-term memory."""
     notes_file = notes_file_for_persona(persona)
@@ -1355,8 +1452,8 @@ _cached_weather: dict | None = None
 _last_weather_fetch: float = 0.0
 _cached_ha: dict | None = None
 _last_ha_fetch: float = 0.0
-_cached_ha_calendar: list | None = None
-_last_ha_calendar_fetch: float = 0.0
+_cached_calendar: list[dict] | None = None
+_last_calendar_fetch: float = 0.0
 _last_spoken_text: str = ""
 _mood_history: list[str] = []
 _last_reactive_phrases: dict = {}  # key="transition:persona", value=recent phrase list (max 3)
@@ -1371,7 +1468,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     """Layer 1: gather perception, detect transitions, enrich context."""
     global _cached_weather, _last_weather_fetch, _time_period_start_mono
     global _cached_ha, _last_ha_fetch
-    global _cached_ha_calendar, _last_ha_calendar_fetch
+    global _cached_calendar, _last_calendar_fetch
 
     sonar_cm = read_sonar(dry)
     frigate = _fetch_frigate_presence(dry)
@@ -1423,6 +1520,16 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             _last_weather_fetch = now_mono
             temp = weather.get("temp_c")
             log(f"weather refreshed: {temp}°C" if temp is not None else "weather refreshed: (no temp data)")
+
+    # Refresh calendar periodically
+    if (now_mono - _last_calendar_fetch) > CALENDAR_INTERVAL_S:
+        cal_events = fetch_calendar_events()
+        if cal_events is not None:
+            _cached_calendar = cal_events
+            _last_calendar_fetch = now_mono
+            summaries = [e["summary"] for e in cal_events[:3]]
+            if summaries:
+                log(f"calendar refreshed: {', '.join(summaries)}")
 
     # Detect transitions (only when both readings are valid)
     transitions = []
@@ -1488,6 +1595,12 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     # Enrich with weather
     if _cached_weather:
         awareness["weather"] = _cached_weather
+
+    # Enrich with calendar (Obi's schedule)
+    if _cached_calendar is not None:
+        cal_ctx = calendar_context(_cached_calendar)
+        if cal_ctx:
+            awareness["calendar"] = cal_ctx
 
     # Enrich with HA presence (who's home)
     if _cached_ha:
@@ -2521,6 +2634,7 @@ def expression(thought: dict, dry: bool) -> None:
 
         elif action == "calendar_check":
             env["PX_CALENDAR_ACTION"] = "next"
+            env.setdefault("PX_CALENDAR_ID", CALENDAR_ID)
             subprocess.run([str(BIN_DIR / "tool-gws-calendar")],
                            capture_output=True, text=True, check=False, env=env, timeout=60)
 
