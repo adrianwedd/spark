@@ -40,7 +40,8 @@ PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent)
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
-MIN_SALIENCE = float(os.environ.get("PX_POST_MIN_SALIENCE", "0.7"))
+MIN_SALIENCE_FEED = float(os.environ.get("PX_POST_MIN_SALIENCE", "0.55"))
+MIN_SALIENCE_SOCIAL = float(os.environ.get("PX_POST_MIN_SALIENCE_SOCIAL", "0.7"))
 SPOKEN_ACTIONS = {"comment", "greet", "weather_comment"}
 SIMILARITY_THRESHOLD = 0.75
 REQUIRED_FIELDS = {"thought", "salience", "action"}
@@ -100,10 +101,21 @@ def log_event(name: str, payload: dict) -> None:
 
 
 def qualifies(entry: dict) -> bool:
-    """Return True if this thought entry qualifies for posting."""
+    """Return True if this thought qualifies for the feed (lower threshold)."""
     if not REQUIRED_FIELDS.issubset(entry.keys()):
         return False
-    if entry.get("salience", 0) >= MIN_SALIENCE:
+    if entry.get("salience", 0) >= MIN_SALIENCE_FEED:
+        return True
+    if entry.get("action") in SPOKEN_ACTIONS:
+        return True
+    return False
+
+
+def qualifies_social(entry: dict) -> bool:
+    """Return True if this thought qualifies for Bluesky/Mastodon (higher threshold)."""
+    if not REQUIRED_FIELDS.issubset(entry.keys()):
+        return False
+    if entry.get("salience", 0) >= MIN_SALIENCE_SOCIAL:
         return True
     if entry.get("action") in SPOKEN_ACTIONS:
         return True
@@ -618,10 +630,16 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
                 entry["posted"]["feed"] = "error:write_failed"
 
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
-            entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry)
+            if qualifies_social(entry):
+                entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry)
+            else:
+                entry["posted"]["bluesky"] = "skipped"  # below social threshold
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
-            entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry)
+            if qualifies_social(entry):
+                entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry)
+            else:
+                entry["posted"]["mastodon"] = "skipped"  # below social threshold
 
         processed += 1
         was_posted = True
