@@ -925,8 +925,12 @@ def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
 
     pct = raw["pct"]
 
-    # First reading or no history — accept and seed
+    # First reading or no history — accept and seed, BUT reject implausibly
+    # low first readings (e.g. 0% from an ADC glitch on cold start).
     if not _battery_history:
+        if pct < BATTERY_CRITICAL:
+            log(f"battery: rejecting implausible first reading {pct}% (< {BATTERY_CRITICAL}%)")
+            return None
         _battery_history.append(pct)
         _battery_glitch_count = 0
         return raw
@@ -1289,7 +1293,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "minutes_since_interaction": round(mins_interaction, 1),
         "minutes_since_speech": round(mins_speech, 1),
         "period_duration_min": round(period_duration_min, 1),
-        "battery_pct": battery["pct"] if battery else session.get("battery_pct"),
+        "battery_pct": curr_batt if battery else prev_batt,
         "battery_volts": battery["volts"] if battery else None,
         "battery_charging": battery["charging"] if battery else False,
         "listening": session.get("listening", False),
@@ -1536,7 +1540,7 @@ def _tmux_run(args: list, **kwargs) -> subprocess.CompletedProcess:
 
 def _tmux_ensure_session() -> bool:
     """Ensure a persistent Claude session is running in tmux. Returns True if ready."""
-    global _tmux_ready, _tmux_timeout_count
+    global _tmux_ready, _tmux_timeout_count, _tmux_turn_count
     import shutil
 
     if _tmux_ready:
@@ -1615,7 +1619,7 @@ def _extract_json_from_pane(text: str) -> str | None:
 
 def call_claude_haiku(prompt: str, system: str) -> dict:
     """Call Claude via persistent tmux session. ~10-25s vs ~55s for CLI cold start."""
-    global _tmux_ready, _tmux_timeout_count
+    global _tmux_ready, _tmux_timeout_count, _tmux_turn_count
 
     if not _tmux_ensure_session():
         return {"error": "tmux claude session not available"}
@@ -1738,7 +1742,11 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
         or (MIND_BACKEND == "auto" and persona == "spark")
     )
     if use_claude:
-        result = call_claude_haiku(prompt, system)
+        try:
+            result = call_claude_haiku(prompt, system)
+        except Exception as exc:
+            log(f"claude crashed ({exc}), falling back to ollama")
+            result = {"error": str(exc)}
         if "error" not in result:
             try:
                 _log_token_usage(prompt + system, result.get("response", ""))
@@ -2365,6 +2373,7 @@ def mind_loop(args) -> None:
     last_expression_mono = 0.0
     last_reactive_mono = 0.0
     last_battery_warn_mono = 0.0
+    consecutive_critical = 0          # require 2 consecutive critical readings before shutdown
 
     # Exponential backoff: reflection interval grows during extended idle periods.
     # Resets on any interaction (listening, transition, reactive event).
@@ -2397,19 +2406,27 @@ def mind_loop(args) -> None:
         battery_pct = awareness.get("battery_pct")
         if battery_pct is not None:
             if battery_pct <= BATTERY_CRITICAL:
-                # Emergency — bypass everything, alarm + shutdown
-                battery_emergency_shutdown(battery_pct, args.dry_run)
-                break  # unreachable after shutdown, but clean for dry-run
+                consecutive_critical += 1
+                log(f"battery: critical reading {battery_pct}% "
+                    f"(consecutive={consecutive_critical}/2)")
+                if consecutive_critical >= 2:
+                    # Confirmed critical — alarm + shutdown
+                    battery_emergency_shutdown(battery_pct, args.dry_run)
+                    break  # unreachable after shutdown, but clean for dry-run
             elif battery_pct <= BATTERY_WARN_15:
+                consecutive_critical = 0
                 if (now - last_battery_warn_mono) > BATTERY_WARN_15_INTERVAL:
                     battery_warn_comment(battery_pct, args.dry_run)
                     last_battery_warn_mono = now
                     last_expression_mono = now
             elif battery_pct <= BATTERY_WARN_20:
+                consecutive_critical = 0
                 if (now - last_battery_warn_mono) > BATTERY_WARN_20_INTERVAL:
                     battery_warn_comment(battery_pct, args.dry_run)
                     last_battery_warn_mono = now
                     last_expression_mono = now
+            else:
+                consecutive_critical = 0
 
         # Reactive behavior: instant template response for key transitions
         reactive_transitions = {"someone_appeared", "someone_left"}

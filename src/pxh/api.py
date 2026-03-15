@@ -503,9 +503,11 @@ async def public_vitals() -> Dict[str, Any]:
         pass
 
     battery_pct = None
+    battery_charging = False
     try:
         data = json.loads((_public_state_dir() / "battery.json").read_text())
         battery_pct = data.get("pct")
+        battery_charging = bool(data.get("charging", False))
     except Exception:
         pass
 
@@ -524,6 +526,7 @@ async def public_vitals() -> Dict[str, Any]:
         "ram_pct": ram_pct,
         "cpu_temp_c": cpu_temp_c,
         "battery_pct": battery_pct,
+        "battery_charging": battery_charging,
         "disk_pct": disk_pct,
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
@@ -1366,13 +1369,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       <div style="background:var(--surface2);border-radius:var(--radius);padding:16px;margin-bottom:8px">
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:auto auto auto;gap:8px;max-width:240px;margin:0 auto 12px">
           <div></div>
-          <button class="btn btn-purple" style="min-height:64px;font-size:24px" onpointerdown="rcStart('forward',0)" onpointerup="rcStop()" onpointerleave="rcStop()">&#x25B2;</button>
+          <button class="btn btn-purple" style="min-height:64px;font-size:24px" data-rc="forward,0">&#x25B2;</button>
           <div></div>
-          <button class="btn btn-purple" style="min-height:64px;font-size:24px" onpointerdown="rcStart('forward',-28)" onpointerup="rcStop()" onpointerleave="rcStop()">&#x25C4;</button>
+          <button class="btn btn-purple" style="min-height:64px;font-size:24px" data-rc="forward,-28">&#x25C4;</button>
           <button class="btn btn-danger" style="min-height:64px;font-size:20px;font-weight:900" onclick="doTool('tool_stop',{})">&#x26D4;</button>
-          <button class="btn btn-purple" style="min-height:64px;font-size:24px" onpointerdown="rcStart('forward',28)" onpointerup="rcStop()" onpointerleave="rcStop()">&#x25BA;</button>
+          <button class="btn btn-purple" style="min-height:64px;font-size:24px" data-rc="forward,28">&#x25BA;</button>
           <div></div>
-          <button class="btn btn-purple" style="min-height:64px;font-size:24px" onpointerdown="rcStart('backward',0)" onpointerup="rcStop()" onpointerleave="rcStop()">&#x25BC;</button>
+          <button class="btn btn-purple" style="min-height:64px;font-size:24px" data-rc="backward,0">&#x25BC;</button>
           <div></div>
         </div>
         <div style="display:flex;align-items:center;gap:10px;max-width:240px;margin:0 auto">
@@ -1406,6 +1409,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       <div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center">
         <div class="spark-stat"><span id="st-mood">&#x2013;</span><br><span class="stat-lbl">mood</span></div>
         <div class="spark-stat"><span id="st-sonar">&#x2013;</span><br><span class="stat-lbl">sonar</span></div>
+        <div class="spark-stat"><span id="st-battery">&#x2013;</span><br><span class="stat-lbl">battery</span></div>
         <div class="spark-stat"><span id="st-period">&#x2013;</span><br><span class="stat-lbl">time</span></div>
         <div class="spark-stat"><span id="st-persona">&#x2013;</span><br><span class="stat-lbl">persona</span></div>
       </div>
@@ -1580,12 +1584,21 @@ async function pollFace(){
   }catch(e){}
   try{
     const logs=await api('/api/v1/logs/px-mind?lines=50');
-    const tl=[...(logs.lines||[])].reverse().find(l=>l.includes('[mind] thought:'));
+    const tl=[...(logs.lines||[])].reverse().find(l=>l.includes('thought:'));
     if(tl){const m=tl.match(/thought: (.+?)  mood=/);if(m)document.getElementById('f-thought').textContent=m[1];}
     const sl=[...(logs.lines||[])].reverse().find(l=>l.includes('sonar='));
     if(sl){
       const ms=sl.match(/sonar=(\\d+)cm/);if(ms)document.getElementById('st-sonar').textContent=ms[1]+'cm';
       const mp=sl.match(/period=(\\w+)/);if(mp)document.getElementById('st-period').textContent=mp[1];
+    }
+  }catch(e){}
+  try{
+    const v=await fetch('/api/v1/public/vitals').then(r=>r.json());
+    if(v.battery_pct!=null){
+      const bp=v.battery_pct;const ch=v.battery_charging;
+      const el=document.getElementById('st-battery');
+      el.textContent=(ch?'\u26A1':'')+bp+'%';
+      el.style.color=bp<=15?'var(--danger)':bp<=30?'var(--orange)':'inherit';
     }
   }catch(e){}
 }
@@ -1628,14 +1641,32 @@ function promptTimer(){
   doTool('tool_timer',{duration_s:parseFloat(mins)*60,label});
 }
 function promptRemember(){const t=prompt('What should SPARK remember?');if(t)doTool('tool_remember',{text:t});}
-let _rcT=null;
+let _rcT=null,_rcBusy=false;
 function rcStart(dir,steer){
   if(_rcT)return;
   const spd=parseInt(document.getElementById('rc-speed').value);
-  const fire=()=>api('/api/v1/tool',{method:'POST',body:JSON.stringify({tool:'tool_drive',params:{direction:dir,speed:spd,duration:0.6,steer},dry:false})});
-  fire();_rcT=setInterval(fire,500);
+  const fire=()=>{
+    if(_rcBusy)return;_rcBusy=true;
+    api('/api/v1/tool',{method:'POST',body:JSON.stringify({tool:'tool_drive',params:{direction:dir,speed:spd,duration:1.0,steer},dry:false})}).finally(()=>{_rcBusy=false;});
+  };
+  fire();_rcT=setInterval(fire,800);
 }
-function rcStop(){if(_rcT){clearInterval(_rcT);_rcT=null;}api('/api/v1/tool',{method:'POST',body:JSON.stringify({tool:'tool_stop',params:{},dry:false})});}
+function rcStop(){if(_rcT){clearInterval(_rcT);_rcT=null;}_rcBusy=false;api('/api/v1/tool',{method:'POST',body:JSON.stringify({tool:'tool_stop',params:{},dry:false})});}
+// Wire up all D-pad buttons for robust mobile touch handling
+document.addEventListener('DOMContentLoaded',()=>{
+  document.querySelectorAll('[data-rc]').forEach(btn=>{
+    const [dir,steer]=btn.dataset.rc.split(',');
+    const s=parseInt(steer||'0');
+    const start=(e)=>{e.preventDefault();rcStart(dir,s);};
+    const stop=(e)=>{e.preventDefault();rcStop();};
+    btn.addEventListener('pointerdown',start);
+    btn.addEventListener('pointerup',stop);
+    btn.addEventListener('pointerleave',stop);
+    btn.addEventListener('pointercancel',stop);
+    btn.addEventListener('contextmenu',e=>e.preventDefault());
+    btn.style.touchAction='none';btn.style.userSelect='none';
+  });
+});
 async function sendChat(){
   const inp=document.getElementById('ci');const text=inp.value.trim();if(!text)return;
   inp.value='';inp.disabled=true;document.getElementById('sbtn').disabled=true;

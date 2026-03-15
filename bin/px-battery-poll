@@ -28,6 +28,8 @@ CHARGE_FALL_V   = 0.03    # V/poll drop to count as discharging evidence
 CHARGE_CONFIRM  = 2       # consecutive confirming readings required before transition
 
 
+VOLTAGE_FLOOR = 3.0  # ADC reads below this are I2C glitch, not real voltage
+
 def volts_to_pct(v: float) -> int:
     return max(0, min(100, int((v - 6.0) / (8.4 - 6.0) * 100)))
 
@@ -113,6 +115,13 @@ warmup_remaining: int = 2  # skip first N readings for ADC to settle after resta
 while True:
     try:
         volts = round(get_battery_voltage(), 2)
+        # ADC glitch guard: 0V (or near-zero) is physically impossible for a
+        # 2S LiPo — it means the I2C read returned garbage.  Skip this tick
+        # entirely so we don't write a bogus 0% that triggers emergency shutdown.
+        if volts < VOLTAGE_FLOOR:
+            print(f"[battery-poll] ADC glitch: {volts}V < {VOLTAGE_FLOOR}V floor — skipping", file=sys.stderr)
+            time.sleep(POLL_S)
+            continue
         pct   = volts_to_pct(volts)
         ts    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
