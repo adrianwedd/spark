@@ -344,7 +344,7 @@ class BlueskyClient:
         if not self.access_token and not self._auth():
             return "error:auth_failed"
 
-        post_text = truncate_at_word(text, 300)
+        post_text = text  # caller pre-truncates to leave room for suffix
         rec = {
             "$type": "app.bsky.feed.post",
             "text": post_text,
@@ -595,8 +595,14 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         thought_ts = entry.get("ts", "")
         permalink = f"https://spark.wedd.au/thought/?ts={urllib.parse.quote(thought_ts)}" if thought_ts else ""
         hashtags = pick_hashtags(text, entry.get("mood", ""))
-        social_suffix = "\n\n" + permalink if permalink else ""
-        social_suffix += "\n\n" + hashtags if hashtags else ""
+        social_suffix = ""
+        if permalink:
+            social_suffix += "\n\n" + permalink
+        if hashtags:
+            social_suffix += "\n\n" + hashtags
+        # Truncate thought to leave room for suffix within platform limits
+        bsky_thought = truncate_at_word(text, 300 - len(social_suffix.encode("utf-8")))
+        masto_thought = truncate_at_word(text, 500 - len(social_suffix.encode("utf-8")))
 
         if posted.get("feed") is None or (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
             if write_feed(entry):
@@ -605,12 +611,10 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
                 entry["posted"]["feed"] = "error:write_failed"
 
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
-            social_text = text + social_suffix
-            entry["posted"]["bluesky"] = bluesky.post(social_text, dry=dry)
+            entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry)
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
-            social_text = text + social_suffix
-            entry["posted"]["mastodon"] = mastodon.post(social_text, dry=dry)
+            entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry)
 
         processed += 1
         was_posted = True
