@@ -19,7 +19,9 @@ A new `bin/px-post` daemon watches `state/thoughts-spark.jsonl` for qualifying e
 
 This follows the existing daemon pattern — px-mind thinks, px-alive moves, px-wake-listen hears, px-post shares. Each daemon reads shared state files and acts independently. Zero changes to px-mind.
 
-**Single-instance guard:** On startup, px-post acquires an exclusive `flock` on `state/px-post.lock`. If the lock cannot be acquired (another instance is running, e.g., during systemd restart overlap), it logs "another px-post instance is running" and exits with code 1. The lock is held for the daemon's lifetime, preventing double-posting.
+**Single-instance guard:** On startup, px-post ensures `state/` exists (`mkdir -p`), opens `state/px-post.lock` in append mode (`open(path, 'a')` — creates the file if missing), then acquires an exclusive `flock`. If the lock cannot be acquired (another instance is running, e.g., during systemd restart overlap), it logs "another px-post instance is running" and exits with code 1. The lock is held for the daemon's lifetime, preventing double-posting.
+
+**Threading model:** px-post is single-threaded. All queue operations (poll→append, flush→rewrite, trim) are sequential within the daemon. The single-instance guard ensures no concurrent access from another px-post process. No additional file locking is needed for `post_queue.jsonl` beyond atomic writes for the trim/rewrite step.
 
 **Credentials loading:** px-post sources `px-env` (same as all other bin scripts), which loads `.env` via `set -a; source .env; set +a`. Credentials are read from environment variables at runtime.
 
@@ -67,19 +69,25 @@ px-post polls `state/thoughts-spark.jsonl` every 60 seconds. It tracks its read 
 {
   "file": "thoughts-spark.jsonl",
   "offset": 4096,
+  "inode": 1234567,
   "last_poll_ts": "2026-03-15T10:32:05+11:00"
 }
 ```
 
-Using byte offset instead of timestamps avoids the second-precision collision problem (multiple thoughts in the same second). On each poll:
+Using byte offset instead of timestamps avoids the second-precision collision problem (multiple thoughts in the same second). The `inode` field (from `os.stat().st_ino`) detects file replacement — if the file is deleted and recreated (or replaced by a different file), the inode changes even if the file size is larger than the saved offset.
 
-1. Seek to saved offset, read new lines
-2. Parse each line with `try/except json.JSONDecodeError` — corrupt lines are logged and skipped, never abort the poll
-3. If the file is smaller than the saved offset (file was trimmed by px-mind), reset offset to 0 and re-scan
-4. Filter for qualifying thoughts (salience OR spoken action)
-5. Deduplicate against recent posts (last 50 in `state/feed.json`)
-6. Append qualifying entries to `state/post_queue.jsonl`
-7. Update cursor file with new offset
+On each poll:
+
+1. Check file inode against stored inode — if different, the file was replaced; reset offset to 0 and update stored inode
+2. Check file size against stored offset — if smaller (file was trimmed by px-mind), reset offset to 0
+3. Seek to saved offset, read new data
+4. Only advance the cursor to the end of **complete lines** (ending in `\n`) — a partial line from a mid-write is left for the next poll
+5. Parse each complete line with `try/except json.JSONDecodeError` — corrupt lines are logged and skipped, never abort the poll. Lines that parse as valid JSON but lack required fields (`thought`, `salience`, `action`) are logged as "malformed entry" and skipped.
+6. Filter for qualifying thoughts (salience OR spoken action). Note: thoughts with spoken actions (`comment`, `greet`) that were suppressed by px-mind's expression gates (obi_mode, charging) are still present in the file and still qualify — the thought was interesting enough to say; the suppression was situational.
+7. Deduplicate against recent posts (last 50 in `state/feed.json`)
+8. Append qualifying entries to `state/post_queue.jsonl`
+9. Update cursor file with new offset and inode. If cursor write fails, log a warning — the next poll will re-process some thoughts, mitigated by deduplication.
+10. If cursor file is unreadable or corrupt on startup, log a warning and reset to offset 0 (fresh start)
 
 ### Claude QA Gate
 
@@ -92,10 +100,11 @@ Answer only YES or NO. Nothing else.
 The thought: "{thought}"
 ```
 
-**Response parsing** (case-insensitive, prefix-matching):
-- Response starts with "yes" (case-insensitive) → **pass**, post to all destinations
-- Response starts with "no" (case-insensitive) → **fail**, log rejection
-- Response is empty, ambiguous, or doesn't start with yes/no → treat as **fail** (safe default), log with `qa_result: "ambiguous"` for monitoring
+**Response parsing** (strip → lowercase → prefix-match):
+- Response is stripped of leading/trailing whitespace, then lowercased
+- Starts with "yes" → **pass**, post to all destinations
+- Starts with "no" → **fail**, log rejection
+- Empty, ambiguous, or doesn't start with yes/no → treat as **fail** (safe default), log with `qa_result: "ambiguous"` for monitoring
 - Error/timeout → skip this entry, retry next cycle (entry stays in queue with `qa_result: null`)
 
 The QA call uses `claude -p` with `--no-session-persistence` and `--output-format text` (same pattern as the public chat endpoint). Env vars stripped as per `_make_clean_env()` pattern.
@@ -133,10 +142,11 @@ Uses the AT Protocol HTTP API directly (no SDK dependency):
 - `com.atproto.repo.createRecord` to post
 
 **Token lifecycle:**
-- Auth on first post of each daemon run
+- Auth on first post of each daemon run via `createSession` (no refresh token available on cold start)
 - Cache access token and refresh token in memory (not on disk)
-- On 401 (expired token): attempt re-auth once using refresh token, then fall back to fresh `createSession`
-- After 3 consecutive auth failures: disable Bluesky for this daemon run, log warning. Service restart re-enables.
+- On 401 (expired token): attempt re-auth using refresh token if available, then fall back to fresh `createSession`
+- On 400 from `createSession` (invalid credentials): treat as auth failure, log "check PX_BSKY_HANDLE and PX_BSKY_APP_PASSWORD"
+- After 3 consecutive auth failures (any combination of 400/401/network): disable Bluesky for this daemon run, log warning. Service restart re-enables.
 
 **Rate limit handling:** On 429 response, read `Retry-After` header, log it, skip Bluesky for this flush cycle. Entry remains in queue for retry.
 
@@ -245,7 +255,7 @@ px-post writes `state/px-post-status.json` on every flush cycle:
 }
 ```
 
-The dashboard can poll this to show "Social Posting: Active" or detect if the daemon has stopped updating.
+Written atomically (temp + rename), consistent with feed.json. The dashboard can poll this to show "Social Posting: Active" or detect if the daemon has stopped updating.
 
 ### Systemd Service
 
@@ -286,7 +296,9 @@ Each destination (feed.json, Bluesky, Mastodon) is attempted independently. A fa
 
 ### Queue corruption recovery
 
-If `post_queue.jsonl` is unreadable or entirely corrupt, px-post logs a warning and starts fresh (empty queue). Qualifying thoughts from `thoughts-spark.jsonl` will be re-queued on the next poll cycle. At worst, some thoughts may be re-posted to feed.json (deduplicated by the similarity check) but will NOT be re-posted to Bluesky/Mastodon (per-destination status is lost, so they are treated as new — this is the trade-off of a simple JSONL queue vs a database).
+If `post_queue.jsonl` is unreadable or entirely corrupt, px-post logs a warning (including the count of lost entries) and starts fresh (empty queue). Qualifying thoughts from `thoughts-spark.jsonl` will be re-queued on the next poll cycle.
+
+**Re-posting mitigation after queue corruption:** Per-destination status is lost, so re-queued thoughts could theoretically be re-posted to social platforms. To prevent this, the flush cycle checks `state/feed.json` before posting to Bluesky/Mastodon — if a thought already appears in feed.json (matched by timestamp + similarity), it is marked as already posted for ALL destinations without re-sending. This makes feed.json the source of truth for "was this already posted," providing a best-effort guard against duplicate social posts after queue corruption.
 
 ### API error handling
 
@@ -329,6 +341,16 @@ All HTTP calls (Claude QA, Bluesky, Mastodon) use explicit timeouts (15s for QA,
 - `test_single_instance_lock` — verify flock prevents concurrent instances
 - `test_truncation_word_boundary` — verify truncation at word boundary, not mid-word
 - `test_health_status_written` — verify px-post-status.json updated each flush
+- `test_health_status_atomic` — verify atomic write (temp + rename)
+- `test_cursor_inode_change` — file replaced (different inode) triggers offset reset
+- `test_cursor_corrupt_resets` — corrupt cursor file resets to offset 0
+- `test_partial_line_not_consumed` — incomplete line at EOF left for next poll
+- `test_malformed_thought_entry` — valid JSON missing required fields logged and skipped
+- `test_bluesky_400_credentials` — mock 400 from createSession, verify auth failure logged
+- `test_qa_response_whitespace` — " YES" and "\nNO" handled correctly after strip
+- `test_repost_guard_after_corruption` — after queue corruption, feed.json cross-check prevents social re-post
+- `test_flush_max_one_per_cycle` — verify only 1 post per flush cycle per rate limits
+- `test_suppressed_expression_qualifies` — thought with action "comment" but suppressed expression still qualifies
 
 All tests use `PX_POST_DRY=1` and mock API calls. No network, no real posts.
 
