@@ -23,9 +23,12 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -538,18 +541,162 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
     return processed
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Social posting daemon")
-    parser.add_argument("--dry-run", action="store_true", help="Skip actual posting")
-    args = parser.parse_args()
+STATUS_FILE = STATE_DIR / "px-post-status.json"
 
-    dry = args.dry_run or os.environ.get("PX_DRY") == "1"
-    log("px-post starting", dry=dry)
 
-    # Placeholder main loop — future tasks will add watching + posting logic
-    print(json.dumps({"status": "ok", "dry": dry}))
+def write_health_status(queue_depth: int, total_posted: int, total_rejected: int,
+                        bluesky_ok: bool, mastodon_ok: bool, last_post_ts: str | None) -> None:
+    """Write health status atomically."""
+    data = {
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "status": "running",
+        "queue_depth": queue_depth,
+        "total_posted": total_posted,
+        "total_rejected": total_rejected,
+        "bluesky_ok": bluesky_ok,
+        "mastodon_ok": mastodon_ok,
+        "last_post_ts": last_post_ts,
+    }
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, str(STATUS_FILE))
+    except Exception as exc:
+        log(f"health status write failed: {exc}")
+
+
+def run_backfill(dry: bool) -> int:
+    """Process entire thoughts file, write feed.json only. Returns count posted."""
+    thoughts_file = STATE_DIR / "thoughts-spark.jsonl"
+    if not thoughts_file.exists():
+        log("backfill: no thoughts file found")
+        return 0
+
+    # Load existing feed for dedup
+    feed_posts = []
+    try:
+        feed = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {}
+        feed_posts = feed.get("posts", [])
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    posted = 0
+    for line in thoughts_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not qualifies(entry):
+            continue
+        # Dedup against existing feed
+        if is_duplicate(entry["thought"], [p.get("thought", "") for p in feed_posts]):
+            continue
+        # QA gate (unless disabled)
+        qa = run_qa_gate(entry["thought"])
+        if qa not in ("pass", None):
+            continue
+        if qa is None and os.environ.get("PX_POST_QA", "1") != "0":
+            continue  # QA error, skip in backfill
+        # Write to feed only (no social posting)
+        if write_feed(entry):
+            posted += 1
+            # Update feed_posts for subsequent dedup
+            feed_posts.append({"thought": entry["thought"]})
+
+    log(f"backfill complete: {posted} thoughts posted to feed")
+    return posted
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="SPARK social posting daemon")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--backfill", action="store_true")
+    parser.add_argument("--poll-interval", type=int, default=60)
+    parser.add_argument("--flush-interval", type=int, default=300)
+    args = parser.parse_args(argv)
+
+    dry = args.dry_run or os.environ.get("PX_POST_DRY", "0") != "0"
+
+    # Single-instance guard
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = STATE_DIR / "px-post.lock"
+    lock_fd = open(lock_path, "a")
+    try:
+        import fcntl
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, OSError):
+        log("another px-post instance is running")
+        return 1
+
+    log(f"starting pid={os.getpid()} dry={dry}")
+
+    if args.backfill:
+        count = run_backfill(dry)
+        log(f"backfill done: {count} posts")
+        return 0
+
+    # SIGTERM handler
+    _shutdown = threading.Event()
+    signal.signal(signal.SIGTERM, lambda s, f: _shutdown.set())
+    signal.signal(signal.SIGINT, lambda s, f: _shutdown.set())
+
+    bluesky = BlueskyClient()
+    mastodon = MastodonClient()
+    thoughts_file = STATE_DIR / "thoughts-spark.jsonl"
+    total_posted = 0
+    total_rejected = 0
+    last_post_ts = None
+    last_flush = 0
+
+    while not _shutdown.is_set():
+        # Poll for new thoughts
+        new_thoughts = poll_new_thoughts(thoughts_file)
+        # Load feed for dedup
+        feed_posts = []
+        try:
+            feed = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {}
+            feed_posts = [p.get("thought", "") for p in feed.get("posts", [])]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+        for entry in new_thoughts:
+            if qualifies(entry) and not is_duplicate(entry["thought"], feed_posts):
+                queue_thought(entry)
+
+        # Flush cycle
+        now = time.monotonic()
+        if now - last_flush >= args.flush_interval:
+            processed = flush_queue(bluesky, mastodon, dry)
+            if processed > 0:
+                # Count results
+                queue = _load_queue()
+                for e in queue:
+                    if e.get("qa_result") in ("rejected", "ambiguous"):
+                        total_rejected += 1
+                    elif all(v == "ok" for v in e.get("posted", {}).values() if v is not None):
+                        total_posted += 1
+                        last_post_ts = e.get("queued_ts")
+
+            write_health_status(
+                queue_depth=len(_load_queue()),
+                total_posted=total_posted,
+                total_rejected=total_rejected,
+                bluesky_ok=bluesky.available(),
+                mastodon_ok=mastodon.available(),
+                last_post_ts=last_post_ts,
+            )
+            last_flush = now
+
+        _shutdown.wait(timeout=args.poll_interval)
+
+    log("shutting down")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
 PY

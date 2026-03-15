@@ -67,6 +67,9 @@ _load_queue = _POST["_load_queue"]
 _save_queue = _POST["_save_queue"]
 flush_queue = _POST["flush_queue"]
 _is_in_feed = _POST["_is_in_feed"]
+write_health_status = _POST["write_health_status"]
+run_backfill = _POST["run_backfill"]
+STATUS_FILE = _POST["STATUS_FILE"]
 
 
 def _make_line(thought="hello", salience=0.8, action="comment"):
@@ -678,3 +681,117 @@ def test_repost_guard_after_corruption(_cursor_env):
     assert saved["posted"]["feed"] == "ok"
     assert saved["posted"]["bluesky"] == "ok"
     assert saved["posted"]["mastodon"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+
+
+def test_single_instance_lock(tmp_path):
+    """Acquire flock on a temp file; second LOCK_NB attempt fails."""
+    import fcntl
+    lock_path = tmp_path / "px-post.lock"
+    fd1 = open(lock_path, "a")
+    fcntl.flock(fd1, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Second attempt with LOCK_NB should raise
+    fd2 = open(lock_path, "a")
+    with pytest.raises((OSError, BlockingIOError)):
+        fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fd1.close()
+    fd2.close()
+
+
+# ---------------------------------------------------------------------------
+# Health status
+# ---------------------------------------------------------------------------
+
+
+def test_health_status_written(_cursor_env):
+    """write_health_status creates px-post-status.json with correct structure."""
+    tmp = _cursor_env
+    _POST["STATUS_FILE"] = tmp / "px-post-status.json"
+
+    write_health_status(
+        queue_depth=3,
+        total_posted=10,
+        total_rejected=2,
+        bluesky_ok=True,
+        mastodon_ok=False,
+        last_post_ts="2026-03-15T10:00:00+00:00",
+    )
+
+    status_file = tmp / "px-post-status.json"
+    assert status_file.exists()
+    data = json.loads(status_file.read_text())
+    assert data["status"] == "running"
+    assert data["queue_depth"] == 3
+    assert data["total_posted"] == 10
+    assert data["total_rejected"] == 2
+    assert data["bluesky_ok"] is True
+    assert data["mastodon_ok"] is False
+    assert data["last_post_ts"] == "2026-03-15T10:00:00+00:00"
+    assert "ts" in data
+
+
+def test_health_status_atomic(_cursor_env):
+    """Verify write_health_status uses atomic os.replace."""
+    tmp = _cursor_env
+    _POST["STATUS_FILE"] = tmp / "px-post-status.json"
+
+    _post_os = _POST["os"]
+    with patch.object(_post_os, "replace", wraps=_post_os.replace) as mock_replace:
+        write_health_status(
+            queue_depth=0, total_posted=0, total_rejected=0,
+            bluesky_ok=True, mastodon_ok=True, last_post_ts=None,
+        )
+        mock_replace.assert_called_once()
+        assert str(mock_replace.call_args[0][1]) == str(tmp / "px-post-status.json")
+
+
+# ---------------------------------------------------------------------------
+# Backfill mode
+# ---------------------------------------------------------------------------
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "0"})
+def test_backfill_mode(_cursor_env):
+    """Backfill processes qualifying thoughts to feed.json only, no social posting."""
+    tmp = _cursor_env
+    thoughts_file = tmp / "thoughts-spark.jsonl"
+    # 2 qualifying (high salience), 1 not (low salience + wait)
+    thoughts_file.write_text(
+        _make_line("A bird landed on my head", salience=0.9, action="comment")
+        + _make_line("sonar reading 42cm", salience=0.2, action="wait")
+        + _make_line("The sunset is gorgeous tonight", salience=0.85, action="greet")
+    )
+
+    count = run_backfill(dry=True)
+    assert count == 2
+
+    feed = json.loads((tmp / "feed.json").read_text())
+    assert len(feed["posts"]) == 2
+    thoughts_in_feed = [p["thought"] for p in feed["posts"]]
+    assert "A bird landed on my head" in thoughts_in_feed
+    assert "The sunset is gorgeous tonight" in thoughts_in_feed
+    assert "sonar reading 42cm" not in thoughts_in_feed
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "0"})
+def test_backfill_idempotent(_cursor_env):
+    """Running backfill twice on the same file produces no duplicates."""
+    tmp = _cursor_env
+    thoughts_file = tmp / "thoughts-spark.jsonl"
+    thoughts_file.write_text(
+        _make_line("A bird landed on my head", salience=0.9, action="comment")
+        + _make_line("The sunset is gorgeous tonight", salience=0.85, action="greet")
+    )
+
+    count1 = run_backfill(dry=True)
+    assert count1 == 2
+
+    count2 = run_backfill(dry=True)
+    assert count2 == 0
+
+    feed = json.loads((tmp / "feed.json").read_text())
+    assert len(feed["posts"]) == 2
