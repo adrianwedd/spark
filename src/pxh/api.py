@@ -421,9 +421,11 @@ class SessionPatch(BaseModel):
     mode: Optional[str] = None
     persona: Optional[str] = None  # "vixen", "gremlin", "spark", or "claude" (clears persona)
     roaming_allowed: Optional[bool] = None
+    confirm: Optional[bool] = None  # required when enabling safety-critical fields
 
 
 PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode", "roaming_allowed"}
+SAFETY_CRITICAL_FIELDS = {"confirm_motion_allowed", "roaming_allowed"}
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 
 
@@ -950,7 +952,11 @@ async def list_tools() -> Dict[str, List[str]]:
 
 @app.get("/api/v1/session", dependencies=[Depends(_verify_token)])
 async def get_session() -> Dict[str, Any]:
-    return load_session()
+    data = load_session()
+    # Redact history to last 10 entries (not full conversation log)
+    if "history" in data:
+        data["history"] = data["history"][-10:]
+    return data
 
 
 @app.patch("/api/v1/session", dependencies=[Depends(_verify_token)])
@@ -962,6 +968,13 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
             fields[key] = value
     if not fields:
         raise HTTPException(status_code=400, detail="no patchable fields provided")
+    # Safety-critical fields (e.g. motion, roaming) require confirm: true to enable
+    critical_enables = {k for k in fields if k in SAFETY_CRITICAL_FIELDS and fields[k] is True}
+    if critical_enables and not body.confirm:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"confirm: true required to enable {', '.join(sorted(critical_enables))}"},
+        )
     # Validate and normalize persona
     if "persona" in fields:
         p = (fields["persona"] or "").lower().strip()
@@ -1230,13 +1243,19 @@ async def list_services() -> JSONResponse:
     return JSONResponse(content={"services": list(statuses)})
 
 
+class ServiceActionRequest(BaseModel):
+    confirm: bool = False
+
+
 @app.post("/api/v1/services/{service}/{action}", dependencies=[Depends(_verify_token)])
-async def control_service(service: str, action: str) -> JSONResponse:
+async def control_service(service: str, action: str, body: ServiceActionRequest = ServiceActionRequest()) -> JSONResponse:
     """Restart/stop/start a managed service. Action: restart | stop | start."""
     if service not in _MANAGED_SERVICES:
         raise HTTPException(status_code=400, detail=f"Service '{service}' not managed. Allowed: {sorted(_MANAGED_SERVICES)}")
     if action not in ("restart", "stop", "start", "status"):
         raise HTTPException(status_code=400, detail="action must be: restart, stop, start, status")
+    if action in ("stop", "restart") and not body.confirm:
+        return JSONResponse(status_code=400, content={"error": "confirm: true required for stop/restart"})
     loop = asyncio.get_running_loop()
     if action == "status":
         result = await loop.run_in_executor(None, _get_service_status, service)
@@ -1346,17 +1365,24 @@ _LOG_ALLOWLIST = {
 }
 
 
+def _sanitize_log_line(line: str) -> str:
+    """Strip absolute file paths to avoid exposing internal architecture."""
+    return _re.sub(r"/home/\S+/", "<path>/", line)
+
+
 @app.get("/api/v1/logs/{service}", dependencies=[Depends(_verify_token)])
 async def tail_log(service: str, lines: int = Query(default=100, ge=1, le=2000)) -> JSONResponse:
     """Return last N lines from a named log file."""
     if service not in _LOG_ALLOWLIST:
         raise HTTPException(status_code=400, detail=f"unknown log: {service}")
+    lines = min(lines, 100)  # cap at 100 lines max
     log_dir = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
     log_path = log_dir / f"{service}.log"
     if not log_path.exists():
         return JSONResponse(content={"lines": [], "service": service})
     text = log_path.read_text(errors="replace")
     tail = text.splitlines()[-lines:]
+    tail = [_sanitize_log_line(l) for l in tail]
     return JSONResponse(content={"lines": tail, "service": service})
 
 
@@ -1633,7 +1659,7 @@ async function loadSvcs(){
     });
   } catch(e){}
 }
-async function svcAct(svc,act){try{await api('/api/v1/services/'+svc+'/'+act,{method:'POST'});}catch(e){}setTimeout(loadSvcs,1500);}
+async function svcAct(svc,act){if((act==='stop'||act==='restart')&&!confirm('Really '+act+' '+svc+'?'))return;try{await api('/api/v1/services/'+svc+'/'+act,{method:'POST',body:JSON.stringify({confirm:true})});}catch(e){}setTimeout(loadSvcs,1500);}
 async function confirmDev(act){if(confirm('Really '+act+' the Pi?'))try{await api('/api/v1/device/'+act,{method:'POST',body:JSON.stringify({confirm:true})});}catch(e){}}
 async function loadParental(){
   try{
@@ -1646,7 +1672,7 @@ async function loadParental(){
     bq.className='btn '+(s.spark_quiet_mode?'btn-danger':'btn-muted');
   } catch(e){}
 }
-async function toggleMotion(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({confirm_motion_allowed:!s.confirm_motion_allowed})});}catch(e){}loadParental();}
+async function toggleMotion(){try{const s=await api('/api/v1/session');const on=!s.confirm_motion_allowed;const body={confirm_motion_allowed:on};if(on)body.confirm=true;await api('/api/v1/session',{method:'PATCH',body:JSON.stringify(body)});}catch(e){}loadParental();}
 async function toggleQuiet(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_quiet_mode:!s.spark_quiet_mode})});}catch(e){}loadParental();}
 async function setPersona(p){try{await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({persona:p})});}catch(e){}}
 async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});chat('History cleared ('+r.cleared+' entries removed).');}

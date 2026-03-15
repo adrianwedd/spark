@@ -105,6 +105,25 @@ class TestSession:
         data = resp.json()
         assert "schema_version" in data
 
+    def test_session_history_truncated(self, api_client, auth_headers):
+        """GET /session should return at most the last 10 history entries."""
+        # First request ensures session file is created
+        api_client.get("/api/v1/session", headers=auth_headers)
+        session_path = os.environ["PX_SESSION_PATH"]
+        with open(session_path, "r") as f:
+            data = json.load(f)
+        data["history"] = [{"role": "user", "text": f"msg-{i}"} for i in range(20)]
+        with open(session_path, "w") as f:
+            json.dump(data, f)
+
+        resp = api_client.get("/api/v1/session", headers=auth_headers)
+        assert resp.status_code == 200
+        history = resp.json()["history"]
+        assert len(history) == 10
+        # Should be the last 10 (msg-10 through msg-19)
+        assert history[0]["text"] == "msg-10"
+        assert history[-1]["text"] == "msg-19"
+
     def test_patch_session_allowed_field(self, api_client, auth_headers):
         resp = api_client.patch(
             "/api/v1/session",
@@ -280,11 +299,11 @@ class TestMotionGate:
                 os.environ.pop("PX_DRY", None)
 
     def test_patch_confirm_motion_allowed(self, api_client, auth_headers):
-        """PATCH /session can set confirm_motion_allowed."""
+        """PATCH /session can set confirm_motion_allowed (with confirm: true)."""
         resp = api_client.patch(
             "/api/v1/session",
             headers=auth_headers,
-            json={"confirm_motion_allowed": True, "wheels_on_blocks": True},
+            json={"confirm_motion_allowed": True, "wheels_on_blocks": True, "confirm": True},
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -344,10 +363,37 @@ class TestMotionGate:
         """PATCH can explicitly set confirm_motion_allowed back to False."""
         # First enable
         api_client.patch("/api/v1/session", headers=auth_headers,
-                         json={"confirm_motion_allowed": True})
+                         json={"confirm_motion_allowed": True, "confirm": True})
         # Then disable
         resp = api_client.patch("/api/v1/session", headers=auth_headers,
                                 json={"confirm_motion_allowed": False})
+        assert resp.status_code == 200
+        assert resp.json()["confirm_motion_allowed"] is False
+
+    def test_patch_motion_requires_confirm(self, api_client, auth_headers):
+        """PATCH with confirm_motion_allowed=True without confirm → 400."""
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"confirm_motion_allowed": True},
+        )
+        assert resp.status_code == 400
+        assert "confirm" in resp.json()["error"]
+
+    def test_patch_roaming_requires_confirm(self, api_client, auth_headers):
+        """PATCH with roaming_allowed=True without confirm → 400."""
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"roaming_allowed": True},
+        )
+        assert resp.status_code == 400
+        assert "confirm" in resp.json()["error"]
+
+    def test_patch_safety_disable_no_confirm_needed(self, api_client, auth_headers):
+        """Disabling safety-critical fields does not require confirm."""
+        resp = api_client.patch(
+            "/api/v1/session", headers=auth_headers,
+            json={"confirm_motion_allowed": False},
+        )
         assert resp.status_code == 200
         assert resp.json()["confirm_motion_allowed"] is False
 
@@ -381,6 +427,27 @@ class TestLogs:
         assert data["service"] == "px-mind"
         assert "alpha" in data["lines"]
         assert "gamma" in data["lines"]
+
+    def test_logs_capped_at_100(self, api_client, auth_headers, isolated_project):
+        log_dir = isolated_project["log_dir"]
+        # Write 200 lines
+        (log_dir / "px-mind.log").write_text(
+            "\n".join(f"line-{i}" for i in range(200)) + "\n"
+        )
+        r = api_client.get("/api/v1/logs/px-mind?lines=200", headers=auth_headers)
+        assert r.status_code == 200
+        assert len(r.json()["lines"]) == 100
+
+    def test_logs_paths_sanitized(self, api_client, auth_headers, isolated_project):
+        log_dir = isolated_project["log_dir"]
+        (log_dir / "px-mind.log").write_text(
+            "error in /home/pi/picar-x-hacking/bin/tool-voice at line 42\n"
+        )
+        r = api_client.get("/api/v1/logs/px-mind", headers=auth_headers)
+        assert r.status_code == 200
+        line = r.json()["lines"][0]
+        assert "/home/pi" not in line
+        assert "<path>/tool-voice" in line
 
 
 class TestWebUI:
@@ -449,6 +516,45 @@ class TestDeviceControl:
                                    json={"confirm": True})
         assert resp.status_code == 500
         assert resp.json()["status"] == "error"
+
+
+class TestServiceControl:
+    def test_service_stop_requires_confirm(self, api_client, auth_headers):
+        """POST /services/{name}/stop without confirm → 400."""
+        resp = api_client.post(
+            "/api/v1/services/px-alive/stop",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "confirm" in resp.json()["error"]
+
+    def test_service_restart_requires_confirm(self, api_client, auth_headers):
+        """POST /services/{name}/restart without confirm → 400."""
+        resp = api_client.post(
+            "/api/v1/services/px-mind/restart",
+            headers=auth_headers,
+        )
+        assert resp.status_code == 400
+        assert "confirm" in resp.json()["error"]
+
+    def test_service_stop_with_confirm(self, api_client, auth_headers):
+        """POST /services/{name}/stop with confirm passes gate (may fail on systemctl)."""
+        resp = api_client.post(
+            "/api/v1/services/px-alive/stop",
+            headers=auth_headers,
+            json={"confirm": True},
+        )
+        # Won't be 400 — confirm gate passed (may be 200 or 500 depending on systemctl)
+        assert resp.status_code != 400
+
+    def test_service_start_no_confirm_needed(self, api_client, auth_headers):
+        """POST /services/{name}/start does not require confirm."""
+        resp = api_client.post(
+            "/api/v1/services/px-alive/start",
+            headers=auth_headers,
+        )
+        # start doesn't require confirm — should not be 400 for missing confirm
+        assert resp.status_code != 400 or "confirm" not in resp.json().get("error", "")
 
 
 class TestPinVerify:
