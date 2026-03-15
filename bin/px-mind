@@ -1622,6 +1622,9 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
     try:
         for tick in range(60):
             time.sleep(1)
+            # Skip first 4s — Read tool + API call can't complete faster
+            if tick < 4:
+                continue
             pane = _tmux_capture()
             lines = pane.strip().splitlines()
 
@@ -1633,10 +1636,15 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
             if marker_idx is None:
                 continue
 
-            # Check for completion: ❯ prompt after our marker
+            # Check for completion: need ● (response content) THEN ❯ (next prompt)
             after_marker = "\n".join(lines[marker_idx + 1:])
-            # Must have at least one ❯ after our prompt (= response complete)
-            if "\u276f" not in after_marker:
+            has_response = "\u25cf" in after_marker  # ● = response line
+            has_prompt = False
+            # ❯ must appear AFTER a ● line to be a completion signal
+            if has_response:
+                after_first_bullet = after_marker[after_marker.index("\u25cf"):]
+                has_prompt = "\u276f" in after_first_bullet
+            if not (has_response and has_prompt):
                 continue
 
             # Try JSON extraction from raw pane text (robust, ignores ● formatting)
