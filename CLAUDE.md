@@ -133,13 +133,22 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 Three-layer cognitive architecture:
 - **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state → `state/awareness.json` + transition detection
 - **Layer 2 — Reflection** (on transition or every 2 min idle): SPARK persona uses Claude Haiku via persistent tmux session (`px-claude` — avoids 14s CLI cold start per call); other personas (GREMLIN, VIXEN) use Ollama `deepseek-r1:1.5b` on M1.local. Falls back to Ollama on Claude error. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`
-- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions: `wait, greet, comment, remember, look_at, weather_comment, scan`. Photo capture (`tool-describe-scene`) is **on-request only** — not dispatched autonomously. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions (14): `wait, greet, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check`. Charging-gated actions (require battery) are blocked when on charger. Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
 The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`) and during quiet mode. Auto-remembers high-salience (>0.7) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
 
 Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escalating warnings at ≤30/20/15% and triggers emergency shutdown at ≤10% (6 beeps → speech → `sudo shutdown -h now`).
 
 State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.json`, `state/mood.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
+
+### Social Posting (px-post)
+
+`bin/px-post` daemon watches `state/thoughts-spark.jsonl` for qualifying thoughts (salience >= 0.7 OR spoken action), runs a Claude QA gate, and posts to three destinations:
+- `state/feed.json` — served at `GET /api/v1/public/feed` and on spark.wedd.au
+- Bluesky (AT Protocol) — credentials via `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD`
+- Mastodon (REST API) — credentials via `PX_MASTODON_INSTANCE` + `PX_MASTODON_TOKEN`
+
+Per-destination retry, flock single-instance guard, 5-minute flush cycle. Backfill mode: `bin/px-post --backfill`.
 
 ### REST API
 
@@ -148,11 +157,37 @@ bin/px-api-server              # live mode
 bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 ```
 
-- **Auth**: Bearer token from `.env` (`PX_API_TOKEN`). Only `/api/v1/health` is unauthenticated.
-- **Endpoints**: `/health`, `POST /tool`, `GET /session`, `PATCH /session`, `GET /tools`, `GET /jobs/{id}`, `GET /photos/{filename}` (serves captured photos; used by web UI)
-- **Web UI**: photo button (📸 Take a photo!) in Actions tab — calls `tool_describe_scene`, shows image + description inline in chat
-- **Async**: `tool_wander` returns 202 with `job_id`; poll via `/jobs/{id}`
-- Always launch via `bin/px-api-server` (not bare uvicorn — needs `px-env` for PYTHONPATH)
+**Auth**: Bearer token from `.env` (`PX_API_TOKEN`), or session token from PIN verify. Only `/api/v1/health` and `/api/v1/public/*` are unauthenticated.
+
+**Public endpoints** (no auth):
+- `GET /api/v1/health`
+- `GET /api/v1/public/status` — live status snapshot
+- `GET /api/v1/public/vitals` — CPU/RAM/disk/battery
+- `GET /api/v1/public/sonar` — latest sonar reading
+- `GET /api/v1/public/awareness` — Layer 1 awareness state
+- `GET /api/v1/public/history` — ring buffer of vitals readings
+- `GET /api/v1/public/thoughts` — recent SPARK thoughts
+- `GET /api/v1/public/services` — service status
+- `GET /api/v1/public/feed` — social posting feed
+- `POST /api/v1/public/chat` — rate-limited public chat (10 msg/10min per IP)
+- `POST /api/v1/pin/verify` — PIN auth, returns session token (4h TTL)
+
+**Authenticated endpoints**:
+- `POST /api/v1/tool` — execute a tool
+- `GET /api/v1/session` — session state (history truncated to last 10)
+- `PATCH /api/v1/session` — update session (safety fields require confirm:true)
+- `POST /api/v1/session/history/clear` — wipe conversation history
+- `GET /api/v1/tools` — list allowed tools
+- `GET /api/v1/jobs/{id}` — async job status
+- `GET /api/v1/photos/{filename}` — captured photos
+- `GET /api/v1/logs/{service}` — tail logs (capped at 100 lines, paths sanitized)
+- `GET /api/v1/services` — full service list with status
+- `POST /api/v1/services/{name}/{action}` — systemd control (stop/restart require confirm:true)
+- `POST /api/v1/device/{action}` — reboot/shutdown (requires confirm:true)
+
+**Async**: `tool_wander` returns 202 with `job_id`; poll via `/jobs/{id}`
+
+Always launch via `bin/px-api-server` (not bare uvicorn — needs `px-env` for PYTHONPATH).
 
 ### Jailbroken Chat Personas
 
@@ -173,7 +208,7 @@ Requires `OLLAMA_HOST=0.0.0.0 ollama serve` on M1.
 
 ### Systemd Services
 
-Four services run at boot:
+Six services run at boot:
 
 | Service | Script | User | Restart |
 |---------|--------|------|---------|
@@ -181,6 +216,8 @@ Four services run at boot:
 | `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10 s |
 | `px-battery-poll` | `bin/px-battery-poll` | root | always, 10 s |
 | `px-mind` | `bin/px-mind` | pi | always, 10 s |
+| `px-post` | `bin/px-post` | pi | always, 30 s |
+| `px-api-server` | `bin/px-api-server` | pi | always, 2 s |
 
 ## Safety Model
 
@@ -188,6 +225,14 @@ Four services run at boot:
 - `confirm_motion_allowed: false` in session state blocks motion tools regardless of dry mode
 - All tools must be in `ALLOWED_TOOLS` set in `voice_loop.py`
 - Parameter ranges are hard-validated in `validate_action()` (speed 0–60, duration 1–12 s, etc.)
+
+## Security
+
+- PIN-based auth with session tokens (4h TTL)
+- Persistent PIN lockout (escalating: 5 failures → 5 min, 10 → 30 min)
+- Confirmation gates on device reboot/shutdown and safety-critical session fields
+- Security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
+- Rate limiting on public chat (10 msg/10min per IP)
 
 ## Adding a New Tool
 
@@ -226,3 +271,30 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_STATE_DIR` | Override state directory (used by tests) |
 | `PX_FRIGATE_HOST` | Frigate API base URL (default: `http://pi5-hailo.local:5000`) |
 | `PX_FRIGATE_CAMERA` | Frigate camera name (default: `picar_x`) |
+| `PX_ADMIN_PIN` | Dashboard PIN for authentication |
+| `PX_MIND_CLAUDE_MODEL` | Claude model for SPARK reflection (default: `claude-haiku-4-5-20251001`) |
+| `PX_CLAUDE_BIN` | Override Claude CLI binary path |
+| `PX_VOICE_LOCK_TIMEOUT` | Voice output lock timeout in seconds (default: 30) |
+| `PX_HA_HOST` | Home Assistant host (default: `http://homeassistant.local:8123`) |
+| `PX_HA_TOKEN` | Home Assistant long-lived access token |
+| `PX_BSKY_HANDLE` | Bluesky handle for social posting |
+| `PX_BSKY_APP_PASSWORD` | Bluesky app password |
+| `PX_MASTODON_INSTANCE` | Mastodon instance URL |
+| `PX_MASTODON_TOKEN` | Mastodon access token |
+| `PX_POST_DRY` | `1` = skip actual social media posts |
+| `PX_POST_QA` | `0` = skip Claude QA gate for testing |
+| `PX_POST_MIN_SALIENCE` | Minimum salience for social posting (default: `0.7`) |
+
+## Multi-Model QA
+
+Adrian uses Codex (OpenAI) and Gemini (Google) CLIs for independent QA reviews. Both are installed locally. When asked to "have codex and gemini QA", run both in parallel via Bash `run_in_background`:
+
+```bash
+# Gemini — prompt via -p flag
+gemini -p "QA prompt here" 2>&1
+
+# Codex — prompt via stdin (the -p flag is NOT supported by codex exec)
+echo "QA prompt here" | codex exec --full-auto - 2>&1
+```
+
+Give both the same comprehensive remit. Synthesise and present the combined results.
