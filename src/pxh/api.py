@@ -1011,6 +1011,12 @@ async def get_session() -> Dict[str, Any]:
     if isinstance(data.get("last_weather"), dict):
         for k in ("lat", "lon", "station", "url"):
             data["last_weather"].pop(k, None)
+        # Also redact station name from summary text
+        summary = data["last_weather"].get("summary", "")
+        if summary:
+            data["last_weather"]["summary"] = _re.sub(
+                r"At \S+,", "At the weather station,", summary
+            )
     return data
 
 
