@@ -100,9 +100,27 @@ def log_event(name: str, payload: dict) -> None:
         pass
 
 
+# Private content that must never be published — medical, custody, household details
+PRIVATE_CONTENT_PATTERNS = [
+    "meds", "medication", "medicated", "prescription",
+    "custody", "mum's place", "dad's place", "mum's house", "dad's house",
+    "thirsty", "hydration", "water intake",
+    "sleep quality", "sleep score",
+    "on a call", "mic active",
+]
+
+
+def _contains_private_content(text: str) -> bool:
+    """Return True if text contains private/medical content that shouldn't be published."""
+    lower = text.lower()
+    return any(pattern in lower for pattern in PRIVATE_CONTENT_PATTERNS)
+
+
 def qualifies(entry: dict) -> bool:
     """Return True if this thought qualifies for the feed (lower threshold)."""
     if not REQUIRED_FIELDS.issubset(entry.keys()):
+        return False
+    if _contains_private_content(entry.get("thought", "")):
         return False
     if entry.get("salience", 0) >= MIN_SALIENCE_FEED:
         return True

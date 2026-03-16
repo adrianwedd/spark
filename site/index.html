@@ -338,10 +338,17 @@
             │   BRAIN (px-mind)             │
             │                               │
             │  Layer 1 ─ Notice  (60s)      │──→ awareness.json
+            │    sonar, 4× Frigate cameras, │
+            │    Home Assistant, weather,    │
+            │    calendar, battery, ambient  │
             │  Layer 2 ─ Think   (5min)     │──→ thoughts.jsonl
             │  Layer 3 ─ Act     (2min gap) │──→ speak / look / remember
             └───────────────────────────────┘
-                    ↑ reads sonar_live.json
+            ┌───────────────────────────────┐
+            │  SOCIAL (px-post)             │
+            │  thoughts → privacy filter    │
+            │  → feed.json + Bluesky        │
+            └───────────────────────────────┘
             ┌───────────────┐
             │  EYES & NECK  │  ← always moving (px-alive)
             │  PCA9685 PWM  │  ← yields on SIGUSR1 for other tools
