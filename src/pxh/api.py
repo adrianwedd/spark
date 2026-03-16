@@ -742,6 +742,25 @@ async def public_feed():
         return {"updated": None, "posts": []}
 
 
+@app.get("/api/v1/public/thought-image")
+async def thought_image(ts: str = Query(...)):
+    """Serve a thought card PNG by timestamp. No auth required."""
+    import re
+    from fastapi.responses import FileResponse
+
+    # Sanitize ts the same way generate_thought_card does
+    safe_ts = re.sub(r'[^a-zA-Z0-9_\-]', '_', ts)
+    if not safe_ts or len(safe_ts) > 200:
+        raise HTTPException(status_code=400, detail="invalid ts")
+    img_path = _public_state_dir() / "thought-images" / f"{safe_ts}.png"
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail="thought image not found")
+    return FileResponse(
+        str(img_path), media_type="image/png",
+        headers={"Cache-Control": "max-age=3600"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public chat — Claude subprocess helper + endpoint
 # ---------------------------------------------------------------------------

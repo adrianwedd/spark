@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.parse
@@ -56,6 +57,161 @@ def pick_hashtags(thought: str = "", mood: str = "") -> str:
     w = _SYS_RNG.choice(_HASHTAGS_WRITING)
     r = _SYS_RNG.choice(_HASHTAGS_ROBOT)
     return f"{w} {r}"
+
+
+MOOD_COLORS = {
+    'peaceful': '#4a9d8f', 'content': '#6b8e5e', 'contemplative': '#7b6fa0',
+    'curious': '#c48a3f', 'active': '#d46b4a', 'excited': '#d44a6b',
+}
+
+THOUGHT_IMAGE_DIR = STATE_DIR / "thought-images"
+
+
+def generate_thought_card(thought_text: str, mood: str, ts: str) -> 'Path | None':
+    """Generate a branded 1200x630 PNG thought card. Returns path or None on failure."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        log("generate_thought_card: Pillow not installed — skipping image generation")
+        return None
+
+    try:
+        THOUGHT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Sanitize ts for filename
+        safe_ts = _re.sub(r'[^a-zA-Z0-9_\-]', '_', ts) if ts else "unknown"
+        out_path = THOUGHT_IMAGE_DIR / f"{safe_ts}.png"
+
+        # If already generated, return existing
+        if out_path.exists():
+            return out_path
+
+        W, H = 1200, 630
+        BG_COLOR = '#fdf6ec'
+        CARD_COLOR = '#ffffff'
+        TEXT_COLOR = '#2d2d2d'
+        URL_COLOR = '#e8875a'
+        BUBBLE_OUTLINE = '#e0d5c8'
+        BADGE_BG = '#f0f0f0'
+        GREEN_DOT = '#4ade80'
+
+        img = Image.new('RGB', (W, H), BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        # Load fonts (with fallbacks)
+        try:
+            font_title = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', 42)
+        except OSError:
+            font_title = ImageFont.load_default()
+        try:
+            font_quote = ImageFont.truetype('/usr/share/fonts/opentype/urw-base35/NimbusMonoPS-Italic.otf', 28)
+        except OSError:
+            font_quote = ImageFont.load_default()
+        try:
+            font_mood = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 18)
+        except OSError:
+            font_mood = ImageFont.load_default()
+        try:
+            font_url = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 16)
+        except OSError:
+            font_url = ImageFont.load_default()
+
+        # Card dimensions
+        card_x, card_y = 60, 50
+        card_w, card_h = W - 120, H - 140
+        card_r = 20
+
+        # Shadow (offset by 4px)
+        draw.rounded_rectangle(
+            [card_x + 4, card_y + 4, card_x + card_w + 4, card_y + card_h + 4],
+            radius=card_r, fill='#e8e0d4'
+        )
+        # Card
+        draw.rounded_rectangle(
+            [card_x, card_y, card_x + card_w, card_y + card_h],
+            radius=card_r, fill=CARD_COLOR
+        )
+
+        # SPARK title with green dot
+        title_x, title_y = card_x + 40, card_y + 30
+        draw.ellipse([title_x, title_y + 10, title_x + 14, title_y + 24], fill=GREEN_DOT)
+        draw.text((title_x + 22, title_y), "SPARK", fill=TEXT_COLOR, font=font_title)
+
+        # Thought text — wrap at ~55 chars, max 6 lines
+        wrapped = textwrap.fill(thought_text, width=55)
+        lines = wrapped.split('\n')
+        max_lines = 6
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1][:52] + '...'
+
+        text_x = card_x + 40
+        text_y = title_y + 70
+        line_height = 38
+        for i, line in enumerate(lines):
+            draw.text((text_x, text_y + i * line_height), line, fill=TEXT_COLOR, font=font_quote)
+
+        # Mood badge bottom-left
+        mood_str = mood.lower() if mood else 'content'
+        mood_color = MOOD_COLORS.get(mood_str, '#6b8e5e')
+
+        badge_x = card_x + 40
+        badge_y = card_y + card_h - 55
+        # Measure mood text width
+        mood_display = mood_str
+        try:
+            mood_bbox = draw.textbbox((0, 0), mood_display, font=font_mood)
+            mood_tw = mood_bbox[2] - mood_bbox[0]
+        except AttributeError:
+            mood_tw = len(mood_display) * 10
+        badge_w = mood_tw + 40  # padding for dot + text
+        badge_h = 30
+
+        draw.rounded_rectangle(
+            [badge_x, badge_y, badge_x + badge_w, badge_y + badge_h],
+            radius=12, fill=BADGE_BG
+        )
+        # Mood dot
+        dot_x = badge_x + 10
+        dot_y = badge_y + 9
+        draw.ellipse([dot_x, dot_y, dot_x + 12, dot_y + 12], fill=mood_color)
+        # Mood text
+        draw.text((dot_x + 18, badge_y + 5), mood_display, fill=mood_color, font=font_mood)
+
+        # URL bottom-right
+        url_text = "spark.wedd.au"
+        try:
+            url_bbox = draw.textbbox((0, 0), url_text, font=font_url)
+            url_tw = url_bbox[2] - url_bbox[0]
+        except AttributeError:
+            url_tw = len(url_text) * 10
+        draw.text(
+            (card_x + card_w - 40 - url_tw, card_y + card_h - 50),
+            url_text, fill=URL_COLOR, font=font_url
+        )
+
+        # Bubble tail circles below card
+        bubble_cx = card_x + 100
+        bubble_y1 = card_y + card_h + 15
+        bubble_y2 = bubble_y1 + 25
+        # Larger bubble
+        draw.ellipse(
+            [bubble_cx - 10, bubble_y1 - 10, bubble_cx + 10, bubble_y1 + 10],
+            fill=CARD_COLOR, outline=BUBBLE_OUTLINE, width=2
+        )
+        # Smaller bubble
+        draw.ellipse(
+            [bubble_cx - 15 - 6, bubble_y2 - 6, bubble_cx - 15 + 6, bubble_y2 + 6],
+            fill=CARD_COLOR, outline=BUBBLE_OUTLINE, width=2
+        )
+
+        img.save(str(out_path), 'PNG', optimize=True)
+        log(f"thought card generated: {out_path.name}")
+        return out_path
+
+    except Exception as exc:
+        log(f"generate_thought_card failed: {exc}")
+        return None
 
 
 def log(msg: str, **extra) -> None:
@@ -374,12 +530,31 @@ class BlueskyClient:
                 log("bluesky: disabled after 3 consecutive auth failures")
             return False
 
-    def post(self, text: str, dry: bool = False) -> str:
+    def _upload_image(self, image_path: 'Path') -> 'dict | None':
+        """Upload image blob to Bluesky. Returns blob dict or None."""
+        try:
+            with open(image_path, 'rb') as f:
+                img_data = f.read()
+            req = urllib.request.Request(
+                'https://bsky.social/xrpc/com.atproto.repo.uploadBlob',
+                data=img_data,
+                headers={
+                    'Content-Type': 'image/png',
+                    'Authorization': f'Bearer {self.access_token}',
+                },
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            return resp.get('blob')
+        except Exception as exc:
+            log(f"bluesky: image upload failed: {exc}")
+            return None
+
+    def post(self, text: str, dry: bool = False, image_path: 'Path | None' = None) -> str:
         """Post text to Bluesky. Returns 'ok', 'error:reason', or 'skipped'."""
         if not self.available():
             return "skipped"
         if dry:
-            log(f"bluesky [DRY]: {text[:80]}")
+            log(f"bluesky [DRY]: {text[:80]}" + (f" [img={image_path}]" if image_path else ""))
             return "ok"
         if not self.access_token and not self._auth():
             return "error:auth_failed"
@@ -420,6 +595,14 @@ class BlueskyClient:
             "collection": "app.bsky.feed.post",
             "record": rec,
         }
+        # Attach image if provided
+        if image_path and Path(image_path).exists():
+            blob = self._upload_image(image_path)
+            if blob:
+                record["record"]["embed"] = {
+                    "$type": "app.bsky.embed.images",
+                    "images": [{"alt": post_text[:100], "image": blob}],
+                }
         url = "https://bsky.social/xrpc/com.atproto.repo.createRecord"
         data = json.dumps(record).encode()
         req = urllib.request.Request(url, data=data, headers={
@@ -466,22 +649,57 @@ class MastodonClient:
             return False
         return True
 
-    def post(self, text: str, dry: bool = False) -> str:
+    def _upload_media(self, image_path: 'Path', alt_text: str) -> 'str | None':
+        """Upload media to Mastodon. Returns media ID or None."""
+        try:
+            with open(image_path, 'rb') as f:
+                img_data = f.read()
+            boundary = '----SPARKBoundary'
+            body = (
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="file"; filename="thought.png"\r\n'
+                f'Content-Type: image/png\r\n\r\n'
+            ).encode() + img_data + f'\r\n--{boundary}\r\n'.encode() + (
+                f'Content-Disposition: form-data; name="description"\r\n\r\n'
+                f'{alt_text[:400]}\r\n'
+                f'--{boundary}--\r\n'
+            ).encode()
+            url = f"{self.instance.rstrip('/')}/api/v2/media"
+            req = urllib.request.Request(url, data=body, headers={
+                'Content-Type': f'multipart/form-data; boundary={boundary}',
+                'Authorization': f'Bearer {self.token}',
+            })
+            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+            return resp.get('id')
+        except Exception as exc:
+            log(f"mastodon: media upload failed: {exc}")
+            return None
+
+    def post(self, text: str, dry: bool = False, image_path: 'Path | None' = None) -> str:
         if not self.available():
             return "skipped"
         if dry:
-            log(f"mastodon [DRY]: {text[:80]}")
+            log(f"mastodon [DRY]: {text[:80]}" + (f" [img={image_path}]" if image_path else ""))
             return "ok"
         post_text = truncate_at_word(text, 500)
+
+        # Upload image if provided
+        media_id = None
+        if image_path and Path(image_path).exists():
+            media_id = self._upload_media(image_path, post_text[:400])
+
         url = f"{self.instance.rstrip('/')}/api/v1/statuses"
-        data = json.dumps({"status": post_text}).encode()
+        payload = {"status": post_text}
+        if media_id:
+            payload["media_ids"] = [media_id]
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=data, headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
         })
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                log(f"mastodon: posted ({len(post_text)} chars)")
+                log(f"mastodon: posted ({len(post_text)} chars)" + (" [with image]" if media_id else ""))
                 return "ok"
         except urllib.error.HTTPError as e:
             if e.code == 429:
@@ -655,6 +873,9 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         bsky_thought = truncate_at_word(text, 300 - len(social_suffix.encode("utf-8")))
         masto_thought = truncate_at_word(text, 500 - len(social_suffix.encode("utf-8")))
 
+        # Generate thought card image for social posts
+        image_path = generate_thought_card(text, entry.get("mood", ""), entry.get("ts", ""))
+
         if posted.get("feed") is None or (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
             if write_feed(entry):
                 entry["posted"]["feed"] = "ok"
@@ -663,13 +884,13 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
 
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
             if qualifies_social(entry):
-                entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry)
+                entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry, image_path=image_path)
             else:
                 entry["posted"]["bluesky"] = "skipped"  # below social threshold
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
             if qualifies_social(entry):
-                entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry)
+                entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry, image_path=image_path)
             else:
                 entry["posted"]["mastodon"] = "skipped"  # below social threshold
 
