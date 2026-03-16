@@ -893,26 +893,28 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         # Generate thought card image
         image_path = generate_thought_card(text, entry.get("mood", ""), entry.get("ts", ""))
 
-        # Post to social platforms
-        social_attempted = False
+        # Post to BOTH social platforms for this entry, then break
+        bsky_attempted = False
+        masto_attempted = False
+
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
             if qualifies_social(entry):
                 entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry, image_path=image_path)
-                social_attempted = True
+                bsky_attempted = True
             else:
                 entry["posted"]["bluesky"] = "skipped"
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
             if qualifies_social(entry):
                 entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry, image_path=image_path)
-                social_attempted = True
+                masto_attempted = True
             else:
                 entry["posted"]["mastodon"] = "skipped"
 
         processed += 1
-        if social_attempted:
+        if bsky_attempted or masto_attempted:
             was_posted = True
-            break  # rate limit: max 1 social API attempt per flush cycle
+            break  # rate limit: max 1 entry's social posts per flush cycle
 
     _save_queue(entries)
     return {"processed": processed, "posted": was_posted, "rejected": was_rejected}
