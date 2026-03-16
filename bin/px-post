@@ -789,7 +789,7 @@ def _is_in_feed(thought_text: str, feed_posts: list[dict]) -> bool:
 
 
 def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool) -> dict:
-    """Process one pending queue entry. Returns dict with processed/posted/rejected counts."""
+    """Two-pass flush: batch all feed writes, then one social post. Never blocks feed on social rate limits."""
     entries = _load_queue()
     if not entries:
         return {"processed": 0, "posted": False, "rejected": False}
@@ -805,62 +805,80 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
     processed = 0
     was_posted = False
     was_rejected = False
-    for entry in entries:
-        # Skip fully posted entries
-        posted = entry.get("posted", {})
-        posted_before = dict(posted)  # snapshot before mutations
-        pending_destinations = [k for k, v in posted.items()
-                                if v is None or (isinstance(v, str) and v.startswith("error:"))]
-        if not pending_destinations and entry.get("qa_result") is not None:
-            continue
 
-        # Privacy gate (defense in depth — catch pre-filter queued entries)
+    # ── Pass 1: Batch all feed writes (local, no rate limit) ──
+    for entry in entries:
+        posted = entry.get("posted", {})
+        if posted.get("feed") is not None and not (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
+            continue  # feed already done
+
+        # Privacy gate
         if _contains_private_content(entry.get("thought", "")):
-            entry["posted"] = {k: v or "skipped" for k, v in entry.get("posted", {}).items()}
+            entry["posted"] = {k: v or "skipped" for k, v in posted.items()}
             log(f"flush: private content blocked: {entry.get('thought', '')[:50]}")
             processed += 1
             continue
 
-        # Repost guard: if thought is already in feed, mark feed as done but NOT social
+        # Repost guard
         if _is_in_feed(entry.get("thought", ""), feed_posts):
             entry["qa_result"] = entry.get("qa_result") or "pass"
             entry["posted"]["feed"] = "ok"
-            # Don't mark bluesky/mastodon — they still need posting
+            continue
 
-        # QA gate (if not already done)
+        # QA gate (if enabled and not already done)
         if entry.get("qa_result") is None:
             qa = run_qa_gate(entry["thought"])
             if qa is None:
-                continue  # error/timeout, skip to next cycle
+                continue  # timeout — skip, try next cycle
             entry["qa_result"] = qa
-            if qa in ("rejected", "ambiguous"):
-                # Mark all destinations as skipped — rejected thoughts must never post
-                entry["posted"] = {k: v or "skipped" for k, v in entry.get("posted", {}).items()}
-                log_event("post_rejected", {
-                    "id": entry.get("id"), "thought": entry["thought"][:100],
-                    "qa_result": qa, "mood": entry.get("mood"),
-                    "salience": entry.get("salience"),
-                })
-                processed += 1
-                was_rejected = True
-                break
 
-        # Guard: only post to social if thought is in feed.json (prevents posting QA-removed thoughts)
+        if entry["qa_result"] in ("rejected", "ambiguous"):
+            entry["posted"] = {k: v or "skipped" for k, v in posted.items()}
+            processed += 1
+            was_rejected = True
+            continue
+
+        # Write to feed
+        if write_feed(entry):
+            entry["posted"]["feed"] = "ok"
+            was_posted = True
+            processed += 1
+        else:
+            entry["posted"]["feed"] = "error:write_failed"
+
+    # ── Pass 2: One social post (rate-limited) ──
+    # Reload feed for cross-check (feed was just updated in pass 1)
+    try:
+        feed_data = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {"posts": []}
+        feed_texts = {p["thought"][:80] for p in feed_data.get("posts", [])}
+    except (json.JSONDecodeError, OSError):
+        feed_texts = set()
+
+    for entry in entries:
+        posted = entry.get("posted", {})
+        # Need social posting?
+        social_pending = any(
+            posted.get(d) is None or (isinstance(posted.get(d), str) and posted[d].startswith("error:"))
+            for d in ("bluesky", "mastodon")
+        )
+        if not social_pending:
+            continue
+
+        # Privacy gate
+        if _contains_private_content(entry.get("thought", "")):
+            entry["posted"]["bluesky"] = entry["posted"].get("bluesky") or "skipped"
+            entry["posted"]["mastodon"] = entry["posted"].get("mastodon") or "skipped"
+            continue
+
         text = entry["thought"]
-        if posted.get("feed") == "ok" and (posted.get("bluesky") is None or posted.get("mastodon") is None):
-            try:
-                feed_data = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {"posts": []}
-                feed_texts = {p["thought"][:80] for p in feed_data.get("posts", [])}
-                if text[:80] not in feed_texts:
-                    log(f"skipping social post — thought removed from feed: {text[:60]}")
-                    entry["posted"]["bluesky"] = entry["posted"].get("bluesky") or "skipped"
-                    entry["posted"]["mastodon"] = entry["posted"].get("mastodon") or "skipped"
-                    processed += 1
-                    break
-            except Exception as exc:
-                log(f"feed cross-check failed: {exc}")
 
-        # Build permalink URL and hashtags for social posts
+        # Feed cross-check: must be in feed to post socially
+        if text[:80] not in feed_texts:
+            entry["posted"]["bluesky"] = entry["posted"].get("bluesky") or "skipped"
+            entry["posted"]["mastodon"] = entry["posted"].get("mastodon") or "skipped"
+            continue
+
+        # Build social text
         thought_ts = entry.get("ts", "")
         permalink = f"https://spark.wedd.au/thought/?ts={urllib.parse.quote(thought_ts)}" if thought_ts else ""
         hashtags = pick_hashtags(text, entry.get("mood", ""))
@@ -869,46 +887,32 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
             social_suffix += "\n\n" + permalink
         if hashtags:
             social_suffix += "\n\n" + hashtags
-        # Truncate thought to leave room for suffix within platform limits
         bsky_thought = truncate_at_word(text, 300 - len(social_suffix.encode("utf-8")))
         masto_thought = truncate_at_word(text, 500 - len(social_suffix.encode("utf-8")))
 
-        # Generate thought card image for social posts
+        # Generate thought card image
         image_path = generate_thought_card(text, entry.get("mood", ""), entry.get("ts", ""))
 
-        if posted.get("feed") is None or (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
-            if write_feed(entry):
-                entry["posted"]["feed"] = "ok"
-            else:
-                entry["posted"]["feed"] = "error:write_failed"
-
+        # Post to social platforms
+        social_attempted = False
         if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
             if qualifies_social(entry):
                 entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry, image_path=image_path)
+                social_attempted = True
             else:
-                entry["posted"]["bluesky"] = "skipped"  # below social threshold
+                entry["posted"]["bluesky"] = "skipped"
 
         if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
             if qualifies_social(entry):
                 entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry, image_path=image_path)
+                social_attempted = True
             else:
-                entry["posted"]["mastodon"] = "skipped"  # below social threshold
+                entry["posted"]["mastodon"] = "skipped"
 
         processed += 1
-        # Did we attempt a social API call (not just feed write or skip)?
-        social_attempted = any(
-            entry["posted"].get(d) != posted_before.get(d) and entry["posted"].get(d) != "skipped"
-            for d in ("bluesky", "mastodon")
-        )
-        feed_posted = entry["posted"].get("feed") == "ok" and posted_before.get("feed") != "ok"
-        if feed_posted:
-            was_posted = True
         if social_attempted:
-            if any(entry["posted"].get(d) == "ok" and posted_before.get(d) != "ok"
-                   for d in ("bluesky", "mastodon")):
-                was_posted = True
-            break  # rate limit: max 1 social API attempt per flush cycle (success or failure)
-        # No social attempt this entry — continue to next (feed-only writes don't consume the slot)
+            was_posted = True
+            break  # rate limit: max 1 social API attempt per flush cycle
 
     _save_queue(entries)
     return {"processed": processed, "posted": was_posted, "rejected": was_rejected}

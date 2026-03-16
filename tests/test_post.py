@@ -613,14 +613,18 @@ def test_flush_empty_queue_returns_dict(_cursor_env):
 def test_per_destination_retry(_cursor_env):
     """Bluesky errored, feed ok — flush retries Bluesky but not feed."""
     tmp = _cursor_env
+    thought_text = "I see something interesting"
     entry = _make_queue_entry(
-        thought="I see something interesting",
+        thought=thought_text,
         posted={"feed": "ok", "bluesky": "error:timeout", "mastodon": "ok"},
         qa_result="pass",
         entry_id="post-retry-001",
     )
     queue_file = tmp / "post_queue.jsonl"
     queue_file.write_text(json.dumps(entry) + "\n")
+    # Feed must contain the thought for cross-check to pass
+    feed_file = tmp / "feed.json"
+    feed_file.write_text(json.dumps({"posts": [{"thought": thought_text, "mood": "calm", "ts": "", "posted_ts": ""}]}))
 
     bsky = MagicMock()
     bsky.post.return_value = "ok"
@@ -643,7 +647,7 @@ def test_per_destination_retry(_cursor_env):
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
 def test_flush_max_one_per_cycle(_cursor_env):
-    """Queue 3 entries. Flush once. Verify only 1 processed."""
+    """Queue 3 entries. Flush: all feed writes batch, max 1 social post."""
     tmp = _cursor_env
     queue_file = tmp / "post_queue.jsonl"
     lines = []
@@ -661,12 +665,18 @@ def test_flush_max_one_per_cycle(_cursor_env):
     masto.post.return_value = "ok"
 
     result = flush_queue(bsky, masto, dry=True)
-    assert result["processed"] == 1
+    # Pass 1 batches all feed writes, pass 2 does 1 social post
+    assert result["processed"] >= 3  # at least 3 feed writes
+    assert result["posted"] is True
 
-    # Only 1 entry should have been touched
+    # All 3 entries should have feed=ok (batched in pass 1)
     saved = [json.loads(l) for l in queue_file.read_text().strip().splitlines()]
     posted_count = sum(1 for e in saved if e["posted"]["feed"] == "ok")
-    assert posted_count == 1
+    assert posted_count == 3  # all fed in one pass
+
+    # But only 1 social post (rate limited in pass 2)
+    bsky_calls = bsky.post.call_count + masto.post.call_count
+    assert bsky_calls <= 2  # max 1 bsky + 1 masto attempt
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})

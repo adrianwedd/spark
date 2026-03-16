@@ -687,7 +687,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
   position: relative;
   margin-top: 2.5rem;
   padding-bottom: 4.5rem;
-  overflow: hidden;
+  overflow: clip;
   transition: height 0.3s ease;
 }
 
