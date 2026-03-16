@@ -302,6 +302,7 @@ def write_feed(thought: dict) -> bool:
 class BlueskyClient:
     def __init__(self):
         self.handle = os.environ.get("PX_BSKY_HANDLE", "")
+        log(f"bluesky: init handle={self.handle!r} password={'***' if os.environ.get('PX_BSKY_APP_PASSWORD') else '(empty)'}")
         self.password = os.environ.get("PX_BSKY_APP_PASSWORD", "")
         self.access_token = None
         self.refresh_token = None
@@ -788,7 +789,13 @@ def main(argv: list[str]) -> int:
         # Flush cycle
         now = time.monotonic()
         if now - last_flush >= args.flush_interval:
-            result = flush_queue(bluesky, mastodon, dry)
+            log(f"flush: starting (interval={args.flush_interval}s, bsky_ok={bluesky.available()}, queue={len(_load_queue())})")
+            try:
+                result = flush_queue(bluesky, mastodon, dry)
+            except Exception as exc:
+                log(f"flush: CRASHED: {exc}")
+                result = {"posted": False, "rejected": False, "processed": 0}
+            log(f"flush: done processed={result.get('processed',0)} posted={result.get('posted')} rejected={result.get('rejected')}")
             if result.get("posted"):
                 total_posted += 1
                 last_post_ts = dt.datetime.now(dt.timezone.utc).isoformat()
