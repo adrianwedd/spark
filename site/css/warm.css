@@ -686,13 +686,9 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .thought-carousel {
   position: relative;
   margin-top: 2.5rem;
-  /* bottom space = bubble tail circles (~50px) + nav dots area */
   padding-bottom: 4.5rem;
-  min-height: 22rem;
-}
-
-@media (max-width: 600px) {
-  .thought-carousel { min-height: 16rem; }
+  overflow: hidden;
+  transition: height 0.3s ease;
 }
 
 /* Thought bubble container */
@@ -771,6 +767,8 @@ details > *:not(summary) { margin-top: 0.75rem; }
   border: none;
   background: none;
   max-width: 100%;
+  max-height: 14em;  /* ~8 lines at 1.55 line-height */
+  overflow: hidden;
 }
 
 .carousel-meta {

@@ -275,6 +275,7 @@
     _carouselIdx = 0;
     _attachCarouselInteraction(container, thoughts.length);
     _startCarousel(thoughts.length);
+    setTimeout(_resizeCarousel, 50);
   }
 
   function _showSlide(idx) {
@@ -287,7 +288,21 @@
       d.classList.toggle('active', i === idx);
       d.setAttribute('aria-selected', i === idx ? 'true' : 'false');
     });
+    _resizeCarousel();
   }
+
+  function _resizeCarousel() {
+    var container = document.getElementById('thought-carousel');
+    if (!container) return;
+    var active = container.querySelector('.carousel-slide.active');
+    if (active) {
+      // Measure the active slide's full height including bubble tail circles
+      var slideHeight = active.offsetHeight + 60; // 60px for bubble tail circles
+      container.style.height = slideHeight + 'px';
+    }
+  }
+
+  window.addEventListener('resize', _resizeCarousel);
 
   let _swipeStartX = null;
 
