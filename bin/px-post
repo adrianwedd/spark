@@ -514,20 +514,29 @@ class BlueskyClient:
             return False
 
     def _upload_image(self, image_path: 'Path') -> 'dict | None':
-        """Upload image blob to Bluesky. Returns blob dict or None."""
+        """Upload image blob to Bluesky. Returns blob dict or None. Re-auths on failure."""
         try:
             with open(image_path, 'rb') as f:
                 img_data = f.read()
-            req = urllib.request.Request(
-                'https://bsky.social/xrpc/com.atproto.repo.uploadBlob',
-                data=img_data,
-                headers={
-                    'Content-Type': 'image/png',
-                    'Authorization': f'Bearer {self.access_token}',
-                },
-            )
-            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-            return resp.get('blob')
+            for attempt in range(2):  # try once, re-auth, try again
+                req = urllib.request.Request(
+                    'https://bsky.social/xrpc/com.atproto.repo.uploadBlob',
+                    data=img_data,
+                    headers={
+                        'Content-Type': 'image/png',
+                        'Authorization': f'Bearer {self.access_token}',
+                    },
+                )
+                try:
+                    resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+                    return resp.get('blob')
+                except urllib.error.HTTPError as e:
+                    if attempt == 0 and e.code in (400, 401):
+                        log(f"bluesky: image upload {e.code} — re-authenticating")
+                        if self._auth():
+                            continue  # retry with fresh token
+                    log(f"bluesky: image upload failed: HTTP {e.code}")
+                    return None
         except Exception as exc:
             log(f"bluesky: image upload failed: {exc}")
             return None
@@ -597,8 +606,8 @@ class BlueskyClient:
                 log(f"bluesky: posted ({len(post_text)} chars)")
                 return "ok"
         except urllib.error.HTTPError as e:
-            if e.code == 401:
-                log("bluesky: 401 — re-authenticating")
+            if e.code in (400, 401):
+                log(f"bluesky: {e.code} — re-authenticating")
                 if self._auth():
                     # Retry once with new token
                     req.remove_header("Authorization")
