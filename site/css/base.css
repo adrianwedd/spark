@@ -26,7 +26,7 @@ body {
 }
 
 /* ── Nav ── */
-nav {
+#main-nav {
   position: fixed;
   top: 0; left: 0; right: 0;
   height: var(--nav-height);
@@ -39,7 +39,7 @@ nav {
   border-bottom: 1px solid rgba(255,255,255,0.06);
 }
 
-nav .logo {
+#main-nav .logo {
   font-family: monospace;
   font-size: 1.1rem;
   font-weight: 700;
@@ -61,24 +61,24 @@ nav .logo {
 #status-dot.amber { background: #f59e0b; }
 #status-dot.red   { background: #ef4444; }
 
-nav .links {
+#main-nav .links {
   display: flex;
   gap: 1rem;
   margin-left: auto;
   list-style: none;
 }
 
-nav .links a {
+#main-nav .links a {
   color: var(--dark-muted);
   text-decoration: none;
   font-size: 0.875rem;
   transition: color var(--transition);
 }
-nav .links a:hover,
-nav .links a.active { color: var(--dark-text); }
+#main-nav .links a:hover,
+#main-nav .links a.active { color: var(--dark-text); }
 
-nav .nav-github { opacity: 0.6; }
-nav .nav-github:hover { opacity: 1; color: var(--dark-text); }
+#main-nav .nav-github { opacity: 0.6; }
+#main-nav .nav-github:hover { opacity: 1; color: var(--dark-text); }
 
 /* ── Hamburger button (hidden on desktop) ── */
 .nav-burger {
@@ -107,7 +107,7 @@ nav .nav-github:hover { opacity: 1; color: var(--dark-text); }
 @media (max-width: 700px) {
   .nav-burger { display: flex; }
 
-  nav .links {
+  #main-nav .links {
     display: none;
     position: absolute;
     top: var(--nav-height);
@@ -120,17 +120,17 @@ nav .nav-github:hover { opacity: 1; color: var(--dark-text); }
     border-bottom: 1px solid rgba(255,255,255,0.06);
     z-index: 99;
   }
-  nav .links li a {
+  #main-nav .links li a {
     display: block;
     padding: 0.65rem 1.5rem;
     font-size: 1rem;
   }
-  nav.nav-open .links {
+  #main-nav.nav-open .links {
     display: flex;
   }
-  nav.nav-open .nav-burger span:nth-child(1) { transform: translateY(8px) rotate(45deg); }
-  nav.nav-open .nav-burger span:nth-child(2) { opacity: 0; }
-  nav.nav-open .nav-burger span:nth-child(3) { transform: translateY(-8px) rotate(-45deg); }
+  #main-nav.nav-open .nav-burger span:nth-child(1) { transform: translateY(8px) rotate(45deg); }
+  #main-nav.nav-open .nav-burger span:nth-child(2) { opacity: 0; }
+  #main-nav.nav-open .nav-burger span:nth-child(3) { transform: translateY(-8px) rotate(-45deg); }
   .nav-burger span { transition: transform 0.2s ease, opacity 0.2s ease, background var(--transition); }
 }
 
