@@ -99,6 +99,7 @@
 
     if (anySuccess) {
       lastSuccessMs = Date.now();
+      window._sparkMood = state.mood || '';
       accumulate({
         ts:              state.ts || new Date().toISOString(),
         cpu_pct:         state.cpu_pct         != null ? state.cpu_pct         : null,
@@ -155,13 +156,21 @@
 
   // ── Status dot ───────────────────────────────────────────────────────────
 
+  var MOOD_DOT_COLORS = {
+    peaceful: '#4a9d8f', content: '#6b8e5e', contemplative: '#7b6fa0',
+    curious: '#c48a3f', active: '#d46b4a', excited: '#d44a6b',
+  };
+
   function _updateDot() {
     const dot = document.getElementById('status-dot');
     if (!dot) return;
-    dot.classList.remove('green', 'amber', 'red');
-    if (lastSuccessMs === null) { dot.classList.add('red'); return; }
+    if (lastSuccessMs === null) { dot.style.background = '#ef4444'; dot.title = 'SPARK is offline'; return; }
     const age = Date.now() - lastSuccessMs;
-    dot.classList.add(age < 60_000 ? 'green' : age < 300_000 ? 'amber' : 'red');
+    if (age > 300_000) { dot.style.background = '#ef4444'; dot.title = 'SPARK is offline'; return; }
+    // Use mood colour from latest status
+    var mood = (window._sparkMood || '').toLowerCase();
+    dot.style.background = MOOD_DOT_COLORS[mood] || '#4ade80';
+    dot.title = mood ? ('SPARK is feeling ' + mood) : 'SPARK is online';
   }
 
   // ── Waveform 2s tick ─────────────────────────────────────────────────────
