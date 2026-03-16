@@ -771,9 +771,16 @@ def main(argv: list[str]) -> int:
     last_post_ts = None
     last_flush = 0
 
+    poll_count = 0
     while not _shutdown.is_set():
+        poll_count += 1
         # Poll for new thoughts
-        new_thoughts = poll_new_thoughts(thoughts_file)
+        try:
+            new_thoughts = poll_new_thoughts(thoughts_file)
+        except Exception as exc:
+            log(f"poll: CRASHED: {exc}")
+            new_thoughts = []
+
         # Load feed for dedup
         feed_posts = []
         try:
@@ -782,12 +789,19 @@ def main(argv: list[str]) -> int:
         except (json.JSONDecodeError, OSError):
             pass
 
+        queued_count = 0
         for entry in new_thoughts:
             if qualifies(entry) and not is_duplicate(entry["thought"], feed_posts):
                 queue_thought(entry)
+                queued_count += 1
+        if new_thoughts or queued_count:
+            log(f"poll: {len(new_thoughts)} new thoughts, {queued_count} queued")
 
         # Flush cycle
         now = time.monotonic()
+        secs_until_flush = max(0, args.flush_interval - (now - last_flush))
+        if poll_count % 5 == 0:  # log heartbeat every 5 polls (~5 min)
+            log(f"heartbeat: poll={poll_count} flush_in={secs_until_flush:.0f}s queue={len(_load_queue())} bsky={bluesky.available()}")
         if now - last_flush >= args.flush_interval:
             log(f"flush: starting (interval={args.flush_interval}s, bsky_ok={bluesky.available()}, queue={len(_load_queue())})")
             try:
