@@ -7,7 +7,7 @@
   const API              = 'https://spark-api.wedd.au/api/v1/public';
   const CACHE_KEY        = 'spark_last_known';
   const HISTORY_KEY      = 'spark_history';
-  const HISTORY_MAX      = 2880;  // 2880 × 30s = 24 h local buffer
+  const HISTORY_MAX      = 720;   // 720 × 30s = 6 h local buffer
   const POLL_MS          = 30_000;
   const TIMEOUT_MS       = 5_000;
   const THOUGHTS_POLL_MS = 5 * 60_000;  // refresh carousel every 5 min
@@ -321,6 +321,20 @@
       _showSlide(_carouselIdx);
       _resetCarousel(count);
     }, { passive: true });
+
+    // Arrow key navigation
+    fresh.setAttribute('tabindex', '0');
+    fresh.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowRight') {
+        _carouselIdx = (_carouselIdx + 1) % count;
+        _showSlide(_carouselIdx);
+        _resetCarousel(count);
+      } else if (e.key === 'ArrowLeft') {
+        _carouselIdx = (_carouselIdx - 1 + count) % count;
+        _showSlide(_carouselIdx);
+        _resetCarousel(count);
+      }
+    });
   }
 
   function _resetCarousel(count) {
@@ -344,9 +358,26 @@
   prefetchHistory();
   poll();
   fetchThoughts();
-  setInterval(poll, POLL_MS);
-  setInterval(tickWaveform, 2_000);
-  setInterval(_updateDot, 10_000);
-  setInterval(fetchThoughts, THOUGHTS_POLL_MS);
+  var pollTimer      = setInterval(poll, POLL_MS);
+  var waveformTimer  = setInterval(tickWaveform, 2_000);
+  var dotTimer       = setInterval(_updateDot, 10_000);
+  var thoughtsTimer  = setInterval(fetchThoughts, THOUGHTS_POLL_MS);
+
+  // Pause polling when tab is hidden to save bandwidth and CPU
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      clearInterval(pollTimer);
+      clearInterval(waveformTimer);
+      clearInterval(dotTimer);
+      clearInterval(thoughtsTimer);
+    } else {
+      poll();            // immediate refresh on return
+      fetchThoughts();
+      pollTimer      = setInterval(poll, POLL_MS);
+      waveformTimer  = setInterval(tickWaveform, 2_000);
+      dotTimer       = setInterval(_updateDot, 10_000);
+      thoughtsTimer  = setInterval(fetchThoughts, THOUGHTS_POLL_MS);
+    }
+  });
 
 })();

@@ -691,6 +691,10 @@ details > *:not(summary) { margin-top: 0.75rem; }
   min-height: 22rem;
 }
 
+@media (max-width: 600px) {
+  .thought-carousel { min-height: 16rem; }
+}
+
 /* Thought bubble container */
 .carousel-slide {
   position: absolute;

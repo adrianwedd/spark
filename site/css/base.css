@@ -146,7 +146,7 @@ section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); }
 }
 
 /* ── Accessibility ── */
-:focus-visible { outline: 2px solid var(--warm-accent); outline-offset: 3px; }
+:focus-visible { outline: 2px solid #c75a2a; outline-offset: 2px; }
 
 /* ── Utility ── */
 .container { max-width: 900px; margin: 0 auto; padding: 0 1rem; overflow-x: hidden; }

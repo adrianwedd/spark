@@ -5,6 +5,7 @@
   const links = document.querySelectorAll('nav .links a');
 
   function onScroll() {
+    if (window.location.pathname !== '/' && window.location.pathname !== '/index.html') return;
     let current = '';
     sections.forEach(sec => {
       const top = sec.getBoundingClientRect().top;

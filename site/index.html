@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- CSP: 'unsafe-inline' in script-src is required because Google Analytics (gtag)
+       uses an inline <script> block that cannot be deferred or externalised. -->
   <meta http-equiv="Content-Security-Policy"
     content="default-src 'self'; script-src 'self' https://www.googletagmanager.com 'unsafe-inline'; style-src 'self' https://fonts.googleapis.com; img-src 'self' data: https://www.googletagmanager.com https://www.google-analytics.com https://region1.google-analytics.com; font-src 'self' https://fonts.gstatic.com; connect-src https://spark-api.wedd.au https://www.google-analytics.com https://analytics.google.com https://www.googletagmanager.com https://region1.google-analytics.com;">
   <!-- Google Analytics -->
@@ -14,6 +16,11 @@
     gtag('config', 'G-BJD5ZFHRLV');
   </script>
   <title>SPARK — a robot with an inner life</title>
+  <meta name="description" content="SPARK is a robot with an inner life — a three-layer cognitive architecture giving a PiCar-X robot thoughts, moods, and a voice. Built by Adrian and Obi.">
+  <meta property="og:title" content="SPARK — a robot with an inner life">
+  <meta property="og:description" content="A three-layer cognitive architecture giving a PiCar-X robot thoughts, moods, and a voice. Built by Adrian and Obi.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://spark.wedd.au/">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital@0;1&family=Courier+Prime:ital@0;1&display=swap" rel="stylesheet">
@@ -58,7 +65,7 @@
         <blockquote class="carousel-quote">Waiting for SPARK's thoughts…</blockquote>
       </div>
     </div>
-    <div id="carousel-dots" class="carousel-dots" role="tablist" aria-label="Thought slides"></div>
+    <div id="carousel-dots" class="carousel-dots" role="group" aria-label="Thought slides"></div>
 
   </div>
 </section>
@@ -301,7 +308,7 @@
     <h2>// how_it_works</h2>
 
     <p class="text-muted-dark mb-md">
-      Six systemd services share a single <code>session.json</code> whiteboard.
+      Seven systemd services share a single <code>session.json</code> whiteboard.
       Each has one job and doesn't need to know how the others work.
     </p>
 
@@ -386,7 +393,7 @@
   GET /api/v1/public/vitals     cpu, ram, disk, temp, battery, tokens
   GET /api/v1/public/sonar      latest sonar distance + age
   GET /api/v1/public/history    ring buffer — 60 samples × 30s ≈ 30 min
-  GET /api/v1/public/services   systemd unit status for all six services
+  GET /api/v1/public/services   systemd unit status for all seven services
   GET /api/v1/health            unauthenticated health check
     </pre>
   </div>
@@ -695,12 +702,12 @@ PX_LOOK_PAN=30 PX_LOOK_TILT=10 bin/tool-look
   </div>
 </section>
 
-<script src="js/highlight.min.js"></script>
-<script src="js/init.js"></script>
-<script src="js/charts.js"></script>
-<script src="js/dashboard.js"></script>
-<script src="js/live.js"></script>
-<script src="js/nav.js"></script>
+<script defer src="js/highlight.min.js"></script>
+<script defer src="js/init.js"></script>
+<script defer src="js/charts.js"></script>
+<script defer src="js/dashboard.js"></script>
+<script defer src="js/live.js"></script>
+<script defer src="js/nav.js"></script>
 
 <!-- ── Chat bubble ───────────────────────────────────────────── -->
 <button id="chat-bubble" class="chat-bubble"
@@ -737,7 +744,7 @@ PX_LOOK_PAN=30 PX_LOOK_TILT=10 bin/tool-look
   </div>
 </div>
 
-<script src="js/chat.js"></script>
+<script defer src="js/chat.js"></script>
 
 <footer class="site-footer" data-theme="dark">
   <nav class="site-footer-links" aria-label="Footer navigation">
