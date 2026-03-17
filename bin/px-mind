@@ -695,10 +695,37 @@ PERSONA_REFLECTION_SYSTEMS = {
 
 
 def atomic_write(path: Path, data: str) -> None:
-    """Write data to file atomically via temp + rename (prevents partial reads)."""
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    tmp.rename(path)
+    """Write data to file atomically via mkstemp + os.replace.
+
+    Uses secure temp file (no deterministic name), preserves ownership for
+    cross-user access (root px-alive / pi px-mind), sets 0o644, cleans up on error.
+    Includes fsync for SD card durability.
+    """
+    try:
+        st = path.stat()
+        orig_uid, orig_gid = st.st_uid, st.st_gid
+    except FileNotFoundError:
+        orig_uid, orig_gid = None, None
+
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        if orig_uid is not None:
+            try:
+                os.chown(tmp, orig_uid, orig_gid)
+            except OSError:
+                pass  # non-root can't chown — mode 0o644 is sufficient
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def log(msg: str) -> None:
