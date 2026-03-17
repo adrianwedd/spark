@@ -2032,9 +2032,7 @@ def append_thought(thought: dict, persona: str = "") -> None:
         try:
             lines = thoughts_file.read_text(encoding="utf-8").strip().splitlines()
             if len(lines) > THOUGHTS_LIMIT:
-                thoughts_file.write_text(
-                    "\n".join(lines[-THOUGHTS_LIMIT:]) + "\n", encoding="utf-8"
-                )
+                atomic_write(thoughts_file, "\n".join(lines[-THOUGHTS_LIMIT:]) + "\n")
         except Exception:
             log(f"thoughts trim failed for {thoughts_file}")
 
