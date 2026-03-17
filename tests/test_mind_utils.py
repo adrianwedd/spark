@@ -542,12 +542,25 @@ def test_ha_presence_auth_failure_raises():
 # ---------------------------------------------------------------------------
 
 import datetime as _dt_cal
+from zoneinfo import ZoneInfo
+
+_HOBART = ZoneInfo("Australia/Hobart")
+HOBART_TZ = _MIND["HOBART_TZ"]
+
+
+def test_hobart_tz_is_dst_aware():
+    """HOBART_TZ must be a DST-aware zone, not a fixed UTC offset."""
+    import datetime as dt
+    summer = dt.datetime(2026, 1, 15, 12, 0, tzinfo=HOBART_TZ)
+    winter = dt.datetime(2026, 7, 15, 12, 0, tzinfo=HOBART_TZ)
+    assert summer.utcoffset() != winter.utcoffset(), "Should have different offsets for summer/winter"
+    assert HOBART_TZ.key == "Australia/Hobart"
 
 
 def test_parse_ha_calendar_events():
     """Timed event 45 minutes in the future is parsed correctly."""
     now = _dt_cal.datetime(2026, 3, 15, 14, 15, 0,
-                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+                           tzinfo=_HOBART)
     raw = [{
         "summary": "Swimming",
         "start": {"dateTime": "2026-03-15T15:00:00+11:00"},
@@ -565,7 +578,7 @@ def test_parse_ha_calendar_events():
 def test_parse_ha_calendar_all_day_event():
     """All-day events use 'date' not 'dateTime' and are parsed correctly."""
     now = _dt_cal.datetime(2026, 3, 15, 10, 0, 0,
-                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+                           tzinfo=_HOBART)
     raw = [{
         "summary": "School",
         "start": {"date": "2026-03-15"},
@@ -582,7 +595,7 @@ def test_parse_ha_calendar_all_day_event():
 def test_parse_ha_calendar_past_event_filtered():
     """Events whose end time is before now are excluded."""
     now = _dt_cal.datetime(2026, 3, 15, 17, 0, 0,
-                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+                           tzinfo=_HOBART)
     raw = [{
         "summary": "Old Meeting",
         "start": {"dateTime": "2026-03-15T14:00:00+11:00"},
@@ -595,7 +608,7 @@ def test_parse_ha_calendar_past_event_filtered():
 def test_parse_ha_calendar_empty():
     """Empty list returns empty list."""
     now = _dt_cal.datetime(2026, 3, 15, 10, 0, 0,
-                           tzinfo=_dt_cal.timezone(_dt_cal.timedelta(hours=11)))
+                           tzinfo=_HOBART)
     events = _parse_calendar_events([], "calendar.test", now)
     assert events == []
 

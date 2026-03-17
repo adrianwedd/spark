@@ -149,14 +149,15 @@ HA_CONTEXT_ENTITIES = {
     "media_player": "media_player.shack_speakers",
 }
 HA_CONTEXT_INTERVAL_S  = 60   # refresh every 60 s (call detection needs to be snappy)
-AEDT = dt.timezone(dt.timedelta(hours=11))  # Hobart, Tasmania (UTC+11)
-OBI_DAY_START  = 7   # 7am AEDT — Obi's waking hours begin
-OBI_DAY_END    = 20  # 8pm AEDT — Obi's waking hours end
+from zoneinfo import ZoneInfo
+HOBART_TZ = ZoneInfo("Australia/Hobart")  # DST-aware: AEDT (UTC+11) / AEST (UTC+10)
+OBI_DAY_START  = 7   # 7am Hobart — Obi's waking hours begin
+OBI_DAY_END    = 20  # 8pm Hobart — Obi's waking hours end
 
 
 def _daytime_action_hint(hour_override: int | None = None) -> str:
     """Return an action-weighting hint for the SPARK reflection prompt based on Hobart time."""
-    hour = hour_override if hour_override is not None else dt.datetime.now(AEDT).hour
+    hour = hour_override if hour_override is not None else dt.datetime.now(HOBART_TZ).hour
     if 7 <= hour < 9:
         return (
             "\n\nIMPORTANT: It's morning in Hobart — Obi might be getting ready for school. "
@@ -181,7 +182,7 @@ def _daytime_action_hint(hour_override: int | None = None) -> str:
 
 def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
     """Infer Obi's state from calendar + HA presence + Frigate + ambient sound + sonar + time."""
-    hour = hour_override if hour_override is not None else dt.datetime.now(AEDT).hour
+    hour = hour_override if hour_override is not None else dt.datetime.now(HOBART_TZ).hour
     ambient_level = (awareness.get("ambient_sound") or {}).get("level", "unknown")
     sonar_cm = awareness.get("sonar_cm")
     frigate = awareness.get("frigate") or {}
@@ -1490,7 +1491,7 @@ def fetch_calendar_events() -> list[dict]:
     try:
         now = dt.datetime.now(dt.timezone.utc)
         # Fetch from now to end of day (AEDT)
-        local_now = now.astimezone(AEDT)
+        local_now = now.astimezone(HOBART_TZ)
         end_of_day = local_now.replace(hour=23, minute=59, second=59)
         params = {
             "calendarId": CALENDAR_ID,
@@ -2786,7 +2787,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
             _last_spoken_text = env["PX_TEXT"][:200]
 
         elif action == "morning_fact":
-            today = dt.datetime.now(AEDT).strftime("%Y-%m-%d")
+            today = dt.datetime.now(HOBART_TZ).strftime("%Y-%m-%d")
             if _last_morning_fact_date == today:
                 log("expression: morning_fact already told today — skipping")
             elif text:
@@ -3019,7 +3020,7 @@ def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
 
     # Day/night split: dict with "day"/"night" keys (used by spark someone_left)
     if isinstance(phrases, dict):
-        hour = dt.datetime.now(AEDT).hour
+        hour = dt.datetime.now(HOBART_TZ).hour
         slot = "night" if (hour >= 19 or hour < 7) else "day"
         phrases = phrases.get(slot, phrases.get("day", list(phrases.values())[0]))
 
