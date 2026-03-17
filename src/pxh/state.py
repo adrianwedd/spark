@@ -15,6 +15,7 @@ from .time import utc_timestamp
 _log = logging.getLogger("pxh.state")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+LOCK_TIMEOUT_S = 10  # seconds — fail fast rather than hang forever
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -92,7 +93,7 @@ def ensure_session() -> Path:
     path = session_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path):
+    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         if not path.exists():
             if TEMPLATE_PATH.exists():
                 _atomic_write(path, TEMPLATE_PATH.read_text(encoding="utf-8"))
@@ -104,7 +105,7 @@ def ensure_session() -> Path:
 def load_session() -> Dict[str, Any]:
     path = ensure_session()
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path):
+    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -117,7 +118,7 @@ def load_session() -> Dict[str, Any]:
 def save_session(data: Dict[str, Any]) -> None:
     path = ensure_session()
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path):
+    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         _atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
@@ -130,7 +131,7 @@ def update_session(
     # the same lock internally and FileLock is not reentrant.
     path = ensure_session()
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path):
+    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
