@@ -501,6 +501,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 0.75rem;
+  max-width: 480px;
 }
 
 @media (max-width: 480px) {
