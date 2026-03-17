@@ -3239,6 +3239,15 @@ def main(argv) -> int:
     args = parser.parse_args(argv)
 
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Guard: if another live px-mind already owns the PID file, exit cleanly
+    _existing_pid = None
+    try:
+        _existing_pid = int(PID_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    if _existing_pid and _existing_pid != os.getpid() and os.path.isdir(f"/proc/{_existing_pid}"):
+        log(f"another px-mind (pid={_existing_pid}) already running — exiting")
+        return 0
     PID_FILE.write_text(str(os.getpid()))
     log(f"starting pid={os.getpid()} dry={args.dry_run} model={MODEL}")
 
