@@ -19,7 +19,7 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (107 tests)
+python -m pytest                          # full suite (459 tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
 python -m pytest -m "not live"           # skip hardware tests (82 tests)
@@ -38,9 +38,9 @@ Test environment variables (set automatically via `conftest.py` `isolated_projec
 
 ### Python Library (`src/pxh/`)
 
-- **`state.py`** — Thread-safe session management via `FileLock`. Key functions: `load_session()`, `save_session()`, `update_session()`, `ensure_session()`. **Important**: `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant.
-- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. Watchdog thread (default 30 s) sends SIGTERM + 5 s grace period (instead of `os._exit(1)`) on stall; only active in voice input mode.
-- **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe. PIN rate limiting uses file-based lockout (`state/pin_lockout.json`) that persists across API restarts. PIN verify returns short-lived session tokens (4h TTL) instead of the raw Bearer token. Device reboot/shutdown requires two-step nonce confirmation.
+- **`state.py`** — Thread-safe session management via `FileLock` (10 s timeout — raises `filelock.Timeout` on deadlock). Key functions: `load_session()`, `save_session()`, `update_session()`, `ensure_session()`. **Important**: `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant. `_atomic_write()` uses `mkstemp` + `fsync` + `os.replace` for SD card durability.
+- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. `execute_tool()` accepts an optional `timeout` parameter — `subprocess.run` kills the child on `TimeoutExpired`. Watchdog thread (default 30 s) sends SIGTERM + 5 s grace period (instead of `os._exit(1)`) on stall; only active in voice input mode.
+- **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe. PIN rate limiting is per-IP (v2 schema in `state/pin_lockout.json`) with file-based persistence across API restarts, 1000-IP hard cap with two-phase eviction. `X-Forwarded-For` only trusted from localhost (Cloudflare tunnel). Rate limit store capped at 10k IPs with oldest-first eviction. PIN verify returns short-lived session tokens (4h TTL) instead of the raw Bearer token. Device reboot/shutdown requires two-step nonce confirmation.
 - **`logging.py`** — Structured JSON log emission to `logs/tool-<event>.log`.
 - **`time.py`** — UTC timestamp helper (`datetime.now(timezone.utc)`, not deprecated `utcnow`).
 - **`patch_login.py`** — Monkey-patches `os.getlogin()` to handle systemd environments (no /dev/tty). Also installed globally as `~/.local/lib/python3.11/site-packages/usercustomize.py`.
@@ -120,7 +120,7 @@ Keeps robot looking alive when idle. Holds a **persistent Picarx handle** to avo
 - **Proximity react**: sonar checked every 5 s; if `< 35 cm` for 3 s, faces forward; writes latest reading to `state/sonar_live.json` so px-mind can read sonar without restarting px-alive
 - **I2C resilience**: catches `OSError` and backs off 30 s instead of crashing
 
-**GPIO exclusivity**: Only one process can hold the Picarx handle. When other tools need servos, they call `yield_alive` (defined in `px-env`), which sends SIGUSR1 to px-alive. px-alive catches it and exits cleanly; systemd restarts it after 10 s (`Restart=always`, `RestartSec=10`).
+**GPIO exclusivity**: Only one process can hold the Picarx handle. When other tools need servos, they call `yield_alive` (defined in `px-env`), which sends SIGUSR1 to px-alive. px-alive catches it and exits cleanly; systemd restarts it after 10 s (`Restart=always`, `RestartSec=10`). Long-running tools (`tool-describe-scene`, `tool-wander`) set `state/exploring.json` to prevent px-alive from restarting mid-operation.
 
 The PCA9685 PWM chip holds servo position autonomously after process exit, so servos stay put between restarts.
 
@@ -141,6 +141,14 @@ The reflection prompt encourages proactive speech — the robot prefers commenti
 
 Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escalating warnings at ≤30/20/15% and triggers emergency shutdown at ≤10% (6 beeps → speech → `sudo shutdown -h now`). Battery glitch filter: requires time-gapped confirmations (90 s between first glitch and acceptance), charging guard, and voltage sanity check.
 
+**Timezone**: All time-of-day logic uses `ZoneInfo("Australia/Hobart")` (DST-aware: AEDT UTC+11 in summer, AEST UTC+10 in winter). Do not use hardcoded UTC offsets.
+
+**Atomic writes**: px-mind's `atomic_write()` uses `mkstemp` + `fsync` + `os.replace` + ownership preservation. JSONL trimming (thoughts and notes) also uses `atomic_write()` to prevent data loss on crash.
+
+**Single-instance guard**: PID file with `/proc/{pid}` liveness check prevents duplicate daemons on rapid systemd restarts.
+
+**Thought-images cleanup**: `state/thought-images/` is cleaned hourly — images older than 30 days are deleted.
+
 State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.json`, `state/mood.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
 
 ### Social Posting (px-post)
@@ -150,7 +158,7 @@ State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.j
 - Bluesky (AT Protocol) — live at [sparkrobot.bsky.social](https://bsky.app/profile/sparkrobot.bsky.social); credentials via `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD`
 - Mastodon (REST API) — credentials via `PX_MASTODON_INSTANCE` + `PX_MASTODON_TOKEN`
 
-Per-destination retry, flock single-instance guard, 5-minute flush cycle. Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
+Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one social post per cycle (rate-limited). Entries needing both platforms are prioritised over single-platform retries. PID-file single-instance guard. Branded 1080×1080 thought card images generated via Pillow (cached in `state/thought-images/`, cleaned up after 30 days). Bluesky re-auths on 400/401 (expired token). Mastodon posting currently disabled (account terminated). Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
 
 ### REST API
 
@@ -232,11 +240,11 @@ Seven services run at boot:
 ## Security
 
 - **PIN auth with session tokens**: `POST /api/v1/pin/verify` returns a short-lived session token (4h TTL) instead of the raw Bearer token. The Bearer token (`PX_API_TOKEN`) is never exposed to the browser.
-- **File-based PIN lockout** (`state/pin_lockout.json`): persists across API restarts. Escalating: 5 failures → 5 min lockout, 10 → 30 min.
+- **Per-IP PIN lockout** (`state/pin_lockout.json`, v2 schema): persists across API restarts. Escalating: 3 failures → 5 min lockout, 10 → 30 min. Per-IP tracking with 1000-IP hard cap (two-phase eviction: expired lockouts first, then lowest-count IPs). `X-Forwarded-For` only trusted from localhost (`_TRUSTED_PROXIES = {"127.0.0.1", "::1"}`).
 - **Two-step device confirmation**: `POST /device/{action}` (reboot/shutdown) returns a nonce; must confirm with `POST /device/confirm` within 60 s.
 - Confirmation gates on safety-critical session fields (`confirm_motion_allowed`, etc.) require `confirm: true`.
 - Security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
-- Rate limiting on public chat (10 msg/10min per IP)
+- Rate limiting on public chat (10 msg/10min per IP, 10k-IP store cap with oldest-first eviction)
 - API server port-free check via `ss` polling replaces previous sleep hack for reliable startup
 
 ## Adding a New Tool
@@ -291,6 +299,7 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_POST_DRY` | `1` = skip actual social media posts |
 | `PX_POST_QA` | `0` = skip Claude QA gate for testing |
 | `PX_POST_MIN_SALIENCE` | Minimum salience for social posting (default: `0.7`) |
+| `PX_HA_DEBUG` | `1` = verbose HA fetch logging (per-entity, calendar, routines); errors always logged |
 
 ## Multi-Model QA
 

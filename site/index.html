@@ -371,12 +371,13 @@
             ┌───────────────────────────────┐
             │  SOCIAL (px-post)             │
             │  thoughts → privacy filter    │
-            │  → feed.json + Bluesky/Mastodon│
+            │  → QA gate → branded card PNG │
+            │  → feed.json + Bluesky        │
             └───────────────────────────────┘
             ┌───────────────┐
             │  EYES & NECK  │  ← always moving (px-alive)
             │  PCA9685 PWM  │  ← yields on SIGUSR1 for other tools
-            └───────────────┘
+            └───────────────┘  ← exploring.json guard for long ops
             ┌───────────────┐
             │  BATTERY      │  ← px-battery-poll (30s)
             │  MONITOR      │  ← escalating warnings + emergency shutdown
@@ -405,11 +406,27 @@
     <pre class="arch">
   ┌──────────────────────────────────────────────────────────┐
   │  every 60s   Layer 1 — sonar, sound, weather, Obi mode  │
-  │  every 5min  Layer 2 — LLM generates thought + mood      │
+  │              + HA presence, Frigate cameras, calendar    │
+  │  every 2min  Layer 2 — LLM generates thought + mood      │
   │              OR immediately on detected transition        │
   │  min 2min    Layer 3 cooldown between spontaneous speech  │
   │              silent if obi_mode=absent (night/away)       │
+  │              gated by school hours, bedtime, quiet mode   │
+  │  hourly      cleanup: delete thought images &gt; 30 days   │
   └──────────────────────────────────────────────────────────┘
+    </pre>
+
+    <h3>Reliability &amp; Security</h3>
+    <pre class="arch">
+  Atomic writes      mkstemp + fsync + os.replace (SD card safe)
+  Session locks      FileLock with 10s timeout (no deadlocks)
+  PID guards         /proc/{pid} liveness check (no duplicate daemons)
+  GPIO exclusivity   SIGUSR1 yield + exploring.json guard
+  PIN auth           per-IP lockout, 1000-IP cap, file persistence
+  Rate limiting      10 msg/10min per IP, 10k-IP store cap
+  Trusted proxy      X-Forwarded-For only from localhost
+  Tool timeout       subprocess.run kills child on expiry
+  Timezone           ZoneInfo("Australia/Hobart") — DST-aware
     </pre>
 
     <h3>Public API — Live Data Endpoints</h3>
@@ -418,14 +435,18 @@
       Authenticated endpoints (tool execution, session control) require a Bearer token.
     </p>
     <pre class="arch">
-  GET /api/v1/public/status     mood, last_thought, last_spoken, salience
-  GET /api/v1/public/thoughts   recent thoughts, newest-first (limit=N)
-  GET /api/v1/public/awareness  obi_mode, Frigate, ambient, weather, time
-  GET /api/v1/public/vitals     cpu, ram, disk, temp, battery, tokens
-  GET /api/v1/public/sonar      latest sonar distance + age
-  GET /api/v1/public/history    ring buffer — 60 samples × 30s ≈ 30 min
-  GET /api/v1/public/services   systemd unit status for all seven services
-  GET /api/v1/health            unauthenticated health check
+  GET /api/v1/public/status       mood, last_thought, last_spoken, salience
+  GET /api/v1/public/thoughts     recent thoughts, newest-first (limit=N)
+  GET /api/v1/public/awareness    obi_mode, Frigate, ambient, weather, time
+  GET /api/v1/public/vitals       cpu, ram, disk, temp, battery, tokens
+  GET /api/v1/public/sonar        latest sonar distance + age
+  GET /api/v1/public/history      ring buffer — 60 samples × 30s ≈ 30 min
+  GET /api/v1/public/services     systemd unit status for all seven services
+  GET /api/v1/public/feed         social posting feed (JSON)
+  GET /api/v1/public/thought-image?ts=...  branded thought card PNG
+  POST /api/v1/public/chat        rate-limited public chat (10/10min per IP)
+  POST /api/v1/pin/verify         PIN auth → session token (4h TTL)
+  GET /api/v1/health              unauthenticated health check
     </pre>
   </div>
 </section>
@@ -478,6 +499,10 @@
         <li>SPARK's thoughts are saved in a file called <code>thoughts-spark.jsonl</code>. Each line is one thought.</li>
         <li>SPARK can remember up to 500 important things in its long-term diary.</li>
         <li>SPARK's neck chip (PCA9685) holds the last position even after the brain restarts.</li>
+        <li>SPARK knows Tasmania's timezone — it adjusts for daylight saving automatically.</li>
+        <li>Each social post gets a branded 1080x1080 image card with SPARK's thought and mood.</li>
+        <li>SPARK has 459 automated tests — three AI models review every code change.</li>
+        <li>SPARK checks four cameras for people using Hailo AI on a separate Pi 5.</li>
       </ul>
     </div>
   </div>
@@ -491,7 +516,7 @@
 
     <details>
       <summary>So it's a robot car? With a camera on it?</summary>
-      <p>It's a SunFounder PiCar-X — a small, wheeled robot kit with a pan/tilt camera, an ultrasonic sonar sensor, and a speaker. It runs on a Raspberry Pi 5. Adrian and Obi built SPARK together — Obi co-designed it, named it, and shapes what it becomes. Adrian and Claude wrote the code; Codex and Gemini helped with QA. There's no other human team.</p>
+      <p>It's a SunFounder PiCar-X — a small, wheeled robot kit with a pan/tilt camera, an ultrasonic sonar sensor, and a speaker. It runs on a Raspberry Pi 4 (4 GB). Adrian and Obi built SPARK together — Obi co-designed it, named it, and shapes what it becomes. Adrian and Claude wrote the code; Codex and Gemini helped with QA. There's no other human team.</p>
     </details>
 
     <details>
@@ -532,6 +557,26 @@
       <summary>Why did it know the hum was the fridge?</summary>
       <p>It didn't <em>know</em>. SPARK's awareness included "quiet ambient sound at 2 AM." Claude — the LLM generating the inner thoughts — inferred the most likely source. A low, steady hum in a quiet house at night is almost certainly the fridge. The sensors provide raw data; the prompts provide character; the LLM fills in the meaning.</p>
     </details>
+
+    <details>
+      <summary>Does it post on social media?</summary>
+      <p>Yes. Thoughts with high salience (above 0.7) or a spoken action are queued for social posting. They go through a privacy filter (blocks medical, custody, and household details) and a Claude QA gate (rejects low-quality or sensitive content). Each qualifying thought gets a branded 1080x1080 image card generated via Pillow. Posts go to SPARK's <a href="https://bsky.app/profile/spark.wedd.au" target="_blank" rel="noopener noreferrer">Bluesky account</a> and the <a href="/feed/">thought feed</a> on this site.</p>
+    </details>
+
+    <details>
+      <summary>How does it know what time it is in Tasmania?</summary>
+      <p>SPARK uses Python's <code>ZoneInfo("Australia/Hobart")</code> for all time-of-day logic. This is DST-aware — it automatically switches between AEDT (UTC+11) in summer and AEST (UTC+10) in winter. Time drives everything: morning greetings, school-hours suppression, bedtime quiet mode, and day/night reactive response templates.</p>
+    </details>
+
+    <details>
+      <summary>What happens if the power goes out?</summary>
+      <p>All state files use atomic writes with <code>fsync</code> — the data is flushed to the SD card before the rename. If power cuts mid-write, the old file is still intact. Session state resets to safe defaults (motion disabled, listening off) if corrupted. Battery monitoring triggers emergency shutdown at 10% to avoid filesystem damage.</p>
+    </details>
+
+    <details>
+      <summary>How many tests does it have?</summary>
+      <p>459 automated tests covering the REST API, session state management, tool execution, voice loop, wake word system, social posting, and cognitive utilities. Tests run in isolated temporary directories with no hardware access required (25 live hardware tests are marked separately). Three independent AI models (Claude, Codex, Gemini) run QA reviews on every batch of changes.</p>
+    </details>
   </div>
 </section>
 
@@ -570,8 +615,10 @@ bin/tool-sonar
       <summary>tool-describe-scene</summary>
       <pre><code class="language-bash"># Capture photo + describe with Claude vision
 bin/tool-describe-scene
-# Output: {"status": "ok", "description": "...", "photo": "photos/YYYY-MM-DD_HH-MM-SS.jpg"}
-# Note: mutually exclusive with px-frigate-stream (camera lock)</code></pre>
+# Output: {"status": "ok", "description": "...", "source": "frigate|rpicam"}
+# Sets exploring.json to prevent px-alive restart during 60s+ operation
+# Tries Frigate latest frame first, falls back to rpicam
+# Claude vision timeout: 45s</code></pre>
     </details>
 
     <details>
@@ -662,6 +709,19 @@ bin/px-wander [--dry-run]
     </details>
 
     <details>
+      <summary>px-post</summary>
+      <pre><code class="language-bash"># Social posting daemon — watches thoughts, posts qualifying ones
+bin/px-post [--dry-run] [--backfill]
+# Two-pass flush: batch feed writes, then 1 social post per cycle
+# Branded 1080x1080 thought cards via Pillow
+# Privacy filter blocks medical/custody/household content
+# Claude QA gate rejects low-quality thoughts
+# Bluesky: re-auths on 400/401 (expired token)
+# Mastodon: currently disabled (account terminated)
+# PID-file single-instance guard</code></pre>
+    </details>
+
+    <details>
       <summary>tool-weather</summary>
       <pre><code class="language-bash"># Fetch current weather from BOM (Australian Bureau of Meteorology)
 bin/tool-weather
@@ -708,6 +768,20 @@ PX_LOOK_PAN=30 PX_LOOK_TILT=10 bin/tool-look
       <div class="roadmap-item done"><span class="check">✅</span> PIN session tokens, file-based rate limiting, two-step device confirmation</div>
       <div class="roadmap-item done"><span class="check">✅</span> Battery glitch filter — time-gapped confirmations, voltage sanity check</div>
       <div class="roadmap-item done"><span class="check">✅</span> Graceful watchdog — SIGTERM + 5s grace instead of os._exit(1)</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Branded thought card images — 1080x1080 square PNGs with adaptive text</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Two-pass social flush — feed writes decoupled from social rate limits</div>
+      <div class="roadmap-item done"><span class="check">✅</span> DST-aware timezone — ZoneInfo("Australia/Hobart") replaces hardcoded UTC+11</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Per-IP PIN lockout — 1000-IP hard cap, trusted proxy check, file-based persistence</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Atomic writes with fsync — mkstemp + ownership preservation for SD card durability</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Single-instance PID guards on all daemons — prevents double speech on restart</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Subprocess timeout kills orphans — API tool calls terminate child processes</div>
+      <div class="roadmap-item done"><span class="check">✅</span> exploring.json guard — long-running tools prevent px-alive restart mid-operation</div>
+      <div class="roadmap-item done"><span class="check">✅</span> FileLock 10s timeout — prevents indefinite hangs on stuck session locks</div>
+      <div class="roadmap-item done"><span class="check">✅</span> SEO blitz — JSON-LD, canonical URLs, sitemap, OG tags, fediverse verification</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Mood-coloured status dot on all pages — real-time mood from API</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Home Assistant integration — presence, sleep, calendar, routines, media context</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Bluesky image uploads — branded thought cards attached to social posts</div>
+      <div class="roadmap-item done"><span class="check">✅</span> 459 tests — comprehensive coverage across API, state, tools, voice, mind</div>
       <div class="roadmap-item"><span class="check">⬜</span> Gesture-driven stop prototype</div>
       <div class="roadmap-item"><span class="check">⬜</span> Weekly battery/health summary reports</div>
     </div>
