@@ -9,11 +9,13 @@ python - "$@" <<'PY'
 """Tool wrapper: photograph the scene then describe it using Claude vision."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 import urllib.request
 import urllib.error
@@ -23,6 +25,7 @@ from pxh.logging import log_event
 from pxh.state import update_session
 
 PROJECT_ROOT      = Path(os.environ["PROJECT_ROOT"])
+STATE_DIR         = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
 TOOL_PHOTOGRAPH   = PROJECT_ROOT / "bin" / "tool-photograph"
 TOOL_VOICE        = PROJECT_ROOT / "bin" / "tool-voice"
 LOG_DIR           = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
@@ -156,6 +159,26 @@ def call_claude_vision(image_path: Path) -> str:
     return result.stdout.strip()[:300]
 
 
+def _set_exploring(active: bool) -> None:
+    """Write exploring.json so px-alive yields GPIO."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "exploring.json"
+    data = {"active": active}
+    if active:
+        data["pid"] = os.getpid()
+        data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
 
@@ -175,76 +198,79 @@ def main() -> int:
         print(json.dumps(payload))
         return 0
 
-    import datetime as dt
-    timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-    photo_path = PROJECT_ROOT / "photos" / f"{timestamp}.jpg"
-    stream_was_running = _stream_pid() is not None
-    stream_paused = False
+    _set_exploring(True)
+    try:
+        timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        photo_path = PROJECT_ROOT / "photos" / f"{timestamp}.jpg"
+        stream_was_running = _stream_pid() is not None
+        stream_paused = False
 
-    # Step 1: try Frigate latest frame first (no camera interruption)
-    got_photo = _frigate_latest_jpg(photo_path)
-    source = "frigate"
+        # Step 1: try Frigate latest frame first (no camera interruption)
+        got_photo = _frigate_latest_jpg(photo_path)
+        source = "frigate"
 
-    if not got_photo:
-        # Step 1b: pause stream and capture directly with rpicam
-        if stream_was_running:
-            log_event("describe_scene", {"status": "pausing_stream"})
-            if not _pause_stream():
-                payload = {"status": "error", "error": "stream did not stop in time"}
+        if not got_photo:
+            # Step 1b: pause stream and capture directly with rpicam
+            if stream_was_running:
+                log_event("describe_scene", {"status": "pausing_stream"})
+                if not _pause_stream():
+                    payload = {"status": "error", "error": "stream did not stop in time"}
+                    log_event("describe_scene", payload)
+                    print(json.dumps(payload))
+                    return 1
+                stream_paused = True
+
+            rc_photo, photo_result = run_tool(TOOL_PHOTOGRAPH, {"PX_PHOTO_PATH": str(photo_path)})
+            if photo_result.get("status") != "ok":
+                if stream_paused:
+                    _resume_stream()
+                payload = {
+                    "status": "error",
+                    "error": "photo capture failed",
+                    "photo": photo_result,
+                }
                 log_event("describe_scene", payload)
                 print(json.dumps(payload))
                 return 1
-            stream_paused = True
+            source = "rpicam"
 
-        rc_photo, photo_result = run_tool(TOOL_PHOTOGRAPH, {"PX_PHOTO_PATH": str(photo_path)})
-        if photo_result.get("status") != "ok":
+        if not photo_path.exists():
             if stream_paused:
                 _resume_stream()
-            payload = {
-                "status": "error",
-                "error": "photo capture failed",
-                "photo": photo_result,
-            }
+            payload = {"status": "error", "error": f"photo file missing: {photo_path}"}
             log_event("describe_scene", payload)
             print(json.dumps(payload))
             return 1
-        source = "rpicam"
 
-    if not photo_path.exists():
+        # Resume stream before the slow Claude vision call
         if stream_paused:
             _resume_stream()
-        payload = {"status": "error", "error": f"photo file missing: {photo_path}"}
+            stream_paused = False
+
+        # Step 2: describe with Claude vision
+        description = call_claude_vision(photo_path)
+
+        # Step 3: speak the description
+        env = os.environ.copy()
+        env["PX_TEXT"] = description[:2000]
+        subprocess.run([str(TOOL_VOICE)], capture_output=True, text=True, check=False, env=env)
+
+        payload = {
+            "status": "ok",
+            "path": str(photo_path),
+            "description": description,
+            "source": source,
+            "dry": False,
+        }
         log_event("describe_scene", payload)
+        update_session(
+            fields={"last_action": "tool_describe_scene"},
+            history_entry={"event": "describe_scene", "dry": False, "description": description[:80]},
+        )
         print(json.dumps(payload))
-        return 1
-
-    # Resume stream before the slow Claude vision call
-    if stream_paused:
-        _resume_stream()
-        stream_paused = False
-
-    # Step 2: describe with Claude vision
-    description = call_claude_vision(photo_path)
-
-    # Step 3: speak the description
-    env = os.environ.copy()
-    env["PX_TEXT"] = description[:2000]
-    subprocess.run([str(TOOL_VOICE)], capture_output=True, text=True, check=False, env=env)
-
-    payload = {
-        "status": "ok",
-        "path": str(photo_path),
-        "description": description,
-        "source": source,
-        "dry": False,
-    }
-    log_event("describe_scene", payload)
-    update_session(
-        fields={"last_action": "tool_describe_scene"},
-        history_entry={"event": "describe_scene", "dry": False, "description": description[:80]},
-    )
-    print(json.dumps(payload))
-    return 0
+        return 0
+    finally:
+        _set_exploring(False)
 
 
 if __name__ == "__main__":
