@@ -111,6 +111,7 @@ WEATHER_INTERVAL_S     = 900   # refresh weather every 15 min (was 10)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
 REACTIVE_COOLDOWN_S    = 30    # min seconds between reactive responses (was 15)
 AMBIENT_STALE_S        = 60    # ignore ambient_sound.json older than this
+THOUGHT_IMAGE_MAX_AGE_S = 30 * 86400  # 30 days in seconds
 FRIGATE_HOST           = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo.local:5000")
 FRIGATE_CAMERA         = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
 # All cameras to query for multi-room presence awareness
@@ -1680,6 +1681,24 @@ _reflection_offline_spoken: bool = False
 _mood_v: float = 0.4   # start at "content"
 _mood_a: float = 0.0
 _time_period_start_mono: float = 0.0  # when current time period began
+_last_image_cleanup: float = 0.0
+
+
+def _cleanup_thought_images() -> int:
+    """Delete thought images older than THOUGHT_IMAGE_MAX_AGE_S. Returns count deleted."""
+    img_dir = STATE_DIR / "thought-images"
+    if not img_dir.is_dir():
+        return 0
+    cutoff = time.time() - THOUGHT_IMAGE_MAX_AGE_S
+    deleted = 0
+    for f in img_dir.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                deleted += 1
+        except OSError:
+            pass
+    return deleted
 
 
 def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
@@ -1691,6 +1710,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     global _cached_ha_routines, _last_ha_routines_fetch
     global _cached_ha_context, _last_ha_context_fetch
     global _cached_calendar, _last_calendar_fetch
+    global _last_image_cleanup
 
     sonar_cm = read_sonar(dry)
     frigate = _fetch_frigate_presence(dry)
@@ -1972,6 +1992,12 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     sonar_str = f"{sonar_cm:.0f}" if sonar_cm is not None else "??"
     if transitions:
         log(f"awareness: transitions={transitions} sonar={sonar_str}cm frigate={frigate_str} period={time_period}")
+
+    if time.monotonic() - _last_image_cleanup > 3600:
+        n = _cleanup_thought_images()
+        if n:
+            log(f"cleaned up {n} old thought images")
+        _last_image_cleanup = time.monotonic()
 
     return awareness, transitions
 
