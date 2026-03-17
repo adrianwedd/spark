@@ -1477,10 +1477,10 @@ def _save_pin_state() -> None:
                 "attempts": attempts,
                 "lockout_until": lockout_iso,
             }
-    # Cap at 1000 IPs to prevent unbounded growth
-    if len(ips_data) > 1000:
+    # Cap at _PIN_MAX_IPS to prevent unbounded growth
+    if len(ips_data) > _PIN_MAX_IPS:
         expired = [ip for ip, v in ips_data.items() if not v.get("lockout_until")]
-        for ip in expired[:len(ips_data) - 1000]:
+        for ip in expired[:len(ips_data) - _PIN_MAX_IPS]:
             del ips_data[ip]
     data = {
         "version": 2,

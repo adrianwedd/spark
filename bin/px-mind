@@ -994,7 +994,8 @@ def _fetch_ha_presence(dry: bool = False) -> dict | None:
             summary = ", ".join(f"{p['name']}={p['state']}" for p in result["people"])
             log(f"ha_presence: result: {summary}")
         return result
-    log("ha_presence: no people found")
+    if HA_DEBUG:
+        log("ha_presence: no people found")
     return None
 
 
@@ -1135,7 +1136,8 @@ def _fetch_ha_routines(dry: bool = False) -> dict | None:
         if not HA_TOKEN:
             log("ha_routines: skipped — no PX_HA_TOKEN")
         return None
-    log("ha_routines: fetching meds + water...")
+    if HA_DEBUG:
+        log("ha_routines: fetching meds + water...")
     headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
     result: dict = {}
     # Meds toggle
