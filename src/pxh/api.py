@@ -82,6 +82,14 @@ def _check_rate_limit(ip: str) -> bool:
                      if not v or now - v[-1] > _RATE_WINDOW_S]
             for k in stale:
                 del _rate_limit_store[k]
+        # Hard cap to prevent memory exhaustion from IP scan bursts
+        if len(_rate_limit_store) > 10000:
+            sorted_ips = sorted(
+                _rate_limit_store,
+                key=lambda k: _rate_limit_store[k][-1] if _rate_limit_store[k] else 0,
+            )
+            for k in sorted_ips[:len(_rate_limit_store) - 10000]:
+                del _rate_limit_store[k]
         return True
 
 
