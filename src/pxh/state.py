@@ -50,6 +50,24 @@ def atomic_write(path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+
+
+def rotate_log(path: Path, max_bytes: int = 5_000_000) -> None:
+    """Rotate log file by keeping the last half of lines when it exceeds max_bytes.
+
+    Uses atomic_write for SD card durability. Silently handles missing files
+    and write errors.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return
+        lines = path.read_text(encoding="utf-8").splitlines()
+        half = len(lines) // 2
+        atomic_write(path, "\n".join(lines[half:]) + "\n")
+    except Exception:
+        pass  # log rotation failure is not fatal
+
+
 STATE_DIR = PROJECT_ROOT / "state"
 DEFAULT_SESSION_PATH = STATE_DIR / "session.json"
 TEMPLATE_PATH = STATE_DIR / "session.template.json"

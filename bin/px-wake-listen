@@ -130,9 +130,11 @@ def log(msg: str) -> None:
             fd, tmp = _tmpmod.mkstemp(dir=str(LOG_FILE.parent), suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(half_content)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, str(LOG_FILE))
-    except Exception as exc:
-        print(f"log rotation failed: {exc}", flush=True)
+    except Exception:
+        pass
 
 
 def rms(data: bytes) -> float:

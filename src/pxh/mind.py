@@ -33,7 +33,7 @@ from pathlib import Path
 
 from filelock import FileLock
 from pxh.logging import log_event
-from pxh.state import atomic_write, load_session, update_session
+from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
 from pxh.voice_loop import PERSONA_VOICE_ENV
@@ -711,19 +711,7 @@ def log(msg: str) -> None:
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     print(line, flush=True)
-    # Simple rotation: keep last half when file exceeds 5MB
-    try:
-        if LOG_FILE.stat().st_size > 5_000_000:
-            lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
-            half = len(lines) // 2
-            half_content = "\n".join(lines[half:]) + "\n"
-            import tempfile as _tmpmod
-            fd, tmp = _tmpmod.mkstemp(dir=str(LOG_FILE.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(half_content)
-            os.replace(tmp, str(LOG_FILE))
-    except Exception as exc:
-        print(f"log rotation failed: {exc}", flush=True)
+    rotate_log(LOG_FILE)
 
 
 def classify_time_period(hour: int) -> str:

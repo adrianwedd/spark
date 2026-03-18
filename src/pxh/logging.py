@@ -44,11 +44,5 @@ def log_event(name: str, payload: Mapping[str, Any]) -> None:
         with log_path.open("a", encoding="utf-8") as handle:
             json.dump(record, handle)
             handle.write("\n")
-        # Simple rotation: if file exceeds max, keep the last half
-        try:
-            if log_path.stat().st_size > _LOG_MAX_BYTES:
-                lines = log_path.read_text(encoding="utf-8").splitlines()
-                half = len(lines) // 2
-                log_path.write_text("\n".join(lines[half:]) + "\n", encoding="utf-8")
-        except Exception:
-            _log.warning("log rotation failed for %s", log_path, exc_info=True)
+        from .state import rotate_log  # late import to avoid circular dependency
+        rotate_log(log_path, max_bytes=_LOG_MAX_BYTES)

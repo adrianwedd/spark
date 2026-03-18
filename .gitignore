@@ -48,3 +48,5 @@ diag_summary.json
 .claude/
 .npm/
 .worktrees/
+.venv
+state/state

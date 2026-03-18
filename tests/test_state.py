@@ -21,6 +21,36 @@ def test_update_session_appends_history(tmp_path, monkeypatch):
     assert data["history"][0]["event"].startswith("e")
 
 
+def test_rotate_log_under_threshold(tmp_path):
+    """File under 5MB is not rotated."""
+    log = tmp_path / "test.log"
+    log.write_text("line1\nline2\n")
+    from pxh.state import rotate_log
+    rotate_log(log)
+    assert log.read_text() == "line1\nline2\n"
+
+
+def test_rotate_log_over_threshold(tmp_path):
+    """File over threshold keeps last half of lines."""
+    log = tmp_path / "test.log"
+    lines = [f"line{i}" for i in range(100)]
+    log.write_text("\n".join(lines) + "\n")
+    from pxh.state import rotate_log
+    rotate_log(log, max_bytes=50)  # force rotation with low threshold
+    content = log.read_text()
+    result_lines = content.strip().split("\n")
+    assert len(result_lines) == 50  # kept last half
+    assert result_lines[0] == "line50"
+    assert result_lines[-1] == "line99"
+
+
+def test_rotate_log_missing_file(tmp_path):
+    """Missing file does not raise."""
+    log = tmp_path / "nonexistent.log"
+    from pxh.state import rotate_log
+    rotate_log(log)  # should not raise
+
+
 def test_default_state_contains_tracking_fields(tmp_path, monkeypatch):
     session_file = tmp_path / "session.json"
     monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
