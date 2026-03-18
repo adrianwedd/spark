@@ -2216,7 +2216,11 @@ def _tmux_ensure_session() -> bool:
     _tmux_run(["tmux", "kill-session", "-t", TMUX_SESSION])
 
     env_str = " ".join(f"unset {k};" for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"))
-    cmd = f"{env_str} {claude_bin} --model {CLAUDE_MODEL}"
+    # cd to spark-reflect dir so Claude CLI reads the minimal reflection CLAUDE.md
+    # instead of the full project CLAUDE.md (which causes refusal drift)
+    reflect_dir = STATE_DIR / "spark-reflect"
+    reflect_dir.mkdir(parents=True, exist_ok=True)
+    cmd = f"cd {reflect_dir} && {env_str} {claude_bin} --model {CLAUDE_MODEL} --allowedTools 'Read'"
 
     r = _tmux_run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50"])
     if r.returncode != 0:
