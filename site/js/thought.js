@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  var API = 'https://spark-api.wedd.au/api/v1/public';
+  var API = window.SPARK_CONFIG.API_BASE;
   var TIMEOUT_MS = 8000;
 
   var MOOD_CLASSES = {
@@ -79,7 +79,7 @@
     var ogDesc = document.querySelector('meta[property="og:description"]');
     if (ogDesc) ogDesc.content = post.thought.substring(0, 160);
     var ogImg = document.querySelector('meta[property="og:image"]');
-    if (ogImg) ogImg.content = 'https://spark-api.wedd.au/api/v1/public/thought-image?ts=' + encodeURIComponent(post.ts);
+    if (ogImg) ogImg.content = API + '/thought-image?ts=' + encodeURIComponent(post.ts);
     var metaDesc = document.querySelector('meta[name="description"]');
     if (metaDesc) metaDesc.content = post.thought.substring(0, 160);
   }

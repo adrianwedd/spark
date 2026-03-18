@@ -71,15 +71,13 @@ window.SparkCharts = (function () {
     ctx.fillText(maxV.toFixed(0), 2, 9);
   }
 
+  // ── Mood colour helper (reads from CSS custom properties in colors.css) ──
+  function _moodColor(mood) {
+    return getComputedStyle(document.documentElement)
+      .getPropertyValue('--mood-' + mood).trim() || '';
+  }
+
   // ── Mood colour strip ─────────────────────────────────────────────────────
-  const _MOOD_COLOR = {
-    peaceful:      '#6aab6b',
-    content:       '#6aab6b',
-    contemplative: '#7c6fcf',
-    curious:       '#e6a817',
-    active:        '#2ea8e0',
-    excited:       '#e05c3a',
-  };
 
   function drawMoodStrip(canvas, points) {
     if (!canvas || !points || points.length < 1) return;
@@ -94,7 +92,7 @@ window.SparkCharts = (function () {
     // Forward-fill: carry the last known colour through null/unknown segments
     let lastColor = null;
     points.forEach((p, i) => {
-      const color = _MOOD_COLOR[(p.mood || '').toLowerCase()];
+      const color = _moodColor((p.mood || '').toLowerCase());
       if (color) lastColor = color;
       if (!lastColor) return;  // no colour seen yet — leave blank
       ctx.fillStyle = lastColor;

@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  const API              = 'https://spark-api.wedd.au/api/v1/public';
+  const API              = window.SPARK_CONFIG.API_BASE;
   const CACHE_KEY        = 'spark_last_known';
   const HISTORY_KEY      = 'spark_history';
   const HISTORY_MAX      = 720;   // 720 × 30s = 6 h local buffer
@@ -154,12 +154,14 @@
     SparkDashboard.renderSparklines(loadHistory());
   }
 
-  // ── Status dot ───────────────────────────────────────────────────────────
+  // ── Mood colour helper (reads from CSS custom properties in colors.css) ──
 
-  var MOOD_DOT_COLORS = {
-    peaceful: '#4a9d8f', content: '#6b8e5e', contemplative: '#7b6fa0',
-    curious: '#c48a3f', active: '#d46b4a', excited: '#d44a6b',
-  };
+  function _moodColor(mood) {
+    return getComputedStyle(document.documentElement)
+      .getPropertyValue('--mood-' + mood).trim() || '#888';
+  }
+
+  // ── Status dot ───────────────────────────────────────────────────────────
 
   function _updateDot() {
     const dot = document.getElementById('status-dot');
@@ -169,7 +171,7 @@
     if (age > 300_000) { dot.style.background = '#ef4444'; dot.title = 'SPARK is offline'; return; }
     // Use mood colour from latest status
     var mood = (window._sparkMood || '').toLowerCase();
-    dot.style.background = MOOD_DOT_COLORS[mood] || '#4ade80';
+    dot.style.background = (mood ? _moodColor(mood) : null) || '#4ade80';
     dot.title = mood ? ('SPARK is feeling ' + mood) : 'SPARK is online';
   }
 
@@ -219,8 +221,6 @@
     if (!container) return;
     // API returns newest-first — keep that order
     while (container.firstChild) container.removeChild(container.firstChild);
-
-    const MOOD_COLOR = SparkDashboard.MOOD_FAVICON_COLOR || {};
 
     thoughts.forEach((t, i) => {
       const slide = document.createElement('div');

@@ -751,11 +751,11 @@ details > *:not(summary) { margin-top: 0.75rem; }
   background: var(--warm-accent);  /* fallback */
 }
 .carousel-mood-badge[data-mood="peaceful"],
-.carousel-mood-badge[data-mood="content"]      { background: #6aab6b; }
-.carousel-mood-badge[data-mood="contemplative"] { background: #7c6fcf; }
-.carousel-mood-badge[data-mood="curious"]       { background: #e6a817; }
-.carousel-mood-badge[data-mood="active"]        { background: #2ea8e0; }
-.carousel-mood-badge[data-mood="excited"]       { background: #e05c3a; }
+.carousel-mood-badge[data-mood="content"]      { background: var(--mood-content); }
+.carousel-mood-badge[data-mood="contemplative"] { background: var(--mood-contemplative); }
+.carousel-mood-badge[data-mood="curious"]       { background: var(--mood-curious); }
+.carousel-mood-badge[data-mood="active"]        { background: var(--mood-active); }
+.carousel-mood-badge[data-mood="excited"]       { background: var(--mood-excited); }
 
 .carousel-quote {
   font-family: 'Courier Prime', 'Courier New', monospace;

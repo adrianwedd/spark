@@ -23,7 +23,7 @@ window.SparkDashboard = (function () {
 
   function renderPresence(state) {
     const mood = (state.mood || '').toLowerCase();
-    const moodColor = MOOD_FAVICON_COLOR[mood] || '#e8875a';
+    const moodColor = _moodColor(mood) || '#e8875a';
     const pulse = $('mood-pulse');
     if (pulse) {
       pulse.classList.remove('pulse-slow', 'pulse-mid', 'pulse-fast', 'pulse-offline');
@@ -349,16 +349,14 @@ window.SparkDashboard = (function () {
     }
   }
 
-  // ── Dynamic favicon ──────────────────────────────────────────────────────
+  // ── Mood colour helper (reads from CSS custom properties in colors.css) ──
 
-  const MOOD_FAVICON_COLOR = {
-    peaceful:      '#6aab6b',   // sage green — restful, low-energy positive
-    content:       '#6aab6b',   // same as peaceful
-    contemplative: '#7c6fcf',   // soft indigo — introspective, inner-focused
-    curious:       '#e6a817',   // warm gold — searching, exploratory
-    active:        '#2ea8e0',   // sky blue — busy, dynamic
-    excited:       '#e05c3a',   // coral — bright high-energy
-  };
+  function _moodColor(mood) {
+    return getComputedStyle(document.documentElement)
+      .getPropertyValue('--mood-' + mood).trim() || '#888';
+  }
+
+  // ── Dynamic favicon ──────────────────────────────────────────────────────
 
   function _drawFavicon(color) {
     const c = document.createElement('canvas');
@@ -409,5 +407,5 @@ window.SparkDashboard = (function () {
   // Draw initial connecting state
   _drawFavicon('#d1c4b8');
 
-  return { renderPresence, renderWorld, renderMachine, renderSparklines, setOnline, setLastUpdated, MOOD_FAVICON_COLOR };
+  return { renderPresence, renderWorld, renderMachine, renderSparklines, setOnline, setLastUpdated, moodColor: _moodColor };
 })();

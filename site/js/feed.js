@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  var API = 'https://spark-api.wedd.au/api/v1/public';
+  var API = window.SPARK_CONFIG.API_BASE;
   var TIMEOUT_MS = 8000;
 
   var MOOD_CLASSES = {

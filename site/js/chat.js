@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  const API_URL = 'https://spark-api.wedd.au/api/v1/public/chat';
+  const API_URL = window.SPARK_CONFIG.API_BASE + '/chat';
   const MAX_HISTORY = 20;
 
   var _history  = [];
@@ -22,10 +22,9 @@
 
   // ── Mood colour ──────────────────────────────────────────────
   function updateBubbleColor() {
-    // MOOD_FAVICON_COLOR is a {mood: color} map — look up by currentMoodWord
-    var colorMap = (window.SparkDashboard && window.SparkDashboard.MOOD_FAVICON_COLOR) || {};
     var word = (window.SparkDashboard && window.SparkDashboard.currentMoodWord) || '';
-    var color = colorMap[word] || null;
+    var color = (word && window.SparkDashboard && window.SparkDashboard.moodColor)
+      ? window.SparkDashboard.moodColor(word) : null;
     if (color) {
       bubble.style.setProperty('--chat-bubble-color', color);
       panel.style.setProperty('--chat-bubble-color', color);

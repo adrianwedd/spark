@@ -1,0 +1,19 @@
+/* colors.css — canonical mood colour palette (Scheme B: warmer, earthier tones).
+   All mood colours are defined here as CSS custom properties and referenced
+   everywhere via var(--mood-*). Do not hardcode mood colours in other files. */
+
+:root {
+  --mood-peaceful: #4a9d8f;
+  --mood-content: #6b8e5e;
+  --mood-contemplative: #7b6fa0;
+  --mood-curious: #c48a3f;
+  --mood-active: #d46b4a;
+  --mood-excited: #d44a6b;
+
+  --mood-peaceful-bg: #e8f5f0;
+  --mood-content-bg: #eef5e8;
+  --mood-contemplative-bg: #f0ecf5;
+  --mood-curious-bg: #faf0e0;
+  --mood-active-bg: #fae8e0;
+  --mood-excited-bg: #fae0ea;
+}

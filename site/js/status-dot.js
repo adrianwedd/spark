@@ -1,18 +1,14 @@
 /* status-dot.js — mood-coloured status dot for all pages */
 (function () {
   'use strict';
-  var API = 'https://spark-api.wedd.au/api/v1/public/status';
+  var API = window.SPARK_CONFIG.API_BASE + '/status';
   var dot = document.getElementById('status-dot');
   if (!dot) return;
 
-  var MOOD_COLORS = {
-    peaceful: '#4a9d8f',
-    content: '#6b8e5e',
-    contemplative: '#7b6fa0',
-    curious: '#c48a3f',
-    active: '#d46b4a',
-    excited: '#d44a6b'
-  };
+  function _moodColor(mood) {
+    return getComputedStyle(document.documentElement)
+      .getPropertyValue('--mood-' + mood).trim() || '#888';
+  }
 
   function check() {
     var ctrl = new AbortController();
@@ -21,7 +17,7 @@
       .then(function (r) { clearTimeout(timer); return r.json(); })
       .then(function (data) {
         var mood = (data.mood || '').toLowerCase();
-        var color = MOOD_COLORS[mood] || '#4ade80';
+        var color = (mood ? _moodColor(mood) : null) || '#4ade80';
         dot.style.background = color;
         dot.title = mood ? ('SPARK is feeling ' + mood) : 'SPARK is online';
       })

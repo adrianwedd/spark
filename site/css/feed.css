@@ -142,12 +142,12 @@ body {
   background: currentColor;
 }
 
-.mood-peaceful    { color: #4a9d8f; background: #e8f5f0; }
-.mood-content     { color: #6b8e5e; background: #eef5e8; }
-.mood-contemplative { color: #7b6fa0; background: #f0ecf5; }
-.mood-curious     { color: #c48a3f; background: #faf0e0; }
-.mood-active      { color: #d46b4a; background: #fae8e0; }
-.mood-excited     { color: #d44a6b; background: #fae0ea; }
+.mood-peaceful    { color: var(--mood-peaceful); background: var(--mood-peaceful-bg); }
+.mood-content     { color: var(--mood-content); background: var(--mood-content-bg); }
+.mood-contemplative { color: var(--mood-contemplative); background: var(--mood-contemplative-bg); }
+.mood-curious     { color: var(--mood-curious); background: var(--mood-curious-bg); }
+.mood-active      { color: var(--mood-active); background: var(--mood-active-bg); }
+.mood-excited     { color: var(--mood-excited); background: var(--mood-excited-bg); }
 
 /* ── Full thought page ──────────────────────────── */
 
