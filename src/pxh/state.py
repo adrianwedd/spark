@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 LOCK_TIMEOUT_S = 10  # seconds — fail fast rather than hang forever
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def atomic_write(path: Path, content: str) -> None:
     """Write content to path atomically via temp file + os.replace.
 
     Preserves original file's ownership and sets mode 0o644 so that
@@ -98,9 +98,9 @@ def ensure_session() -> Path:
     with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         if not path.exists():
             if TEMPLATE_PATH.exists():
-                _atomic_write(path, TEMPLATE_PATH.read_text(encoding="utf-8"))
+                atomic_write(path, TEMPLATE_PATH.read_text(encoding="utf-8"))
             else:
-                _atomic_write(path, json.dumps(default_state(), indent=2) + "\n")
+                atomic_write(path, json.dumps(default_state(), indent=2) + "\n")
     return path
 
 
@@ -113,7 +113,7 @@ def load_session() -> Dict[str, Any]:
         except json.JSONDecodeError:
             _log.warning("session.json corrupt — resetting to defaults: %s", path)
             data = default_state()
-            _atomic_write(path, json.dumps(data, indent=2) + "\n")
+            atomic_write(path, json.dumps(data, indent=2) + "\n")
             return data
 
 
@@ -121,7 +121,7 @@ def save_session(data: Dict[str, Any]) -> None:
     path = ensure_session()
     lock_path = str(path) + ".lock"
     with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
-        _atomic_write(path, json.dumps(data, indent=2) + "\n")
+        atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
 def update_session(
@@ -149,5 +149,5 @@ def update_session(
             if len(history) > history_limit:
                 data["history"] = history[-history_limit:]
 
-        _atomic_write(path, json.dumps(data, indent=2) + "\n")
+        atomic_write(path, json.dumps(data, indent=2) + "\n")
         return data
