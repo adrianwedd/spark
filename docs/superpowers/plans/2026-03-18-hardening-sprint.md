@@ -152,6 +152,11 @@ In `site/js/thought.js` line 5:
 var API = window.SPARK_CONFIG.API_BASE;
 ```
 
+Also in `site/js/thought.js` line 82, replace the hardcoded URL:
+```javascript
+if (ogImg) ogImg.content = API + '/thought-image?ts=' + encodeURIComponent(post.ts);
+```
+
 In `site/js/chat.js` line 6:
 ```javascript
 const API_URL = window.SPARK_CONFIG.API_BASE + '/chat';
@@ -397,20 +402,18 @@ def _clean_mind_state():
 @pytest.fixture
 def mind_state(tmp_path):
     """Redirect px-mind state files to tmp_path and isolate session."""
+    # STATE_DIR is the only path global — thoughts/notes paths are derived
+    # via thoughts_file_for_persona() / notes_file_for_persona() at call time.
     old_state = getattr(pxh.mind, "STATE_DIR", None)
     old_aw = getattr(pxh.mind, "AWARENESS_FILE", None)
     old_bat = getattr(pxh.mind, "BATTERY_FILE", None)
     old_log = getattr(pxh.mind, "LOG_FILE", None)
-    old_thoughts = getattr(pxh.mind, "THOUGHTS_FILE", None)
-    old_notes = getattr(pxh.mind, "NOTES_FILE", None)
     old_session = os.environ.get("PX_SESSION_PATH")
 
     pxh.mind.STATE_DIR = tmp_path
     pxh.mind.AWARENESS_FILE = tmp_path / "awareness.json"
     pxh.mind.BATTERY_FILE = tmp_path / "battery.json"
     pxh.mind.LOG_FILE = tmp_path / "px-mind.log"
-    pxh.mind.THOUGHTS_FILE = tmp_path / "thoughts.jsonl"
-    pxh.mind.NOTES_FILE = tmp_path / "notes.jsonl"
     # Isolate session state so reflection() doesn't read real session.json
     session_path = tmp_path / "session.json"
     session_path.write_text('{"persona": "spark", "listening": false, "history": []}')
@@ -422,8 +425,6 @@ def mind_state(tmp_path):
     pxh.mind.AWARENESS_FILE = old_aw
     pxh.mind.BATTERY_FILE = old_bat
     pxh.mind.LOG_FILE = old_log
-    pxh.mind.THOUGHTS_FILE = old_thoughts
-    pxh.mind.NOTES_FILE = old_notes
     if old_session is None:
         os.environ.pop("PX_SESSION_PATH", None)
     else:
@@ -548,6 +549,8 @@ def _awareness_patches():
     stack.enter_context(patch.object(pxh.mind, "_fetch_ha_routines", return_value=None))
     stack.enter_context(patch.object(pxh.mind, "_fetch_ha_context", return_value=None))
     stack.enter_context(patch.object(pxh.mind, "fetch_weather", return_value={"temp_c": 15}))
+    stack.enter_context(patch.object(pxh.mind, "read_wifi_signal", return_value={}))
+    stack.enter_context(patch.object(pxh.mind, "read_system_stats", return_value={}))
     return stack
 
 
@@ -559,36 +562,31 @@ def test_awareness_tick_dry_returns_dict(mind_state):
     assert isinstance(result, dict)
     assert isinstance(transitions, list)
     assert "hour" in result
-    assert "time_of_day" in result
+    assert "time_period" in result
 
 
 def test_awareness_tick_detects_transition(mind_state):
-    """Changed time_of_day triggers a transition."""
-    prev = {"time_of_day": "night"}
-    # Mock datetime.now to return 10:00 AM so time_of_day is "morning", not "night"
+    """Changed time_period triggers a transition."""
+    prev = {"time_period": "night"}
+    # datetime.datetime.now is immutable (C-level) — mock the module-level dt reference
     mock_now = _dt.datetime(2026, 3, 18, 10, 0, tzinfo=HOBART_TZ)
+    mock_dt = MagicMock(wraps=_dt)
+    mock_dt.datetime.now = MagicMock(return_value=mock_now)
     with _awareness_patches(), \
-         patch.object(pxh.mind.dt.datetime, "now", return_value=mock_now):
+         patch.object(pxh.mind, "dt", mock_dt):
         result, transitions = awareness_tick(prev, dry=True)
-    assert result.get("time_of_day") != "night"
-    assert any("time_of_day" in t for t in transitions)
+    assert result.get("time_period") != "night"
+    assert any("time_period" in t for t in transitions)
 
 
 def test_awareness_tick_writes_file(mind_state):
     """awareness_tick writes awareness.json."""
-    with patch("subprocess.run") as mock_run, \
-         patch.object(pxh.mind, "_fetch_frigate_presence", return_value=None), \
-         patch.object(pxh.mind, "_fetch_ha_presence", return_value=None), \
-         patch.object(pxh.mind, "_fetch_ha_calendar", return_value=None), \
-         patch.object(pxh.mind, "_fetch_ha_sleep", return_value=None), \
-         patch.object(pxh.mind, "_fetch_ha_routines", return_value=None), \
-         patch.object(pxh.mind, "_fetch_ha_context", return_value=None), \
-         patch.object(pxh.mind, "fetch_weather", return_value={"temp_c": 15}):
-        mock_run.return_value = MagicMock(returncode=1, stdout='{}')
+    with _awareness_patches():
         awareness_tick({}, dry=True)
     assert pxh.mind.AWARENESS_FILE.exists()
     data = json.loads(pxh.mind.AWARENESS_FILE.read_text())
     assert "hour" in data
+    assert "time_period" in data
 ```
 
 - [ ] **Step 6: Add `reflection` tests**
