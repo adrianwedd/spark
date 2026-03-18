@@ -153,12 +153,11 @@ State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.j
 
 ### Social Posting (px-post)
 
-`bin/px-post` daemon watches `state/thoughts-spark.jsonl` for qualifying thoughts (salience >= 0.7 OR spoken action), runs a Claude QA gate, and posts to three destinations:
+`bin/px-post` daemon watches `state/thoughts-spark.jsonl` for qualifying thoughts (salience >= 0.7 OR spoken action), runs a Claude QA gate, and posts to two destinations:
 - `state/feed.json` — served at `GET /api/v1/public/feed` and on [spark.wedd.au/feed/](https://spark.wedd.au/feed/) (thought feed page with individual permalinks at `/thought/?ts=`)
 - Bluesky (AT Protocol) — live at [sparkrobot.bsky.social](https://bsky.app/profile/sparkrobot.bsky.social); credentials via `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD`
-- Mastodon (REST API) — credentials via `PX_MASTODON_INSTANCE` + `PX_MASTODON_TOKEN`
 
-Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one social post per cycle (rate-limited). Entries needing both platforms are prioritised over single-platform retries. PID-file single-instance guard. Branded 1080×1080 thought card images generated via Pillow (cached in `state/thought-images/`, cleaned up after 30 days). Bluesky re-auths on 400/401 (expired token). Mastodon posting currently disabled (account terminated). Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
+Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one Bluesky post per cycle (rate-limited). PID-file single-instance guard. Branded 1080×1080 thought card images generated via Pillow (cached in `state/thought-images/`, cleaned up after 30 days). Bluesky re-auths on 400/401 (expired token). Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
 
 ### REST API
 
@@ -294,8 +293,6 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_HA_TOKEN` | Home Assistant long-lived access token |
 | `PX_BSKY_HANDLE` | Bluesky handle for social posting |
 | `PX_BSKY_APP_PASSWORD` | Bluesky app password |
-| `PX_MASTODON_INSTANCE` | Mastodon instance URL |
-| `PX_MASTODON_TOKEN` | Mastodon access token |
 | `PX_POST_DRY` | `1` = skip actual social media posts |
 | `PX_POST_QA` | `0` = skip Claude QA gate for testing |
 | `PX_POST_MIN_SALIENCE` | Minimum salience for social posting (default: `0.7`) |

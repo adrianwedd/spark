@@ -272,7 +272,7 @@ def qualifies(entry: dict) -> bool:
 
 
 def qualifies_social(entry: dict) -> bool:
-    """Return True if this thought qualifies for Bluesky/Mastodon (higher threshold)."""
+    """Return True if this thought qualifies for Bluesky (higher threshold)."""
     if not REQUIRED_FIELDS.issubset(entry.keys()):
         return False
     if _contains_private_content(entry.get("thought", "")):
@@ -627,78 +627,6 @@ class BlueskyClient:
             return f"error:{exc}"
 
 
-class MastodonClient:
-    def __init__(self):
-        self.instance = os.environ.get("PX_MASTODON_INSTANCE", "")
-        self.token = os.environ.get("PX_MASTODON_TOKEN", "")
-        self._logged_missing = False
-
-    def available(self) -> bool:
-        # Mastodon account terminated — disabled until a new instance is set up
-        return False
-
-    def _upload_media(self, image_path: 'Path', alt_text: str) -> 'str | None':
-        """Upload media to Mastodon. Returns media ID or None."""
-        try:
-            with open(image_path, 'rb') as f:
-                img_data = f.read()
-            boundary = '----SPARKBoundary'
-            body = (
-                f'--{boundary}\r\n'
-                f'Content-Disposition: form-data; name="file"; filename="thought.png"\r\n'
-                f'Content-Type: image/png\r\n\r\n'
-            ).encode() + img_data + f'\r\n--{boundary}\r\n'.encode() + (
-                f'Content-Disposition: form-data; name="description"\r\n\r\n'
-                f'{alt_text[:400]}\r\n'
-                f'--{boundary}--\r\n'
-            ).encode()
-            url = f"{self.instance.rstrip('/')}/api/v2/media"
-            req = urllib.request.Request(url, data=body, headers={
-                'Content-Type': f'multipart/form-data; boundary={boundary}',
-                'Authorization': f'Bearer {self.token}',
-            })
-            resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
-            return resp.get('id')
-        except Exception as exc:
-            log(f"mastodon: media upload failed: {exc}")
-            return None
-
-    def post(self, text: str, dry: bool = False, image_path: 'Path | None' = None) -> str:
-        if not self.available():
-            return "skipped"
-        if dry:
-            log(f"mastodon [DRY]: {text[:80]}" + (f" [img={image_path}]" if image_path else ""))
-            return "ok"
-        post_text = truncate_at_word(text, 500)
-
-        # Upload image if provided
-        media_id = None
-        if image_path and Path(image_path).exists():
-            media_id = self._upload_media(image_path, post_text[:400])
-
-        url = f"{self.instance.rstrip('/')}/api/v1/statuses"
-        payload = {"status": post_text}
-        if media_id:
-            payload["media_ids"] = [media_id]
-        data = json.dumps(payload).encode()
-        req = urllib.request.Request(url, data=data, headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.token}",
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                log(f"mastodon: posted ({len(post_text)} chars)" + (" [with image]" if media_id else ""))
-                return "ok"
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                retry_after = e.headers.get("Retry-After", "unknown")
-                log(f"mastodon: rate limited (429), Retry-After: {retry_after}")
-                return "error:rate_limited"
-            return f"error:http_{e.code}"
-        except Exception as exc:
-            return f"error:{exc}"
-
-
 QUEUE_FILE = STATE_DIR / "post_queue.jsonl"
 QUEUE_LIMIT = 200
 
@@ -724,7 +652,7 @@ def queue_thought(entry: dict) -> None:
         "salience": entry.get("salience", 0),
         "queued_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
         "qa_result": None,
-        "posted": {"feed": None, "bluesky": None, "mastodon": None},
+        "posted": {"feed": None, "bluesky": None},
     }
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -776,7 +704,7 @@ def _is_in_feed(thought_text: str, feed_posts: list[dict]) -> bool:
     return False
 
 
-def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool) -> dict:
+def flush_queue(bluesky: 'BlueskyClient', dry: bool) -> dict:
     """Two-pass flush: batch all feed writes, then one social post. Never blocks feed on social rate limits."""
     entries = _load_queue()
     if not entries:
@@ -842,32 +770,16 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
     except (json.JSONDecodeError, OSError):
         feed_texts = set()
 
-    # Prioritise entries where BOTH platforms need posting (avoids Mastodon-only
-    # entries starving Bluesky for hours)
-    def _social_priority(e):
-        p = e.get("posted", {})
-        b_pending = p.get("bluesky") is None or (isinstance(p.get("bluesky"), str) and p["bluesky"].startswith("error:"))
-        m_pending = p.get("mastodon") is None or (isinstance(p.get("mastodon"), str) and p["mastodon"].startswith("error:"))
-        if b_pending and m_pending:
-            return 0  # both — highest priority
-        if b_pending or m_pending:
-            return 1  # one platform
-        return 2  # neither
-
-    for entry in sorted(entries, key=_social_priority):
+    for entry in entries:
         posted = entry.get("posted", {})
-        # Need social posting?
-        social_pending = any(
-            posted.get(d) is None or (isinstance(posted.get(d), str) and posted[d].startswith("error:"))
-            for d in ("bluesky", "mastodon")
-        )
-        if not social_pending:
+        # Need Bluesky posting?
+        bsky_pending = posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:"))
+        if not bsky_pending:
             continue
 
         # Privacy gate
         if _contains_private_content(entry.get("thought", "")):
             entry["posted"]["bluesky"] = entry["posted"].get("bluesky") or "skipped"
-            entry["posted"]["mastodon"] = entry["posted"].get("mastodon") or "skipped"
             continue
 
         text = entry["thought"]
@@ -875,7 +787,6 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         # Feed cross-check: must be in feed to post socially
         if text[:80] not in feed_texts:
             entry["posted"]["bluesky"] = entry["posted"].get("bluesky") or "skipped"
-            entry["posted"]["mastodon"] = entry["posted"].get("mastodon") or "skipped"
             continue
 
         # Build social text
@@ -888,33 +799,17 @@ def flush_queue(bluesky: 'BlueskyClient', mastodon: 'MastodonClient', dry: bool)
         if hashtags:
             social_suffix += "\n\n" + hashtags
         bsky_thought = truncate_at_word(text, 300 - len(social_suffix.encode("utf-8")))
-        masto_thought = truncate_at_word(text, 500 - len(social_suffix.encode("utf-8")))
 
         # Generate thought card image
         image_path = generate_thought_card(text, entry.get("mood", ""), entry.get("ts", ""))
 
-        # Post to BOTH social platforms for this entry, then break
-        bsky_attempted = False
-        masto_attempted = False
-
-        if posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:")):
-            if qualifies_social(entry):
-                entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry, image_path=image_path)
-                bsky_attempted = True
-            else:
-                entry["posted"]["bluesky"] = "skipped"
-
-        if posted.get("mastodon") is None or (isinstance(posted.get("mastodon"), str) and posted["mastodon"].startswith("error:")):
-            if qualifies_social(entry):
-                entry["posted"]["mastodon"] = mastodon.post(masto_thought + social_suffix, dry=dry, image_path=image_path)
-                masto_attempted = True
-            else:
-                entry["posted"]["mastodon"] = "skipped"
-
-        processed += 1
-        if bsky_attempted or masto_attempted:
+        if qualifies_social(entry):
+            entry["posted"]["bluesky"] = bluesky.post(bsky_thought + social_suffix, dry=dry, image_path=image_path)
+            processed += 1
             was_posted = True
-            break  # rate limit: max 1 entry's social posts per flush cycle
+            break  # rate limit: max 1 social post per flush cycle
+        else:
+            entry["posted"]["bluesky"] = "skipped"
 
     _save_queue(entries)
     return {"processed": processed, "posted": was_posted, "rejected": was_rejected}
@@ -924,7 +819,7 @@ STATUS_FILE = STATE_DIR / "px-post-status.json"
 
 
 def write_health_status(queue_depth: int, total_posted: int, total_rejected: int,
-                        bluesky_ok: bool, mastodon_ok: bool, last_post_ts: str | None) -> None:
+                        bluesky_ok: bool, last_post_ts: str | None) -> None:
     """Write health status atomically."""
     data = {
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -933,7 +828,6 @@ def write_health_status(queue_depth: int, total_posted: int, total_rejected: int
         "total_posted": total_posted,
         "total_rejected": total_rejected,
         "bluesky_ok": bluesky_ok,
-        "mastodon_ok": mastodon_ok,
         "last_post_ts": last_post_ts,
     }
     try:
@@ -1044,7 +938,6 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     bluesky = BlueskyClient()
-    mastodon = MastodonClient()
     thoughts_file = STATE_DIR / "thoughts-spark.jsonl"
     total_posted = 0
     total_rejected = 0
@@ -1086,7 +979,7 @@ def main(argv: list[str]) -> int:
             if now - last_flush >= args.flush_interval:
                 log(f"flush: starting (interval={args.flush_interval}s, bsky_ok={bluesky.available()}, queue={len(_load_queue())})")
                 try:
-                    result = flush_queue(bluesky, mastodon, dry)
+                    result = flush_queue(bluesky, dry)
                 except Exception as exc:
                     log(f"flush: CRASHED: {exc}")
                     result = {"posted": False, "rejected": False, "processed": 0}
@@ -1102,7 +995,6 @@ def main(argv: list[str]) -> int:
                     total_posted=total_posted,
                     total_rejected=total_rejected,
                     bluesky_ok=bluesky.available(),
-                    mastodon_ok=mastodon.available(),
                     last_post_ts=last_post_ts,
                 )
                 last_flush = now

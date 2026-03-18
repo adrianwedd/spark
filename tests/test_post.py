@@ -61,7 +61,6 @@ _post_subprocess = _POST["subprocess"]
 _post_urllib_request = _POST["urllib"].request
 _post_urllib_error = _POST["urllib"].error
 BlueskyClient = _POST["BlueskyClient"]
-MastodonClient = _POST["MastodonClient"]
 queue_thought = _POST["queue_thought"]
 _load_queue = _POST["_load_queue"]
 _save_queue = _POST["_save_queue"]
@@ -374,7 +373,7 @@ def test_feed_json_atomic(_cursor_env):
 
 
 def test_truncation_word_boundary():
-    """Truncate 350-char text for Bluesky (300) at word boundary; Mastodon (500) untouched."""
+    """Truncate 350-char text for Bluesky (300) at word boundary."""
     # Build a string that is exactly 350 chars
     words = "hello world this is a very long text that keeps going and going "
     text = (words * 10)[:350]
@@ -391,7 +390,7 @@ def test_truncation_word_boundary():
     # (i.e., the cut was at rfind(" "))
     assert " " not in truncated[-2:-1] or truncated[-2] == " "
 
-    # Mastodon: max 500 — text is only 350, should be returned as-is
+    # Higher limit — text is only 350, should be returned as-is
     assert truncate_at_word(text, 500) == text
 
 
@@ -480,55 +479,6 @@ def test_missing_credentials_skipped():
 
 
 # ---------------------------------------------------------------------------
-# MastodonClient tests
-# ---------------------------------------------------------------------------
-
-
-@patch.dict(os.environ, {"PX_MASTODON_INSTANCE": "https://mastodon.social", "PX_MASTODON_TOKEN": "tok123"})
-def test_mastodon_post_dry():
-    """With dry=True, no HTTP call is made, returns 'ok'."""
-    client = MastodonClient()
-    with patch.object(_post_urllib_request, "urlopen") as mock_urlopen:
-        result = client.post("Hello from SPARK!", dry=True)
-        assert result == "ok"
-        mock_urlopen.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Cross-destination tests
-# ---------------------------------------------------------------------------
-
-
-@patch.dict(os.environ, {
-    "PX_BSKY_HANDLE": "test.bsky.social",
-    "PX_BSKY_APP_PASSWORD": "pass123",
-    "PX_MASTODON_INSTANCE": "https://mastodon.social",
-    "PX_MASTODON_TOKEN": "tok123",
-})
-def test_destination_independence():
-    """Bluesky failure does not prevent Mastodon from succeeding."""
-    bsky = BlueskyClient()
-    masto = MastodonClient()
-
-    mastodon_resp = _mock_response({"id": "12345"})
-
-    with patch.object(_post_urllib_request, "urlopen") as mock_urlopen:
-        # Auth succeeds for Bluesky, but createRecord fails with 500
-        auth_resp = _mock_response({"accessJwt": "tok", "refreshJwt": "ref", "did": "did:plc:test"})
-        mock_urlopen.side_effect = [
-            auth_resp,        # bsky auth
-            _http_error(500), # bsky createRecord fails
-        ]
-        bsky_result = bsky.post("test thought")
-        assert bsky_result.startswith("error:")
-
-    with patch.object(_post_urllib_request, "urlopen") as mock_urlopen:
-        mock_urlopen.return_value = mastodon_resp
-        masto_result = masto.post("test thought")
-        assert masto_result == "ok"
-
-
-# ---------------------------------------------------------------------------
 # Queue management tests
 # ---------------------------------------------------------------------------
 
@@ -544,7 +494,7 @@ def _make_queue_entry(thought="test thought", posted=None, qa_result="pass", ent
         "salience": 0.82,
         "queued_ts": "2026-03-15T10:00:05+00:00",
         "qa_result": qa_result,
-        "posted": posted or {"feed": None, "bluesky": None, "mastodon": None},
+        "posted": posted or {"feed": None, "bluesky": None},
     }
 
 
@@ -563,17 +513,14 @@ def test_flush_empty_queue_returns_dict(_cursor_env):
         queue_file.unlink()
 
     bsky = MagicMock()
-    masto = MagicMock()
 
-    result = flush_queue(bsky, masto, dry=True)
+    result = flush_queue(bsky, dry=True)
     assert isinstance(result, dict), f"Expected dict, got {type(result)}"
     assert result["processed"] == 0
     assert result["posted"] is False
     assert result["rejected"] is False
 
-    # Neither client should have been called
     bsky.post.assert_not_called()
-    masto.post.assert_not_called()
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
@@ -583,7 +530,7 @@ def test_per_destination_retry(_cursor_env):
     thought_text = "I see something interesting"
     entry = _make_queue_entry(
         thought=thought_text,
-        posted={"feed": "ok", "bluesky": "error:timeout", "mastodon": "ok"},
+        posted={"feed": "ok", "bluesky": "error:timeout"},
         qa_result="pass",
         entry_id="post-retry-001",
     )
@@ -595,21 +542,17 @@ def test_per_destination_retry(_cursor_env):
 
     bsky = MagicMock()
     bsky.post.return_value = "ok"
-    masto = MagicMock()
 
-    result = flush_queue(bsky, masto, dry=True)
+    result = flush_queue(bsky, dry=True)
     assert result["processed"] == 1
 
     # Bluesky was retried
     bsky.post.assert_called_once()
-    # Mastodon was NOT retried (already "ok")
-    masto.post.assert_not_called()
 
     # Verify queue entry updated
     saved = json.loads(queue_file.read_text().strip())
     assert saved["posted"]["feed"] == "ok"
     assert saved["posted"]["bluesky"] == "ok"
-    assert saved["posted"]["mastodon"] == "ok"
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
@@ -628,10 +571,8 @@ def test_flush_max_one_per_cycle(_cursor_env):
 
     bsky = MagicMock()
     bsky.post.return_value = "ok"
-    masto = MagicMock()
-    masto.post.return_value = "ok"
 
-    result = flush_queue(bsky, masto, dry=True)
+    result = flush_queue(bsky, dry=True)
     # Pass 1 batches all feed writes, pass 2 does 1 social post
     assert result["processed"] >= 3  # at least 3 feed writes
     assert result["posted"] is True
@@ -642,8 +583,7 @@ def test_flush_max_one_per_cycle(_cursor_env):
     assert posted_count == 3  # all fed in one pass
 
     # But only 1 social post (rate limited in pass 2)
-    bsky_calls = bsky.post.call_count + masto.post.call_count
-    assert bsky_calls <= 2  # max 1 bsky + 1 masto attempt
+    assert bsky.post.call_count <= 1
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
@@ -652,7 +592,7 @@ def test_qa_rejected_not_posted_on_next_flush(_cursor_env):
     tmp = _cursor_env
     entry = _make_queue_entry(
         thought="Boring sonar reading 42cm",
-        posted={"feed": None, "bluesky": None, "mastodon": None},
+        posted={"feed": None, "bluesky": None},
         qa_result=None,
         entry_id="post-reject-001",
     )
@@ -661,27 +601,22 @@ def test_qa_rejected_not_posted_on_next_flush(_cursor_env):
 
     bsky = MagicMock()
     bsky.post.return_value = "ok"
-    masto = MagicMock()
-    masto.post.return_value = "ok"
 
     # First flush: QA returns "NO" -> rejected
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("NO")):
-        result1 = flush_queue(bsky, masto, dry=False)
+        result1 = flush_queue(bsky, dry=False)
     assert result1["rejected"] is True
 
     # Verify destinations are marked "skipped"
     saved = json.loads(queue_file.read_text().strip())
     assert saved["posted"]["feed"] == "skipped"
     assert saved["posted"]["bluesky"] == "skipped"
-    assert saved["posted"]["mastodon"] == "skipped"
 
     # Second flush: should NOT post anything
     bsky.post.reset_mock()
-    masto.post.reset_mock()
-    result2 = flush_queue(bsky, masto, dry=False)
+    result2 = flush_queue(bsky, dry=False)
     assert result2["processed"] == 0
     bsky.post.assert_not_called()
-    masto.post.assert_not_called()
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
@@ -697,7 +632,7 @@ def test_repost_guard_after_corruption(_cursor_env):
     # Queue the same thought (simulating corruption recovery)
     entry = _make_queue_entry(
         thought=thought_text,
-        posted={"feed": None, "bluesky": None, "mastodon": None},
+        posted={"feed": None, "bluesky": None},
         qa_result=None,
         entry_id="post-corrupt-001",
     )
@@ -706,21 +641,17 @@ def test_repost_guard_after_corruption(_cursor_env):
 
     bsky = MagicMock()
     bsky.post.return_value = "ok"
-    masto = MagicMock()
-    masto.post.return_value = "ok"
 
-    result = flush_queue(bsky, masto, dry=True)
+    result = flush_queue(bsky, dry=True)
     assert result["processed"] == 1
 
-    # Social clients SHOULD be called (thought is in feed, needs social posting)
+    # Social client SHOULD be called (thought is in feed, needs social posting)
     bsky.post.assert_called_once()
-    masto.post.assert_called_once()
 
     # Feed should be marked ok, social should be posted
     saved = json.loads(queue_file.read_text().strip())
     assert saved["posted"]["feed"] == "ok"
     assert saved["posted"]["bluesky"] == "ok"
-    assert saved["posted"]["mastodon"] == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +688,6 @@ def test_health_status_written(_cursor_env):
         total_posted=10,
         total_rejected=2,
         bluesky_ok=True,
-        mastodon_ok=False,
         last_post_ts="2026-03-15T10:00:00+00:00",
     )
 
@@ -769,7 +699,6 @@ def test_health_status_written(_cursor_env):
     assert data["total_posted"] == 10
     assert data["total_rejected"] == 2
     assert data["bluesky_ok"] is True
-    assert data["mastodon_ok"] is False
     assert data["last_post_ts"] == "2026-03-15T10:00:00+00:00"
     assert "ts" in data
 
@@ -783,7 +712,7 @@ def test_health_status_atomic(_cursor_env):
     with patch.object(_post_os, "replace", wraps=_post_os.replace) as mock_replace:
         write_health_status(
             queue_depth=0, total_posted=0, total_rejected=0,
-            bluesky_ok=True, mastodon_ok=True, last_post_ts=None,
+            bluesky_ok=True, last_post_ts=None,
         )
         mock_replace.assert_called_once()
         assert str(mock_replace.call_args[0][1]) == str(tmp / "px-post-status.json")
