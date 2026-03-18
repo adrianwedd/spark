@@ -95,7 +95,64 @@ def main() -> int:
         "text": text,
     }
 
-    if dry_mode:
+    # Network TTS routing by persona
+    # GREMLIN → GLaDOS TTS on Pi (localhost:7861)
+    # VIXEN → Qwen3-TTS on M1.local (M1.local:7860)
+    _TTS_HOSTS = {
+        "gremlin": os.environ.get("PX_TTS_GREMLIN", "http://localhost:7861"),
+        "vixen": os.environ.get("PX_TTS_VIXEN", "http://M1.local:7860"),
+    }
+
+    def _try_network_tts(text: str, persona: str) -> bytes | None:
+        """Try network TTS for persona. Returns WAV bytes or None on failure."""
+        host = _TTS_HOSTS.get(persona)
+        if not host:
+            return None
+        import urllib.request
+        import urllib.parse
+        import urllib.error
+        url = f"{host}/synthesize?text={urllib.parse.quote(text)}&voice={persona}"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                if resp.status == 200:
+                    return resp.read()
+        except (OSError, urllib.error.URLError) as exc:
+            print(json.dumps({"status": "warn", "tts_fallback": str(exc), "persona": persona}), flush=True)
+        return None
+
+    # Try network TTS for personas with dedicated TTS backends
+    _used_network_tts = False
+    if not dry_mode and persona in _TTS_HOSTS:
+        wav_data = _try_network_tts(text, persona)
+        if wav_data:
+            try:
+                with VOICE_LOCK:
+                    subprocess.run(
+                        ["sudo", "-n", "/usr/bin/python3", "-c",
+                         "from robot_hat import enable_speaker; enable_speaker()"],
+                        check=False, capture_output=True,
+                    )
+                    pulse_env = os.environ.copy()
+                    pulse_env.setdefault("PULSE_SERVER", "unix:/run/user/1000/pulse/native")
+                    play_res = subprocess.run(
+                        ["aplay", "-q", "-D", "pulse"],
+                        input=wav_data, capture_output=True, check=False, env=pulse_env,
+                    )
+                    payload["player"] = f"network-tts({persona})+aplay"
+                    payload["returncode"] = play_res.returncode
+                    if play_res.returncode != 0:
+                        payload["status"] = "error"
+                        payload["stderr"] = play_res.stderr[-512:].decode("latin1", errors="ignore")
+                    _used_network_tts = True
+            except _FileLockTimeout:
+                payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
+                log_event("voice", payload)
+                print(json.dumps(payload))
+                return 1
+
+    if _used_network_tts:
+        pass  # already handled above
+    elif dry_mode:
         payload["note"] = "dry-run: audio skipped"
     elif not DEFAULT_PLAYER:
         payload["note"] = "no speech engine available"

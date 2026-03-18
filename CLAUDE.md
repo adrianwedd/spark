@@ -301,6 +301,8 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_MIND_CLAUDE_MODEL` | Claude model for SPARK reflection (default: `claude-haiku-4-5-20251001`) |
 | `PX_CLAUDE_BIN` | Override Claude CLI binary path |
 | `PX_VOICE_LOCK_TIMEOUT` | Voice output lock timeout in seconds (default: 30) |
+| `PX_TTS_GREMLIN` | GREMLIN TTS server URL (default: `http://localhost:7861`) — GLaDOS TTS on Pi |
+| `PX_TTS_VIXEN` | VIXEN TTS server URL (default: `http://M1.local:7860`) — Qwen3-TTS voice clone on M1 |
 | `PX_HA_HOST` | Home Assistant host (default: `http://homeassistant.local:8123`) |
 | `PX_HA_TOKEN` | Home Assistant long-lived access token |
 | `PX_BSKY_HANDLE` | Bluesky handle for social posting |

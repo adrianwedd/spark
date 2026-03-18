@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# GLaDOS TTS server for GREMLIN persona.
+# Runs on Pi, serves WAV audio over HTTP on port 7861.
+# Requires: pip install torch flask deep_phonemizer inflect nltk pydub scipy tqdm unidecode audioop-lts
+#
+# Usage: bin/tts-glados-server [--port 7861]
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+GLADOS_DIR="${GLADOS_DIR:-/home/pi/glados-tts}"
+GLADOS_PORT="${PX_GLADOS_PORT:-7861}"
+
+if [[ ! -d "$GLADOS_DIR" ]]; then
+    echo "ERROR: GLaDOS TTS not found at $GLADOS_DIR"
+    echo "Clone it: git clone https://github.com/R2D2FISH/glados-tts.git $GLADOS_DIR"
+    exit 1
+fi
+
+cd "$GLADOS_DIR"
+exec python3 - "$@" <<'PY'
+"""GLaDOS TTS HTTP server — serves WAV audio for GREMLIN persona."""
+import argparse
+import io
+import os
+import sys
+import time
+
+import torch
+
+# Patch torch.load for legacy model compatibility
+_orig_load = torch.load
+def _patched_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _orig_load(*args, **kwargs)
+torch.load = _patched_load
+
+sys.path.insert(0, ".")
+from glados import tts_runner
+from flask import Flask, request, Response, jsonify
+
+app = Flask(__name__)
+tts = None
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "model": "glados-tts", "backend": "forward-tacotron"})
+
+
+@app.route("/synthesize")
+def synthesize():
+    text = request.args.get("text", "")
+    if not text:
+        return jsonify({"error": "text parameter required"}), 400
+
+    t0 = time.time()
+    audio = tts.run_tts(text)
+    elapsed = time.time() - t0
+
+    buf = io.BytesIO()
+    audio.export(buf, format="wav")
+    buf.seek(0)
+
+    duration = audio.duration_seconds
+    print(f"synthesize: {len(text)} chars, {duration:.1f}s audio in {elapsed:.1f}s")
+
+    return Response(
+        buf.read(),
+        mimetype="audio/wav",
+        headers={
+            "X-Synthesis-Time": f"{elapsed:.3f}",
+            "X-Duration": f"{duration:.3f}",
+        },
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PX_GLADOS_PORT", "7861")))
+    parser.add_argument("--host", default="0.0.0.0")
+    args = parser.parse_args()
+
+    print("Loading GLaDOS TTS model...")
+    tts = tts_runner(use_p1=False, log=False)
+    print(f"GLaDOS TTS ready on {args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, threaded=False)
+PY
