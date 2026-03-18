@@ -115,7 +115,7 @@ Boot
  ├── px-wake-listen.service     (pi)     — loads Vosk wake word model; starts mic capture loop
  ├── px-battery-poll.service    (root)   — polls Robot HAT ADC every 30s → state/battery.json; plays rising/falling sweep tones on plug/unplug with voice announcement; escalating warnings + emergency shutdown at 10%
  ├── px-api-server.service      (pi)     — REST API + SPARK web dashboard on port 8420
- ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via Claude, posts to Bluesky/Mastodon + local feed
+ ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via Claude, posts to Bluesky + local feed
  ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration (stops px-alive to claim libcamera)
  └── cloudflared.service        (pi)     — Cloudflare Tunnel (api.spark.wedd.au → localhost:8420)
 ```
@@ -343,11 +343,10 @@ px-post (every 60s poll, every 300s flush)
  └── flush_queue()        — one entry per cycle:
       ├── run_qa_gate()   — Claude CLI binary YES/NO quality check (15s timeout)
       ├── write_feed()    — append to state/feed.json (served by /api/v1/public/feed)
-      ├── BlueskyClient   — post to Bluesky (truncate at 300 chars, word boundary)
-      └── MastodonClient  — post to Mastodon (truncate at 500 chars)
+      └── BlueskyClient   — post to Bluesky (truncate at 300 chars, word boundary)
 ```
 
-Supports `--backfill` to process the entire thoughts file into `feed.json` without social posting. Single-instance guard via `fcntl.flock`. Requires `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD` and/or `PX_MASTODON_INSTANCE` + `PX_MASTODON_TOKEN` in `.env`.
+Supports `--backfill` to process the entire thoughts file into `feed.json` without social posting. Single-instance guard via `fcntl.flock`. Requires `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD` in `.env`.
 
 ### 8. Memory System — Persona-Scoped Persistence
 
@@ -466,7 +465,7 @@ sudo systemctl status px-alive             # Idle gaze drift daemon
 sudo systemctl status px-wake-listen       # Wake word listener
 sudo systemctl status px-battery-poll      # Battery voltage poller (writes state/battery.json)
 sudo systemctl status px-api-server        # REST API + web dashboard (:8420)
-sudo systemctl status px-post              # Social posting daemon (Bluesky/Mastodon)
+sudo systemctl status px-post              # Social posting daemon (Bluesky)
 sudo systemctl status px-frigate-stream    # Frigate camera RTSP stream
 sudo systemctl status cloudflared          # Cloudflare Tunnel
 ```
@@ -739,7 +738,7 @@ picar-x-hacking/
 │   ├── px-wake-listen            # Wake word listener (systemd)
 │   ├── px-battery-poll           # Battery voltage poller (systemd)
 │   ├── px-api-server             # REST API launcher
-│   ├── px-post                   # Social posting daemon (Bluesky, Mastodon, local feed)
+│   ├── px-post                   # Social posting daemon (Bluesky + local feed)
 │   ├── px-statusline             # Claude Code statusbar script
 │   ├── px-{circle,drive,look,…}  # Hardware control scripts
 │   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (26 tools)
