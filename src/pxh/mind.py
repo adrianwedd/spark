@@ -2220,7 +2220,7 @@ def _tmux_ensure_session() -> bool:
     # instead of the full project CLAUDE.md (which causes refusal drift)
     reflect_dir = STATE_DIR / "spark-reflect"
     reflect_dir.mkdir(parents=True, exist_ok=True)
-    cmd = f"cd {reflect_dir} && {env_str} {claude_bin} --model {CLAUDE_MODEL} --allowedTools 'Read'"
+    cmd = f"cd {reflect_dir} && {env_str} {claude_bin} --model {CLAUDE_MODEL}"
 
     r = _tmux_run(["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-x", "200", "-y", "50"])
     if r.returncode != 0:
@@ -2280,8 +2280,11 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
 
     full_prompt = f"[System: {system}]\n\n{prompt}"
 
-    # Use tempfile for security (restrictive perms) and concurrency safety
-    fd, tmp_path = tempfile.mkstemp(dir=str(STATE_DIR), prefix=".claude_prompt_",
+    # Write prompt into spark-reflect dir so it's within Claude's working directory
+    # (Claude CLI in don't-ask mode only reads files in its cwd tree)
+    reflect_dir = STATE_DIR / "spark-reflect"
+    reflect_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(reflect_dir), prefix=".claude_prompt_",
                                      suffix=".tmp")
     prompt_file = Path(tmp_path)
     try:
