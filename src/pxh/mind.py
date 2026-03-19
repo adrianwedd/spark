@@ -2712,7 +2712,7 @@ def _run_voice(env: dict, *, timeout: int = 45, label: str = "") -> subprocess.C
                     log(f"expression: voice contention — voice.lock busy, skipping speech"
                         f"{f' ({label})' if label else ''}")
                     logged = True
-            except (json.JSONDecodeError, IndexError):
+            except (json.JSONDecodeError, IndexError, TypeError):
                 pass
         if not logged:
             log(f"expression: tool-voice failed rc={result.returncode}"
