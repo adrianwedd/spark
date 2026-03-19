@@ -2213,8 +2213,14 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
             if has_response:
                 after_first_bullet = after_marker[after_marker.index("\u25cf"):]
                 has_prompt = "\u276f" in after_first_bullet
-            if not (has_response and has_prompt):
+
+            # Normal path: require both ● and ❯
+            # Fallback: in the last 30s before timeout, accept ● alone
+            # (the response is complete but ❯ hasn't rendered yet)
+            if not has_response:
                 continue
+            if not has_prompt and tick < 150:
+                continue  # wait for ❯ during first 150s
 
             # Try JSON extraction from raw pane text (robust, ignores ● formatting)
             json_str = _extract_json_from_pane(after_marker)
