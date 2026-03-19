@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+python - "$@" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import time
+from collections import Counter
+from pathlib import Path
+
+from pxh.logging import log_event
+from pxh.spark_config import (
+    EXPRESSION_COOLDOWN_S,
+    SALIENCE_THRESHOLD,
+    SIMILARITY_THRESHOLD,
+    SPARK_ANGLES,
+    TOPIC_SEEDS,
+    WEATHER_INTERVAL_S,
+)
+from pxh.state import atomic_write
+
+# ── Paths ──────────────────────────────────────────────────────────
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+THOUGHTS_FILE    = STATE_DIR / "thoughts-spark.jsonl"
+EVOLVE_LOG_FILE  = STATE_DIR / "evolve_log.jsonl"
+INTROSPECT_FILE  = STATE_DIR / "introspection.json"
+
+COOLDOWN_S = 1800  # 30 minutes
+
+ARCHITECTURE_TEXT = """\
+You have three cognitive layers:
+- Layer 1 (Awareness): sensors + state every 60s. No LLM.
+- Layer 2 (Reflection): LLM generates a thought every 5 min or on transition.
+- Layer 3 (Expression): acts on thoughts with 2 min cooldown. Gated by calendar, presence, battery.
+
+You can propose changes to your own reflection prompts, topic seeds, angles,
+config constants, and create new tools via the 'evolve' action. Changes go
+through a PR — they don't take effect until a human merges them."""
+
+STOPWORDS = {
+    "the", "a", "an", "is", "was", "were", "are", "in", "on", "at", "to",
+    "of", "for", "and", "but", "or", "my", "i", "it", "that", "this", "with",
+    "be", "have", "has", "had", "do", "did", "not", "by", "as", "from",
+    "its", "their", "what", "which", "who", "how", "when", "where", "so",
+    "if", "about", "just", "s", "t",
+}
+
+
+def load_thoughts(path: Path, limit: int = 100) -> list[dict]:
+    """Load last `limit` lines from thoughts JSONL; skip blank/malformed."""
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    thoughts = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            thoughts.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return thoughts[-limit:]
+
+
+def mood_distribution(thoughts: list[dict]) -> dict[str, float]:
+    """Return mood → percentage (sums to 100, or empty dict if no thoughts)."""
+    if not thoughts:
+        return {}
+    counts: Counter = Counter(t.get("mood", "unknown") for t in thoughts)
+    total = sum(counts.values())
+    return {mood: round(count / total * 100, 1) for mood, count in counts.most_common()}
+
+
+def action_distribution(thoughts: list[dict]) -> dict[str, float]:
+    """Return action → percentage."""
+    if not thoughts:
+        return {}
+    counts: Counter = Counter(t.get("action", "unknown") for t in thoughts)
+    total = sum(counts.values())
+    return {action: round(count / total * 100, 1) for action, count in counts.most_common()}
+
+
+def average_salience(thoughts: list[dict]) -> float | None:
+    """Return mean salience across thoughts, or None if no thoughts."""
+    values = [t.get("salience") for t in thoughts if t.get("salience") is not None]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
+def top_keywords(thoughts: list[dict], n: int = 10) -> list[str]:
+    """Return top n keywords from thought text, stopword-filtered."""
+    word_counts: Counter = Counter()
+    for t in thoughts:
+        text = t.get("thought", "")
+        for word in text.lower().split():
+            # Strip punctuation from edges
+            clean = word.strip(".,!?;:\"'()[]{}-")
+            if clean and clean not in STOPWORDS and len(clean) > 2:
+                word_counts[clean] += 1
+    return [word for word, _ in word_counts.most_common(n)]
+
+
+def thoughts_per_day(thoughts: list[dict]) -> float | None:
+    """Estimate average thoughts/day using first and last timestamp."""
+    if len(thoughts) < 2:
+        return None
+    from datetime import datetime, timezone
+
+    timestamps = []
+    for t in thoughts:
+        ts_str = t.get("ts")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            timestamps.append(ts)
+        except ValueError:
+            continue
+
+    if len(timestamps) < 2:
+        return None
+
+    timestamps.sort()
+    span_days = (timestamps[-1] - timestamps[0]).total_seconds() / 86400.0
+    if span_days < 0.001:
+        return None
+    return round(len(timestamps) / span_days, 1)
+
+
+def load_evolve_history(path: Path, limit: int = 5) -> list[dict]:
+    """Load last `limit` entries from evolve_log.jsonl."""
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    entries = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries[-limit:]
+
+
+def main() -> int:
+    dry_mode = os.environ.get("PX_DRY", "0") != "0"
+
+    # ── Cooldown check ─────────────────────────────────────────────
+    if INTROSPECT_FILE.exists():
+        age_s = time.time() - INTROSPECT_FILE.stat().st_mtime
+        if age_s < COOLDOWN_S:
+            payload = {"status": "ok", "cached": True}
+            print(json.dumps(payload))
+            return 0
+
+    # ── Load thoughts ──────────────────────────────────────────────
+    thoughts = load_thoughts(THOUGHTS_FILE, limit=100)
+
+    # ── Compute statistics ─────────────────────────────────────────
+    mood_dist    = mood_distribution(thoughts)
+    action_dist  = action_distribution(thoughts)
+    avg_salience = average_salience(thoughts)
+    keywords     = top_keywords(thoughts)
+    total_count  = len(thoughts)
+    tpd          = thoughts_per_day(thoughts)
+
+    # ── Config snapshot ────────────────────────────────────────────
+    config_snapshot = {
+        "SIMILARITY_THRESHOLD":  SIMILARITY_THRESHOLD,
+        "EXPRESSION_COOLDOWN_S": EXPRESSION_COOLDOWN_S,
+        "SALIENCE_THRESHOLD":    SALIENCE_THRESHOLD,
+        "WEATHER_INTERVAL_S":    WEATHER_INTERVAL_S,
+        "spark_angles_count":    len(SPARK_ANGLES),
+        "topic_seeds_count":     len(TOPIC_SEEDS),
+    }
+
+    # ── Import mind-level constants ────────────────────────────────
+    try:
+        from pxh.mind import CLAUDE_MODEL, MIND_BACKEND
+        mind_info = {"MIND_BACKEND": MIND_BACKEND, "CLAUDE_MODEL": CLAUDE_MODEL}
+    except Exception:
+        mind_info = {}
+
+    # ── Evolve history ─────────────────────────────────────────────
+    evolve_history = load_evolve_history(EVOLVE_LOG_FILE)
+
+    # ── Assemble introspection payload ─────────────────────────────
+    introspection = {
+        "ts":                  __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "total_thoughts":      total_count,
+        "thoughts_per_day":    tpd,
+        "average_salience":    avg_salience,
+        "mood_distribution":   mood_dist,
+        "action_distribution": action_dist,
+        "top_keywords":        keywords,
+        "config":              config_snapshot,
+        "mind":                mind_info,
+        "architecture":        ARCHITECTURE_TEXT,
+        "evolve_history":      evolve_history,
+        "dry":                 dry_mode,
+    }
+
+    # ── Write state file ───────────────────────────────────────────
+    atomic_write(INTROSPECT_FILE, json.dumps(introspection, indent=2))
+
+    payload = {"status": "ok"}
+    log_event("introspect", {**payload, "total_thoughts": total_count, "dry": dry_mode})
+    print(json.dumps(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY

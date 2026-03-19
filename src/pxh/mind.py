@@ -339,7 +339,8 @@ VALID_MOODS   = {"curious", "content", "alert", "playful", "contemplative", "bor
 VALID_ACTIONS = {"wait", "greet", "comment", "remember", "look_at",
                  "weather_comment", "scan", "explore",
                  "play_sound", "photograph", "emote", "look_around",
-                 "time_check", "calendar_check", "morning_fact"}
+                 "time_check", "calendar_check", "morning_fact",
+                 "introspect", "evolve"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
@@ -2916,6 +2917,13 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
             env.setdefault("PX_CALENDAR_ID", CALENDAR_ID)
             subprocess.run([str(BIN_DIR / "tool-gws-calendar")],
                            capture_output=True, text=True, check=False, env=env, timeout=60)
+
+        elif action == "introspect":
+            env["PX_DRY"] = "1" if dry else "0"
+            result = subprocess.run(
+                [str(BIN_DIR / "tool-introspect")],
+                capture_output=True, text=True, check=False, env=env, timeout=30)
+            log(f"expression: introspect completed rc={result.returncode}")
 
         else:
             log(f"expression: unhandled action: {action}")
