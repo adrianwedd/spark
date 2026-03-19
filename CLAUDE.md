@@ -294,6 +294,45 @@ Seven services run at boot:
 | `px-api-server` | `bin/px-api-server` | pi | always, 2 s |
 | `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10 s |
 
+### Login Dashboard (px-motd)
+
+`bin/px-motd` generates a rich login banner on every SSH connection. Hooked into PAM via `/etc/update-motd.d/90-spark` (one-line shim: `/home/pi/picar-x-hacking/bin/px-motd 2>/dev/null || true`).
+
+**Sections displayed**: system vitals (uptime, CPU, RAM/disk bars, battery, WiFi, throttle), all 9 systemd service states with uptimes, tmux sessions with attach/monitor commands, cognitive state (mood, persona, sonar, Obi mode, last thought, weather), social posting (daemon status, Bluesky, latest feed post), recent errors (tail-scanned from 5 log files), numbered quick actions, and clickable API endpoint links.
+
+**Quick actions**: `px N` shell function (defined in `~/.bashrc`) maps numbers 1–9 to common commands. `px` with no args re-displays the MOTD.
+
+```
+px 1  — bin/px-session (interactive tmux)
+px 2  — bin/px-spark (voice persona)
+px 3  — bin/px-diagnostics --short
+px 4  — bin/px-api-server
+px 5  — bin/px-race --status
+px 6  — journalctl -fu px-mind
+px 7  — tail -f logs/*.log (firehose)
+px 8  — tail -f logs/px-claude.log (SPARK's inner monologue)
+px 9  — bin/px-motd (re-show dashboard)
+```
+
+**OSC 8 hyperlinks**: Banner includes clickable links to `spark.wedd.au`, `picar.local:8420` dashboard, Bluesky profile, feed page, and all public API endpoints. Supported by iTerm2, macOS Terminal (Sequoia+), Ghostty, WezTerm, Kitty.
+
+**tmux monitoring**: `px-claude` tmux session (owned by px-mind for Claude Haiku reflections) pipes output to `logs/px-claude.log` via `tmux pipe-pane`. **Do not attach** to `px-claude` — it interferes with px-mind's `send-keys`/`capture-pane` workflow. Monitor via `tail -f logs/px-claude.log` instead.
+
+**PAM context**: MOTD scripts run as root before privilege drop. `px-motd` explicitly targets the pi user's tmux socket at `/tmp/tmux-1000/default` (same class of fix as the PulseAudio root socket issue). Static `/etc/motd` blanked (backup at `/etc/motd.bak`).
+
+**Performance**: ~620ms total. Error scanning uses `tail -n 150` (not full file reads). Mood colours use 256-colour ANSI codes aligned with `site/css/colors.css` Scheme B palette.
+
+### Claude Code Statusline (px-statusline)
+
+`bin/px-statusline` outputs a compact single-line status for the Claude Code statusbar. Must complete in <300ms, no I2C/GPIO/sudo.
+
+**Fields**: persona + listening state, mood (emoji + name), Obi mode, sonar proximity, weather temp, CPU temp + throttle, RAM, battery (with charging icon), social posting (posted count + queue depth), and 5 service dots (batched single `systemctl is-active` call).
+
+**Example output**:
+```
+⚡spark │ 🤔contemplative │ 🧒calm │ 📡108cm │ 🌡️14.0°C │ 56°C │ 1361MB │ 🔋8.3V(97%) │ 📫8↑200⏳ │ ●alive ●mind ●wake ●api ●post
+```
+
 ## Safety Model
 
 - `PX_DRY=1` (or `--dry-run`) skips all motion and audio in tool wrappers. Tools default to **live** when `PX_DRY` is unset — set `PX_DRY=1` explicitly for dry runs.
