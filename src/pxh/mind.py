@@ -1024,8 +1024,8 @@ def _fetch_ha_calendar(dry: bool = False) -> list[dict] | None:
 
     now = dt.datetime.now(dt.timezone.utc)
     end = now + dt.timedelta(hours=HA_CALENDAR_HORIZON_H)
-    start_iso = now.isoformat()
-    end_iso = end.isoformat()
+    start_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     all_events: list[dict] = []
 

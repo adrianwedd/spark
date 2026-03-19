@@ -120,11 +120,37 @@ def main() -> int:
             pass  # fall through to espeak
         return None
 
+    def _normalize_wav(data: bytes, target_peak: int = 28000) -> bytes:
+        """Normalize WAV audio to target peak amplitude."""
+        import struct, wave, io
+        try:
+            r = wave.open(io.BytesIO(data))
+            raw = r.readframes(r.getnframes())
+            params = r.getparams()
+            r.close()
+            if params.sampwidth != 2:
+                return data
+            samples = list(struct.unpack(f"<{len(raw)//2}h", raw))
+            peak = max((abs(s) for s in samples), default=0)
+            if peak < 500 or peak >= target_peak:
+                return data
+            gain = target_peak / peak
+            samples = [max(-32768, min(32767, int(s * gain))) for s in samples]
+            buf = io.BytesIO()
+            w = wave.open(buf, "wb")
+            w.setparams(params)
+            w.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+            w.close()
+            return buf.getvalue()
+        except Exception:
+            return data
+
     # Try network TTS for personas with dedicated TTS backends
     _used_network_tts = False
     if not dry_mode and persona in _TTS_HOSTS:
         wav_data = _try_network_tts(text, persona)
         if wav_data:
+            wav_data = _normalize_wav(wav_data)
             try:
                 with VOICE_LOCK:
                     subprocess.run(
@@ -143,8 +169,8 @@ def main() -> int:
                     if play_res.returncode == 0:
                         _used_network_tts = True
                     else:
-                        payload["status"] = "error"
-                        payload["stderr"] = play_res.stderr[-512:].decode("latin1", errors="ignore")
+                        payload["tts_aplay_error"] = play_res.stderr[-512:].decode("latin1", errors="ignore")
+                        # Don't set status=error — fall through to espeak fallback
             except _FileLockTimeout:
                 payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
                 log_event("voice", payload)
