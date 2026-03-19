@@ -198,7 +198,7 @@ def main() -> int:
 
     # ── Assemble introspection payload ─────────────────────────────
     introspection = {
-        "ts":                  __import__("datetime").datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ts":                  __import__("time").time(),
         "total_thoughts":      total_count,
         "thoughts_per_day":    tpd,
         "average_salience":    avg_salience,

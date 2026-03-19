@@ -2498,7 +2498,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if intro_file.exists():
         try:
             intro = json.loads(intro_file.read_text(encoding="utf-8"))
-            age = time.time() - intro.get("ts", 0)
+            ts_raw = intro.get("ts", 0)
+            if isinstance(ts_raw, str):
+                from datetime import datetime as _dt, timezone as _tz
+                ts_epoch = _dt.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+            else:
+                ts_epoch = float(ts_raw)
+            age = time.time() - ts_epoch
             if age < INTROSPECTION_STALE_S:
                 context_parts.append(
                     "Self-awareness (from recent introspection):\n"
