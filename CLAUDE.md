@@ -221,7 +221,7 @@ SPARK can introspect on its own thought patterns and propose targeted code chang
 
 **`bin/tool-introspect`** — Computes thought statistics (mood distribution, action distribution, top keywords, average salience, thoughts/day), snapshots `spark_config.py` constants, and records architecture awareness. 30-min cooldown enforced via `introspection.json` timestamp. Writes `state/introspection.json`. Dry-run supported (`PX_DRY=1` sets `dry: true` in output but still writes the file).
 
-**`bin/tool-evolve`** — Validates introspection freshness (must be <1h old), intent quality (≥20 chars), and 24h rate limit (max 1 evolution per day). Respects `PX_DRY=1` (skips queue write). Writes a `pending` entry to `state/evolve_queue.jsonl` including the full introspection snapshot. Returns `{"status": "queued", "id": "..."}`.
+**`bin/tool-evolve`** — Validates introspection freshness (must be <1h old), intent quality (≥20 chars), and 24h rate limit (max 1 evolution per day). Respects `PX_DRY=1` (writes entry with `dry: true` flag; daemon marks it `skipped:dry`). Writes a `pending` entry to `state/evolve_queue.jsonl` including the full introspection snapshot. Returns `{"status": "queued", "id": "..."}`.
 
 **`bin/px-evolve` daemon** — Polls `evolve_queue.jsonl` for `pending` entries. For each:
 1. Creates a git worktree in `/tmp/px-evolve-<id>/`
@@ -241,7 +241,7 @@ Single-instance PID guard. Restart policy: on-failure, 30 s.
 
 **State files** (gitignored):
 - `state/introspection.json` — latest thought stats + config snapshot
-- `state/evolve_queue.jsonl` — evolution queue (status: pending/applied/failed)
+- `state/evolve_queue.jsonl` — evolution queue (status: pending/pr_created/failed:*/skipped:dry)
 - `state/evolve_log.jsonl` — per-run audit log with PR URL
 
 **New env vars**: `PX_EVOLVE_DRY` (1 = skip worktree/PR), `PX_EVOLVE_MODEL` (default: `claude-opus-4-6`), `PX_EVOLVE_TIMEOUT` (default: 300 s), `PX_EVOLVE_MAX_FILES` (default: 3).

@@ -2253,10 +2253,29 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
                     break
 
             if response_lines and (found_final_prompt or tick >= 150):
+                # Without ❯, require quiescence: pane text must be stable for 3 ticks
+                # to avoid capturing truncated streaming responses
+                if not found_final_prompt:
+                    _pane_text = after_marker
+                    if not hasattr(call_claude_haiku, '_last_pane'):
+                        call_claude_haiku._last_pane = ""
+                        call_claude_haiku._stable_ticks = 0
+                    if _pane_text == call_claude_haiku._last_pane:
+                        call_claude_haiku._stable_ticks += 1
+                    else:
+                        call_claude_haiku._stable_ticks = 0
+                    call_claude_haiku._last_pane = _pane_text
+                    if call_claude_haiku._stable_ticks < 3:
+                        continue  # wait for quiescence
+
                 _tmux_timeout_count = 0
                 _tmux_turn_count += 1
                 resp = "\n".join(response_lines)
-                log(f"tmux response captured ({tick+1}s, {len(response_lines)} lines, prompt={'yes' if found_final_prompt else 'no'})")
+                log(f"tmux response captured ({tick+1}s, {len(response_lines)} lines, prompt={'yes' if found_final_prompt else 'quiescent'})")
+                # Clean up quiescence state
+                if hasattr(call_claude_haiku, '_last_pane'):
+                    del call_claude_haiku._last_pane
+                    del call_claude_haiku._stable_ticks
                 return {"response": resp}
     finally:
         try:
@@ -2509,7 +2528,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
             intro = json.loads(intro_file.read_text(encoding="utf-8"))
             ts_raw = intro.get("ts", 0)
             if isinstance(ts_raw, str):
-                from datetime import datetime as _dt, timezone as _tz
+                from datetime import datetime as _dt
                 ts_epoch = _dt.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
             else:
                 ts_epoch = float(ts_raw)
@@ -2521,7 +2540,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
                     + "\n\nYou can use action='evolve' to propose a change to yourself.\n"
                     "Only do this if you have a specific, well-formed idea — not vague wishes."
                 )
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
             pass
 
     # Inject topic seed, or free-will prompt if no seed was drawn

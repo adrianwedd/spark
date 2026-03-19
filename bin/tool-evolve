@@ -60,12 +60,16 @@ def main() -> int:
                 continue
             try:
                 entry = json.loads(line)
-                # ts_completed is ISO string; ts may be epoch or ISO
-                ts_raw = entry.get("ts_completed") or entry.get("ts", 0)
-                if isinstance(ts_raw, str):
+                # Prefer numeric ts (epoch), fall back to ts_completed (ISO string)
+                ts_raw = entry.get("ts")  # numeric epoch from our fix
+                if ts_raw is None or not isinstance(ts_raw, (int, float)):
+                    ts_raw = entry.get("ts_completed", "")
+                if isinstance(ts_raw, str) and ts_raw:
                     ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
-                else:
+                elif isinstance(ts_raw, (int, float)):
                     ts = float(ts_raw)
+                else:
+                    continue  # unparseable — skip this entry
                 if now - ts < RATE_LIMIT_S:
                     return error("rate limit: max 1 evolution per 24 hours")
             except (json.JSONDecodeError, TypeError, ValueError):
