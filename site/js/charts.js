@@ -74,7 +74,7 @@ window.SparkCharts = (function () {
   // ── Mood colour helper (reads from CSS custom properties in colors.css) ──
   function _moodColor(mood) {
     return getComputedStyle(document.documentElement)
-      .getPropertyValue('--mood-' + mood).trim() || '';
+      .getPropertyValue('--mood-' + mood).trim() || '#888';
   }
 
   // ── Mood colour strip ─────────────────────────────────────────────────────

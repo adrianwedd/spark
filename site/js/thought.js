@@ -8,14 +8,8 @@
   var FALLBACK_GITHUB = window.SPARK_CONFIG.FALLBACK_GITHUB;
   var TIMEOUT_MS = 8000;
 
-  var MOOD_CLASSES = {
-    peaceful: 'mood-peaceful',
-    content: 'mood-content',
-    contemplative: 'mood-contemplative',
-    curious: 'mood-curious',
-    active: 'mood-active',
-    excited: 'mood-excited'
-  };
+  var VALID_MOODS = ['peaceful','content','contemplative','curious','active','excited',
+    'alert','playful','mischievous','bored','lonely','grumpy','anxious'];
 
   function fetchJSON(url) {
     var ctrl = new AbortController();
@@ -39,7 +33,8 @@
   }
 
   function moodClass(mood) {
-    return MOOD_CLASSES[(mood || '').toLowerCase()] || 'mood-content';
+    var m = (mood || '').toLowerCase();
+    return VALID_MOODS.indexOf(m) >= 0 ? 'mood-' + m : 'mood-content';
   }
 
   function findByTs(posts, targetTs) {

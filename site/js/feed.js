@@ -9,14 +9,9 @@
   var TIMEOUT_MS = 8000;
   var CACHE_KEY = 'spark_feed_cache';
 
-  var MOOD_CLASSES = {
-    peaceful: 'mood-peaceful',
-    content: 'mood-content',
-    contemplative: 'mood-contemplative',
-    curious: 'mood-curious',
-    active: 'mood-active',
-    excited: 'mood-excited'
-  };
+  // All 12 moods have .mood-{name} classes in feed.css (plus legacy "active")
+  var VALID_MOODS = ['peaceful','content','contemplative','curious','active','excited',
+    'alert','playful','mischievous','bored','lonely','grumpy','anxious'];
 
   function fetchJSON(url) {
     var ctrl = new AbortController();
@@ -44,7 +39,8 @@
   }
 
   function moodClass(mood) {
-    return MOOD_CLASSES[(mood || '').toLowerCase()] || 'mood-content';
+    var m = (mood || '').toLowerCase();
+    return VALID_MOODS.indexOf(m) >= 0 ? 'mood-' + m : 'mood-content';
   }
 
   function renderCard(post) {
