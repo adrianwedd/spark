@@ -37,3 +37,24 @@ def test_mood_to_sound_is_dict():
 def test_mood_to_emote_is_dict():
     assert isinstance(MOOD_TO_EMOTE, dict)
     assert "curious" in MOOD_TO_EMOTE
+
+
+def test_pick_spark_angles_returns_subset():
+    from pxh.spark_config import _pick_spark_angles
+    angles = _pick_spark_angles(5)
+    assert isinstance(angles, list)
+    assert len(angles) == 5
+    assert all(a in SPARK_ANGLES for a in angles)
+    # No duplicates
+    assert len(set(angles)) == 5
+
+
+def test_pick_reflection_seed_returns_string_or_none():
+    from pxh.spark_config import _pick_reflection_seed
+    results = [_pick_reflection_seed() for _ in range(50)]
+    strings = [r for r in results if r is not None]
+    nones = [r for r in results if r is None]
+    # Should get a mix (20% free-will = None)
+    assert len(strings) > 0
+    assert all(isinstance(s, str) for s in strings)
+    assert all(s in TOPIC_SEEDS for s in strings)

@@ -34,11 +34,11 @@ from pathlib import Path
 from filelock import FileLock
 from pxh.logging import log_event
 from pxh.spark_config import (
-    SPARK_ANGLES, TOPIC_SEEDS, _pick_spark_angles, _pick_reflection_seed,
+    _pick_spark_angles, _pick_reflection_seed,
     _SPARK_REFLECTION_PREFIX, _SPARK_REFLECTION_SUFFIX,
     MOOD_TO_SOUND, MOOD_TO_EMOTE,
     SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
-    SALIENCE_THRESHOLD, _FREE_WILL_WEIGHT, WEATHER_INTERVAL_S,
+    SALIENCE_THRESHOLD, WEATHER_INTERVAL_S,
 )
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
