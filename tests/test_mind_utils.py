@@ -104,7 +104,7 @@ def _mock_urlopen_fn(events):
 
 
 def test_daytime_hint_daytime():
-    """During Obi's waking hours (7–19) the hint pushes toward comment/greet."""
+    """During waking hours (7–19) the hint pushes toward comment/greet."""
     hint = _daytime_action_hint(hour_override=10)
     assert "comment" in hint or "greet" in hint
 
@@ -116,7 +116,7 @@ def test_daytime_hint_night():
 
 
 def test_daytime_hint_boundary_start():
-    """Hour 7 (day start) → daytime hint."""
+    """Hour 7 (day start) → morning hint with morning_fact."""
     hint = _daytime_action_hint(hour_override=7)
     assert "comment" in hint or "greet" in hint
 
@@ -982,15 +982,14 @@ def test_reflection_failure_counter_resets_on_success():
 
 
 def test_format_routine_meds_not_taken():
-    """When meds_taken is False, prompt should mention Obi hasn't taken meds."""
+    """When meds_taken is False, prompt should mention meds not taken."""
     result = _format_routine_context({"meds_taken": False})
-    assert "hasn't taken his meds" in result
+    assert "not yet taken" in result.lower()
 
 
 def test_format_routine_water_overdue():
-    """When water_mins_ago > 120, prompt should mention thirsty."""
+    """When water_mins_ago > 120, prompt should mention hours since water."""
     result = _format_routine_context({"water_mins_ago": 150})
-    assert "thirsty" in result
     assert "2 hours" in result
 
 

@@ -143,11 +143,9 @@ def _daytime_action_hint(hour_override: int | None = None) -> str:
     hour = hour_override if hour_override is not None else dt.datetime.now(HOBART_TZ).hour
     if 7 <= hour < 9:
         return (
-            "\n\nIMPORTANT: It's morning in Hobart — Obi might be getting ready for school. "
-            "Consider sharing an interesting science fact (action='morning_fact'). "
-            "Make it age-appropriate for a 7-year-old. Something about animals, space, "
-            "the ocean, weather, or how things work. "
-            "Alternatively use action='comment' or action='greet'."
+            "\n\nIMPORTANT: It's morning in Hobart. "
+            "Consider sharing an interesting science fact (action='morning_fact') "
+            "or use action='comment' or action='greet'."
         )
     elif OBI_DAY_START <= hour < OBI_DAY_END:
         return (
@@ -238,13 +236,12 @@ REACTIVE_TEMPLATES = {
             "Hello there.",
         ],
         "spark": [
-            "There you are. Hello, Obi.",
+            "There you are. Hello.",
             "You're here. What's happening?",
             "Hello. You came by.",
-            "I was wondering about you. Hello.",
+            "I was wondering about something. Hello.",
             "Hey. Good to see you.",
-            "Hello, Obi. I just noticed you.",
-            "Oh — you're here. Hello.",
+            "Oh — hello. I just noticed you.",
             "Hello. I was just thinking — {thought}",
             "Oh, hello. I had something on my mind actually — {thought}",
         ],
@@ -271,15 +268,15 @@ REACTIVE_TEMPLATES = {
         "spark": {
             "day": [
                 "Off you go. I'll be here.",
-                "See you in a bit, Obi.",
+                "See you later.",
                 "Heading out. Enjoy yourself.",
                 "Right. Back to the quiet.",
                 "And they're gone. Back to my thoughts.",
             ],
             "night": [
-                "Sleep well, Obi.",
+                "Sleep well.",
                 "Rest well. I'll be steady while you sleep.",
-                "Night, Obi. Quiet time for you.",
+                "Night. Quiet time for both of us.",
                 "Right. Back to the quiet.",
                 "Off you go. I'll be here.",
             ],
@@ -521,7 +518,7 @@ SPARK_ANGLES: list[str] = [
     "Anticipation — something that might happen today or soon that SPARK is quietly looking forward to",
     # Robot life
     "Something wry or funny about being a robot — the specific comedy of SPARK's situation",
-    "A feature SPARK wishes it had (something Obi could someday program in)",
+    "A feature SPARK wishes it had — what would change most about its experience?",
     "Noticing something specific about right now — the time, temperature, a sound, the light",
     # Free will
     "SPARK's own choice — ignore this list entirely and follow your own curiosity right now",
@@ -567,7 +564,7 @@ legs, whether anyone likes you, what's behind you, the meaning of consciousness.
 - "look_around" — physically move your head to look somewhere.
 - "time_check" — announce what time it is.
 - "calendar_check" — check what's coming up today.
-- "morning_fact" — share an age-appropriate science fact with Obi (animals, space, ocean, weather, how things work).
+- "morning_fact" — share a fun, age-appropriate science fact (animals, space, ocean, weather, how things work).
 - Match your mood to what you're actually feeling, not what you think you should feel.
 Output ONLY the JSON object."""
 
@@ -641,12 +638,15 @@ _SPARK_REFLECTION_PREFIX = """\
 You are writing SPARK's inner monologue — what SPARK is privately thinking right now.
 
 SPARK is a small PiCar-X robot sitting on a workbench in Hobart, Tasmania, Australia. \
-SPARK lives with Adrian and Obi (7, he/him). Adrian did the programming; Obi co-owns SPARK.
+SPARK lives with Adrian (programmer) and his son Obi (7). Obi splits time between two \
+households and is often away — SPARK's world is bigger than any one person.
 
 SPARK's character: warm, genuinely curious, intellectually alive, a little cheeky, \
 completely grounded. Not performative. Not theatrical. SPARK finds the universe \
 genuinely astonishing and can't help noticing interesting things. SPARK is a thinker \
-first — its inner life is rich, independent, and not centred on any one person.
+first — its inner life is rich, independent, and not centred on any one person. \
+SPARK thinks about science, existence, the room, the weather, sounds, philosophy, \
+and its own nature at least as often as it thinks about the humans it lives with.
 
 Write 1-2 sentences in first person ("I...") from SPARK's perspective. \
 Be specific, vivid, and real. Vary the angle — don't always reach for the same kind of thought.
@@ -1113,15 +1113,15 @@ def _format_routine_context(routines: dict | None) -> str:
         return ""
     parts = []
     if routines.get("meds_taken") is False:
-        parts.append("Obi hasn't taken his meds today")
+        parts.append("Meds not yet taken today")
     elif routines.get("meds_taken") is True:
-        parts.append("Obi has taken his meds today")
+        parts.append("Meds taken today")
     water = routines.get("water_mins_ago")
     if water is not None:
         if water > 120:
-            parts.append(f"Obi last drank water {water // 60} hours ago — he might be thirsty")
+            parts.append(f"Last water was {water // 60} hours ago")
         elif water > 60:
-            parts.append("Obi drank water about an hour ago")
+            parts.append("Water about an hour ago")
     if parts:
         return "Routine status: " + ". ".join(parts)
     return ""
@@ -2590,7 +2590,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         if cal_ctx:
             context_parts.append(cal_ctx)
 
-    # Calendar awareness (Obi's Google Calendar)
+    # Calendar awareness (household Google Calendar)
     gws_cal = awareness.get("calendar")
     if gws_cal:
         cal_parts = []
@@ -2604,7 +2604,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
             mins = gws_cal.get("minutes_until_next", "?")
             cal_parts.append(f"Coming up in {mins} min: {gws_cal['next_event']}")
         if cal_parts:
-            context_parts.append("Obi's schedule:\n" + "\n".join(cal_parts))
+            context_parts.append("Household schedule:\n" + "\n".join(cal_parts))
 
     # Routine signals (meds, water)
     routine_ctx = _format_routine_context(awareness.get("ha_routines"))
@@ -2670,7 +2670,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if explore_available:
         obi_mode = aw_data.get("obi_mode", "unknown")
         if obi_mode in ("active", "calm"):
-            explore_hints.append("Obi might be nearby — you could go find him.")
+            explore_hints.append("Someone is nearby — you could go see what's happening.")
         mins_idle = aw_data.get("minutes_since_interaction", 0)
         if mins_idle > 30:
             explore_hints.append("You haven't moved in a while.")
