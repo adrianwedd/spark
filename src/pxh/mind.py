@@ -2126,10 +2126,10 @@ def _extract_json_from_pane(text: str) -> str | None:
     before parsing: any newline followed by whitespace that is NOT a JSON
     structural indent (not starting with ") is treated as a line wrap.
     """
-    # Rejoin pane-wrapped lines: \n followed by 1-2 spaces then non-quote/non-brace
-    # is a continuation of the previous line (pane line wrap, not JSON structure)
+    # Rejoin pane-wrapped lines: \n followed by 1-3 spaces then a non-structural
+    # character is a continuation of the previous line (pane line wrap, not JSON indent)
     import re
-    text = re.sub(r'\n  (?=[^"{}\[\]])', ' ', text)
+    text = re.sub(r'\n {1,3}(?=[^"{}\[\]])', ' ', text)
 
     decoder = json.JSONDecoder()
     last_match = None
@@ -2252,11 +2252,11 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
                     found_final_prompt = True
                     break
 
-            if found_final_prompt and response_lines:
+            if response_lines and (found_final_prompt or tick >= 150):
                 _tmux_timeout_count = 0
                 _tmux_turn_count += 1
                 resp = "\n".join(response_lines)
-                log(f"tmux response captured ({tick+1}s, {len(response_lines)} lines)")
+                log(f"tmux response captured ({tick+1}s, {len(response_lines)} lines, prompt={'yes' if found_final_prompt else 'no'})")
                 return {"response": resp}
     finally:
         try:
