@@ -1,7 +1,7 @@
 # SPARK Self-Evolution: Introspection + Autonomous Code Proposals
 
 **Date**: 2026-03-20
-**Status**: Draft
+**Status**: Approved
 **Author**: Adrian + Claude
 
 ## Problem
@@ -30,6 +30,36 @@ SPARK never modifies live code directly. The PR is the gate.
 - Modifying security surfaces (API auth, PIN lockout, systemd)
 - Modifying the self-evolution system itself
 - Real-time code hot-reloading
+
+## Key Architectural Decision: `spark_config.py`
+
+Extract SPARK's tunable configuration from `mind.py` (3300+ lines) into a dedicated `src/pxh/spark_config.py`. This gives SPARK a clean, focused file it can modify freely, and keeps `mind.py` (cognitive loop logic) out of the blast radius entirely.
+
+**What moves to `spark_config.py`:**
+- `SPARK_ANGLES` list
+- `TOPIC_SEEDS` list
+- `_SPARK_REFLECTION_PREFIX` string
+- `_SPARK_REFLECTION_SUFFIX` string
+- `MOOD_TO_SOUND` dict
+- `MOOD_TO_EMOTE` dict
+- Tunable constants: `SIMILARITY_THRESHOLD`, `EXPRESSION_COOLDOWN_S`, `SALIENCE_THRESHOLD`, `_FREE_WILL_WEIGHT`, `WEATHER_INTERVAL_S`
+
+**What stays in `mind.py`:**
+- All cognitive loop logic (awareness, reflection, expression)
+- `VALID_MOODS`, `VALID_ACTIONS`, `MOOD_COORDS` (structural, not tunable)
+- Gating logic, safety gates, tmux management
+- `REFLECTION_SYSTEM`, `REFLECTION_SYSTEM_GREMLIN`, `REFLECTION_SYSTEM_VIXEN` (other personas)
+
+`mind.py` imports from `spark_config.py`:
+```python
+from pxh.spark_config import (SPARK_ANGLES, TOPIC_SEEDS,
+    _SPARK_REFLECTION_PREFIX, _SPARK_REFLECTION_SUFFIX,
+    MOOD_TO_SOUND, MOOD_TO_EMOTE,
+    SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
+    SALIENCE_THRESHOLD, _FREE_WILL_WEIGHT, WEATHER_INTERVAL_S)
+```
+
+The file whitelist for SPARK evolution is now simply: **`src/pxh/spark_config.py`** + new `bin/tool-*` + test files. `mind.py` itself is blacklisted.
 
 ## Architecture Overview
 
@@ -79,9 +109,10 @@ Add `introspect` to `VALID_ACTIONS` in `mind.py`. Update `test_valid_actions_inc
 
 `tool-introspect` sources `px-env` (which sets `PYTHONPATH`) and imports constants directly:
 ```python
-from pxh.mind import (SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
+from pxh.spark_config import (SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
     SALIENCE_THRESHOLD, _FREE_WILL_WEIGHT, WEATHER_INTERVAL_S,
-    SPARK_ANGLES, TOPIC_SEEDS, MIND_BACKEND, CLAUDE_MODEL)
+    SPARK_ANGLES, TOPIC_SEEDS)
+from pxh.mind import MIND_BACKEND, CLAUDE_MODEL
 ```
 
 Reported values:
@@ -218,44 +249,32 @@ WORKDIR="/tmp/spark-evolve-${id}"
 git worktree add "$WORKDIR" -b "$BRANCH"
 ```
 
-**Step 2: Launch Claude Sonnet**
+**Step 2: Run Claude Sonnet via subprocess**
 
-Open a tmux session `px-evolve` (or reuse if exists). Note: `px-evolve` needs its own tmux management — `_tmux_ensure_session()` from mind.py cannot be reused directly because it hardcodes session name `px-claude`, model `claude-haiku`, and working directory `spark-reflect`. Write a standalone `_ensure_evolve_session(workdir)` function in `bin/px-evolve` that:
-- Uses session name `px-evolve`
-- Sets cwd to the worktree directory
-- Passes `--dangerously-skip-permissions --model claude-sonnet-4-6`
+No tmux session needed — at 1 evolution per 24 hours, the 14s Claude CLI cold start is irrelevant. Use a single-shot `claude -p` subprocess call, which is far simpler than tmux session management.
 
-Inside the worktree, run:
-```bash
-claude --dangerously-skip-permissions --model claude-sonnet-4-6
-```
-
-Send the scoped system prompt via `tmux send-keys`:
-
-```
-You are SPARK, a PiCar-X robot, proposing a change to your own code.
+Build the prompt string and run:
+```python
+prompt = f"""You are SPARK, a PiCar-X robot, proposing a change to your own code.
 
 ## Your intent
-{intent from queue entry}
+{intent}
 
 ## Your current state
-{introspection snapshot: stats, config, architecture}
+{introspection_json}
 
 ## File whitelist (you may ONLY modify these)
-- src/pxh/mind.py — regions: SPARK_ANGLES, TOPIC_SEEDS, _SPARK_REFLECTION_PREFIX,
-  _SPARK_REFLECTION_SUFFIX, MOOD_TO_SOUND, MOOD_TO_EMOTE, and constants
-  (SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S, SALIENCE_THRESHOLD,
-  _FREE_WILL_WEIGHT, WEATHER_INTERVAL_S)
+- src/pxh/spark_config.py — SPARK's tunable configuration (angles, topic seeds, constants)
 - bin/tool-* — create new tools only (do not modify existing tools)
 - src/pxh/voice_loop.py — ALLOWED_TOOLS and TOOL_COMMANDS dicts only
   (to register new tools you created)
-- tests/ — add new test files for any new tools
+- tests/ — add new test files for any new tools or config changes
 
 ## File blacklist (NEVER touch these)
 - docs/prompts/persona-gremlin.md, persona-vixen.md
 - bin/tool-chat, bin/tool-chat-vixen
 - REFLECTION_SYSTEM_GREMLIN, REFLECTION_SYSTEM_VIXEN in mind.py
-- src/pxh/api.py
+- src/pxh/api.py, src/pxh/mind.py (use spark_config.py instead)
 - .env, credentials, systemd units, bin/px-evolve
 - Any file not in the whitelist
 
@@ -263,19 +282,40 @@ You are SPARK, a PiCar-X robot, proposing a change to your own code.
 - Make minimal, focused changes that serve your intent
 - Add tests for new tools
 - Every tool must emit a single JSON object to stdout and support PX_DRY=1
-- When adding tools to ALLOWED_TOOLS/TOOL_COMMANDS, also update any test assertions that check these dicts (e.g., test_valid_actions_includes_new_actions)
-- Commit with message: "[SPARK] {concise description}"
+- When adding tools to ALLOWED_TOOLS/TOOL_COMMANDS, also update any test assertions
+  that check these dicts
+- Commit with message: "[SPARK] {{concise description}}"
 - Do not modify more than 3 files
 - Do not change safety gates or validation logic
+"""
+
+result = subprocess.run(
+    ["claude", "-p", prompt,
+     "--dangerously-skip-permissions",
+     "--model", evolve_model],
+    cwd=workdir, capture_output=True, text=True,
+    timeout=evolve_timeout, env=env)
 ```
 
-**Step 3: Wait for completion**
+Log the full command to `logs/px-evolve.log` for audit trail before execution.
 
-Capture-pane polling (like px-claude), timeout 5 minutes. Look for the Claude CLI prompt returning to indicate completion.
+**Step 3: Verify changes**
 
-**Step 4: Create PR**
+Check if the branch has any commits beyond the base:
 
-If the worktree has uncommitted or committed changes on the branch:
+**Step 4: Run tests**
+
+Before creating the PR, run tests in the worktree to catch obvious breakage:
+```bash
+cd "$WORKDIR"
+python -m pytest tests/ -x -q --timeout=120 2>&1
+```
+
+If tests fail, set status to `"failed:tests"`, log the failure output, and clean up the worktree. Do not create a PR for code that doesn't pass tests.
+
+**Step 5: Create PR**
+
+If tests pass and the branch has commits beyond the base:
 ```bash
 cd "$WORKDIR"
 git push -u origin "$BRANCH"
@@ -301,12 +341,12 @@ EOF
 )"
 ```
 
-**Step 5: Cleanup**
+**Step 6: Cleanup**
 ```bash
 git worktree remove "$WORKDIR" --force
 ```
 
-**Step 6: Update state**
+**Step 7: Update state**
 
 Update `state/evolve_queue.jsonl` entry:
 ```json
@@ -330,6 +370,7 @@ Append to `state/evolve_log.jsonl`:
 
 - Claude timeout (5 min): set status to `"failed:timeout"`, clean up worktree
 - No changes made: set status to `"failed:no_changes"`, clean up
+- Tests fail: set status to `"failed:tests"`, log test output, clean up worktree
 - `gh pr create` fails: set status to `"failed:pr_create"`, leave branch for manual inspection
 - Git worktree creation fails: set status to `"failed:worktree"`, log error
 - All failures logged to `logs/px-evolve.log`
@@ -425,13 +466,16 @@ WantedBy=multi-user.target
 1. **Introspection cooldown** (30 min) — can't obsess
 2. **Evolution rate limit** (1/24h) — can't spam
 3. **Introspection prerequisite** — can't evolve blindly
-4. **File whitelist** — can't touch arbitrary code
-5. **File blacklist** — can't touch personas, security, self-evolution
-6. **Max 3 files** — can't make sweeping changes
-7. **5 min timeout** — can't run indefinitely
-8. **Git worktree** — live code is never at risk
-9. **PR gate** — human reviews before merge
-10. **Dry-run mode** — can test without creating PRs
+4. **`spark_config.py` extraction** — SPARK modifies one focused file, not 3300-line mind.py
+5. **File whitelist** — can't touch arbitrary code
+6. **File blacklist** — can't touch personas, security, self-evolution, mind.py
+7. **Max 3 files** — can't make sweeping changes
+8. **5 min timeout** — can't run indefinitely
+9. **Git worktree** — live code is never at risk
+10. **Test gate** — tests must pass before PR creation
+11. **PR gate** — human reviews before merge
+12. **Audit logging** — full claude command logged to `logs/px-evolve.log`
+13. **Dry-run mode** — can test without creating PRs
 
 ## Testing strategy
 
@@ -440,8 +484,8 @@ WantedBy=multi-user.target
 - `test_px_evolve.py`: mock git/gh/claude commands, verify worktree creation/cleanup, verify PR creation, verify failure handling
 - Integration: `PX_EVOLVE_DRY=1` end-to-end test with a real introspection + evolve cycle
 
-## Open questions
+## Resolved questions
 
-1. Should SPARK see the diff of its own merged PRs in future introspections? (Would close the feedback loop — "I changed X and it made me think differently")
-2. Should there be a "confidence" field in the evolution request, so SPARK can signal how strongly it wants the change?
-3. Should px-evolve run tests before creating the PR? (Adds reliability but also complexity and time)
+1. **Should SPARK see merged PR diffs?** Yes. `tool-introspect` reads `state/evolve_log.jsonl` and includes the last 5 entries with their status. A future enhancement can add `merged_diff_summary` to log entries after merge detection.
+2. **Confidence field?** No. Adds complexity without value. If SPARK isn't confident, it shouldn't propose.
+3. **Run tests before PR?** Yes. Step 4 runs `pytest -x -q` in the worktree. Failing tests → `failed:tests` status, no PR created.
