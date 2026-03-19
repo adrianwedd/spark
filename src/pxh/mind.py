@@ -301,9 +301,28 @@ REACTIVE_TEMPLATES = {
 
 # Ollama config (same host as tool-chat)
 OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
-MODEL             = os.environ.get("PX_MIND_MODEL", "deepseek-r1:1.5b")
+_MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 LOCAL_OLLAMA_HOST = os.environ.get("PX_MIND_LOCAL_OLLAMA_HOST", "http://localhost:11434")
-LOCAL_MODEL       = os.environ.get("PX_MIND_LOCAL_MODEL", "deepseek-r1:1.5b")
+_LOCAL_MODEL_ENV  = os.environ.get("PX_MIND_LOCAL_MODEL", "auto")
+
+
+def _resolve_ollama_model(host: str, preferred: str) -> str:
+    """Resolve 'auto' to the first loaded model on the Ollama host."""
+    if preferred != "auto":
+        return preferred
+    try:
+        r = urllib.request.urlopen(f"{host}/api/tags", timeout=3)
+        tags = json.loads(r.read())
+        models = [m["name"] for m in tags.get("models", [])]
+        if models:
+            return models[0]
+    except Exception:
+        pass
+    return "deepseek-r1:1.5b"  # ultimate fallback
+
+
+MODEL       = _resolve_ollama_model(OLLAMA_HOST, _MODEL_ENV)
+LOCAL_MODEL = _resolve_ollama_model(LOCAL_OLLAMA_HOST, _LOCAL_MODEL_ENV)
 TEMPERATURE  = 1.3   # high for variety — small models need more randomness
 TOP_P        = 0.95  # nucleus sampling to complement temperature
 MAX_TOKENS   = 200
@@ -1902,8 +1921,13 @@ def call_ollama(prompt: str, system: str,
     try:
         with urllib.request.urlopen(req, timeout=_timeout) as resp:
             return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return {"error": f"ollama model '{_model}' not found on {_host} (404)"}
+        return {"error": f"ollama HTTP {exc.code} on {_host}: {exc}"}
     except urllib.error.URLError as exc:
-        return {"error": f"ollama unreachable ({_host}): {exc}"}
+        reason = str(exc.reason) if hasattr(exc, 'reason') else str(exc)
+        return {"error": f"ollama unreachable ({_host}): {reason}"}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -3002,6 +3026,19 @@ def mind_loop(args) -> None:
 
     log(f"cognitive loop started (awareness every {args.awareness_interval}s, "
         f"reflection every {args.reflection_interval}s idle)")
+
+    # Startup check: verify Ollama models are available
+    for label, host, model in [("M1", OLLAMA_HOST, MODEL)]:
+        try:
+            r = urllib.request.urlopen(f"{host}/api/tags", timeout=3)
+            tags = json.loads(r.read())
+            available = [m["name"] for m in tags.get("models", [])]
+            if model in available:
+                log(f"✓ {label} ollama: model '{model}' available ({host})")
+            else:
+                log(f"⚠ {label} ollama: model '{model}' NOT found — available: {', '.join(available) or 'none'}")
+        except Exception as exc:
+            log(f"⚠ {label} ollama unreachable at startup: {exc}")
 
     while True:
         now = time.monotonic()
