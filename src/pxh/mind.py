@@ -774,7 +774,10 @@ def _fetch_ha_sleep(dry: bool = False) -> dict | None:
         req = urllib.request.Request(f"{HA_HOST}/api/states/sensor.sleep", headers=headers)
         with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as r:
             data = json.loads(r.read())
-        total_s = float(data["state"])
+        raw_state = data.get("state", "")
+        if raw_state in ("unknown", "unavailable", ""):
+            return None
+        total_s = float(raw_state)
         if total_s <= 0:
             if HA_DEBUG:
                 log(f"ha_sleep: sensor returned {total_s}s — unavailable")
