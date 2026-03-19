@@ -666,7 +666,7 @@ Rules:
 Output ONLY this JSON:
 {
   "thought": "1-2 sentences, first person, specific and vivid",
-  "mood": "one of: curious, content, alert, playful, excited, peaceful, contemplative",
+  "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, excited, peaceful, anxious, lonely, grumpy",
   "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, morning_fact",
   "salience": 0.0 to 1.0
 }"""
