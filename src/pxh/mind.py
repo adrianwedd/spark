@@ -2258,7 +2258,7 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
         except Exception as exc:
             log(f"tmux: prompt file cleanup failed: {exc}")
 
-    # Timeout — reset session after 2 consecutive timeouts
+    # Timeout — reset session after 5 consecutive timeouts
     _tmux_timeout_count += 1
     if _tmux_timeout_count >= 5:
         log("tmux: 5 consecutive timeouts — resetting session")
