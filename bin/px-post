@@ -873,8 +873,10 @@ def run_backfill(dry: bool) -> int:
         # Dedup against existing feed
         if is_duplicate(entry["thought"], [p.get("thought", "") for p in feed_posts]):
             continue
-        # QA gate (unless disabled)
+        # QA gate (unless disabled). "ambiguous" defaults to pass (safety net, not quality bar)
         qa = run_qa_gate(entry["thought"])
+        if qa == "ambiguous":
+            qa = "pass"
         if qa not in ("pass", None):
             continue
         if qa is None and os.environ.get("PX_POST_QA", "1") != "0":

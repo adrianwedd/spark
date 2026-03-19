@@ -418,7 +418,7 @@ window.SparkDashboard = (function () {
     const container = $('race-status');
     if (!container) return;
     const race = state.race;
-    if (!race) return;
+    if (!race) { container.classList.add('hidden'); return; }
 
     container.classList.remove('hidden');
     const calibrated = $('race-calibrated');

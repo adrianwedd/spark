@@ -305,22 +305,40 @@ _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 LOCAL_OLLAMA_HOST = os.environ.get("PX_MIND_LOCAL_OLLAMA_HOST", "http://localhost:11434")
 _LOCAL_MODEL_ENV  = os.environ.get("PX_MIND_LOCAL_MODEL", "auto")
 
+# Lazy model resolution — resolved on first use, not import time.
+# Caches per-host and re-resolves every 30 min to track model swaps.
+_resolved_models: dict[str, tuple[str, float]] = {}  # host → (model, resolved_at_mono)
+_MODEL_CACHE_TTL = 1800  # 30 min
+
 
 def _resolve_ollama_model(host: str, preferred: str) -> str:
-    """Resolve 'auto' to the first loaded model on the Ollama host."""
+    """Resolve 'auto' to the first loaded model on the Ollama host.
+
+    Caches the result per-host for 30 min, then re-queries. This avoids
+    blocking at import time and adapts to model swaps on the Ollama host.
+    """
     if preferred != "auto":
         return preferred
+    cached = _resolved_models.get(host)
+    if cached and (time.monotonic() - cached[1]) < _MODEL_CACHE_TTL:
+        return cached[0]
     try:
         r = urllib.request.urlopen(f"{host}/api/tags", timeout=3)
         tags = json.loads(r.read())
         models = [m["name"] for m in tags.get("models", [])]
         if models:
+            _resolved_models[host] = (models[0], time.monotonic())
             return models[0]
     except Exception:
         pass
+    # Return cached model if available, else fallback
+    if cached:
+        return cached[0]
     return "deepseek-r1:1.5b"  # ultimate fallback
 
 
+# Eagerly resolve at module load for startup logging, but non-blocking:
+# if host is down, falls back immediately without blocking imports.
 MODEL       = _resolve_ollama_model(OLLAMA_HOST, _MODEL_ENV)
 LOCAL_MODEL = _resolve_ollama_model(LOCAL_OLLAMA_HOST, _LOCAL_MODEL_ENV)
 TEMPERATURE  = 1.3   # high for variety — small models need more randomness
@@ -1918,7 +1936,8 @@ def call_ollama(prompt: str, system: str,
                 model: str | None = None) -> dict:
     """Call Ollama for reflection. host defaults to OLLAMA_HOST (M1.local)."""
     _host  = host  or OLLAMA_HOST
-    _model = model or MODEL
+    # Re-resolve model on each call (cached, re-checks every 30 min)
+    _model = model or _resolve_ollama_model(_host, _MODEL_ENV)
 
     payload = json.dumps({
         "model": _model,

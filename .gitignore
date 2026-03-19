@@ -37,6 +37,10 @@ state/px-post.pid
 state/px-post-status.json
 state/thought-images/
 state/token_usage.json
+state/introspection.json
+state/evolve_queue.jsonl
+state/evolve_log.jsonl
+state/spark-reflect/
 state/race_calibration.json
 state/race_track.json
 state/race_log.jsonl

@@ -135,7 +135,7 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer cognitive architecture:
 - **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state + calendar + multi-camera Frigate → `state/awareness.json` + transition detection. Fetches Obi's Google Calendar every 5 min via `gws` CLI; queries all Frigate cameras (picar_x, picamera, driveway_camera, garden_camera) for per-camera person/object presence with room names.
-- **Layer 2 — Reflection** (on transition or every 5 min idle): SPARK persona uses Claude Haiku via persistent tmux session (`px-claude` on dedicated `-L px-mind` socket — isolates from user tmux sessions so `systemctl restart px-mind` won't kill interactive sessions). Other personas (GREMLIN, VIXEN) use Ollama `deepseek-r1:1.5b` on M1.local. Falls back to Ollama on Claude error. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt. 42 reflection angles sampled 5 per call to diversify mood range across all 12 moods. Weather refreshed every 30 min (BOM updates half-hourly). `px-claude` output piped to `logs/px-claude.log` via `tmux pipe-pane` for safe monitoring.
+- **Layer 2 — Reflection** (on transition or every 5 min idle): SPARK persona uses Claude Haiku via persistent tmux session (`px-claude` on dedicated `-L px-mind` socket — isolates from user tmux sessions so `systemctl restart px-mind` won't kill interactive sessions). Other personas (GREMLIN, VIXEN) use Ollama on M1.local (auto-detects loaded model; default fallback `deepseek-r1:1.5b`). Falls back to Ollama on Claude error. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt. 42 reflection angles sampled 5 per call to diversify mood range across all 12 moods. Weather refreshed every 30 min (BOM updates half-hourly). `px-claude` output piped to `logs/px-claude.log` via `tmux pipe-pane` for safe monitoring.
 - **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions (15): `wait, greet, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check, morning_fact`. Charging-gated actions (require battery) are blocked when on charger. Expression gating: suppresses speech during school hours, Mum's custody time, quiet time, bedtime, and decompress periods (all calendar-driven). Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
 `compute_obi_mode()` returns calendar-authoritative states (`at-school`, `at-mums`) when calendar events match, falling back to ambient heuristics otherwise.
@@ -300,7 +300,7 @@ Always launch via `bin/px-api-server` (not bare uvicorn — needs `px-env` for P
 
 ### Jailbroken Chat Personas
 
-Two jailbroken chat personas via Ollama (qwen3:1.7b on M1.local; px-mind reflection uses deepseek-r1:1.5b on M1.local for non-SPARK personas), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
+Two jailbroken chat personas via Ollama (qwen3:1.7b on M1.local; px-mind reflection auto-detects the loaded Ollama model on M1.local for non-SPARK personas), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
 
 | Persona | Tool | Voice | Character |
 |---------|------|-------|-----------|
@@ -418,10 +418,10 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_VIXEN_TEMPERATURE` | VIXEN sampling temperature (default: `0.9`) |
 | `PX_OLLAMA_HOST` | Ollama server (default: `http://M1.local:11434`) |
 | `PX_MIND_BACKEND` | Reflection backend: `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` (default: `auto`) |
-| `PX_MIND_MODEL` | Ollama model for non-SPARK reflection (default: `deepseek-r1:1.5b`) |
+| `PX_MIND_MODEL` | Ollama model for non-SPARK reflection (default: `auto` — queries loaded model) |
 | `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (disabled by default — Pi 4 OOM) |
 | `PX_MIND_LOCAL_OLLAMA_HOST` | Tier-3 fallback Ollama host on Pi (default: `http://localhost:11434`) |
-| `PX_MIND_LOCAL_MODEL` | Tier-3 fallback model (default: `deepseek-r1:1.5b`) |
+| `PX_MIND_LOCAL_MODEL` | Tier-3 fallback model (default: `auto` — queries loaded model) |
 | `PX_STATE_DIR` | Override state directory (used by tests) |
 | `PX_FRIGATE_HOST` | Frigate API base URL (default: `http://pi5-hailo.local:5000`) |
 | `PX_FRIGATE_CAMERA` | Frigate camera name (default: `picar_x`) |
