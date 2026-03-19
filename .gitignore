@@ -37,6 +37,10 @@ state/px-post.pid
 state/px-post-status.json
 state/thought-images/
 state/token_usage.json
+state/race_calibration.json
+state/race_track.json
+state/race_log.jsonl
+state/race_live.json
 state/pin_lockout.json
 state/*.tmp
 state/.*.tmp

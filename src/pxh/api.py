@@ -755,6 +755,49 @@ async def public_feed():
         return {"updated": None, "posts": []}
 
 
+@app.get("/api/v1/public/race")
+async def public_race():
+    """Race telemetry and status. No auth required."""
+    sd = _public_state_dir()
+    result: dict[str, Any] = {"calibrated": False, "profile": None, "live": None}
+    # Calibration
+    cal_path = sd / "race_calibration.json"
+    try:
+        cal = json.loads(cal_path.read_text())
+        result["calibrated"] = True
+        result["calibration"] = cal
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # Track profile
+    profile_path = sd / "race_track.json"
+    try:
+        prof = json.loads(profile_path.read_text())
+        result["profile"] = {
+            "segments": len(prof.get("segments", [])),
+            "lap_duration_s": prof.get("lap_duration_s"),
+            "track_width_cm": prof.get("track_width_cm"),
+            "laps_completed": len(prof.get("lap_history", [])),
+        }
+        if prof.get("lap_history"):
+            result["profile"]["best_lap_s"] = min(
+                lh["duration_s"] for lh in prof["lap_history"]
+                if "duration_s" in lh
+            ) if prof["lap_history"] else None
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    # Live telemetry
+    live_path = sd / "race_live.json"
+    try:
+        live = json.loads(live_path.read_text())
+        age = _time.time() - live.get("ts", 0)
+        if age < 10:
+            result["live"] = live
+            result["live"]["age_s"] = round(age, 1)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return result
+
+
 @app.get("/api/v1/public/thought-image")
 async def thought_image(ts: str = Query(...)):
     """Serve a thought card PNG by timestamp. No auth required."""
@@ -796,6 +839,7 @@ _PUBLIC_CHAT_TIMEOUT_S = 15.0
 
 
 _PUBLIC_CHAT_EXECUTOR = ThreadPoolExecutor(max_workers=2)
+_executor = ThreadPoolExecutor(max_workers=2)
 _public_chat_log = logging.getLogger("pxh.api.public_chat")
 
 # Strip Claude Code session vars but NOT CLAUDE_API_KEY (used with OAuth).
@@ -1191,6 +1235,124 @@ async def get_job(job_id: str) -> Dict[str, Any]:
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
     return job
+
+
+# ---------------------------------------------------------------------------
+# Race control — launch px-race commands as async jobs
+# ---------------------------------------------------------------------------
+
+# Track active race process so we can stop it
+_race_proc: Optional[subprocess.Popen] = None
+_race_proc_lock = threading.Lock()
+
+
+class RaceRequest(BaseModel):
+    laps: int = Field(default=3, ge=1, le=100)
+    max_speed: int = Field(default=50, ge=10, le=60)
+    dry: Optional[bool] = None
+
+
+@app.post("/api/v1/race/{action}", dependencies=[Depends(_verify_token)])
+async def race_action(action: str, request: Request) -> JSONResponse:
+    """Start/stop race commands. Actions: map, race, stop, status, calibrate_gate."""
+    global _race_proc
+
+    if action == "stop":
+        with _race_proc_lock:
+            if _race_proc and _race_proc.poll() is None:
+                _race_proc.terminate()
+                try:
+                    _race_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _race_proc.kill()
+                _race_proc = None
+                return JSONResponse(content={"status": "stopped"})
+            return JSONResponse(content={"status": "not_running"})
+
+    if action == "status":
+        sd = _public_state_dir()
+        with _race_proc_lock:
+            running = _race_proc is not None and _race_proc.poll() is None
+        cal_exists = (sd / "race_calibration.json").exists()
+        profile_exists = (sd / "race_track.json").exists()
+        return JSONResponse(content={
+            "running": running,
+            "calibrated": cal_exists,
+            "has_profile": profile_exists,
+        })
+
+    if action not in ("map", "race", "calibrate_gate"):
+        raise HTTPException(status_code=400, detail=f"unknown action: {action}")
+
+    # Don't start if already running
+    with _race_proc_lock:
+        if _race_proc and _race_proc.poll() is None:
+            return JSONResponse(
+                status_code=409,
+                content={"status": "already_running", "detail": "stop current race first"},
+            )
+
+    # Build command
+    dry = _resolve_dry(None)
+    cmd = ["/usr/bin/python3", "-m", "pxh.race"]
+
+    if action == "calibrate_gate":
+        # Non-interactive gate-only calibration for dashboard
+        cmd.extend(["--calibrate", "--dry-run"] if dry else ["--calibrate"])
+    elif action == "map":
+        cmd.append("--map")
+        if dry:
+            cmd.append("--dry-run")
+    elif action == "race":
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        laps = max(1, min(100, int(body.get("laps", 3))))
+        max_speed = max(10, min(60, int(body.get("max_speed", 50))))
+        cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
+        if dry:
+            cmd.append("--dry-run")
+
+    # Launch as async job
+    job_id = str(uuid.uuid4())
+    _set_job(job_id, {"status": "running", "action": f"race_{action}"})
+
+    def _run_race():
+        global _race_proc
+        try:
+            env = os.environ.copy()
+            env.setdefault("PYTHONPATH", str(PROJECT_ROOT / "src"))
+            with _race_proc_lock:
+                _race_proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=env, cwd=str(PROJECT_ROOT),
+                )
+            stdout, stderr = _race_proc.communicate(timeout=600)
+            _set_job(job_id, {
+                "status": "complete" if _race_proc.returncode == 0 else "error",
+                "action": f"race_{action}",
+                "returncode": _race_proc.returncode,
+                "stdout": (stdout or b"").decode(errors="replace")[-4096:],
+                "stderr": (stderr or b"").decode(errors="replace")[-2048:],
+            })
+        except subprocess.TimeoutExpired:
+            with _race_proc_lock:
+                if _race_proc:
+                    _race_proc.kill()
+            _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "timeout"})
+        except Exception as exc:
+            _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": str(exc)})
+        finally:
+            with _race_proc_lock:
+                _race_proc = None
+
+    _executor.submit(_run_race)
+    return JSONResponse(
+        status_code=202,
+        content={"status": "accepted", "job_id": job_id, "poll": f"/api/v1/jobs/{job_id}"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1759,6 +1921,31 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <button class="btn btn-purple" onclick="doTool('tool_describe_scene',{})">&#x1F4F8; What do you see?</button>
         <button class="btn btn-purple" onclick="doTool('tool_sonar',{})">&#x1F4E1; How far away?</button>
       </div>
+      <div class="sec-hdr" style="color:var(--danger)">&#x1F3CE;&#xFE0F; Racing</div>
+      <div id="race-status" style="background:var(--surface2);border-radius:var(--radius);padding:12px 16px;margin-bottom:8px;font-size:13px;color:var(--muted)">Loading race status&#x2026;</div>
+      <div id="race-live" style="display:none;background:var(--surface2);border-radius:var(--radius);padding:12px 16px;margin-bottom:8px;border-left:3px solid var(--danger)">
+        <div style="font-size:11px;font-weight:800;color:var(--danger);margin-bottom:6px">LIVE TELEMETRY</div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;text-align:center">
+          <div class="spark-stat" style="padding:6px 4px"><span id="rl-lap">-</span><br><span class="stat-lbl">lap</span></div>
+          <div class="spark-stat" style="padding:6px 4px"><span id="rl-speed">-</span><br><span class="stat-lbl">speed</span></div>
+          <div class="spark-stat" style="padding:6px 4px"><span id="rl-steer">-</span><br><span class="stat-lbl">steer</span></div>
+          <div class="spark-stat" style="padding:6px 4px"><span id="rl-sonar">-</span><br><span class="stat-lbl">sonar</span></div>
+        </div>
+        <div style="margin-top:6px;font-size:11px;color:var(--muted)">Seg: <span id="rl-seg">-</span> | Edge: <span id="rl-edge">-</span></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+        <button class="btn btn-muted" onclick="raceCmd('map')">&#x1F5FA;&#xFE0F; Map track</button>
+        <button class="btn btn-danger" onclick="raceStart()">&#x1F3C1; Start race</button>
+        <button class="btn btn-danger" style="font-weight:900" onclick="raceCmd('stop')">&#x26D4; E-STOP race</button>
+        <button class="btn btn-muted" onclick="raceCmd('status')">&#x1F4CA; Race status</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+        <span style="font-size:12px;color:var(--muted);white-space:nowrap">Laps</span>
+        <input type="number" id="race-laps" min="1" max="100" value="3" style="width:60px;background:var(--surface2);border:none;border-radius:8px;padding:8px;color:var(--text);font-family:inherit;font-size:14px;text-align:center">
+        <span style="font-size:12px;color:var(--muted);white-space:nowrap">Max speed</span>
+        <input type="range" id="race-max-speed" min="10" max="60" value="40" style="flex:1;accent-color:var(--danger)" oninput="document.getElementById('race-spd-val').textContent=this.value">
+        <span id="race-spd-val" style="font-size:13px;font-weight:800;color:var(--danger);min-width:28px">40</span>
+      </div>
     </div>
   </div>
   <div id="panel-spark"   class="tab-panel">
@@ -2068,6 +2255,57 @@ function sw(name){
   document.getElementById('tab-'+name).classList.add('active');
   if(name==='spark')pollFace();
 }
+// ── Racing ──
+let _raceJobId=null;
+async function raceCmd(action){
+  try{
+    const r=await api('/api/v1/race/'+action,{method:'POST',body:JSON.stringify({})});
+    if(r.job_id){_raceJobId=r.job_id;pollRaceJob();}
+    else{const st=document.getElementById('race-status');st.textContent=JSON.stringify(r);st.style.color='var(--spark)';}
+  }catch(e){document.getElementById('race-status').textContent='Error: '+e.message;}
+}
+async function raceStart(){
+  const laps=parseInt(document.getElementById('race-laps').value)||3;
+  const ms=parseInt(document.getElementById('race-max-speed').value)||40;
+  try{
+    const r=await api('/api/v1/race/race',{method:'POST',body:JSON.stringify({laps,max_speed:ms})});
+    if(r.job_id){_raceJobId=r.job_id;document.getElementById('race-status').textContent='Race started (job: '+r.job_id.slice(0,8)+')';document.getElementById('race-status').style.color='var(--danger)';pollRaceJob();}
+  }catch(e){document.getElementById('race-status').textContent='Error: '+e.message;}
+}
+async function pollRaceJob(){
+  if(!_raceJobId)return;
+  try{
+    const r=await api('/api/v1/jobs/'+_raceJobId);
+    const st=document.getElementById('race-status');
+    if(r.status==='running'){st.textContent='Running: '+r.action;st.style.color='var(--danger)';setTimeout(pollRaceJob,2000);}
+    else{st.textContent=r.status+': '+(r.stdout||r.error||'done');st.style.color=r.status==='complete'?'var(--spark)':'var(--danger)';_raceJobId=null;}
+  }catch(e){setTimeout(pollRaceJob,3000);}
+}
+async function pollRaceLive(){
+  try{
+    const r=await fetch('/api/v1/public/race').then(x=>x.json());
+    const lp=document.getElementById('race-live');
+    if(r.live){
+      lp.style.display='block';
+      document.getElementById('rl-lap').textContent=r.live.lap;
+      document.getElementById('rl-speed').textContent=r.live.speed;
+      document.getElementById('rl-steer').textContent=r.live.steer;
+      document.getElementById('rl-sonar').textContent=r.live.sonar_cm!=null?r.live.sonar_cm+'cm':'-';
+      document.getElementById('rl-seg').textContent=(r.live.seg_type||'-')+' #'+r.live.seg_idx;
+      document.getElementById('rl-edge').textContent=r.live.edge_error;
+    }else{lp.style.display='none';}
+    // Update status bar
+    const st=document.getElementById('race-status');
+    if(!_raceJobId){
+      let parts=[];
+      parts.push(r.calibrated?'\\u2705 Calibrated':'\\u274C Not calibrated');
+      if(r.profile)parts.push(r.profile.segments+' segs, '+r.profile.laps_completed+' laps'+(r.profile.best_lap_s?' (best: '+r.profile.best_lap_s.toFixed(1)+'s)':''));
+      else parts.push('No track profile');
+      st.textContent=parts.join(' \\u00b7 ');st.style.color='var(--muted)';
+    }
+  }catch(e){}
+}
+setInterval(pollRaceLive,2000);
 </script>
 </body></html>"""
 

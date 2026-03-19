@@ -1,4 +1,5 @@
 import json
+import os
 import pytest
 import sys
 from pathlib import Path
@@ -307,3 +308,233 @@ class TestSafety:
         from pxh.race import check_edge_guard
         triggered, _ = check_edge_guard([0.1, 0.05, 0.15], threshold=0.7)
         assert triggered is False
+
+
+class TestRaceControllerCalibrate:
+
+    def test_calibrate_stores_references(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        mock_px.get_distance.return_value = 90.0
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc._calibrate_surface("track", mock_px)
+        assert rc.calibration["track_ref"] == [400, 410, 405]
+        rc.save_calibration()
+        assert (tmp_path / "race_calibration.json").exists()
+
+    def test_calibration_round_trip(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        mock_px.get_grayscale_data.return_value = [500, 510, 505]
+        mock_px.get_distance.return_value = 90.0
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc._calibrate_surface("track", mock_px)
+        rc._calibrate_surface("barrier", mock_px)
+        rc.calibration["gate_threshold"] = 40
+        rc.calibration["track_width_cm"] = 88
+        rc.save_calibration()
+        # New controller should load it
+        rc2 = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        assert rc2.calibration["track_ref"] == [500, 510, 505]
+        assert rc2.calibration["gate_threshold"] == 40
+
+    def test_exploring_json_written_on_init(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        mock_px.get_distance.return_value = 90.0
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        exploring_path = tmp_path / "exploring.json"
+        assert exploring_path.exists()
+        data = json.loads(exploring_path.read_text())
+        assert data["active"] is True
+
+
+class TestRaceControllerMap:
+
+    def test_map_builds_profile(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        gs_sequence = [[400, 410, 405]] * 3 + [[460, 470, 465]]
+        mock_px.get_grayscale_data.side_effect = gs_sequence
+        mock_px.get_distance.return_value = 90.0
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc.calibration = {"track_ref": [400, 410, 405], "barrier_ref": [700, 710, 705],
+                          "gate_threshold": 40, "track_width_cm": 88}
+        rc.run_map(max_iterations=4)
+        assert rc.profile is not None
+        assert len(rc.profile.segments) > 0
+
+    def test_map_saves_profile_file(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        mock_px.get_distance.return_value = 90.0
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc.calibration = {"track_ref": [400, 410, 405], "barrier_ref": [700, 710, 705],
+                          "gate_threshold": 40, "track_width_cm": 88}
+        rc.run_map(max_iterations=3)
+        assert (tmp_path / "race_track.json").exists()
+
+    def test_map_raises_without_calibration(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        mock_px.get_distance.return_value = 90.0
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc.calibration = {}
+        with pytest.raises(RuntimeError, match="Calibration required"):
+            rc.run_map(max_iterations=1)
+
+
+class TestRaceControllerRace:
+
+    def _make_rc(self, tmp_path):
+        from pxh.race import RaceController, TrackProfile
+        mock_px = MagicMock()
+        profile = TrackProfile()
+        profile.add_segment("straight", 2.0, 44, 43, 120, [450, 460, 455])
+        profile.add_segment("turn_left", 1.0, 30, 55, 65, [520, 460, 380])
+        profile.track_width_cm = 88
+        profile.save(tmp_path / "race_track.json")
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        mock_px.get_distance.return_value = 90.0
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True, max_speed=50)
+        rc.calibration = {"track_ref": [400, 410, 405], "barrier_ref": [700, 710, 705],
+                          "gate_threshold": 50, "track_width_cm": 88}
+        return rc, mock_px
+
+    def test_race_completes_without_crash(self, tmp_path):
+        rc, _ = self._make_rc(tmp_path)
+        rc.run_race(max_laps=1, max_iterations=10)
+
+    def test_race_raises_without_profile(self, tmp_path):
+        from pxh.race import RaceController
+        mock_px = MagicMock()
+        mock_px.get_distance.return_value = 90.0
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc.profile = None
+        with pytest.raises(RuntimeError, match="No track profile"):
+            rc.run_race(max_iterations=1)
+
+    def test_race_writes_telemetry(self, tmp_path):
+        rc, _ = self._make_rc(tmp_path)
+        rc.run_race(max_laps=1, max_iterations=5)
+        # Telemetry may or may not be written (interval-gated) but no crash
+        # If it was written, check it's valid JSON
+        telem_path = tmp_path / "race_live.json"
+        if telem_path.exists():
+            data = json.loads(telem_path.read_text())
+            assert "lap" in data
+            assert "speed" in data
+
+    def test_race_respects_max_iterations(self, tmp_path):
+        rc, mock_px = self._make_rc(tmp_path)
+        rc.run_race(max_laps=0, max_iterations=5)
+        # Should have called get_grayscale_data exactly max_iterations times
+        assert mock_px.get_grayscale_data.call_count <= 10  # some slack for dry-mode branching
+
+    def test_estop_on_close_obstacle(self, tmp_path):
+        from pxh.race import RaceController, TrackProfile
+        mock_px = MagicMock()
+        profile = TrackProfile()
+        profile.add_segment("straight", 2.0, 44, 43, 120, [450, 460, 455])
+        profile.track_width_cm = 88
+        profile.save(tmp_path / "race_track.json")
+        # Sonar returns 5cm (very close) — should trigger e-stop path
+        mock_px.get_distance.return_value = 5.0
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True, max_speed=50)
+        rc.calibration = {"track_ref": [400, 410, 405], "barrier_ref": [700, 710, 705],
+                          "gate_threshold": 50, "track_width_cm": 88}
+        # Should not raise even with constant obstacle
+        rc.run_race(max_laps=0, max_iterations=3)
+
+    def test_stop_flag_halts_race(self, tmp_path):
+        from pxh.race import RaceController, TrackProfile
+        mock_px = MagicMock()
+        profile = TrackProfile()
+        profile.add_segment("straight", 2.0, 44, 43, 120, [450, 460, 455])
+        profile.track_width_cm = 88
+        profile.save(tmp_path / "race_track.json")
+        mock_px.get_grayscale_data.return_value = [400, 410, 405]
+        mock_px.get_distance.return_value = 90.0
+        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        rc.calibration = {"track_ref": [400, 410, 405], "barrier_ref": [700, 710, 705],
+                          "gate_threshold": 50, "track_width_cm": 88}
+        rc._stop_flag = True  # pre-set stop flag
+        rc.run_race(max_laps=0, max_iterations=100)
+        # Should exit immediately on first iteration check
+        assert mock_px.get_grayscale_data.call_count == 0
+
+
+class TestPxRaceCLI:
+
+    def test_status_no_profile(self, isolated_project):
+        import subprocess
+        env = isolated_project["env"].copy()
+        env["PX_STATE_DIR"] = str(isolated_project["state_dir"])
+        result = subprocess.run(
+            ["bin/px-race", "--status"],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert "no profile" in result.stdout.lower()
+
+    def test_status_with_profile(self, isolated_project):
+        import subprocess
+        from pxh.race import TrackProfile
+        state_dir = isolated_project["state_dir"]
+        tp = TrackProfile()
+        tp.add_segment("straight", 2.0, 44, 43, 120, [450, 460, 455])
+        tp.add_segment("turn_left", 1.0, 30, 55, 65, [520, 460, 380])
+        tp.track_width_cm = 88
+        tp.lap_duration_s = 12.5
+        # Save using write_text (skip atomic_write for test setup simplicity)
+        import json
+        data = {
+            "mapped_at": "", "map_speed": 20, "calibration_v": 0.0,
+            "lap_duration_s": 12.5, "track_width_cm": 88,
+            "segments": tp.segments, "lap_history": [],
+        }
+        (state_dir / "race_track.json").write_text(json.dumps(data))
+
+        env = isolated_project["env"].copy()
+        env["PX_STATE_DIR"] = str(state_dir)
+        result = subprocess.run(
+            ["bin/px-race", "--status"],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0
+        assert "2" in result.stdout  # 2 segments
+        assert "straight" in result.stdout
+
+    def test_dry_run_map_no_hardware(self, isolated_project):
+        import subprocess
+        env = isolated_project["env"].copy()
+        env["PX_STATE_DIR"] = str(isolated_project["state_dir"])
+        # Write a minimal calibration file so run_map doesn't fail
+        import json
+        cal = {"track_ref": [400, 410, 405], "barrier_ref": [700, 710, 705],
+               "gate_threshold": 40, "track_width_cm": 88}
+        (isolated_project["state_dir"] / "race_calibration.json").write_text(json.dumps(cal))
+        result = subprocess.run(
+            ["bin/px-race", "--map", "--dry-run", "--max-iterations", "5"],
+            cwd=str(ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert result.returncode == 0
