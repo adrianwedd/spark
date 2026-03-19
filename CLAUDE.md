@@ -213,6 +213,39 @@ Additional: `confirm_motion_allowed` gate; `yield_alive` at startup; `exploring.
 
 Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one Bluesky post per cycle (rate-limited). QA gate: Claude CLI answers YES/NO; "ambiguous" responses (e.g. "Maybe") default to pass — QA is a safety net for bad content, not a quality bar. PID-file single-instance guard. Branded 1080×1080 thought card images generated via Pillow (cached in `state/thought-images/`, cleaned up after 30 days). Bluesky re-auths on 400/401 (expired token). Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
 
+### Self-Evolution (px-evolve)
+
+SPARK can introspect on its own thought patterns and propose targeted code changes via GitHub PR — a controlled self-modification loop with human approval required before any change takes effect.
+
+**`src/pxh/spark_config.py`** — Tunable constants extracted from `mind.py`: reflection angles (`SPARK_ANGLES`), topic seeds (`TOPIC_SEEDS`), prompts, cooldowns, salience thresholds. This is the primary safe target for self-evolution; changes here reshape SPARK's personality and curiosity without touching core logic.
+
+**`bin/tool-introspect`** — Computes thought statistics (mood distribution, action distribution, top keywords, average salience, thoughts/day), snapshots `spark_config.py` constants, and records architecture awareness. 30-min cooldown enforced via `introspection.json` timestamp. Writes `state/introspection.json`. Dry-run supported (`PX_DRY=1` sets `dry: true` in output but still writes the file).
+
+**`bin/tool-evolve`** — Validates introspection freshness (must be <2h old), intent quality (≥20 chars), and 24h rate limit (max 3 queued/applied entries per day). Writes a `pending` entry to `state/evolve_queue.jsonl` including the full introspection snapshot. Returns `{"status": "queued", "id": "..."}`.
+
+**`bin/px-evolve` daemon** — Polls `evolve_queue.jsonl` for `pending` entries. For each:
+1. Creates a git worktree in `/tmp/px-evolve-<id>/`
+2. Runs `claude -p` with a scoped prompt (intent + introspection + file whitelist) and `--allowedTools` whitelist
+3. Runs `pytest` — marks entry `failed` and aborts on test failure
+4. Creates a PR via `gh pr create` — marks entry `applied` on success
+5. Cleans up worktree
+
+Single-instance PID guard. Restart policy: on-failure, 30 s.
+
+**Safety constraints**:
+- **File whitelist**: `src/pxh/spark_config.py`, `bin/tool-*` (new tools only), `tests/`
+- **File blacklist**: personas, `api.py`, `mind.py`, credentials, `.env`, `px-evolve` itself
+- Max 3 files changed per evolution; 5-min Claude subprocess timeout
+- Test gate: `pytest` must pass before PR is created
+- PR gate: human must merge — changes never auto-apply
+
+**State files** (gitignored):
+- `state/introspection.json` — latest thought stats + config snapshot
+- `state/evolve_queue.jsonl` — evolution queue (status: pending/applied/failed)
+- `state/evolve_log.jsonl` — per-run audit log with PR URL
+
+**New env vars**: `PX_EVOLVE_DRY` (1 = skip worktree/PR), `PX_EVOLVE_MODEL` (default: `claude-opus-4-6`), `PX_EVOLVE_TIMEOUT` (default: 300 s), `PX_EVOLVE_MAX_FILES` (default: 3).
+
 ### Site (spark.wedd.au)
 
 Static site hosted on **Cloudflare Pages** (auto-deploys from `master` branch, `site/` directory). Three pages: landing (`/`), thought feed (`/feed/`), thought permalink (`/thought/?ts=`).
@@ -284,7 +317,7 @@ Requires `OLLAMA_HOST=0.0.0.0 ollama serve` on M1.
 
 ### Systemd Services
 
-Nine services run at boot:
+Ten services run at boot:
 
 | Service | Script | User | Restart |
 |---------|--------|------|---------|
@@ -295,6 +328,7 @@ Nine services run at boot:
 | `px-post` | `bin/px-post` | pi | always, 30 s |
 | `px-api-server` | `bin/px-api-server` | pi | always, 2 s |
 | `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10 s |
+| `px-evolve` | `bin/px-evolve` | pi | on-failure, 30 s |
 | `px-tts-glados` | GLaDOS TTS server :7861 | pi | always, 10 s |
 | `cloudflared` | Cloudflare tunnel → spark-api.wedd.au | pi | always, 10 s |
 
@@ -407,6 +441,10 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_POST_QA` | `0` = skip Claude QA gate for testing |
 | `PX_POST_MIN_SALIENCE` | Minimum salience for social posting (default: `0.7`) |
 | `PX_HA_DEBUG` | `1` = verbose HA fetch logging (per-entity, calendar, routines); errors always logged |
+| `PX_EVOLVE_DRY` | `1` = skip worktree creation and PR (queue entry still written) |
+| `PX_EVOLVE_MODEL` | Claude model for evolution proposals (default: `claude-opus-4-6`) |
+| `PX_EVOLVE_TIMEOUT` | Claude subprocess timeout in seconds (default: `300`) |
+| `PX_EVOLVE_MAX_FILES` | Maximum files changed per evolution (default: `3`) |
 
 ## Multi-Model QA
 
