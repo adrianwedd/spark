@@ -19,5 +19,12 @@ git diff --quiet site/data/feed.json 2>/dev/null && exit 0
 
 git add site/data/feed.json
 git commit -m "data: update feed snapshot"
-git pull --rebase --quiet 2>/dev/null || true
+
+# Pull with rebase; abort on conflict to avoid committing merge markers
+if ! git pull --rebase --quiet 2>/dev/null; then
+  git rebase --abort 2>/dev/null || true
+  echo "px-feed-snapshot: rebase conflict, skipping push" >&2
+  exit 1
+fi
+
 git push --quiet 2>/dev/null || true
