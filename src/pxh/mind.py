@@ -2141,6 +2141,7 @@ def call_ollama(prompt: str, system: str,
 
 
 TMUX_SESSION = "px-claude"
+TMUX_SOCKET  = "px-mind"  # separate socket so systemd restart doesn't kill user tmux sessions
 TMUX_MAX_TURNS = 20  # reset session after N turns to prevent context buildup / refusal
 _tmux_ready = False
 _tmux_timeout_count = 0
@@ -2197,8 +2198,11 @@ def _reset_state():
 
 
 def _tmux_run(args: list, **kwargs) -> subprocess.CompletedProcess:
-    """Run a tmux command, catching FileNotFoundError if tmux is missing."""
+    """Run a tmux command on the px-mind socket, catching FileNotFoundError."""
     try:
+        # Inject -L px-mind after 'tmux' to use a dedicated socket
+        if args and args[0] == "tmux" and "-L" not in args and "-S" not in args:
+            args = [args[0], "-L", TMUX_SOCKET] + args[1:]
         return subprocess.run(args, capture_output=True, **kwargs)
     except FileNotFoundError:
         empty = "" if kwargs.get("text") else b""

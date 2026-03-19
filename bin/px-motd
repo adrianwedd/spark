@@ -177,27 +177,34 @@ def _svc_status(name: str) -> tuple[bool, str]:
 
 
 def _tmux_sessions() -> list[dict]:
-    """PAM runs as root — explicitly target pi's tmux socket."""
-    PI_SOCKET = "/tmp/tmux-1000/default"
-    try:
-        cmd = ["tmux", "-S", PI_SOCKET, "list-sessions", "-F",
-               "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}"]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
-        if r.returncode != 0:
-            return []
-        sessions = []
-        for line in r.stdout.strip().splitlines():
-            parts = line.split("|")
-            if len(parts) >= 4:
-                sessions.append({
-                    "name": parts[0],
-                    "windows": int(parts[1]),
-                    "attached": int(parts[2]) > 0,
-                    "created": int(parts[3]),
-                })
-        return sessions
-    except Exception:
-        return []
+    """PAM runs as root — explicitly target pi's tmux sockets.
+
+    User sessions live on the default socket (/tmp/tmux-1000/default).
+    px-mind uses a dedicated socket (-L px-mind → /tmp/tmux-1000/px-mind)
+    to isolate its tmux server from user sessions.
+    """
+    PI_DEFAULT = "/tmp/tmux-1000/default"
+    PI_PXMIND  = "/tmp/tmux-1000/px-mind"
+    sessions = []
+    for socket_path in (PI_DEFAULT, PI_PXMIND):
+        try:
+            cmd = ["tmux", "-S", socket_path, "list-sessions", "-F",
+                   "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if r.returncode != 0:
+                continue
+            for line in r.stdout.strip().splitlines():
+                parts = line.split("|")
+                if len(parts) >= 4:
+                    sessions.append({
+                        "name": parts[0],
+                        "windows": int(parts[1]),
+                        "attached": int(parts[2]) > 0,
+                        "created": int(parts[3]),
+                    })
+        except Exception:
+            continue
+    return sessions
 
 
 def _recent_errors(log_path: Path, n: int = 150) -> list[tuple[str, str]]:
