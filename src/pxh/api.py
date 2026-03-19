@@ -1430,11 +1430,11 @@ async def chat(body: ChatRequest) -> JSONResponse:
 # Service management — restart/stop/start allowlisted systemd services
 # ---------------------------------------------------------------------------
 
-# Public services endpoint queries these five explicitly. px-battery-poll is not
-# in _MANAGED_SERVICES (the auth'd endpoint doesn't control it) but the public
-# dashboard needs to show its status.
+# Public services endpoint queries all boot services. _MANAGED_SERVICES (below)
+# controls which ones the auth'd endpoint can stop/restart.
 _PUBLIC_SERVICES = frozenset({
-    "px-mind", "px-alive", "px-wake-listen", "px-battery-poll", "px-api-server"
+    "px-mind", "px-alive", "px-wake-listen", "px-battery-poll", "px-api-server",
+    "px-post", "px-frigate-stream", "px-tts-glados", "px-evolve", "cloudflared",
 })
 _PUBLIC_SERVICE_STATES = frozenset({"active", "activating", "failed", "inactive", "unknown"})
 
