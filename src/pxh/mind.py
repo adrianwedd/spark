@@ -88,7 +88,7 @@ SALIENCE_THRESHOLD     = 0.75  # auto-remember only high-quality thoughts (raise
 EXPRESSION_COOLDOWN_S  = 120   # min 2 min between spontaneous speech (was 30s)
 PROXIMITY_NEAR_CM      = 60
 PROXIMITY_FAR_CM       = 100
-WEATHER_INTERVAL_S     = 900   # refresh weather every 15 min (was 10)
+WEATHER_INTERVAL_S     = 1800  # refresh weather every 30 min (BOM updates half-hourly)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
 REACTIVE_COOLDOWN_S    = 30    # min seconds between reactive responses (was 15)
 AMBIENT_STALE_S        = 60    # ignore ambient_sound.json older than this
@@ -2227,6 +2227,13 @@ def _tmux_ensure_session() -> bool:
         log(f"tmux: new-session failed (rc={r.returncode})")
         return False
     _tmux_run(["tmux", "send-keys", "-t", TMUX_SESSION, cmd, "Enter"])
+
+    # Pipe all pane output to a log file for monitoring without attaching
+    log_dir = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    claude_log = log_dir / "px-claude.log"
+    _tmux_run(["tmux", "pipe-pane", "-t", TMUX_SESSION, "-o",
+               f"cat >> '{claude_log}'"])
 
     for _ in range(30):
         time.sleep(1)

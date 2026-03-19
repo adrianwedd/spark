@@ -60,8 +60,10 @@ def battery() -> str:
     d = _read_json(STATE_DIR / "battery.json")
     if not d:
         return "🔋?"
-    v, pct = d.get("volts", 0), d.get("pct", 0)
-    icon = "🔋" if pct > 30 else ("🪫" if pct > 10 else "❌")
+    v = d.get("volts") or 0
+    pct = d.get("pct") or 0
+    charging = d.get("charging", False)
+    icon = "🔌" if charging else ("🔋" if pct > 30 else ("🪫" if pct > 10 else "❌"))
     return f"{icon}{v:.1f}V({pct}%)"
 
 
@@ -103,18 +105,57 @@ def session() -> str:
     return " ".join(parts)
 
 
+def obi_mode() -> str:
+    d = _read_json(STATE_DIR / "awareness.json")
+    mode = d.get("obi_mode")
+    if not mode:
+        return ""
+    icons = {
+        "active": "🧒", "calm": "🧒", "absent": "💤",
+        "at-school": "🏫", "at-mums": "🏠",
+        "possibly-overloaded": "⚡", "unknown": "",
+    }
+    icon = icons.get(mode, "")
+    return f"{icon}{mode}" if icon else ""
+
+
+def weather() -> str:
+    d = _read_json(STATE_DIR / "awareness.json")
+    w = d.get("weather", {})
+    if not w:
+        return ""
+    temp = w.get("temp_c")
+    if temp is None:
+        return ""
+    return f"🌡️{temp}°C"
+
+
+def social() -> str:
+    d = _read_json(STATE_DIR / "px-post-status.json")
+    if not d:
+        return ""
+    bsky = d.get("bluesky_ok", False)
+    total = d.get("total_posted", 0)
+    queue = d.get("queue_depth", 0)
+    icon = "📫" if bsky else "📭"
+    return f"{icon}{total}↑{queue}⏳"
+
+
 def services() -> str:
-    svcs = {"alive": "px-alive", "mind": "px-mind", "wake": "px-wake-listen"}
+    labels = ["alive", "mind", "wake", "api", "post"]
+    svc_names = ["px-alive", "px-mind", "px-wake-listen", "px-api-server", "px-post"]
+    try:
+        # Single systemctl call for all services
+        r = subprocess.run(
+            ["systemctl", "is-active"] + svc_names,
+            capture_output=True, text=True, timeout=2,
+        )
+        results = r.stdout.strip().splitlines()
+    except Exception:
+        results = []
     states = []
-    for label, svc in svcs.items():
-        try:
-            r = subprocess.run(
-                ["systemctl", "is-active", svc],
-                capture_output=True, text=True, timeout=1,
-            )
-            active = r.returncode == 0
-        except Exception:
-            active = False
+    for i, label in enumerate(labels):
+        active = i < len(results) and results[i].strip() == "active"
         states.append(("●" if active else "○") + label)
     return " ".join(states)
 
@@ -132,15 +173,30 @@ def main() -> None:
     if m:
         parts.append(m)
 
+    # Obi
+    o = obi_mode()
+    if o:
+        parts.append(o)
+
     # Sonar proximity
     sr = sonar()
     if sr:
         parts.append(sr)
 
+    # Weather
+    w = weather()
+    if w:
+        parts.append(w)
+
     # Hardware
     parts.append(cpu_temp() + throttle())
     parts.append(mem())
     parts.append(battery())
+
+    # Social
+    sc = social()
+    if sc:
+        parts.append(sc)
 
     # Services
     parts.append(services())

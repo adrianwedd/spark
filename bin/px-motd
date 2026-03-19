@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""px-motd — SPARK login banner with system status, tmux sessions, and diagnostics.
+
+Designed for /etc/update-motd.d/ — runs on every SSH login.
+Reads only fast sources (state files, /sys, systemctl). No I2C/GPIO/network.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+PROJECT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
+STATE   = Path(os.environ.get("PX_STATE_DIR", PROJECT / "state"))
+LOGS    = Path(os.environ.get("LOG_DIR", PROJECT / "logs"))
+
+# ── ANSI colours ─────────────────────────────────────────────────────────────
+
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+YELLOW  = "\033[33m"
+CYAN    = "\033[36m"
+GREEN   = "\033[32m"
+RED     = "\033[31m"
+MAGENTA = "\033[35m"
+WHITE   = "\033[97m"
+BLUE    = "\033[34m"
+GREY    = "\033[90m"
+BG_GREY = "\033[48;5;236m"
+
+# Extended 256-colour palette (closer to site's mood palette in colors.css)
+AMBER   = "\033[38;5;179m"  # warm gold — curious (#c48a3f)
+OLIVE   = "\033[38;5;107m"  # soft green — content (#6b8e5e)
+PURPLE  = "\033[38;5;140m"  # muted purple — contemplative (#7b6fa0)
+TEAL    = "\033[38;5;73m"   # calm blue-green — peaceful (#4a9d8f)
+ROSE    = "\033[38;5;168m"  # warm pink — excited (#d44a6b)
+TERRA   = "\033[38;5;167m"  # earthy red — active (#d46b4a)
+
+
+def _link(url: str, label: str) -> str:
+    """OSC 8 clickable hyperlink (iTerm2, macOS Terminal, Ghostty, WezTerm, etc.)."""
+    return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
+
+# Mood → colour map (aligned with site/css/colors.css Scheme B palette)
+MOOD_COLOURS = {
+    "curious": AMBER,         # warm amber — inquisitive energy
+    "content": OLIVE,         # soft olive — settled, not urgent
+    "contemplative": PURPLE,  # muted purple — introspective
+    "peaceful": TEAL,         # calm teal — serene
+    "playful": MAGENTA,       # bright — bouncy energy
+    "excited": ROSE,          # warm pink — high arousal, positive
+    "bored": GREY,            # muted — low energy
+    "mischievous": YELLOW,    # cheeky attention-grab
+    "lonely": BLUE,           # subdued cool — withdrawn
+    "grumpy": RED,            # hot — irritated
+    "alert": WHITE,           # high contrast — demands attention
+    "anxious": TERRA,         # uneasy warmth — not as alarming as red
+}
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _jsonl_last(path: Path, n: int = 1) -> list[dict]:
+    """Read last N lines from a JSONL file."""
+    try:
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        results = []
+        for l in lines[-n:]:
+            try:
+                results.append(json.loads(l))
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return results
+    except Exception:
+        return []
+
+
+def _age_str(ts_str: str | None) -> str:
+    """Human-readable age from an ISO timestamp string."""
+    if not ts_str:
+        return "never"
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - ts
+        secs = int(delta.total_seconds())
+        if secs < 0:
+            return "just now"
+        if secs < 60:
+            return f"{secs}s ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        return f"{secs // 86400}d ago"
+    except Exception:
+        return "?"
+
+
+def _trunc(s: str, maxlen: int = 72) -> str:
+    return s[:maxlen - 1] + "\u2026" if len(s) > maxlen else s
+
+
+def _bar(pct: float, width: int = 12) -> str:
+    """Compact bar chart: [████░░░░░░░░]"""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(pct / 100 * width)
+    empty = width - filled
+    colour = GREEN if pct < 70 else (YELLOW if pct < 85 else RED)
+    return f"{colour}{'█' * filled}{GREY}{'░' * empty}{RESET}"
+
+
+def _svc_status(name: str) -> tuple[bool, str]:
+    """Return (is_active, uptime_str) for a systemd service."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "show", name, "--property=ActiveState,ActiveEnterTimestamp"],
+            capture_output=True, text=True, timeout=2,
+        )
+        props = dict(line.split("=", 1) for line in r.stdout.strip().splitlines() if "=" in line)
+        active = props.get("ActiveState") == "active"
+        up_str = ""
+        if active and props.get("ActiveEnterTimestamp"):
+            try:
+                # systemd format: "Thu 2026-03-19 18:04:05 AEDT"
+                ts_raw = props["ActiveEnterTimestamp"]
+                # Parse with subprocess for reliability
+                r2 = subprocess.run(
+                    ["date", "-d", ts_raw, "+%s"], capture_output=True, text=True, timeout=1,
+                )
+                if r2.returncode == 0:
+                    epoch = int(r2.stdout.strip())
+                    delta = max(0, int(datetime.now().timestamp()) - epoch)
+                    if delta < 60:
+                        up_str = f"{delta}s"
+                    elif delta < 3600:
+                        up_str = f"{delta // 60}m"
+                    elif delta < 86400:
+                        up_str = f"{delta // 3600}h{(delta % 3600) // 60}m"
+                    else:
+                        up_str = f"{delta // 86400}d"
+            except Exception:
+                pass
+        return active, up_str
+    except Exception:
+        return False, ""
+
+
+def _tmux_sessions() -> list[dict]:
+    """List tmux sessions with window info.
+
+    PAM runs MOTD scripts as root, so tmux defaults to /tmp/tmux-0/.
+    The pi user's sessions live at /tmp/tmux-1000/. We explicitly target
+    the pi user's socket so sessions are visible regardless of caller uid.
+    """
+    PI_SOCKET = "/tmp/tmux-1000/default"
+    try:
+        cmd = ["tmux", "-S", PI_SOCKET, "list-sessions", "-F",
+               "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        if r.returncode != 0:
+            return []
+        sessions = []
+        for line in r.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) >= 4:
+                sessions.append({
+                    "name": parts[0],
+                    "windows": int(parts[1]),
+                    "attached": int(parts[2]) > 0,
+                    "created": int(parts[3]),
+                })
+        return sessions
+    except Exception:
+        return []
+
+
+def _recent_errors(log_path: Path, n: int = 200) -> list[str]:
+    """Scan last N lines of a log for errors. Uses tail to avoid reading multi-MB files."""
+    try:
+        r = subprocess.run(
+            ["tail", "-n", str(n), str(log_path)],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode != 0:
+            return []
+        errors = []
+        for line in r.stdout.strip().splitlines():
+            if re.search(r'\b(error|ERROR|Traceback|CRITICAL|fail(?:ed|ure)?)\b', line, re.I):
+                # Clean up timestamp prefix for brevity
+                cleaned = re.sub(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\s*', '', line.strip())
+                if cleaned and cleaned not in errors:
+                    errors.append(cleaned)
+        return errors[-3:]  # Last 3 unique errors
+    except Exception:
+        return []
+
+
+# ── Sections ─────────────────────────────────────────────────────────────────
+
+def banner() -> list[str]:
+    site = _link("https://spark.wedd.au", "spark.wedd.au")
+    dash = _link("http://picar.local:8420", "dashboard")
+    bsky = _link("https://bsky.app/profile/spark.wedd.au", "bluesky")
+    out = []
+    out.append("")
+    out.append(f"  {YELLOW}{BOLD}  ┌─────────────────────────────────────────────┐{RESET}")
+    out.append(f"  {YELLOW}{BOLD}  │   ⚡  S P A R K    ·    PiCar-X  ·  v2     │{RESET}")
+    out.append(f"  {YELLOW}{BOLD}  │      Sentient  Playful  Autonomous  Robot   │{RESET}")
+    out.append(f"  {YELLOW}{BOLD}  └─────────────────────────────────────────────┘{RESET}")
+    out.append(f"    {DIM}web{RESET} {CYAN}{site}{RESET}   {DIM}local{RESET} {CYAN}{dash}{RESET}   {DIM}social{RESET} {CYAN}{bsky}{RESET}")
+    return out
+
+
+def section_system() -> list[str]:
+    out = [f"  {WHITE}{BOLD}SYSTEM{RESET}"]
+
+    # Uptime
+    try:
+        with open("/proc/uptime") as f:
+            up_secs = int(float(f.read().split()[0]))
+        days, rem = divmod(up_secs, 86400)
+        hours, rem = divmod(rem, 3600)
+        mins = rem // 60
+        up_str = f"{days}d {hours}h {mins}m" if days else f"{hours}h {mins}m"
+    except Exception:
+        up_str = "?"
+
+    # CPU temp
+    try:
+        t = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000
+        temp_colour = RED if t >= 80 else (YELLOW if t >= 70 else GREEN)
+        temp_str = f"{temp_colour}{t:.0f}°C{RESET}"
+    except Exception:
+        temp_str = "?°C"
+
+    # Load
+    try:
+        load_str = open("/proc/loadavg").read().split()[:3]
+        load_str = " ".join(load_str)
+    except Exception:
+        load_str = "?"
+
+    # RAM
+    try:
+        info = Path("/proc/meminfo").read_text()
+        total = int(next(l.split()[1] for l in info.splitlines() if l.startswith("MemTotal")))
+        avail = int(next(l.split()[1] for l in info.splitlines() if l.startswith("MemAvailable")))
+        ram_pct = (1 - avail / total) * 100
+        ram_str = f"{_bar(ram_pct)} {ram_pct:.0f}% ({avail // 1024}MB free)"
+    except Exception:
+        ram_pct = 0
+        ram_str = "?"
+
+    # Disk
+    try:
+        st = os.statvfs("/")
+        disk_total = st.f_blocks * st.f_frsize
+        disk_free = st.f_bavail * st.f_frsize
+        disk_pct = (1 - disk_free / disk_total) * 100
+        disk_str = f"{_bar(disk_pct)} {disk_pct:.0f}% ({disk_free / 1e9:.1f}GB free)"
+    except Exception:
+        disk_str = "?"
+
+    # WiFi
+    try:
+        r = subprocess.run(["iwconfig", "wlan0"], capture_output=True, text=True, timeout=2)
+        m = re.search(r'Signal level=(-?\d+)', r.stdout)
+        wifi_dbm = int(m.group(1)) if m else None
+        wifi_str = f"{wifi_dbm} dBm" if wifi_dbm else "?"
+        if wifi_dbm and wifi_dbm > -50:
+            wifi_str = f"{GREEN}{wifi_str}{RESET} excellent"
+        elif wifi_dbm and wifi_dbm > -70:
+            wifi_str = f"{GREEN}{wifi_str}{RESET} good"
+        elif wifi_dbm:
+            wifi_str = f"{YELLOW}{wifi_str}{RESET} weak"
+    except Exception:
+        wifi_str = "?"
+
+    # Battery
+    bat = _json(STATE / "battery.json")
+    if bat:
+        v = bat.get("volts") or 0
+        pct = bat.get("pct") or 0
+        charging = bat.get("charging", False)
+        bat_colour = GREEN if pct > 30 else (YELLOW if pct > 10 else RED)
+        charge_str = f" {GREEN}⚡charging{RESET}" if charging else ""
+        bat_str = f"{bat_colour}{pct}%{RESET} ({v:.2f}V){charge_str}"
+    else:
+        bat_str = "unknown"
+
+    # Throttle
+    try:
+        raw = subprocess.check_output(["vcgencmd", "get_throttled"], text=True, timeout=1).strip()
+        val = int(raw.split("=")[1], 16)
+        if val != 0:
+            flags = []
+            if val & 0x1:  flags.append("under-voltage")
+            if val & 0x4:  flags.append("throttled")
+            if val & 0x2:  flags.append("freq-capped")
+            throttle_str = f"{RED}{', '.join(flags)}{RESET}"
+        else:
+            throttle_str = None
+    except Exception:
+        throttle_str = None
+
+    out.append(f"    Uptime   {DIM}│{RESET} {up_str}     Load {load_str}")
+    out.append(f"    CPU      {DIM}│{RESET} {temp_str}         WiFi {wifi_str}")
+    out.append(f"    RAM      {DIM}│{RESET} {ram_str}")
+    out.append(f"    Disk     {DIM}│{RESET} {disk_str}")
+    out.append(f"    Battery  {DIM}│{RESET} {bat_str}")
+    if throttle_str:
+        out.append(f"    {RED}⚠ {throttle_str}{RESET}")
+    return out
+
+
+def section_services() -> list[str]:
+    out = [f"\n  {WHITE}{BOLD}SERVICES{RESET}"]
+
+    services = [
+        ("px-alive",          "idle servos"),
+        ("px-mind",           "cognitive"),
+        ("px-wake-listen",    "wake/STT"),
+        ("px-battery-poll",   "battery"),
+        ("px-api-server",     "API :8420"),
+        ("px-post",           "social"),
+        ("px-frigate-stream", "camera"),
+        ("px-tts-glados",     "GLaDOS TTS"),
+        ("cloudflared",       "tunnel"),
+    ]
+
+    # Compact: all on two rows
+    row_items: list[str] = []
+    for name, desc in services:
+        active, uptime = _svc_status(name)
+        dot = f"{GREEN}●{RESET}" if active else f"{RED}○{RESET}"
+        up = f"/{uptime}" if uptime else ""
+        short_name = name.replace("px-", "")
+        row_items.append(f"{dot}{short_name}{DIM}{up}{RESET}")
+
+    # Split into two rows
+    mid = (len(row_items) + 1) // 2
+    out.append(f"    {' · '.join(row_items[:mid])}")
+    out.append(f"    {' · '.join(row_items[mid:])}")
+
+    return out
+
+
+def section_tmux() -> list[str]:
+    # Known session descriptions
+    SESSION_INFO: dict[str, str] = {
+        "px-claude":  "persistent Claude Haiku for px-mind reflection",
+        "picar-x":    "interactive voice loop + wake listener + logs",
+    }
+
+    out = [f"\n  {WHITE}{BOLD}TMUX SESSIONS{RESET}"]
+    sessions = _tmux_sessions()
+
+    # Sessions that px-mind owns — attaching interferes with send-keys/capture-pane
+    OWNED_SESSIONS = {"px-claude"}
+
+    if not sessions:
+        out.append(f"    {DIM}No tmux sessions running{RESET}")
+    else:
+        for s in sessions:
+            name = s["name"]
+            attached = f" {GREEN}(attached){RESET}" if s["attached"] else ""
+            age = _age_str(datetime.fromtimestamp(s["created"], tz=timezone.utc).isoformat())
+            windows = f"{s['windows']} window{'s' if s['windows'] != 1 else ''}"
+            desc = SESSION_INFO.get(name, "")
+            desc_str = f"  {DIM}— {desc}{RESET}" if desc else ""
+            out.append(f"    {CYAN}❯{RESET} {BOLD}{name}{RESET}  {DIM}{windows} · {age}{RESET}{attached}{desc_str}")
+            if name in OWNED_SESSIONS:
+                out.append(f"      {CYAN}tail -f logs/{name}.log{RESET}  {DIM}(read-only — do not attach){RESET}")
+            else:
+                out.append(f"      {CYAN}tmux attach -t {name}{RESET}")
+
+    # Always show the interactive session hint if picar-x isn't running
+    session_names = {s["name"] for s in sessions}
+    if "picar-x" not in session_names:
+        out.append(f"    {DIM}Start voice session:{RESET}  {CYAN}bin/px-session{RESET}")
+
+    return out
+
+
+def section_cognitive() -> list[str]:
+    out = [f"\n  {WHITE}{BOLD}COGNITIVE STATE{RESET}"]
+
+    # Mood
+    mood_data = _json(STATE / "mood.json")
+    mood = mood_data.get("mood", "unknown")
+    valence = mood_data.get("valence") or 0.0
+    arousal = mood_data.get("arousal") or 0.0
+    mood_colour = MOOD_COLOURS.get(mood, WHITE)
+    mood_age = _age_str(mood_data.get("ts"))
+    out.append(f"    Mood     {DIM}│{RESET} {mood_colour}{BOLD}{mood}{RESET}  {DIM}v={valence:+.1f} a={arousal:+.1f} · {mood_age}{RESET}")
+
+    # Awareness
+    aw = _json(STATE / "awareness.json")
+    if aw:
+        persona = aw.get("persona", "?")
+        sonar = aw.get("sonar_cm")
+        sonar_str = f"{sonar:.0f}cm" if sonar and sonar < 999 else "clear"
+        period = aw.get("time_period", "?")
+        obi = aw.get("obi_mode") or aw.get("ha_presence", {}).get("obi_mode", "?")
+        mins_idle = aw.get("minutes_since_interaction")
+        idle_str = f"{mins_idle:.0f}m idle" if mins_idle is not None else "?"
+
+        out.append(f"    Persona  {DIM}│{RESET} {YELLOW}{persona}{RESET}    Period {period}    Sonar {sonar_str}")
+
+        # Obi mode from awareness
+        if isinstance(obi, str) and obi != "?":
+            out.append(f"    Obi      {DIM}│{RESET} {obi}    {DIM}{idle_str}{RESET}")
+
+    # Last thought
+    thoughts = _jsonl_last(STATE / "thoughts.jsonl", n=1)
+    if thoughts:
+        t = thoughts[0]
+        thought_text = _trunc(t.get("thought", ""), 65)
+        thought_mood = t.get("mood", "")
+        thought_age = _age_str(t.get("ts"))
+        action = t.get("action", "")
+        salience = t.get("salience")
+        sal_str = f"  sal={salience:.1f}" if salience is not None else ""
+        out.append(f"    Thought  {DIM}│{RESET} {DIM}\"{thought_text}\"{RESET}")
+        out.append(f"             {DIM}│ {thought_mood} · {action}{sal_str} · {thought_age}{RESET}")
+
+    # Weather (from awareness)
+    weather = aw.get("weather", {}) if aw else {}
+    if weather:
+        temp = weather.get("temp_c")
+        wind = weather.get("wind_kmh")
+        humidity = weather.get("humidity_pct")
+        if temp is not None:
+            out.append(f"    Weather  {DIM}│{RESET} {temp}°C  wind {wind or '?'}km/h  humidity {humidity or '?'}%")
+
+    return out
+
+
+def section_social() -> list[str]:
+    out = [f"\n  {WHITE}{BOLD}SOCIAL{RESET}"]
+
+    # Post status
+    ps = _json(STATE / "px-post-status.json")
+    if ps:
+        status = ps.get("status", "?")
+        total = ps.get("total_posted", 0)
+        queue = ps.get("queue_depth", 0)
+        bsky = ps.get("bluesky_ok", False)
+        rejected = ps.get("total_rejected", 0)
+        last_post = _age_str(ps.get("last_post_ts"))
+
+        status_colour = GREEN if status == "running" else RED
+        bsky_str = f"{GREEN}connected{RESET}" if bsky else f"{RED}disconnected{RESET}"
+
+        out.append(f"    Daemon   {DIM}│{RESET} {status_colour}{status}{RESET}    Queue {queue}    Posted {total}    Rejected {rejected}")
+        bsky_link = _link("https://bsky.app/profile/spark.wedd.au", "bsky.app/profile/spark.wedd.au")
+        out.append(f"    Bluesky  {DIM}│{RESET} {bsky_str}    Last post {last_post}    {DIM}{bsky_link}{RESET}")
+    else:
+        out.append(f"    {DIM}px-post status unavailable{RESET}")
+
+    # Latest feed entry
+    feed = _json(STATE / "feed.json")
+    posts = feed.get("posts", []) if isinstance(feed, dict) else (feed if isinstance(feed, list) else [])
+    if posts:
+        latest = posts[0]
+        text = _trunc(latest.get("thought", latest.get("text", "")), 65)
+        ts = _age_str(latest.get("posted_ts") or latest.get("ts"))
+        mood_str = latest.get("mood", "")
+        feed_link = _link("https://spark.wedd.au/feed/", "feed")
+        out.append(f"    Latest   {DIM}│{RESET} {DIM}\"{text}\"{RESET}")
+        out.append(f"             {DIM}│ {mood_str} · {ts}  {RESET}{DIM}{feed_link}{RESET}")
+
+    return out
+
+
+def section_errors() -> list[str]:
+    out = [f"\n  {WHITE}{BOLD}RECENT ERRORS{RESET}"]
+
+    logs_to_check = [
+        ("px-mind",    LOGS / "px-mind.log"),
+        ("api",        LOGS / "px-api-server.log"),
+        ("wake",       LOGS / "px-wake-listen.log"),
+        ("alive",      LOGS / "px-alive.log"),
+        ("post",       LOGS / "tool-post.log"),
+    ]
+
+    any_errors = False
+    for label, path in logs_to_check:
+        errors = _recent_errors(path, n=150)
+        if errors:
+            any_errors = True
+            for err in errors[-1:]:  # Just the latest error per service
+                out.append(f"    {RED}▸{RESET} {DIM}[{label}]{RESET} {_trunc(err, 68)}")
+
+    if not any_errors:
+        out.append(f"    {GREEN}✓ No recent errors{RESET}")
+
+    return out
+
+
+def section_quickref() -> list[str]:
+    API = "http://picar.local:8420/api/v1"
+    return [
+        f"\n  {WHITE}{BOLD}QUICK ACTIONS{RESET}  {DIM}— type {CYAN}px N{DIM} to run{RESET}",
+        f"    {YELLOW}1{RESET}  {CYAN}bin/px-session{RESET}        {DIM}│ Interactive tmux (voice + wake + logs){RESET}",
+        f"    {YELLOW}2{RESET}  {CYAN}bin/px-spark{RESET}           {DIM}│ Launch SPARK voice persona{RESET}",
+        f"    {YELLOW}3{RESET}  {CYAN}bin/px-diagnostics --short{RESET}",
+        f"                              {DIM}│ Hardware health check (no motion){RESET}",
+        f"    {YELLOW}4{RESET}  {CYAN}bin/px-api-server{RESET}      {DIM}│ REST API server{RESET}",
+        f"    {YELLOW}5{RESET}  {CYAN}bin/px-race --status{RESET}   {DIM}│ Race telemetry{RESET}",
+        f"    {YELLOW}6{RESET}  {CYAN}journalctl -fu px-mind{RESET} {DIM}│ Mind service logs (follow){RESET}",
+        f"    {YELLOW}7{RESET}  {CYAN}tail -f logs/*.log{RESET}     {DIM}│ Live firehose (all services){RESET}",
+        f"    {YELLOW}8{RESET}  {CYAN}tail -f logs/px-claude.log{RESET}",
+        f"                              {DIM}│ Watch SPARK's inner monologue{RESET}",
+        f"    {YELLOW}9{RESET}  {CYAN}bin/px-motd{RESET}            {DIM}│ Show this screen again{RESET}",
+        f"\n  {WHITE}{BOLD}API{RESET}  {DIM}— click to open in browser{RESET}",
+        f"    {_link(f'{API}/public/status',    'status')}    "
+            f"{_link(f'{API}/public/thoughts',  'thoughts')}    "
+            f"{_link(f'{API}/public/awareness', 'awareness')}    "
+            f"{_link(f'{API}/public/feed',      'feed')}    "
+            f"{_link(f'{API}/public/vitals',    'vitals')}",
+        f"    {_link(f'{API}/public/race',      'race')}      "
+            f"{_link(f'{API}/public/sonar',     'sonar')}      "
+            f"{_link(f'{API}/public/services',  'services')}     "
+            f"{_link(f'{API}/public/history',   'history')}    "
+            f"{_link(f'{API}/health',           'health')}",
+        "",
+    ]
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    sections = [
+        banner(),
+        section_system(),
+        section_services(),
+        section_tmux(),
+        section_cognitive(),
+        section_social(),
+        section_errors(),
+        section_quickref(),
+    ]
+
+    for section in sections:
+        for line in section:
+            print(line)
+
+
+if __name__ == "__main__":
+    main()
