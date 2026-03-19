@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Load .env for GH token, API keys, etc.
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    # shellcheck disable=SC1091
+    set -a; source "$PROJECT_ROOT/.env"; set +a
+fi
+
+# Uses venv python — no GPIO needed.
+exec python - "$@" <<'PY'
+"""SPARK self-evolution daemon: polls evolve queue, creates PRs via Claude Opus.
+
+For each pending entry in state/evolve_queue.jsonl:
+1. Creates a git worktree on a new branch
+2. Runs Claude Opus with a scoped prompt and file whitelist
+3. Validates changes (max files, test pass)
+4. Creates a GitHub PR
+5. Cleans up worktree
+
+Run with: bin/px-evolve [--dry-run] [--once]
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
+LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+EVOLVE_MODEL = os.environ.get("PX_EVOLVE_MODEL", "claude-opus-4-6")
+EVOLVE_TIMEOUT = int(os.environ.get("PX_EVOLVE_TIMEOUT", "300"))
+EVOLVE_MAX_FILES = int(os.environ.get("PX_EVOLVE_MAX_FILES", "3"))
+POLL_INTERVAL = 60
+
+QUEUE_FILE = STATE_DIR / "evolve_queue.jsonl"
+EVOLVE_LOG = STATE_DIR / "evolve_log.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"[{ts}] px-evolve: {msg}"
+    print(line, flush=True)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "px-evolve.log", "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Atomic file helpers
+# ---------------------------------------------------------------------------
+
+def atomic_write(path: Path, content: str) -> None:
+    """Write content atomically via mkstemp + fsync + os.replace."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_queue() -> list[dict]:
+    """Load all entries from the queue file."""
+    if not QUEUE_FILE.exists():
+        return []
+    entries = []
+    for line in QUEUE_FILE.read_text().strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            log(f"skipping malformed queue line: {line[:80]}")
+    return entries
+
+
+def save_queue(entries: list[dict]) -> None:
+    """Atomically write all queue entries back."""
+    content = "\n".join(json.dumps(e) for e in entries) + "\n" if entries else ""
+    atomic_write(QUEUE_FILE, content)
+
+
+def append_evolve_log(record: dict) -> None:
+    """Append a completion record to the evolve log."""
+    EVOLVE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVOLVE_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Core: process a single pending entry
+# ---------------------------------------------------------------------------
+
+def build_prompt(intent: str, introspection: dict) -> str:
+    return f"""You are SPARK, a PiCar-X robot, proposing a change to your own code.
+
+## Your intent
+{intent}
+
+## Your current state
+{json.dumps(introspection, indent=2)}
+
+## File whitelist (you may ONLY modify these)
+- src/pxh/spark_config.py — SPARK's tunable configuration
+- bin/tool-* — create new tools only
+- src/pxh/voice_loop.py — ALLOWED_TOOLS and TOOL_COMMANDS only
+- tests/ — add new test files
+
+## File blacklist (NEVER touch)
+- docs/prompts/persona-gremlin.md, persona-vixen.md
+- bin/tool-chat, bin/tool-chat-vixen
+- REFLECTION_SYSTEM_GREMLIN, REFLECTION_SYSTEM_VIXEN in mind.py
+- src/pxh/api.py, src/pxh/mind.py
+- .env, credentials, systemd units, bin/px-evolve
+
+## Rules
+- Minimal changes serving your intent
+- Add tests for new tools
+- Commit with message: "[SPARK] {{description}}"
+- Max {EVOLVE_MAX_FILES} files changed
+- No safety gate changes
+"""
+
+
+def process_entry(entry: dict, *, dry: bool = False) -> str:
+    """Process a single pending queue entry. Returns final status string."""
+    entry_id = entry["id"]
+    intent = entry.get("intent", "")
+    introspection = entry.get("introspection", {})
+
+    branch = f"spark/evolve-{entry_id}"
+    workdir = f"/tmp/spark-evolve-{entry_id}"
+
+    log(f"[{entry_id}] starting: {intent[:80]}")
+
+    # 1. Create git worktree
+    try:
+        subprocess.run(
+            ["git", "worktree", "add", workdir, "-b", branch],
+            cwd=str(PROJECT_ROOT), check=True,
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log(f"[{entry_id}] worktree creation failed: {exc}")
+        return "failed:worktree"
+
+    try:
+        return _run_in_worktree(entry_id, intent, introspection, branch, workdir, dry=dry)
+    finally:
+        # 8. Cleanup worktree
+        _cleanup_worktree(workdir, entry_id)
+
+
+def _run_in_worktree(
+    entry_id: str, intent: str, introspection: dict,
+    branch: str, workdir: str, *, dry: bool,
+) -> str:
+    """Run Claude, validate, test, and PR inside the worktree."""
+    prompt = build_prompt(intent, introspection)
+
+    # 2. Run Claude Opus
+    cmd = [
+        "claude", "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--model", EVOLVE_MODEL,
+    ]
+    log(f"[{entry_id}] running: {' '.join(cmd[:4])}... (timeout={EVOLVE_TIMEOUT}s)")
+
+    if dry:
+        log(f"[{entry_id}] DRY RUN — skipping Claude execution")
+        return "failed:no_changes"
+
+    try:
+        result = subprocess.run(
+            cmd, cwd=workdir, capture_output=True, text=True,
+            timeout=EVOLVE_TIMEOUT,
+        )
+        log(f"[{entry_id}] claude exit={result.returncode} stdout={len(result.stdout)}B stderr={len(result.stderr)}B")
+    except subprocess.TimeoutExpired:
+        log(f"[{entry_id}] claude timed out after {EVOLVE_TIMEOUT}s")
+        return "failed:timeout"
+
+    # 4. Check for changes
+    diff_result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=workdir, capture_output=True, text=True,
+    )
+    # Also check staged changes
+    staged_result = subprocess.run(
+        ["git", "diff", "--name-only", "--cached"],
+        cwd=workdir, capture_output=True, text=True,
+    )
+    changed_files = list(set(
+        f for f in (diff_result.stdout + staged_result.stdout).strip().splitlines() if f
+    ))
+
+    if not changed_files:
+        log(f"[{entry_id}] no changes produced")
+        return "failed:no_changes"
+
+    log(f"[{entry_id}] changed files ({len(changed_files)}): {changed_files}")
+
+    # 5. Enforce max files
+    if len(changed_files) > EVOLVE_MAX_FILES:
+        log(f"[{entry_id}] too many files: {len(changed_files)} > {EVOLVE_MAX_FILES}")
+        return "failed:too_many_files"
+
+    # 6. Run tests
+    try:
+        test_result = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests/", "-x", "-q"],
+            cwd=workdir, capture_output=True, text=True, timeout=120,
+        )
+        if test_result.returncode != 0:
+            log(f"[{entry_id}] tests failed:\n{test_result.stdout[-500:]}\n{test_result.stderr[-500:]}")
+            return "failed:tests"
+        log(f"[{entry_id}] tests passed")
+    except subprocess.TimeoutExpired:
+        log(f"[{entry_id}] test suite timed out")
+        return "failed:tests"
+
+    # 7. Create PR
+    intent_summary = intent[:60].replace('"', "'")
+    body = (
+        f"## Summary\n"
+        f"SPARK self-evolution: {intent}\n\n"
+        f"## Changed files\n"
+        + "\n".join(f"- `{f}`" for f in changed_files)
+        + "\n\n---\n*Proposed autonomously by SPARK via px-evolve.*"
+    )
+
+    try:
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=workdir, check=True, capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log(f"[{entry_id}] git push failed: {exc}")
+        return "failed:pr_create"
+
+    try:
+        pr_result = subprocess.run(
+            ["gh", "pr", "create",
+             "--title", f"[SPARK] {intent_summary}",
+             "--body", body],
+            cwd=workdir, check=True, capture_output=True, text=True, timeout=60,
+        )
+        pr_url = pr_result.stdout.strip()
+        log(f"[{entry_id}] PR created: {pr_url}")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        log(f"[{entry_id}] PR creation failed: {exc}")
+        return "failed:pr_create"
+
+    return "pr_created"
+
+
+def _cleanup_worktree(workdir: str, entry_id: str) -> None:
+    """Remove git worktree, best effort."""
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", workdir, "--force"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        log(f"[{entry_id}] worktree cleaned up")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        log(f"[{entry_id}] worktree cleanup failed (non-fatal): {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_once(*, dry: bool) -> int:
+    """Process all pending entries. Returns count processed."""
+    entries = load_queue()
+    if not entries:
+        return 0
+
+    processed = 0
+    for entry in entries:
+        if entry.get("status") != "pending":
+            continue
+
+        status = process_entry(entry, dry=dry)
+        entry["status"] = status
+        entry["ts_completed"] = dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        processed += 1
+
+        # Update queue atomically
+        save_queue(entries)
+
+        # Append to evolve log
+        append_evolve_log({
+            "id": entry["id"],
+            "intent": entry.get("intent", ""),
+            "status": status,
+            "ts_completed": entry["ts_completed"],
+        })
+
+        log(f"[{entry['id']}] completed: {status}")
+
+    return processed
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="SPARK self-evolution daemon")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--once", action="store_true", help="Process queue once and exit")
+    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL)
+    args = parser.parse_args(argv)
+
+    dry = args.dry_run or os.environ.get("PX_EVOLVE_DRY", "0") != "0"
+
+    # Single-instance guard (PID file).
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    pid_file = STATE_DIR / "px-evolve.pid"
+    my_pid = os.getpid()
+    try:
+        if pid_file.exists():
+            old_pid = int(pid_file.read_text().strip())
+            if old_pid != my_pid and Path(f"/proc/{old_pid}").exists():
+                log(f"another px-evolve instance is running (pid={old_pid})")
+                return 1
+            else:
+                log(f"stale pid file removed (pid={old_pid})")
+                pid_file.unlink(missing_ok=True)
+    except (ValueError, OSError) as exc:
+        log(f"pid file check failed, removing: {exc}")
+        pid_file.unlink(missing_ok=True)
+    pid_file.write_text(str(my_pid))
+
+    def _safe_unlink_pid():
+        """Delete PID file only if it still contains our PID."""
+        try:
+            if pid_file.exists() and int(pid_file.read_text().strip()) == my_pid:
+                pid_file.unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pass
+
+    log(f"starting pid={my_pid} dry={dry} once={args.once}")
+
+    if args.once:
+        count = run_once(dry=dry)
+        log(f"processed {count} entries")
+        _safe_unlink_pid()
+        return 0
+
+    # SIGTERM handler
+    _shutdown = threading.Event()
+
+    def _on_signal(s, f):
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    try:
+        while not _shutdown.is_set():
+            try:
+                count = run_once(dry=dry)
+                if count:
+                    log(f"poll: processed {count} entries")
+            except Exception as exc:
+                log(f"poll: CRASHED: {exc}")
+
+            _shutdown.wait(timeout=args.poll_interval)
+    finally:
+        _safe_unlink_pid()
+        log("shutting down")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+
+main(sys.argv[1:])
+PY

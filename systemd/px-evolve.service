@@ -1,0 +1,21 @@
+[Unit]
+Description=SPARK Self-Evolution Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/picar-x-hacking
+ExecStart=/home/pi/picar-x-hacking/bin/px-evolve
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=-/home/pi/picar-x-hacking/.env
+Environment=HOME=/home/pi
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PATH=/home/pi/.local/bin:/home/pi/.nvm/versions/node/v22.14.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+KillMode=control-group
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
