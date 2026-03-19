@@ -2097,7 +2097,18 @@ def _tmux_capture() -> str:
 
 
 def _extract_json_from_pane(text: str) -> str | None:
-    """Extract the LAST JSON object with a 'thought' key from pane text."""
+    """Extract the LAST JSON object with a 'thought' key from pane text.
+
+    Claude CLI wraps long lines in the tmux pane, inserting literal newlines
+    and leading whitespace inside JSON string values. We rejoin wrapped lines
+    before parsing: any newline followed by whitespace that is NOT a JSON
+    structural indent (not starting with ") is treated as a line wrap.
+    """
+    # Rejoin pane-wrapped lines: \n followed by 1-2 spaces then non-quote/non-brace
+    # is a continuation of the previous line (pane line wrap, not JSON structure)
+    import re
+    text = re.sub(r'\n  (?=[^"{}\[\]])', ' ', text)
+
     decoder = json.JSONDecoder()
     last_match = None
     _logged_non_thought = False
