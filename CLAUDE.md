@@ -19,7 +19,7 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (450 tests)
+python -m pytest                          # full suite (511 tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
 python -m pytest -m "not live"           # skip hardware tests (82 tests)
@@ -153,6 +153,57 @@ Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escala
 **Thought-images cleanup**: `state/thought-images/` is cleaned hourly — images older than 30 days are deleted.
 
 State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.json`, `state/mood.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
+
+### Autonomous Racing (px-race)
+
+```bash
+bin/px-race --calibrate       # on-site sensor calibration (surfaces + gate)
+bin/px-race --map             # practice lap (slow mapping run)
+bin/px-race --race --laps 5   # timed race for N laps
+bin/px-race --status          # print current profile summary
+bin/px-race --dry-run --map   # full loop, no motors
+bin/px-race --max-speed 40    # cap top speed (PWM duty cycle)
+```
+
+Two-phase autonomous racing system: Phase 1 (map) builds a track segment profile at safe speed; Phase 2 (race) uses the profile to anticipate turns, maximize straight-line speed, and refine the profile each lap via per-lap learning.
+
+**Architecture**: `src/pxh/race.py` (~600–800 lines) provides `RaceController`, `TrackProfile`, `PDController`, and helper functions. `bin/px-race` is the bash launcher (sources `px-env`, calls `yield_alive`, delegates to Python).
+
+**Dual-sensor model**:
+- **Grayscale** (3-channel underside array, <1ms): primary edge avoidance and gate detection. Continuous wall-tracking with no moving parts.
+- **Sonar** (ultrasonic on camera pan servo, ~30ms per ping): obstacle detection, centering, turn anticipation. Three scan modes: Forward-only (every loop, no pan move, ~10–15 Hz), Quick-3 (~700ms: −25°, 0°, +25° + return-to-center, ~1.4 Hz), Full sweep (~1.1s: 5 angles, mapping/lost recovery).
+
+**Two PD controllers**:
+- `pd_edge(gs, calibration)` — grayscale edge avoidance. Input: 3 normalized readings (0.0 = track, 1.0 = barrier). Error: `right_normalized − left_normalized`. Gains: `Kp_edge = −20.0`, `Kd_edge = 5.0` (negative Kp so positive error → negative steer = left correction — see sign convention note below).
+- `pd_center(sonar_left, sonar_right)` — sonar centering. Error: `right_cm − left_cm`. Gains: `Kp_sonar = 0.5`, `Kd_sonar = 0.2`. Age-weighted blend with grayscale (sonar weight decays to 0 over 2 s between Quick-3 scans).
+
+**Key constants**: `DIR_MAX = 30` (steering ±30°), `MAP_SPEED = 20` (PWM), servo settle 150ms (matches `px-wander`), Quick-3 ~700ms total, derivative uses measured `dt` (not hardcoded).
+
+**Profile-based speed control**: Track profile stored as ordered segments (straight / turn_left / turn_right). Each segment carries `race_speed`, `entry_speed`, `steer_bias`, `brake_before_s`. Position tracked by sonar pattern matching (primary) → elapsed time (secondary) → grayscale landmarks / orange corners (fallback). Lost recovery: reactive wall-following until a recognizable feature re-syncs.
+
+**Per-lap learning**: After each lap, `apply_lap_learning()` adjusts segment durations (speed-ratio scaled), reduces `race_speed` −5 on wall clips, increases +3 on clean pass. Changes capped at ±5 PWM per lap. Battery voltage compensation: `effective_speed = race_speed × (current_v / calibration_v)` used for timing prediction only — motor PWM is unchanged.
+
+**Safety layers** (priority order):
+1. E-stop: center sonar < `max(8, speed × 0.3)` cm → `px.stop()` + reverse 0.3 s (threshold scales with speed: 8 cm at PWM 20, 15 cm at PWM 50)
+2. Edge guard: grayscale detects barrier → hard steer away, reduce to OBSTACLE_SPEED
+3. Obstacle dodge: unexpected close sonar → slow + edge-hug
+4. I2C failure: 3 consecutive sensor errors → emergency brake
+5. Stuck detect: no distance change for 2 s while motors running → stop, reverse, full sweep
+6. Timeout: no gate for 60 s → stop (assume lost)
+7. Battery: < 20% → finish current lap, stop
+8. SIGTERM handler → `px.stop()`, clean exit
+
+Additional: `confirm_motion_allowed` gate; `yield_alive` at startup; `exploring.json` active during race to prevent `px-alive` restart; `--max-speed N` flag (default 50, hard cap 60).
+
+**PD sign convention**: `compute_edge_error` returns positive when drifting right (`gs_norm[2] − gs_norm[0]`). The edge PD uses negative `Kp` (−20) so positive error → negative steer (left correction). This differs from the spec's stated `Kp = 20` — the code is correct for the error convention used. The `PDController` class tests use `kp=20.0` as a generic unit test; the actual edge controller instantiation uses `kp=−20.0`.
+
+**State files** (gitignored):
+- `state/race_calibration.json` — grayscale surface refs + gate threshold
+- `state/race_track.json` — track profile with segment list and lap history
+- `state/race_log.jsonl` — per-lap telemetry (speed, incidents, battery_v, lap time)
+- `state/race_live.json` — live telemetry written every ~0.5 s during racing (lap, segment, speed, steer, sonar, gs, incidents, best_lap_s) — readable by API/dashboard
+
+**Integration**: No LLM, no network calls, no audio in the race loop. Post-race narration via `tool-voice` is possible but separate. `race_live.json` is the integration point for the dashboard. The `bin/px-race` script does not yet exist — only `src/pxh/race.py` and `tests/test_race.py` are implemented (47 tests).
 
 ### Social Posting (px-post)
 
