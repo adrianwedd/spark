@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "spark": {
+      "command": "/Users/adrian/repos/picar-x-hacking/bin/mcp-server",
+      "args": []
+    }
+  }
+}
