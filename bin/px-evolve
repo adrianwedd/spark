@@ -44,7 +44,7 @@ LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
 EVOLVE_MODEL = os.environ.get("PX_EVOLVE_MODEL", "claude-opus-4-6")
-EVOLVE_TIMEOUT = int(os.environ.get("PX_EVOLVE_TIMEOUT", "300"))
+EVOLVE_TIMEOUT = int(os.environ.get("PX_EVOLVE_TIMEOUT", "600"))
 EVOLVE_MAX_FILES = int(os.environ.get("PX_EVOLVE_MAX_FILES", "3"))
 POLL_INTERVAL = 60
 
