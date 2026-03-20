@@ -253,6 +253,7 @@ Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your descr
         patch_text = patch_match.group(1)
         log(f"[{entry_id}] extracted patch ({len(patch_text)}B)")
         try:
+            # Try git apply first (strict), fall back to patch -p1 (lenient)
             apply_result = subprocess.run(
                 ["git", "apply", "--check", "-"],
                 input=patch_text, cwd=workdir,
@@ -264,6 +265,17 @@ Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your descr
                     input=patch_text, cwd=workdir,
                     capture_output=True, text=True, timeout=10,
                 )
+            else:
+                # Lenient fallback: patch -p1 with fuzz
+                log(f"[{entry_id}] git apply --check failed, trying patch -p1")
+                fallback = subprocess.run(
+                    ["patch", "-p1", "--fuzz=3", "--no-backup-if-mismatch"],
+                    input=patch_text, cwd=workdir,
+                    capture_output=True, text=True, timeout=10,
+                )
+                if fallback.returncode != 0:
+                    log(f"[{entry_id}] patch -p1 also failed: {fallback.stderr[:200]}")
+                    return "failed:patch"
                 # Extract commit message
                 commit_match = _re.search(r'COMMIT_MSG:\s*(.+)', result.stdout)
                 commit_msg = commit_match.group(1).strip() if commit_match else f"[SPARK] {intent[:60]}"
