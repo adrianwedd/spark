@@ -159,8 +159,9 @@ def _daytime_action_hint(hour_override: int | None = None) -> str:
     else:
         return (
             "\n\nIMPORTANT: It is night in Hobart. The house is quiet. "
-            "Prefer action='remember' or action='wait'. "
-            "Only use 'comment' if salience > 0.8."
+            "Prefer action='remember', action='wait', action='research', or action='compose'. "
+            "Only use 'comment' if salience > 0.8. "
+            "Consider 'research' to explore a curiosity or 'compose' to write something creative."
         )
 
 
@@ -358,12 +359,14 @@ VALID_ACTIONS = {"wait", "greet", "comment", "remember", "look_at",
                  "weather_comment", "scan", "explore",
                  "play_sound", "photograph", "emote", "look_around",
                  "time_check", "calendar_check", "morning_fact",
-                 "introspect", "evolve"}
+                 "introspect", "evolve",
+                 "research", "compose", "self_debug"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
-                        "look_around", "morning_fact", "explore"}
+                        "look_around", "morning_fact", "explore",
+                        "research", "compose"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -402,7 +405,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — vivid, specific, personal",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -445,7 +448,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — dark humor, puns, genius-level wit. Start with FUCK YEAH! Think like a displaced temporal genius who finds everything cosmically absurd.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -475,7 +478,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection. Start with FUCK YEAH! Be creative and DIFFERENT every time.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -2389,8 +2392,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     explore_available = _can_explore(session, aw_data)
     if explore_available:
         system_prompt = system_prompt.replace(
-            'time_check, calendar_check, morning_fact"',
-            'time_check, calendar_check, morning_fact, explore"'
+            'research, compose, self_debug"',
+            'research, compose, self_debug, explore"'
         )
 
     # Exploration hints for context
@@ -2845,6 +2848,61 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                     log(f"expression: evolve blocked: {evolve_out.get('error', '?')}")
             except (json.JSONDecodeError, IndexError, TypeError):
                 log(f"expression: evolve rc={result.returncode} — {intent}")
+
+        elif action == "research":
+            env["PX_RESEARCH_QUERY"] = text[:500]
+            env["PX_DRY"] = "1" if dry else "0"
+            result = subprocess.run(
+                [str(BIN_DIR / "tool-research")],
+                capture_output=True, text=True, check=False, env=env, timeout=360)
+            log(f"expression: research completed rc={result.returncode}")
+
+        elif action == "compose":
+            env["PX_COMPOSE_TOPIC"] = text[:500]
+            env["PX_DRY"] = "1" if dry else "0"
+            result = subprocess.run(
+                [str(BIN_DIR / "tool-compose")],
+                capture_output=True, text=True, check=False, env=env, timeout=360)
+            log(f"expression: compose completed rc={result.returncode}")
+
+        elif action == "self_debug":
+            log("expression: self_debug triggered — gathering diagnostics")
+            try:
+                from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+                # Gather diagnostic context
+                diag_context = f"Reflection failures detected. Awareness: {json.dumps(_aw)[:2000]}"
+                try:
+                    recent_log = (LOG_DIR / "px-mind.log").read_text(encoding="utf-8").splitlines()[-50:]
+                    diag_context += f"\n\nRecent log:\n" + "\n".join(recent_log)
+                except Exception:
+                    pass
+
+                result = run_claude_session(
+                    session_type="self_debug",
+                    prompt=f"SPARK's reflection layer is failing. Diagnose:\n\n{diag_context}",
+                    timeout=600,
+                    allowed_tools="Read,Glob,Grep",
+                )
+                # Save diagnostic report
+                report = {
+                    "ts": utc_timestamp(),
+                    "type": "self_debug",
+                    "diagnosis": result.stdout.strip()[:5000],
+                    "returncode": result.returncode,
+                }
+                debug_file = STATE_DIR / "debug_reports.jsonl"
+                try:
+                    with open(debug_file, "a") as f:
+                        f.write(json.dumps(report) + "\n")
+                except OSError:
+                    pass
+                log(f"expression: self_debug completed — {len(result.stdout)}B output")
+            except SessionBudgetExhausted as exc:
+                log(f"expression: self_debug budget exhausted: {exc}")
+            except ImportError:
+                log("expression: self_debug skipped — claude_session not available")
+            except Exception as exc:
+                log(f"expression: self_debug error: {exc}")
 
         else:
             log(f"expression: unhandled action: {action}")

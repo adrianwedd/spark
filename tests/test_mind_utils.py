@@ -620,13 +620,14 @@ def test_can_explore_corrupt_meta_fails_safe(explore_state):
 
 
 def test_valid_actions_includes_new_actions():
-    """All 17 actions must be present in VALID_ACTIONS."""
+    """All 20 actions must be present in VALID_ACTIONS."""
     expected = {
         "wait", "greet", "comment", "remember", "look_at",
         "weather_comment", "scan", "explore",
         "play_sound", "photograph", "emote", "look_around",
         "time_check", "calendar_check", "morning_fact",
         "introspect", "evolve",
+        "research", "compose", "self_debug",
     }
     assert VALID_ACTIONS == expected
 
@@ -719,8 +720,8 @@ def test_explore_injection_after_enum_expansion():
     }
 
     # The injection target is the LAST action before the closing quote
-    inject_target = 'morning_fact"'
-    inject_result = 'morning_fact, explore"'
+    inject_target = 'self_debug"'
+    inject_result = 'self_debug, explore"'
 
     for name, prompt in prompts.items():
         # Simulate the injection that reflection() does
