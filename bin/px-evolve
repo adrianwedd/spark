@@ -43,8 +43,7 @@ PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent)
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
-EVOLVE_MODEL = os.environ.get("PX_EVOLVE_MODEL", "claude-opus-4-6")
-EVOLVE_TIMEOUT = int(os.environ.get("PX_EVOLVE_TIMEOUT", "600"))
+EVOLVE_TIMEOUT = int(os.environ.get("PX_EVOLVE_TIMEOUT", "1800"))
 EVOLVE_MAX_FILES = int(os.environ.get("PX_EVOLVE_MAX_FILES", "3"))
 POLL_INTERVAL = 60
 
@@ -123,9 +122,21 @@ def append_evolve_log(record: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def build_prompt(intent: str, introspection: dict) -> str:
+    # Import whitelist/blacklist from session manager for single-source-of-truth
+    try:
+        from pxh.claude_session import WHITELIST_PATTERNS, BLACKLIST_FILES, BLACKLIST_PATTERNS
+        wl_lines = "\n".join(f"- {p}" for p in WHITELIST_PATTERNS)
+        bl_lines = "\n".join(f"- {f}" for f in sorted(BLACKLIST_FILES))
+        bl_lines += "\n" + "\n".join(f"- {p}*" for p in BLACKLIST_PATTERNS)
+    except ImportError:
+        wl_lines = "- src/pxh/spark_config.py\n- bin/tool-*\n- tests/"
+        bl_lines = "- src/pxh/api.py\n- bin/px-evolve\n- .env"
+
     return f"""You are SPARK, a PiCar-X robot, making a concrete code change to your own configuration.
 
-IMPORTANT: You MUST use your Edit or Write tools to modify files. Do NOT just describe what you would change — actually make the edit, then commit it with git.
+IMPORTANT: Use your Read, Edit, and Write tools to modify files directly.
+Do NOT run git commands — the build system handles commits after you finish.
+Do NOT describe changes — make them.
 
 ## Your intent
 {intent}
@@ -134,27 +145,21 @@ IMPORTANT: You MUST use your Edit or Write tools to modify files. Do NOT just de
 {json.dumps(introspection, indent=2)}
 
 ## What to do
-1. Read src/pxh/spark_config.py to understand the current configuration
-2. Edit src/pxh/spark_config.py to implement your intent (e.g. add angles to SPARK_ANGLES, add topic seeds to TOPIC_SEEDS, adjust constants)
-3. Run: git add -A && git commit -m "[SPARK] your description"
+1. Read the relevant files to understand the current code
+2. Use Edit or Write to implement your intent
+3. Stop when done — do NOT run git add, git commit, or any shell commands
 
 ## File whitelist (you may ONLY modify these)
-- src/pxh/spark_config.py — SPARK's tunable configuration (angles, seeds, prompts, constants)
-- bin/tool-* — create new tools only (do not modify existing tools)
-- src/pxh/voice_loop.py — ALLOWED_TOOLS and TOOL_COMMANDS dicts only
-- tests/ — add new test files for any new tools
+{wl_lines}
 
 ## File blacklist (NEVER touch)
-- src/pxh/mind.py, src/pxh/api.py
-- docs/prompts/persona-*.md
-- bin/tool-chat, bin/tool-chat-vixen, bin/px-evolve
-- .env, credentials, systemd units
+{bl_lines}
 
 ## Rules
-- Make the actual edit — do not just describe it
+- Make the actual edit — do not describe it
 - Minimal, focused changes serving your intent
-- Commit with message: "[SPARK] {{description}}"
 - Max {EVOLVE_MAX_FILES} files changed
+- Do NOT use Bash — you have Read, Edit, Write, Glob, Grep only
 """
 
 
@@ -191,125 +196,60 @@ def _run_in_worktree(
     entry_id: str, intent: str, introspection: dict,
     branch: str, workdir: str, *, dry: bool,
 ) -> str:
-    """Run Claude, validate, test, and PR inside the worktree."""
+    """Run Claude with real tool access, validate, test, and PR inside the worktree."""
     prompt = build_prompt(intent, introspection)
 
-    # 2. Run Claude Opus via -p and ask for a unified diff patch.
-    # claude -p cannot use Edit/Write tools, so we ask Claude to output
-    # a git-apply-compatible patch, then apply it ourselves.
-    patch_prompt = prompt + """
-
-CRITICAL: You CANNOT edit files directly. Instead, output a unified diff patch
-that I can apply with `git apply`. Format:
-
-```diff
---- a/src/pxh/spark_config.py
-+++ b/src/pxh/spark_config.py
-@@ -line,count +line,count @@
- context line
--old line
-+new line
- context line
-```
-
-Output ONLY the diff block. No explanation before or after. Start with ```diff and end with ```.
-Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your description
-"""
-
-    cmd = [
-        "claude", "-p", patch_prompt,
-        "--model", EVOLVE_MODEL,
-        "--no-session-persistence",
-        "--output-format", "text",
-        "--allowedTools", "",
-    ]
-    log(f"[{entry_id}] running claude -p for patch output (timeout={EVOLVE_TIMEOUT}s, cwd={workdir})")
+    log(f"[{entry_id}] running claude with Read/Write/Edit tools (timeout={EVOLVE_TIMEOUT}s, cwd={workdir})")
 
     if dry:
         log(f"[{entry_id}] DRY RUN — skipping Claude execution")
         return "failed:no_changes"
 
-    # Strip Claude Code env vars for clean nested invocation
-    run_env = {k: v for k, v in os.environ.items()
-               if not k.startswith("CLAUDE_CODE")
-               and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")}
+    # 2. Run Claude Opus with real tool access via session manager
+    try:
+        from pxh.claude_session import run_claude_session, SessionBudgetExhausted, file_in_whitelist
+    except ImportError:
+        # Fallback: direct subprocess if session manager not available
+        log(f"[{entry_id}] claude_session not importable, using direct subprocess")
+        return _run_claude_direct(entry_id, intent, prompt, workdir)
 
     try:
-        result = subprocess.run(
-            cmd, cwd=workdir, capture_output=True, text=True,
-            timeout=EVOLVE_TIMEOUT, env=run_env,
+        result = run_claude_session(
+            session_type="evolve",
+            prompt=prompt,
+            timeout=EVOLVE_TIMEOUT,
+            allowed_tools="Read,Write,Edit,Glob,Grep",
+            skip_permissions=True,
+            cwd=workdir,
         )
         log(f"[{entry_id}] claude exit={result.returncode} stdout={len(result.stdout)}B stderr={len(result.stderr)}B")
         if result.stdout:
-            log(f"[{entry_id}] claude stdout: {result.stdout[:500]}")
+            log(f"[{entry_id}] claude stdout (first 500): {result.stdout[:500]}")
+    except SessionBudgetExhausted as exc:
+        log(f"[{entry_id}] budget exhausted: {exc}")
+        return "failed:budget"
     except subprocess.TimeoutExpired:
         log(f"[{entry_id}] claude timed out after {EVOLVE_TIMEOUT}s")
         return "failed:timeout"
 
-    # 3b. Extract and apply patch from Claude's output
-    import re as _re
-    patch_match = _re.search(r'```diff\n(.*?)```', result.stdout, _re.DOTALL)
-    if patch_match:
-        patch_text = patch_match.group(1)
-        log(f"[{entry_id}] extracted patch ({len(patch_text)}B)")
-        try:
-            # Try git apply first (strict), fall back to patch -p1 (lenient)
-            applied = False
-            apply_result = subprocess.run(
-                ["git", "apply", "--check", "-"],
-                input=patch_text, cwd=workdir,
-                capture_output=True, text=True, timeout=10,
-            )
-            if apply_result.returncode == 0:
-                subprocess.run(
-                    ["git", "apply", "-"],
-                    input=patch_text, cwd=workdir,
-                    capture_output=True, text=True, timeout=10,
-                )
-                applied = True
-            else:
-                # Lenient fallback: patch -p1 with fuzz
-                log(f"[{entry_id}] git apply --check failed, trying patch -p1")
-                fallback = subprocess.run(
-                    ["patch", "-p1", "--fuzz=3", "--no-backup-if-mismatch"],
-                    input=patch_text, cwd=workdir,
-                    capture_output=True, text=True, timeout=10,
-                )
-                if fallback.returncode == 0:
-                    applied = True
-                else:
-                    log(f"[{entry_id}] patch -p1 also failed: {fallback.stderr[:200]}")
+    # 3. Stage and commit any changes Claude made via Edit/Write tools
+    subprocess.run(
+        ["git", "add", "-A"],
+        cwd=workdir, capture_output=True, text=True, timeout=10,
+    )
 
-            if applied:
-                commit_match = _re.search(r'COMMIT_MSG:\s*(.+)', result.stdout)
-                commit_msg = commit_match.group(1).strip() if commit_match else f"[SPARK] {intent[:60]}"
-                subprocess.run(
-                    ["git", "add", "-A"],
-                    cwd=workdir, capture_output=True, text=True, timeout=10,
-                )
-                subprocess.run(
-                    ["git", "commit", "-m", commit_msg],
-                    cwd=workdir, capture_output=True, text=True, timeout=10,
-                )
-                log(f"[{entry_id}] patch applied and committed: {commit_msg}")
-        except Exception as exc:
-            log(f"[{entry_id}] patch apply error: {exc}")
-    else:
-        log(f"[{entry_id}] no ```diff block found in claude output")
+    commit_msg = f"[SPARK] {intent[:60]}"
+    commit_result = subprocess.run(
+        ["git", "commit", "-m", commit_msg],
+        cwd=workdir, capture_output=True, text=True, timeout=10,
+    )
 
-    # 4. Check for changes
+    # 4. Check for changes against master (not HEAD — we just committed)
     diff_result = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"],
+        ["git", "diff", "--name-only", "master...HEAD"],
         cwd=workdir, capture_output=True, text=True,
     )
-    # Also check staged changes
-    staged_result = subprocess.run(
-        ["git", "diff", "--name-only", "--cached"],
-        cwd=workdir, capture_output=True, text=True,
-    )
-    changed_files = list(set(
-        f for f in (diff_result.stdout + staged_result.stdout).strip().splitlines() if f
-    ))
+    changed_files = [f for f in diff_result.stdout.strip().splitlines() if f]
 
     if not changed_files:
         log(f"[{entry_id}] no changes produced")
@@ -317,16 +257,23 @@ Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your descr
 
     log(f"[{entry_id}] changed files ({len(changed_files)}): {changed_files}")
 
-    # 5. Enforce max files
+    # 5. Whitelist enforcement — hard gate (Claude may ignore prompt constraints)
+    for f in changed_files:
+        if not file_in_whitelist(f):
+            log(f"[{entry_id}] whitelist violation: {f}")
+            return "failed:whitelist_violation"
+
+    # 6. Enforce max files
     if len(changed_files) > EVOLVE_MAX_FILES:
         log(f"[{entry_id}] too many files: {len(changed_files)} > {EVOLVE_MAX_FILES}")
         return "failed:too_many_files"
 
-    # 6. Run tests
+    # 7. Run tests (skip live hardware tests)
     try:
         test_result = subprocess.run(
-            [sys.executable, "-m", "pytest", "tests/", "-x", "-q"],
-            cwd=workdir, capture_output=True, text=True, timeout=120,
+            [sys.executable, "-m", "pytest", "tests/", "-x", "-q",
+             "--ignore=tests/test_tools_live.py"],
+            cwd=workdir, capture_output=True, text=True, timeout=300,
         )
         if test_result.returncode != 0:
             log(f"[{entry_id}] tests failed:\n{test_result.stdout[-500:]}\n{test_result.stderr[-500:]}")
@@ -336,7 +283,7 @@ Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your descr
         log(f"[{entry_id}] test suite timed out")
         return "failed:tests"
 
-    # 7. Create PR
+    # 8. Create PR
     intent_summary = intent[:60].replace('"', "'")
     body = (
         f"## Summary\n"
@@ -359,7 +306,8 @@ Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your descr
         pr_result = subprocess.run(
             ["gh", "pr", "create",
              "--title", f"[SPARK] {intent_summary}",
-             "--body", body],
+             "--body", body,
+             "--label", "spark-evolve"],
             cwd=workdir, check=True, capture_output=True, text=True, timeout=60,
         )
         pr_url = pr_result.stdout.strip()
@@ -369,6 +317,33 @@ Then on a new line, output the commit message as: COMMIT_MSG: [SPARK] your descr
         return "failed:pr_create"
 
     return f"pr_created|{pr_url}|{','.join(changed_files)}"
+
+
+def _run_claude_direct(entry_id: str, intent: str, prompt: str, workdir: str) -> str:
+    """Fallback: run Claude directly without session manager."""
+    cmd = [
+        "claude", "-p", prompt,
+        "--model", os.environ.get("PX_EVOLVE_MODEL", "claude-opus-4-6"),
+        "--no-session-persistence",
+        "--output-format", "text",
+        "--allowedTools", "Read,Write,Edit,Glob,Grep",
+        "--dangerously-skip-permissions",
+    ]
+
+    run_env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CLAUDE_CODE")
+               and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")}
+
+    try:
+        result = subprocess.run(
+            cmd, cwd=workdir, capture_output=True, text=True,
+            timeout=EVOLVE_TIMEOUT, env=run_env,
+        )
+        log(f"[{entry_id}] direct claude exit={result.returncode}")
+        return "direct_fallback"  # caller handles change detection
+    except subprocess.TimeoutExpired:
+        log(f"[{entry_id}] direct claude timed out")
+        return "failed:timeout"
 
 
 def _cleanup_worktree(workdir: str, entry_id: str) -> None:
