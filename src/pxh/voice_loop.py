@@ -62,6 +62,9 @@ ALLOWED_TOOLS = {
     "tool_repair",
     "tool_gws_calendar",
     "tool_gws_sheets_log",
+    # SPARK cognitive tools
+    "tool_research",
+    "tool_compose",
 }
 
 TOOL_COMMANDS = {
@@ -103,7 +106,28 @@ TOOL_COMMANDS = {
     "tool_repair":           BIN_DIR / "tool-repair",
     "tool_gws_calendar":     BIN_DIR / "tool-gws-calendar",
     "tool_gws_sheets_log":   BIN_DIR / "tool-gws-sheets-log",
+    # SPARK cognitive tools
+    "tool_research":         BIN_DIR / "tool-research",
+    "tool_compose":          BIN_DIR / "tool-compose",
 }
+
+
+# Conversation depth trigger — user says "think deeper" etc. to invoke Sonnet
+_DEPTH_TRIGGERS = {
+    "think about that more",
+    "go deeper",
+    "go deeper on that",
+    "explain that properly",
+    "think deeper",
+    "tell me more about that",
+    "elaborate on that",
+}
+
+
+def is_depth_trigger(text: str) -> bool:
+    """Check if user text contains a conversation depth trigger phrase."""
+    lower = text.lower()
+    return any(trigger in lower for trigger in _DEPTH_TRIGGERS)
 
 
 # Persona voice settings — injected into tool env when persona is active
@@ -643,6 +667,20 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         notes = str(params.get("notes", "")).strip()[:500]
         if notes:
             sanitized["PX_SHEETS_NOTES"] = notes
+    elif tool == "tool_research":
+        query = str(params.get("query", "")).strip()
+        if not query or len(query) < 5:
+            raise VoiceLoopError("tool_research requires a query (min 5 chars)")
+        if len(query) > 500:
+            query = query[:500]
+        sanitized["PX_RESEARCH_QUERY"] = query
+    elif tool == "tool_compose":
+        topic = str(params.get("topic", "")).strip()
+        if not topic or len(topic) < 3:
+            raise VoiceLoopError("tool_compose requires a topic (min 3 chars)")
+        if len(topic) > 500:
+            topic = topic[:500]
+        sanitized["PX_COMPOSE_TOPIC"] = topic
     else:
         if params:
             raise VoiceLoopError("unexpected parameters for tool")

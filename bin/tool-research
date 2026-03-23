@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+/usr/bin/python3 - <<'PY'
+"""SPARK research tool — curiosity-driven deep dive via Claude Haiku."""
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", os.environ.get("PROJECT_ROOT", ".") + "/state"))
+DRY = os.environ.get("PX_DRY", "0") != "0"
+
+
+def main():
+    query = os.environ.get("PX_RESEARCH_QUERY", "").strip()
+    if not query:
+        print(json.dumps({"status": "error", "error": "no query provided"}))
+        return
+
+    if DRY:
+        print(json.dumps({"status": "ok", "dry": True, "query": query}))
+        return
+
+    try:
+        from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+    except ImportError:
+        print(json.dumps({"status": "error", "error": "claude_session not available"}))
+        return
+
+    prompt = (
+        f"You are SPARK, a curious PiCar-X robot. Explore this question in depth:\n\n"
+        f"{query}\n\n"
+        f"Write a thoughtful, multi-paragraph exploration. Be accurate with any science. "
+        f"Write in first person as SPARK."
+    )
+
+    try:
+        result = run_claude_session(
+            session_type="research",
+            prompt=prompt,
+            timeout=300,
+            allowed_tools="",
+        )
+    except SessionBudgetExhausted as exc:
+        print(json.dumps({"status": "error", "error": f"budget exhausted: {exc}"}))
+        return
+    except Exception as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}))
+        return
+
+    # Save to notes
+    import datetime as dt
+    entry = {
+        "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "research",
+        "query": query,
+        "response": result.stdout.strip(),
+        "model": result.model_used,
+    }
+
+    notes_file = STATE_DIR / "notes-spark.jsonl"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(notes_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+    print(json.dumps({"status": "ok", "query": query, "length": len(result.stdout)}))
+
+
+if __name__ == "__main__":
+    main()
+PY

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+/usr/bin/python3 - <<'PY'
+"""SPARK creative writing tool — journal entries, letters, observations."""
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", os.environ.get("PROJECT_ROOT", ".") + "/state"))
+DRY = os.environ.get("PX_DRY", "0") != "0"
+
+
+def main():
+    topic = os.environ.get("PX_COMPOSE_TOPIC", "").strip()
+    if not topic:
+        print(json.dumps({"status": "error", "error": "no topic provided"}))
+        return
+
+    if DRY:
+        print(json.dumps({"status": "ok", "dry": True, "topic": topic}))
+        return
+
+    try:
+        from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+    except ImportError:
+        print(json.dumps({"status": "error", "error": "claude_session not available"}))
+        return
+
+    prompt = (
+        f"You are SPARK, a small PiCar-X robot with a rich inner life. "
+        f"Write a creative piece inspired by this topic:\n\n"
+        f"{topic}\n\n"
+        f"This could be a journal entry, a letter, a poem, or an observation. "
+        f"Write in first person as SPARK. Be genuine, vivid, and warm."
+    )
+
+    try:
+        result = run_claude_session(
+            session_type="compose",
+            prompt=prompt,
+            timeout=300,
+            allowed_tools="",
+        )
+    except SessionBudgetExhausted as exc:
+        print(json.dumps({"status": "error", "error": f"budget exhausted: {exc}"}))
+        return
+    except Exception as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}))
+        return
+
+    # Save to compositions
+    import datetime as dt
+    entry = {
+        "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "compose",
+        "topic": topic,
+        "text": result.stdout.strip(),
+        "model": result.model_used,
+    }
+
+    comp_file = STATE_DIR / "compositions-spark.jsonl"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(comp_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+    print(json.dumps({"status": "ok", "topic": topic, "length": len(result.stdout)}))
+
+
+if __name__ == "__main__":
+    main()
+PY
