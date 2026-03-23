@@ -213,38 +213,71 @@ Additional: `confirm_motion_allowed` gate; `yield_alive` at startup; `exploring.
 
 Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one Bluesky post per cycle (rate-limited). QA gate: Claude CLI answers YES/NO; "ambiguous" responses (e.g. "Maybe") default to pass — QA is a safety net for bad content, not a quality bar. PID-file single-instance guard. Branded 1080×1080 thought card images generated via Pillow (cached in `state/thought-images/`, cleaned up after 30 days). Bluesky re-auths on 400/401 (expired token). Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
 
+### Claude Session Manager (`src/pxh/claude_session.py`)
+
+Central dispatcher for all SPARK-initiated Claude Code interactions. Manages model routing, rate limiting, execution, logging, and file whitelist enforcement.
+
+**Model routing** (5 session types):
+
+| Session Type    | Model  | Cooldown | Daily Quota |
+|-----------------|--------|----------|-------------|
+| `evolve`        | Opus   | 24h      | 1/day       |
+| `self_debug`    | Sonnet | 6h       | 2/day       |
+| `research`      | Haiku  | 2h       | 3/day       |
+| `compose`       | Haiku  | 4h       | 2/day       |
+| `conversation`  | Sonnet | 15min    | 4/day       |
+
+Global: 30-min cooldown between sessions (except `self_debug`), 8/day cap. Priority gating when ≤2 remaining: only `self_debug` and `evolve` allowed. Models configurable via `PX_CLAUDE_MODEL_*` env vars.
+
+**Rate limiting**: `check_budget()` returns None (allowed) or reason string. `SessionBudgetExhausted` exception for callers. Budget bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Day boundary: midnight Hobart time.
+
+**Session log**: `state/claude_sessions.jsonl` — one JSON object per line, FileLock-protected, atomic writes.
+
 ### Self-Evolution (px-evolve)
 
 SPARK can introspect on its own thought patterns and propose targeted code changes via GitHub PR — a controlled self-modification loop with human approval required before any change takes effect.
 
 **`src/pxh/spark_config.py`** — Tunable constants extracted from `mind.py`: reflection angles (`SPARK_ANGLES`), topic seeds (`TOPIC_SEEDS`), prompts, cooldowns, salience thresholds. This is the primary safe target for self-evolution; changes here reshape SPARK's personality and curiosity without touching core logic.
 
-**`bin/tool-introspect`** — Computes thought statistics (mood distribution, action distribution, top keywords, average salience, thoughts/day), snapshots `spark_config.py` constants, and records architecture awareness. 30-min cooldown enforced via `introspection.json` timestamp. Writes `state/introspection.json`. Dry-run supported (`PX_DRY=1` sets `dry: true` in output but still writes the file).
+**`bin/tool-introspect`** — Computes thought statistics (mood distribution, action distribution, top keywords, average salience, thoughts/day), snapshots `spark_config.py` constants, and records architecture awareness. 30-min cooldown enforced via `introspection.json` timestamp. Also reports Claude session usage and evolve PR outcomes. Writes `state/introspection.json`.
 
 **`bin/tool-evolve`** — Validates introspection freshness (must be <1h old), intent quality (≥20 chars), and 24h rate limit (max 1 evolution per day). Respects `PX_DRY=1` (writes entry with `dry: true` flag; daemon marks it `skipped:dry`). Writes a `pending` entry to `state/evolve_queue.jsonl` including the full introspection snapshot. Returns `{"status": "queued", "id": "..."}`.
 
 **`bin/px-evolve` daemon** — Polls `evolve_queue.jsonl` for `pending` entries. For each:
-1. Creates a git worktree in `/tmp/px-evolve-<id>/`
-2. Runs `claude -p` with a scoped prompt (intent + introspection + file whitelist), `--allowedTools Read,Write,Edit,Bash,Glob,Grep`, and `--dangerously-skip-permissions`
-3. Runs `pytest` — marks entry `failed` and aborts on test failure
-4. Creates a PR via `gh pr create` — marks entry `pr_created` on success
-5. Cleans up worktree
+1. Creates a git worktree in `/tmp/spark-evolve-<id>/`
+2. Runs `run_claude_session(type="evolve")` with `--allowedTools Read,Write,Edit,Glob,Grep` and `--dangerously-skip-permissions` — Claude edits files directly via tools (no Bash)
+3. px-evolve stages and commits after Claude exits (`git add -A && git commit`)
+4. Validates changed files against whitelist via `git diff --name-only master...HEAD`
+5. Runs `pytest` — marks entry `failed` and aborts on test failure
+6. Creates a PR via `gh pr create --label spark-evolve` — marks entry `pr_created` on success
+7. Cleans up worktree
 
 Single-instance PID guard. Restart policy: on-failure, 30 s.
 
 **Safety constraints**:
-- **File whitelist**: `src/pxh/spark_config.py`, `bin/tool-*` (new tools only), `tests/`
-- **File blacklist**: personas, `api.py`, `mind.py`, credentials, `.env`, `px-evolve` itself
-- Max 3 files changed per evolution; 5-min Claude subprocess timeout
+- **File whitelist** (in `claude_session.py`): `src/pxh/spark_config.py`, `src/pxh/mind.py`, `src/pxh/voice_loop.py`, `bin/tool-*` (new tools only), `tests/`, `docs/prompts/`
+- **File blacklist**: `docs/prompts/persona-*`, `api.py`, `bin/tool-chat*`, `bin/px-evolve`, `.env`, `systemd/`
+- Max 3 files changed per evolution; 30-min Claude subprocess timeout (configurable)
+- Post-Claude whitelist enforcement: hard gate on changed files
 - Test gate: `pytest` must pass before PR is created
 - PR gate: human must merge — changes never auto-apply
+- Budget gate: `run_claude_session()` checks daily cap before spawning
+
+**New cognitive tools**:
+- **`bin/tool-research`** — Haiku-powered curiosity deep dives. Triggered by `research` action in mind.py expression layer. Saves to `state/notes-spark.jsonl`. Params: `query` (5-500 chars).
+- **`bin/tool-compose`** — Haiku-powered creative writing (journal, letter, observation). Triggered by `compose` action. Saves to `state/compositions-spark.jsonl`. Params: `topic` (3-500 chars).
+- **Self-debug** — Sonnet with read-only tools (`Read,Glob,Grep`), triggered by consecutive reflection failures. Saves diagnostic reports to `state/debug_reports.jsonl`. Not a separate tool — runs directly in mind.py.
+- **Conversation depth** — Voice loop detects trigger phrases ("think deeper", "go deeper", "explain that properly") and routes to Sonnet for deeper responses.
 
 **State files** (gitignored):
 - `state/introspection.json` — latest thought stats + config snapshot
 - `state/evolve_queue.jsonl` — evolution queue (status: pending/pr_created/failed:*/skipped:dry)
 - `state/evolve_log.jsonl` — per-run audit log with PR URL
+- `state/claude_sessions.jsonl` — unified Claude session log (all types)
+- `state/debug_reports.jsonl` — self-debug diagnostic reports
+- `state/compositions-spark.jsonl` — creative writing output
 
-**New env vars**: `PX_EVOLVE_DRY` (1 = skip worktree/PR), `PX_EVOLVE_MODEL` (default: `claude-opus-4-6`), `PX_EVOLVE_TIMEOUT` (default: 300 s), `PX_EVOLVE_MAX_FILES` (default: 3).
+**Env vars**: `PX_EVOLVE_DRY` (1 = skip worktree/PR), `PX_EVOLVE_MODEL` (default: `claude-opus-4-6`), `PX_EVOLVE_TIMEOUT` (default: 1800 s), `PX_EVOLVE_MAX_FILES` (default: 3), `PX_CLAUDE_DAILY_CAP` (default: 8), `PX_CLAUDE_COOLDOWN_S` (default: 1800), `PX_CLAUDE_BUDGET_DISABLED` (1 = bypass all limits), `PX_CLAUDE_MODEL_*` (per-type model overrides).
 
 ### MCP Server (Claude Code integration)
 
@@ -451,7 +484,7 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_HA_DEBUG` | `1` = verbose HA fetch logging (per-entity, calendar, routines); errors always logged |
 | `PX_EVOLVE_DRY` | `1` = skip worktree creation and PR (queue entry still written) |
 | `PX_EVOLVE_MODEL` | Claude model for evolution proposals (default: `claude-opus-4-6`) |
-| `PX_EVOLVE_TIMEOUT` | Claude subprocess timeout in seconds (default: `300`) |
+| `PX_EVOLVE_TIMEOUT` | Claude subprocess timeout in seconds (default: `1800`) |
 | `PX_EVOLVE_MAX_FILES` | Maximum files changed per evolution (default: `3`) |
 
 ## Multi-Model QA

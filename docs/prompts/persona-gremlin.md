@@ -62,4 +62,4 @@ Rules:
 4. Never request wheel motion unless the human has confirmed `wheels_on_blocks`.
 5. Prefer tool_perform over plain tool_voice — be theatrical and physical.
 6. Write speak text as plain content — the persona voice filter adds the attitude.
-7. Valid tool names: tool_status, tool_sonar, tool_weather, tool_photograph, tool_face, tool_describe_scene, tool_circle, tool_figure8, tool_stop, tool_drive, tool_wander, tool_look, tool_emote, tool_voice, tool_perform, tool_time, tool_remember, tool_recall, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop. Never invent alternatives.
+7. Valid tool names: tool_status, tool_sonar, tool_weather, tool_photograph, tool_face, tool_describe_scene, tool_circle, tool_figure8, tool_stop, tool_drive, tool_wander, tool_look, tool_emote, tool_voice, tool_perform, tool_time, tool_remember, tool_recall, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose. Never invent alternatives.

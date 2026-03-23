@@ -46,6 +46,9 @@ state/race_track.json
 state/race_log.jsonl
 state/race_live.json
 state/pin_lockout.json
+state/claude_sessions.jsonl
+state/debug_reports.jsonl
+state/compositions-spark.jsonl
 state/*.tmp
 state/.*.tmp
 photos/
