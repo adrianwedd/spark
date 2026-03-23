@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from collections import Counter
 from pathlib import Path
@@ -196,6 +197,40 @@ def main() -> int:
     # ── Evolve history ─────────────────────────────────────────────
     evolve_history = load_evolve_history(EVOLVE_LOG_FILE)
 
+    # ── Claude session stats ─────────────────────────────────────
+    claude_sessions = {}
+    try:
+        from pxh.claude_session import _load_session_log, _today_entries, DAILY_CAP
+        all_entries = _load_session_log()
+        today = _today_entries(all_entries)
+        by_type = {}
+        total_duration = 0.0
+        for e in today:
+            t = e.get("type", "unknown")
+            by_type[t] = by_type.get(t, 0) + 1
+            total_duration += e.get("duration_s", 0)
+        claude_sessions = {
+            "today_count": len(today),
+            "daily_cap": DAILY_CAP,
+            "by_type": by_type,
+            "total_duration_s": round(total_duration, 1),
+        }
+    except Exception:
+        pass
+
+    # ── Evolve PR outcomes ────────────────────────────────────────
+    evolve_outcomes = []
+    try:
+        pr_result = subprocess.run(
+            ["gh", "pr", "list", "--state", "all", "--search", "head:spark/evolve-",
+             "--json", "number,state,title,mergedAt", "--limit", "5"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if pr_result.returncode == 0:
+            evolve_outcomes = json.loads(pr_result.stdout)
+    except Exception:
+        pass
+
     # ── Assemble introspection payload ─────────────────────────────
     introspection = {
         "ts":                  __import__("time").time(),
@@ -209,6 +244,8 @@ def main() -> int:
         "mind":                mind_info,
         "architecture":        ARCHITECTURE_TEXT,
         "evolve_history":      evolve_history,
+        "claude_sessions":     claude_sessions,
+        "evolve_outcomes":     evolve_outcomes,
         "dry":                 dry_mode,
     }
 

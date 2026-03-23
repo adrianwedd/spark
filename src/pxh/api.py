@@ -540,6 +540,17 @@ async def public_status() -> Dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
         pass  # expected on missing/corrupt thoughts file
 
+    # Claude session budget
+    claude_sessions_today = 0
+    claude_budget_remaining = 8
+    try:
+        from pxh.claude_session import _load_session_log, _today_entries, DAILY_CAP
+        today = _today_entries(_load_session_log())
+        claude_sessions_today = len(today)
+        claude_budget_remaining = max(0, DAILY_CAP - claude_sessions_today)
+    except Exception:
+        pass
+
     return {
         "persona": persona or None,
         "mood": last.get("mood"),
@@ -550,6 +561,8 @@ async def public_status() -> Dict[str, Any]:
         "salience": last.get("salience"),
         "ts": last.get("ts"),
         "listening": session.get("listening", False),
+        "claude_sessions_today": claude_sessions_today,
+        "claude_budget_remaining": claude_budget_remaining,
     }
 
 
