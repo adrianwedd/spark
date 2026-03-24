@@ -185,14 +185,19 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
     sched = SCHEDULE[post_type]
 
     if post_type == "daily":
-        # Target: today at 22:00 Hobart
-        target = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-        if now < target:
-            return False, None
-        pid = id_for_post("daily", now)
-        if post_exists(blog_data.get("posts", []), pid):
-            return False, None
-        return True, now
+        # Target: today at 22:00 Hobart. If it's before 22:00, check yesterday.
+        target_today = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
+        if now >= target_today:
+            # Past 10pm today — generate today's daily
+            pid = id_for_post("daily", now)
+            if not post_exists(blog_data.get("posts", []), pid):
+                return True, now
+        # Also check yesterday (catch-up for overnight or missed)
+        yesterday = now - dt.timedelta(days=1)
+        pid_yesterday = id_for_post("daily", yesterday)
+        if not post_exists(blog_data.get("posts", []), pid_yesterday):
+            return True, yesterday
+        return False, None
 
     elif post_type == "weekly":
         # Target: most recent Sunday at 22:30
