@@ -281,3 +281,22 @@ body {
   }
 
 }
+
+/* Load more button */
+.feed-load-more-btn {
+  display: block;
+  margin: 2rem auto;
+  padding: 0.75rem 2rem;
+  background: transparent;
+  color: var(--warm-text, #5a4a3a);
+  border: 1px solid var(--warm-muted, #c4b5a0);
+  border-radius: 24px;
+  font-family: 'Courier Prime', monospace;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: border-color 0.2s, color 0.2s;
+}
+.feed-load-more-btn:hover {
+  border-color: var(--warm-accent, #e8875a);
+  color: var(--warm-accent, #e8875a);
+}

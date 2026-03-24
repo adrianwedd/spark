@@ -152,3 +152,33 @@
   margin: 0;
   color: var(--dark-muted);
 }
+
+/* Machine band collapsible */
+.machine-details { margin-bottom: 0.75rem; }
+.machine-toggle {
+  cursor: pointer;
+  color: var(--dark-muted);
+  font-family: 'Courier New', monospace;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 0.5rem 0;
+  list-style: none;
+}
+.machine-toggle::-webkit-details-marker { display: none; }
+.machine-details[open] .machine-toggle { color: var(--dark-accent); }
+
+/* Roadmap completed toggle */
+.roadmap-completed-toggle {
+  margin: 0.5rem 0;
+  border: none;
+}
+.roadmap-completed-toggle summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.4rem 0;
+  list-style: none;
+}
+.roadmap-completed-toggle summary::-webkit-details-marker { display: none; }
+.roadmap-completed-toggle summary::before { content: '+ '; }
+.roadmap-completed-toggle[open] summary::before { content: '- '; }

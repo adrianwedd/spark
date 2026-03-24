@@ -252,6 +252,8 @@
         <div id="services-dots" class="services-strip-dots"></div>
       </div>
 
+      <details class="machine-details" id="machine-details">
+        <summary class="machine-toggle">System Vitals ▸</summary>
       <div class="metric-grid">
 
         <!-- CPU % -->
@@ -317,6 +319,7 @@
         </div>
 
       </div><!-- /metric-grid -->
+      </details>
 
       <!-- Race status -->
       <div class="race-strip hidden" id="race-status">
@@ -800,46 +803,52 @@ PX_PAN=30 PX_TILT=10 bin/tool-look
 
     <div class="roadmap-group">
       <h3>Foundation (0–1 Month)</h3>
-      <div class="roadmap-item done"><span class="check">✅</span> Upgrade diagnostics to log predictive signals</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Extend energy sensing (voltage/temperature)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Boot health service — captures throttle/voltage at boot</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Ship safety fallbacks: wake-word halt, watchdog heartbeats</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Harden logging paths (FileLock, isolated test fixtures)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Source control: repo at adrianwedd/spark</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Three-layer cognitive loop (px-mind) with LLM fallback</div>
-      <div class="roadmap-item done"><span class="check">✅</span> SPARK persona + neurodivergent-aware system prompt</div>
-      <div class="roadmap-item done"><span class="check">✅</span> REST API + web UI (px-api-server)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Frigate camera stream (go2rtc RTSP pull model)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Battery monitoring — escalating warnings + emergency shutdown</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Live dashboard with mood, thoughts, sparklines (this page)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Public API — unauthenticated live data endpoints</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Thoughts carousel — real-time inner monologue on home page</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Semantic mood colour palette — pulse circle + favicon</div>
-      <div class="roadmap-item done"><span class="check">✅</span> obi_mode inference (absent/calm/active/possibly-overloaded)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Social posting — Bluesky (spark.wedd.au) + thought feed (spark.wedd.au/feed/)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Multi-camera Frigate — 4 cameras with per-room presence detection (Hailo AI)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> PIN session tokens, file-based rate limiting, two-step device confirmation</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Battery glitch filter — time-gapped confirmations, voltage sanity check</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Graceful watchdog — SIGTERM + 5s grace instead of os._exit(1)</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Branded thought card images — 1080x1080 square PNGs with adaptive text</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Two-pass social flush — feed writes decoupled from social rate limits</div>
-      <div class="roadmap-item done"><span class="check">✅</span> DST-aware timezone — ZoneInfo("Australia/Hobart") replaces hardcoded UTC+11</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Per-IP PIN lockout — 1000-IP hard cap, trusted proxy check, file-based persistence</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Atomic writes with fsync — mkstemp + ownership preservation for SD card durability</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Single-instance PID guards on all daemons — prevents double speech on restart</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Subprocess timeout kills orphans — API tool calls terminate child processes</div>
-      <div class="roadmap-item done"><span class="check">✅</span> exploring.json guard — long-running tools prevent px-alive restart mid-operation</div>
-      <div class="roadmap-item done"><span class="check">✅</span> FileLock 10s timeout — prevents indefinite hangs on stuck session locks</div>
-      <div class="roadmap-item done"><span class="check">✅</span> SEO blitz — JSON-LD, canonical URLs, sitemap, OG tags, fediverse verification</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Mood-coloured status dot on all pages — real-time mood from API</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Home Assistant integration — presence, sleep, calendar, routines, media context</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Bluesky image uploads — branded thought cards attached to social posts</div>
-      <div class="roadmap-item done"><span class="check">✅</span> 562 tests — comprehensive coverage across API, state, tools, voice, mind, race, evolve</div>
-      <div class="roadmap-item done"><span class="check">✅</span> 12-mood colour palette — full arousal spectrum with CSS vars, terminal ANSI, pulse animations</div>
+      <!-- Recent completions (last 5) -->
       <div class="roadmap-item done"><span class="check">✅</span> Autonomous racing — dual-sensor PD control, per-lap learning, track profiling</div>
       <div class="roadmap-item done"><span class="check">✅</span> SSH login dashboard — system status, tmux, cognitive state, errors, quick actions</div>
       <div class="roadmap-item done"><span class="check">✅</span> Race telemetry on dashboard — calibration, profile, live lap/speed/incidents</div>
       <div class="roadmap-item done"><span class="check">✅</span> Network TTS — GLaDOS on Pi, Qwen3-TTS voice clone on M1</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Claude session manager — model routing, rate limiting, self-evolution with real tool access</div>
+      <!-- Collapsed older completions -->
+      <details class="roadmap-completed-toggle">
+        <summary class="text-muted-dark">Show all 35 completed items</summary>
+        <div class="roadmap-item done"><span class="check">✅</span> Upgrade diagnostics to log predictive signals</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Extend energy sensing (voltage/temperature)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Boot health service — captures throttle/voltage at boot</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Ship safety fallbacks: wake-word halt, watchdog heartbeats</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Harden logging paths (FileLock, isolated test fixtures)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Source control: repo at adrianwedd/spark</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Three-layer cognitive loop (px-mind) with LLM fallback</div>
+        <div class="roadmap-item done"><span class="check">✅</span> SPARK persona + neurodivergent-aware system prompt</div>
+        <div class="roadmap-item done"><span class="check">✅</span> REST API + web UI (px-api-server)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Frigate camera stream (go2rtc RTSP pull model)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Battery monitoring — escalating warnings + emergency shutdown</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Live dashboard with mood, thoughts, sparklines (this page)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Public API — unauthenticated live data endpoints</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Thoughts carousel — real-time inner monologue on home page</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Semantic mood colour palette — pulse circle + favicon</div>
+        <div class="roadmap-item done"><span class="check">✅</span> obi_mode inference (absent/calm/active/possibly-overloaded)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Social posting — Bluesky (spark.wedd.au) + thought feed (spark.wedd.au/feed/)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Multi-camera Frigate — 4 cameras with per-room presence detection (Hailo AI)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> PIN session tokens, file-based rate limiting, two-step device confirmation</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Battery glitch filter — time-gapped confirmations, voltage sanity check</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Graceful watchdog — SIGTERM + 5s grace instead of os._exit(1)</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Branded thought card images — 1080x1080 square PNGs with adaptive text</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Two-pass social flush — feed writes decoupled from social rate limits</div>
+        <div class="roadmap-item done"><span class="check">✅</span> DST-aware timezone — ZoneInfo("Australia/Hobart") replaces hardcoded UTC+11</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Per-IP PIN lockout — 1000-IP hard cap, trusted proxy check, file-based persistence</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Atomic writes with fsync — mkstemp + ownership preservation for SD card durability</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Single-instance PID guards on all daemons — prevents double speech on restart</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Subprocess timeout kills orphans — API tool calls terminate child processes</div>
+        <div class="roadmap-item done"><span class="check">✅</span> exploring.json guard — long-running tools prevent px-alive restart mid-operation</div>
+        <div class="roadmap-item done"><span class="check">✅</span> FileLock 10s timeout — prevents indefinite hangs on stuck session locks</div>
+        <div class="roadmap-item done"><span class="check">✅</span> SEO blitz — JSON-LD, canonical URLs, sitemap, OG tags, fediverse verification</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Mood-coloured status dot on all pages — real-time mood from API</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Home Assistant integration — presence, sleep, calendar, routines, media context</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Bluesky image uploads — branded thought cards attached to social posts</div>
+        <div class="roadmap-item done"><span class="check">✅</span> 12-mood colour palette — full arousal spectrum with CSS vars, terminal ANSI, pulse animations</div>
+      </details>
+      <!-- Upcoming -->
       <div class="roadmap-item"><span class="check">⬜</span> Gesture-driven stop prototype</div>
       <div class="roadmap-item"><span class="check">⬜</span> Weekly battery/health summary reports</div>
     </div>

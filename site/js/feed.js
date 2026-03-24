@@ -8,6 +8,9 @@
   var FALLBACK_GITHUB = window.SPARK_CONFIG.FALLBACK_GITHUB;
   var TIMEOUT_MS = 8000;
   var CACHE_KEY = 'spark_feed_cache';
+  var PAGE_SIZE = 20;
+  var _allPosts = [];
+  var _displayedCount = 0;
 
   // All 12 moods have .mood-{name} classes in feed.css (plus legacy "active")
   var VALID_MOODS = ['peaceful','content','contemplative','curious','active','excited',
@@ -70,31 +73,53 @@
     return a;
   }
 
+  function renderPage() {
+    var list = document.getElementById('feed-list');
+    var batch = _allPosts.slice(_displayedCount, _displayedCount + PAGE_SIZE);
+    batch.forEach(function (post) {
+      list.appendChild(renderCard(post));
+    });
+    _displayedCount += batch.length;
+    updateLoadMore();
+  }
+
+  function updateLoadMore() {
+    var existing = document.getElementById('feed-load-more');
+    if (existing) existing.remove();
+    if (_displayedCount >= _allPosts.length) return;
+    var remaining = _allPosts.length - _displayedCount;
+    var btn = document.createElement('button');
+    btn.id = 'feed-load-more';
+    btn.className = 'feed-load-more-btn';
+    btn.textContent = 'Load more (' + remaining + ' remaining)';
+    btn.onclick = function () { renderPage(); };
+    document.getElementById('feed-list').after(btn);
+  }
+
   function render(data) {
     var list = document.getElementById('feed-list');
     var empty = document.getElementById('feed-empty');
     var posts = (data && data.posts) || [];
 
     // Newest first
-    posts = posts.slice().reverse();
+    _allPosts = posts.slice().reverse();
+    _displayedCount = 0;
 
     // Clear existing children
     while (list.firstChild) list.removeChild(list.firstChild);
 
-    if (posts.length === 0) {
+    if (_allPosts.length === 0) {
       empty.hidden = false;
       return;
     }
 
     empty.hidden = true;
-    posts.forEach(function (post) {
-      list.appendChild(renderCard(post));
-    });
+    renderPage();
 
     // Update OG description with latest thought
     var ogDesc = document.querySelector('meta[property="og:description"]');
-    if (ogDesc && posts[0]) {
-      ogDesc.content = posts[0].thought.substring(0, 160);
+    if (ogDesc && _allPosts[0]) {
+      ogDesc.content = _allPosts[0].thought.substring(0, 160);
     }
   }
 
