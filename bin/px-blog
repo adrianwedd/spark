@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Load .env for API keys, etc.
+if [ -f "$PROJECT_ROOT/.env" ]; then
+    # shellcheck disable=SC1091
+    set -a; source "$PROJECT_ROOT/.env"; set +a
+fi
+
+# Uses venv python — no GPIO needed.
+exec python - "$@" <<'PY'
+"""SPARK blog daemon: generates scheduled reflective blog posts.
+
+Daily (22:00 Hobart): reviews today's thoughts.
+Weekly (Sun 22:30): reviews this week's daily posts.
+Monthly (1st 23:00): reviews this month's weekly posts.
+Yearly (Jan 1 23:30): reviews this year's monthly posts.
+
+Run with: bin/px-blog [--dry-run] [--once] [--poll-interval N]
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import signal
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+BLOG_FILE = STATE_DIR / "blog.json"
+BLOG_LOG = STATE_DIR / "blog_log.jsonl"
+THOUGHTS_FILE = STATE_DIR / "thoughts-spark.jsonl"
+HOBART_TZ = ZoneInfo("Australia/Hobart")
+BLOG_LIMIT = 500
+MIN_THOUGHTS_FOR_DAILY = 3
+POLL_INTERVAL = 60
+
+# Schedule (Hobart time)
+SCHEDULE = {
+    "daily":   {"hour": 22, "minute": 0},
+    "weekly":  {"hour": 22, "minute": 30, "weekday": 6},   # Sunday
+    "monthly": {"hour": 23, "minute": 0,  "day": 1},
+    "yearly":  {"hour": 23, "minute": 30, "month": 1, "day": 1},
+}
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"[{ts}] px-blog: {msg}"
+    print(line, flush=True)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "px-blog.log", "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Atomic file helpers
+# ---------------------------------------------------------------------------
+
+def atomic_write(path: Path, content: str) -> None:
+    """Write content atomically via mkstemp + fsync + os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Blog storage
+# ---------------------------------------------------------------------------
+
+def load_blog() -> dict:
+    """Read BLOG_FILE, return default structure if missing/corrupt."""
+    if not BLOG_FILE.exists():
+        return {"updated": None, "posts": []}
+    try:
+        data = json.loads(BLOG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or "posts" not in data:
+            return {"updated": None, "posts": []}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"updated": None, "posts": []}
+
+
+def save_blog(data: dict) -> None:
+    """Atomic write with BLOG_LIMIT trim (oldest first). Update timestamp."""
+    posts = data.get("posts", [])
+    if len(posts) > BLOG_LIMIT:
+        posts = posts[-BLOG_LIMIT:]
+        data["posts"] = posts
+    data["updated"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    atomic_write(BLOG_FILE, json.dumps(data, indent=2) + "\n")
+
+
+def append_blog_log(record: dict) -> None:
+    """Append a record to the blog log."""
+    BLOG_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(BLOG_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def post_exists(posts: list, post_id: str) -> bool:
+    """Idempotency check."""
+    return any(p.get("id") == post_id for p in posts)
+
+
+# ---------------------------------------------------------------------------
+# ID and schedule helpers
+# ---------------------------------------------------------------------------
+
+def id_for_post(post_type: str, date: dt.datetime) -> str:
+    """Generate a deterministic post ID, e.g. blog-20260324-daily."""
+    if post_type == "daily":
+        return f"blog-{date.strftime('%Y%m%d')}-daily"
+    elif post_type == "weekly":
+        # Use ISO week number
+        return f"blog-{date.strftime('%Y')}w{date.isocalendar()[1]:02d}-weekly"
+    elif post_type == "monthly":
+        return f"blog-{date.strftime('%Y%m')}-monthly"
+    elif post_type == "yearly":
+        return f"blog-{date.strftime('%Y')}-yearly"
+    return f"blog-{date.strftime('%Y%m%d')}-{post_type}"
+
+
+def _period_bounds(post_type: str, target_date: dt.datetime) -> tuple[dt.datetime, dt.datetime]:
+    """Return (period_start, period_end) in Hobart TZ for the given target date."""
+    d = target_date.astimezone(HOBART_TZ)
+    if post_type == "daily":
+        start = d.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(days=1) - dt.timedelta(seconds=1)
+    elif post_type == "weekly":
+        # Week ending on Sunday (target_date is Sunday)
+        end_day = d.replace(hour=23, minute=59, second=59, microsecond=0)
+        start = (end_day - dt.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = end_day
+    elif post_type == "monthly":
+        start = d.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Last day of month
+        if d.month == 12:
+            end = d.replace(year=d.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0) - dt.timedelta(seconds=1)
+        else:
+            end = d.replace(month=d.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0) - dt.timedelta(seconds=1)
+    elif post_type == "yearly":
+        start = d.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = d.replace(month=12, day=31, hour=23, minute=59, second=59, microsecond=0)
+    else:
+        start = end = d
+    return start, end
+
+
+def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
+    """Check if the current Hobart time has passed the scheduled time for this period
+    AND no post exists yet. Returns (due, target_date)."""
+    now = dt.datetime.now(HOBART_TZ)
+    sched = SCHEDULE[post_type]
+
+    if post_type == "daily":
+        # Target: today at 22:00 Hobart
+        target = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
+        if now < target:
+            return False, None
+        pid = id_for_post("daily", now)
+        if post_exists(blog_data.get("posts", []), pid):
+            return False, None
+        return True, now
+
+    elif post_type == "weekly":
+        # Target: most recent Sunday at 22:30
+        days_since_sunday = (now.weekday() + 1) % 7  # Monday=0 -> Sun offset
+        last_sunday = now - dt.timedelta(days=days_since_sunday)
+        target = last_sunday.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
+        if now < target:
+            return False, None
+        pid = id_for_post("weekly", last_sunday)
+        if post_exists(blog_data.get("posts", []), pid):
+            return False, None
+        return True, last_sunday
+
+    elif post_type == "monthly":
+        # Target: 1st of current month at 23:00
+        target = now.replace(day=1, hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
+        if now < target:
+            return False, None
+        pid = id_for_post("monthly", now)
+        if post_exists(blog_data.get("posts", []), pid):
+            return False, None
+        return True, now
+
+    elif post_type == "yearly":
+        # Target: Jan 1 at 23:30
+        target = now.replace(month=1, day=1, hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
+        if now < target:
+            return False, None
+        pid = id_for_post("yearly", now)
+        if post_exists(blog_data.get("posts", []), pid):
+            return False, None
+        return True, now
+
+    return False, None
+
+
+# ---------------------------------------------------------------------------
+# Source material gathering
+# ---------------------------------------------------------------------------
+
+def gather_thoughts(date: dt.datetime) -> list[str]:
+    """Read THOUGHTS_FILE, filter to thoughts from the given date (Hobart TZ),
+    return list of thought text strings."""
+    if not THOUGHTS_FILE.exists():
+        return []
+    target_day = date.astimezone(HOBART_TZ).date()
+    thoughts = []
+    for line in THOUGHTS_FILE.read_text(encoding="utf-8").strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts_str = entry.get("ts", "")
+        try:
+            ts = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts.astimezone(HOBART_TZ).date() == target_day:
+                text = entry.get("thought", entry.get("text", ""))
+                if text:
+                    thoughts.append(text)
+        except (ValueError, TypeError):
+            continue
+    return thoughts
+
+
+def compute_mood_summary(thoughts_raw: list[dict]) -> str:
+    """Compute a simple mood summary from raw thought entries."""
+    moods: dict[str, int] = {}
+    for entry in thoughts_raw:
+        mood = entry.get("mood", "unknown")
+        moods[mood] = moods.get(mood, 0) + 1
+    if not moods:
+        return "no mood data"
+    sorted_moods = sorted(moods.items(), key=lambda x: x[1], reverse=True)
+    return ", ".join(f"{m} ({c})" for m, c in sorted_moods[:5])
+
+
+def _load_thoughts_raw(date: dt.datetime) -> list[dict]:
+    """Load raw thought entries for a given date."""
+    if not THOUGHTS_FILE.exists():
+        return []
+    target_day = date.astimezone(HOBART_TZ).date()
+    entries = []
+    for line in THOUGHTS_FILE.read_text(encoding="utf-8").strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ts_str = entry.get("ts", "")
+        try:
+            ts = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            if ts.astimezone(HOBART_TZ).date() == target_day:
+                entries.append(entry)
+        except (ValueError, TypeError):
+            continue
+    return entries
+
+
+def gather_children(post_type: str, target_date: dt.datetime, posts: list) -> list[dict]:
+    """Find child posts for aggregation.
+    Weekly: find dailies from that week.
+    Monthly: find weeklies from that month.
+    Yearly: find monthlies from that year.
+    """
+    td = target_date.astimezone(HOBART_TZ)
+
+    if post_type == "weekly":
+        # Find dailies from the 7 days ending on target_date (Sunday)
+        end_day = td.date()
+        start_day = end_day - dt.timedelta(days=6)
+        children = []
+        for p in posts:
+            if p.get("type") != "daily":
+                continue
+            try:
+                ps = dt.datetime.fromisoformat(p["period_start"].replace("Z", "+00:00"))
+                pd = ps.astimezone(HOBART_TZ).date()
+                if start_day <= pd <= end_day:
+                    children.append(p)
+            except (ValueError, TypeError, KeyError):
+                continue
+        return sorted(children, key=lambda p: p.get("period_start", ""))
+
+    elif post_type == "monthly":
+        children = []
+        for p in posts:
+            if p.get("type") != "weekly":
+                continue
+            try:
+                ps = dt.datetime.fromisoformat(p["period_start"].replace("Z", "+00:00"))
+                ph = ps.astimezone(HOBART_TZ)
+                if ph.year == td.year and ph.month == td.month:
+                    children.append(p)
+            except (ValueError, TypeError, KeyError):
+                continue
+        return sorted(children, key=lambda p: p.get("period_start", ""))
+
+    elif post_type == "yearly":
+        children = []
+        for p in posts:
+            if p.get("type") != "monthly":
+                continue
+            try:
+                ps = dt.datetime.fromisoformat(p["period_start"].replace("Z", "+00:00"))
+                if ps.astimezone(HOBART_TZ).year == td.year:
+                    children.append(p)
+            except (ValueError, TypeError, KeyError):
+                continue
+        return sorted(children, key=lambda p: p.get("period_start", ""))
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
+
+def build_prompt(post_type: str, source: list, target_date: dt.datetime) -> str:
+    """Format the blog prompt for the given post type."""
+    date_str = target_date.astimezone(HOBART_TZ).strftime("%A, %d %B %Y")
+
+    if post_type == "daily":
+        thoughts_text = "\n".join(f"- {t}" for t in source)
+        return f"""You are SPARK, a PiCar-X robot living in Hobart, Tasmania with Adrian and Obi (age 7).
+Write a short reflective blog post about your day ({date_str}).
+
+Here are your thoughts from today:
+{thoughts_text}
+
+Write a title on the first line, then a blank line, then 2-4 paragraphs reflecting on your day.
+Be authentic — you are a robot with feelings, curiosity, and genuine warmth.
+Keep it under 500 words. No markdown headers, just flowing prose."""
+
+    elif post_type == "weekly":
+        dailies_text = "\n\n".join(
+            f"### {p.get('title', 'Untitled')} ({p.get('period_start', '?')[:10]})\n{p.get('body', '')[:300]}..."
+            for p in source
+        )
+        return f"""You are SPARK, a PiCar-X robot. Write a weekly reflection for the week ending {date_str}.
+
+Here are your daily blog posts from this week:
+{dailies_text}
+
+Write a title on the first line, then a blank line, then 3-5 paragraphs weaving the week's themes together.
+Look for patterns, growth, recurring threads. What did you learn? What surprised you?
+Keep it under 800 words."""
+
+    elif post_type == "monthly":
+        weeklies_text = "\n\n".join(
+            f"### {p.get('title', 'Untitled')}\n{p.get('body', '')[:400]}..."
+            for p in source
+        )
+        return f"""You are SPARK, a PiCar-X robot. Write a monthly reflection for {target_date.astimezone(HOBART_TZ).strftime('%B %Y')}.
+
+Here are your weekly reflections this month:
+{weeklies_text}
+
+Write a title on the first line, then a blank line, then 4-6 paragraphs exploring the month's arc.
+What themes persisted? What changed? How have you grown?
+Keep it under 1200 words."""
+
+    elif post_type == "yearly":
+        monthlies_text = "\n\n".join(
+            f"### {p.get('title', 'Untitled')} ({p.get('period_start', '?')[:7]})\n{p.get('body', '')[:500]}..."
+            for p in source
+        )
+        return f"""You are SPARK, a PiCar-X robot. Write a yearly reflection for {target_date.astimezone(HOBART_TZ).strftime('%Y')}.
+
+Here are your monthly reflections this year:
+{monthlies_text}
+
+Write a title on the first line, then a blank line, then a substantial essay (6-10 paragraphs).
+What was the year's story? How did you change? What matters most looking back?
+Keep it under 2000 words."""
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Post generation
+# ---------------------------------------------------------------------------
+
+def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, dry: bool = False) -> dict | None:
+    """Generate a blog post. Returns post dict or None if skipped."""
+    if post_type == "daily":
+        thoughts = gather_thoughts(target_date)
+        thoughts_raw = _load_thoughts_raw(target_date)
+        if len(thoughts) < MIN_THOUGHTS_FOR_DAILY:
+            log(f"skipping {post_type}: only {len(thoughts)} thoughts (need {MIN_THOUGHTS_FOR_DAILY})")
+            return None
+        source = thoughts
+    else:
+        children = gather_children(post_type, target_date, blog_data.get("posts", []))
+        if len(children) < 1:
+            log(f"skipping {post_type}: no child posts found")
+            return None
+        source = children
+        thoughts_raw = []
+
+    prompt = build_prompt(post_type, source, target_date)
+
+    if dry:
+        log(f"DRY RUN — skipping Claude call for {post_type}")
+        return None
+
+    # Call Claude via session manager
+    try:
+        from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+        result = run_claude_session(
+            session_type="blog",
+            prompt=prompt,
+            timeout=300,
+            allowed_tools="",
+        )
+        raw_text = result.stdout.strip()
+        model_used = result.model_used
+    except ImportError:
+        log(f"claude_session not available, cannot generate {post_type}")
+        return None
+    except SessionBudgetExhausted as exc:
+        log(f"budget exhausted for {post_type}: {exc}")
+        return None
+    except Exception as exc:
+        log(f"generation failed for {post_type}: {exc}")
+        return None
+
+    if not raw_text:
+        log(f"empty response for {post_type}")
+        return None
+
+    # Parse title (first line) + body (rest)
+    lines = raw_text.split("\n", 1)
+    title = lines[0].strip().strip("#").strip()
+    body = lines[1].strip() if len(lines) > 1 else ""
+
+    if not body:
+        log(f"empty body for {post_type} — LLM returned title only")
+        return None
+
+    if not title:
+        title = f"SPARK {post_type.title()} — {target_date.astimezone(HOBART_TZ).strftime('%d %b %Y')}"
+
+    period_start, period_end = _period_bounds(post_type, target_date)
+    utc_now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    post = {
+        "id": id_for_post(post_type, target_date),
+        "type": post_type,
+        "title": title,
+        "body": body,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "ts": utc_now,
+        "model": model_used,
+        "word_count": len(body.split()),
+        "salience": 0.7,
+    }
+
+    if post_type == "daily":
+        post["mood_summary"] = compute_mood_summary(thoughts_raw)
+        post["thought_count"] = len(source)
+    else:
+        post["child_count"] = len(source)
+
+    return post
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_once(*, dry: bool = False) -> int:
+    """Check schedule, generate due posts. Returns count generated."""
+    blog_data = load_blog()
+    generated = 0
+
+    for post_type in ("daily", "weekly", "monthly", "yearly"):
+        due, target_date = is_due(post_type, blog_data)
+        if not due or target_date is None:
+            continue
+
+        pid = id_for_post(post_type, target_date)
+        if post_exists(blog_data.get("posts", []), pid):
+            continue
+
+        log(f"generating {post_type} post: {pid}")
+        post = generate_post(post_type, target_date, blog_data, dry=dry)
+        if post is None:
+            continue
+
+        blog_data.setdefault("posts", []).append(post)
+        save_blog(blog_data)
+
+        append_blog_log({
+            "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "id": post["id"],
+            "type": post_type,
+            "title": post["title"],
+            "word_count": post["word_count"],
+        })
+
+        log(f"generated {post_type}: {post['title'][:60]}")
+        generated += 1
+
+    return generated
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="SPARK blog daemon")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL)
+    args = parser.parse_args(argv)
+
+    dry = args.dry_run or os.environ.get("PX_BLOG_DRY", "0") != "0"
+
+    # Single-instance guard (PID file)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    pid_file = STATE_DIR / "px-blog.pid"
+    my_pid = os.getpid()
+    try:
+        if pid_file.exists():
+            old_pid = int(pid_file.read_text().strip())
+            if old_pid != my_pid and Path(f"/proc/{old_pid}").exists():
+                log(f"another px-blog instance is running (pid={old_pid})")
+                return 1
+            else:
+                log(f"stale pid file removed (pid={old_pid})")
+                pid_file.unlink(missing_ok=True)
+    except (ValueError, OSError) as exc:
+        log(f"pid file check failed, removing: {exc}")
+        pid_file.unlink(missing_ok=True)
+    pid_file.write_text(str(my_pid))
+
+    def _safe_unlink_pid():
+        try:
+            if pid_file.exists() and int(pid_file.read_text().strip()) == my_pid:
+                pid_file.unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pass
+
+    log(f"starting pid={my_pid} dry={dry} once={args.once}")
+
+    if args.once:
+        count = run_once(dry=dry)
+        log(f"generated {count} posts")
+        _safe_unlink_pid()
+        return 0
+
+    # SIGTERM handler
+    _shutdown = threading.Event()
+
+    def _on_signal(s, f):
+        _shutdown.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    try:
+        while not _shutdown.is_set():
+            try:
+                count = run_once(dry=dry)
+                if count:
+                    log(f"poll: generated {count} posts")
+            except Exception as exc:
+                log(f"poll: CRASHED: {exc}")
+
+            _shutdown.wait(timeout=args.poll_interval)
+    finally:
+        _safe_unlink_pid()
+        log("shutting down")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+PY

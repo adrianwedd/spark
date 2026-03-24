@@ -360,13 +360,13 @@ VALID_ACTIONS = {"wait", "greet", "comment", "remember", "look_at",
                  "play_sound", "photograph", "emote", "look_around",
                  "time_check", "calendar_check", "morning_fact",
                  "introspect", "evolve",
-                 "research", "compose", "self_debug"}
+                 "research", "compose", "self_debug", "blog_essay"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
-                        "research", "compose"}
+                        "research", "compose", "blog_essay"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -405,7 +405,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — vivid, specific, personal",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -448,7 +448,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — dark humor, puns, genius-level wit. Start with FUCK YEAH! Think like a displaced temporal genius who finds everything cosmically absurd.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -478,7 +478,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection. Start with FUCK YEAH! Be creative and DIFFERENT every time.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -2392,8 +2392,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     explore_available = _can_explore(session, aw_data)
     if explore_available:
         system_prompt = system_prompt.replace(
-            'research, compose, self_debug"',
-            'research, compose, self_debug, explore"'
+            'research, compose, self_debug, blog_essay"',
+            'research, compose, self_debug, blog_essay, explore"'
         )
 
     # Exploration hints for context
@@ -2864,6 +2864,14 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 [str(BIN_DIR / "tool-compose")],
                 capture_output=True, text=True, check=False, env=env, timeout=360)
             log(f"expression: compose completed rc={result.returncode}")
+
+        elif action == "blog_essay":
+            env["PX_BLOG_TOPIC"] = text[:500]
+            env["PX_DRY"] = "1" if dry else "0"
+            result = subprocess.run(
+                [str(BIN_DIR / "tool-blog")],
+                capture_output=True, text=True, check=False, env=env, timeout=360)
+            log(f"expression: blog_essay completed rc={result.returncode}")
 
         elif action == "self_debug":
             log("expression: self_debug triggered — gathering diagnostics")

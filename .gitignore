@@ -31,6 +31,8 @@ state/sonar_live.json
 state/*.lock
 state/exploring.json
 state/feed.json
+state/blog.json
+state/blog_log.jsonl
 state/post_queue.jsonl
 state/px-post-cursor.json
 state/px-post.pid

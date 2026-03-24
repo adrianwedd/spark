@@ -38,6 +38,7 @@ _DEFAULT_MODELS: dict[str, str] = {
     "research": "claude-haiku-4-5-20251001",
     "compose": "claude-haiku-4-5-20251001",
     "conversation": "claude-sonnet-4-6",
+    "blog": "claude-haiku-4-5-20251001",
 }
 
 _ENV_OVERRIDES: dict[str, str] = {
@@ -46,6 +47,7 @@ _ENV_OVERRIDES: dict[str, str] = {
     "research": "PX_CLAUDE_MODEL_RESEARCH",
     "compose": "PX_CLAUDE_MODEL_COMPOSE",
     "conversation": "PX_CLAUDE_MODEL_CONVERSATION",
+    "blog": "PX_CLAUDE_MODEL_BLOG",
 }
 
 
@@ -71,6 +73,7 @@ _TYPE_COOLDOWNS: dict[str, int] = {
     "research": 7200,      # 2 hours
     "compose": 14400,      # 4 hours
     "conversation": 900,   # 15 min
+    "blog": 1800,          # 30 min
 }
 
 _TYPE_QUOTAS: dict[str, int] = {
@@ -79,6 +82,7 @@ _TYPE_QUOTAS: dict[str, int] = {
     "research": 3,
     "compose": 2,
     "conversation": 4,
+    "blog": 3,
 }
 
 # Higher number = higher priority.  Used for budget-tight gating.
@@ -88,9 +92,10 @@ _PRIORITY: dict[str, int] = {
     "conversation": 3,
     "research": 2,
     "compose": 1,
+    "blog": 2,
 }
 
-_GLOBAL_COOLDOWN_EXEMPT = {"self_debug"}
+_GLOBAL_COOLDOWN_EXEMPT = {"self_debug", "blog"}
 
 
 def _load_session_log() -> list[dict]:

@@ -137,8 +137,8 @@ class TestRateLimiting:
 
     def test_per_type_quota_blocks(self, tmp_path):
         sd = _make_state_dir(tmp_path)
-        # 4 conversation sessions within last hour = at quota (4/day)
-        entries = [{"ts": _ts_ago(i * 60 + 1000), "type": "conversation"} for i in range(4)]
+        # 4 conversation sessions within last 10 min = at quota (4/day)
+        entries = [{"ts": _ts_ago(i * 60 + 60), "type": "conversation"} for i in range(4)]
         _write_session_log(sd, entries)
         import pxh.claude_session as cs
         with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
@@ -165,7 +165,7 @@ class TestRateLimiting:
     def test_priority_gating_blocks_low_priority(self, tmp_path):
         sd = _make_state_dir(tmp_path)
         # 6 sessions today with cap=8 → 2 remaining → low priority blocked
-        entries = [{"ts": _ts_ago(i * 100 + 2000), "type": "conversation"} for i in range(6)]
+        entries = [{"ts": _ts_ago(i * 30 + 60), "type": "conversation"} for i in range(6)]
         _write_session_log(sd, entries)
         import pxh.claude_session as cs
         with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
@@ -180,7 +180,7 @@ class TestRateLimiting:
     def test_priority_gating_allows_high_priority(self, tmp_path):
         sd = _make_state_dir(tmp_path)
         # 6 sessions today with cap=8 → 2 remaining
-        entries = [{"ts": _ts_ago(i * 100 + 2000), "type": "conversation"} for i in range(6)]
+        entries = [{"ts": _ts_ago(i * 30 + 60), "type": "conversation"} for i in range(6)]
         _write_session_log(sd, entries)
         import pxh.claude_session as cs
         with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
@@ -369,3 +369,35 @@ class TestConversationDepthTrigger:
     def test_case_insensitive(self):
         from pxh.voice_loop import is_depth_trigger
         assert is_depth_trigger("THINK ABOUT THAT MORE")
+
+
+# ---------------------------------------------------------------------------
+# Blog Session Type (Task 1)
+# ---------------------------------------------------------------------------
+
+class TestBlogSessionType:
+    def test_blog_uses_haiku(self):
+        from pxh.claude_session import _model_for_type
+        assert "haiku" in _model_for_type("blog")
+
+    def test_blog_env_override(self):
+        from pxh.claude_session import _ENV_OVERRIDES
+        assert "blog" in _ENV_OVERRIDES
+        assert _ENV_OVERRIDES["blog"] == "PX_CLAUDE_MODEL_BLOG"
+
+    def test_blog_cooldown(self):
+        from pxh.claude_session import _TYPE_COOLDOWNS
+        assert _TYPE_COOLDOWNS["blog"] == 1800
+
+    def test_blog_quota(self):
+        from pxh.claude_session import _TYPE_QUOTAS
+        assert _TYPE_QUOTAS["blog"] == 3
+
+    def test_blog_priority(self):
+        from pxh.claude_session import _PRIORITY
+        assert "blog" in _PRIORITY
+        assert _PRIORITY["blog"] == 2
+
+    def test_blog_exempt_from_global_cooldown(self):
+        from pxh.claude_session import _GLOBAL_COOLDOWN_EXEMPT
+        assert "blog" in _GLOBAL_COOLDOWN_EXEMPT

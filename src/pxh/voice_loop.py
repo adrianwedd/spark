@@ -65,6 +65,7 @@ ALLOWED_TOOLS = {
     # SPARK cognitive tools
     "tool_research",
     "tool_compose",
+    "tool_blog",
 }
 
 TOOL_COMMANDS = {
@@ -109,6 +110,7 @@ TOOL_COMMANDS = {
     # SPARK cognitive tools
     "tool_research":         BIN_DIR / "tool-research",
     "tool_compose":          BIN_DIR / "tool-compose",
+    "tool_blog":             BIN_DIR / "tool-blog",
 }
 
 
@@ -681,6 +683,13 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if len(topic) > 500:
             topic = topic[:500]
         sanitized["PX_COMPOSE_TOPIC"] = topic
+    elif tool == "tool_blog":
+        topic = str(params.get("topic", "")).strip()
+        if not topic or len(topic) < 5:
+            raise VoiceLoopError("tool_blog requires a topic (min 5 chars)")
+        if len(topic) > 500:
+            topic = topic[:500]
+        sanitized["PX_BLOG_TOPIC"] = topic
     else:
         if params:
             raise VoiceLoopError("unexpected parameters for tool")

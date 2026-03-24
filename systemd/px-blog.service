@@ -1,0 +1,16 @@
+[Unit]
+Description=SPARK Blog Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/picar-x-hacking
+ExecStart=/home/pi/picar-x-hacking/bin/px-blog
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=0
+EnvironmentFile=/home/pi/picar-x-hacking/.env
+
+[Install]
+WantedBy=multi-user.target

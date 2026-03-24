@@ -768,6 +768,16 @@ async def public_feed():
         return {"updated": None, "posts": []}
 
 
+@app.get("/api/v1/public/blog")
+async def public_blog() -> Dict[str, Any]:
+    """Blog posts — daily/weekly/monthly/yearly reflections + essays."""
+    blog_file = _public_state_dir() / "blog.json"
+    try:
+        return json.loads(blog_file.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"updated": None, "posts": []}
+
+
 @app.get("/api/v1/public/race")
 async def public_race():
     """Race telemetry and status. No auth required."""

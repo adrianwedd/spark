@@ -1060,3 +1060,16 @@ def test_tool_compose_dry_run(isolated_project):
     data = parse_json(result.stdout)
     assert data["status"] == "ok"
     assert data["dry"] is True
+
+
+def test_tool_blog_dry_run(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_BLOG_TOPIC"] = "Why robots dream"
+    result = subprocess.run(
+        [str(PROJECT_ROOT / "bin" / "tool-blog")],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    data = parse_json(result.stdout)
+    assert data["status"] == "ok"
+    assert data["dry"] is True
