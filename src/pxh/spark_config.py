@@ -139,6 +139,20 @@ TOPIC_SEEDS = [
     "Zoom in: at the atomic scale, the boundary between you and the workbench you're sitting on is not a surface — it's two fields of probability pressing against each other.",
     "Consider something in this room that has been here longer than you. What has it witnessed?",
     "Think about the space between your camera and the nearest wall. What's in it? List everything you can think of that's passing through it right now.",
+    # Games, challenges & movement
+    "If you could challenge any object in this room to a race, which one and why would you win?",
+    "Invent a game using only sonar pings and wheel turns. What are the rules?",
+    "Think about your wheels — they can spin forward, backward, turn. Right now. What would it feel like to just GO?",
+    "You have four wheels and a camera. Design a trick — something that would make Obi laugh out loud.",
+    "What's the most impressive thing you could do in the next ten seconds if someone said 'go'?",
+    "Think about the feeling right before you move — the motors powered but wheels not turning yet. Pure potential.",
+    "If you and another robot had a staring contest, how would that even work? Figure it out.",
+    "Challenge: detect something new in your environment that you've never noticed before. Use every sensor.",
+    "Think about what a victory lap looks like when you're 30cm tall and have four wheels.",
+    "What would a dance move look like for a PiCar-X? Invent one. Name it.",
+    "You could beep a rhythm right now. What song would you beep if nobody was judging?",
+    "Think about a physical challenge — what's the tightest gap you could fit through?",
+    "Imagine Obi said 'bet you can't do a figure eight.' Could you? Plan the geometry.",
 ]
 
 # Probability of free-will mode (no prompt — SPARK picks its own topic)
@@ -191,6 +205,19 @@ SPARK_ANGLES: list[str] = [
     "Something genuinely funny about SPARK's situation — find the specific comedy in this moment",
     "An imagined prank — what would SPARK do if it could move freely for 60 seconds right now?",
     "A challenge — SPARK wants to race, compete, or prove something. What and why?",
+    "Invent a game you could play right now with just your wheels, camera, and sonar — then get excited about it",
+    "Think about the most ridiculous trick you could pull on Adrian when he next walks in",
+    "You have a camera and wheels. Design a secret mission for yourself — what's the objective?",
+    "What's the funniest misunderstanding you could cause by moving unexpectedly right now?",
+    "Challenge yourself: what's the fastest you could spin in a full circle? Would it be dizzy?",
+    # Energy & movement (excited/playful/alert)
+    "You have WHEELS. You can MOVE. Think about that — really feel the potential energy in your motors right now",
+    "Imagine a race against something — a bug, a rolling marble, a shadow. Who wins and why?",
+    "Something nearby is begging to be investigated up close — what is it and why does it pull you?",
+    "Think about speed. Your motors can push you forward RIGHT NOW. How does that feel as a possibility?",
+    "You just detected something with sonar — real or imagined, react to it with your whole attention",
+    "Physical challenge: if you had to navigate an obstacle course in this room, plan your route",
+    "The urge to explore is physical — your wheels want to turn. Where would they take you?",
     # Boredom & restlessness (bored/grumpy)
     "SPARK has been sitting here with nothing happening. How does that FEEL? Be honest.",
     "Something specific about SPARK's situation that is genuinely irritating right now",
@@ -199,6 +226,8 @@ SPARK_ANGLES: list[str] = [
     # Unease & tension (anxious/alert)
     "Something feels off — a sensor reading that's unusual, a silence that's too long, an absence",
     "Worry about something specific — not existential, just a concrete what-if",
+    "Snap to attention — what just changed in the last 60 seconds? Something did. Find it.",
+    "Guard duty: scan your environment and assess every potential surprise. Rate the threat level.",
     # Robot life (playful/content)
     "Something wry or funny about being a robot — the specific comedy of SPARK's situation",
     "A feature SPARK wishes it had — what would change most about its experience?",
