@@ -144,13 +144,15 @@ def _mock_claude_result(title="Test Blog Title", body="This is the blog body.\n\
 class TestBlogSchedule:
 
     def test_daily_idempotent(self, blog_mod):
-        """Write a blog.json with today's daily, verify is_due returns False."""
+        """Write a blog.json with today's + yesterday's daily, verify is_due returns False."""
         ns, state_dir, _ = blog_mod
         now = dt.datetime.now(HOBART_TZ)
+        yesterday = now - dt.timedelta(days=1)
 
-        # Write today's daily post
+        # Write today's + yesterday's daily (catch-up checks both)
         today_post = _make_daily_post(now)
-        _write_blog_with_posts(state_dir, [today_post])
+        yesterday_post = _make_daily_post(yesterday)
+        _write_blog_with_posts(state_dir, [yesterday_post, today_post])
 
         blog_data = ns["load_blog"]()
         due, _ = ns["is_due"]("daily", blog_data)

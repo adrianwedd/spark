@@ -99,6 +99,7 @@ def main():
     post = {
         "id": post_id,
         "type": "essay",
+        "source": "voice",
         "title": title,
         "body": body,
         "ts": ts,

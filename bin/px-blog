@@ -28,7 +28,9 @@ import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -200,36 +202,49 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
         return False, None
 
     elif post_type == "weekly":
-        # Target: most recent Sunday at 22:30
-        days_since_sunday = (now.weekday() + 1) % 7  # Monday=0 -> Sun offset
+        # Target: most recent Sunday at 22:30. Also catch-up previous Sunday.
+        days_since_sunday = (now.weekday() + 1) % 7
         last_sunday = now - dt.timedelta(days=days_since_sunday)
         target = last_sunday.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-        if now < target:
-            return False, None
-        pid = id_for_post("weekly", last_sunday)
-        if post_exists(blog_data.get("posts", []), pid):
-            return False, None
-        return True, last_sunday
+        if now >= target:
+            pid = id_for_post("weekly", last_sunday)
+            if not post_exists(blog_data.get("posts", []), pid):
+                return True, last_sunday
+        # Catch-up: previous Sunday
+        prev_sunday = last_sunday - dt.timedelta(days=7)
+        pid_prev = id_for_post("weekly", prev_sunday)
+        if not post_exists(blog_data.get("posts", []), pid_prev):
+            return True, prev_sunday
+        return False, None
 
     elif post_type == "monthly":
-        # Target: 1st of current month at 23:00
+        # Target: 1st of current month at 23:00. Also catch-up previous month.
         target = now.replace(day=1, hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-        if now < target:
-            return False, None
-        pid = id_for_post("monthly", now)
-        if post_exists(blog_data.get("posts", []), pid):
-            return False, None
-        return True, now
+        if now >= target:
+            pid = id_for_post("monthly", now)
+            if not post_exists(blog_data.get("posts", []), pid):
+                return True, now
+        # Catch-up: previous month
+        first_of_month = now.replace(day=1)
+        prev_month = first_of_month - dt.timedelta(days=1)
+        pid_prev = id_for_post("monthly", prev_month)
+        if not post_exists(blog_data.get("posts", []), pid_prev):
+            return True, prev_month
+        return False, None
 
     elif post_type == "yearly":
-        # Target: Jan 1 at 23:30
+        # Target: Jan 1 at 23:30. Also catch-up previous year.
         target = now.replace(month=1, day=1, hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-        if now < target:
-            return False, None
-        pid = id_for_post("yearly", now)
-        if post_exists(blog_data.get("posts", []), pid):
-            return False, None
-        return True, now
+        if now >= target:
+            pid = id_for_post("yearly", now)
+            if not post_exists(blog_data.get("posts", []), pid):
+                return True, now
+        # Catch-up: previous year
+        prev_year = now.replace(year=now.year - 1, month=1, day=1)
+        pid_prev = id_for_post("yearly", prev_year)
+        if not post_exists(blog_data.get("posts", []), pid_prev):
+            return True, prev_year
+        return False, None
 
     return False, None
 
@@ -425,6 +440,43 @@ Keep it under 2000 words."""
 # Post generation
 # ---------------------------------------------------------------------------
 
+def _qa_gate(text: str) -> str | None:
+    """Run Claude QA gate on blog text. Returns 'pass', 'rejected', 'ambiguous', or None on error."""
+    claude_bin = (os.environ.get("PX_CLAUDE_BIN")
+                  or shutil.which("claude")
+                  or "/home/pi/.local/bin/claude")
+    prompt = ('Is this blog post from a small robot appropriate to publish publicly?\n'
+              'Check for: offensive content, personal information leaks, factual errors.\n'
+              'Answer only YES or NO. Nothing else.\n\n'
+              f'The post:\n{text[:3000]}')
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CLAUDE_CODE")
+           and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")}
+    try:
+        result = subprocess.run(
+            [claude_bin, "-p", prompt,
+             "--no-session-persistence", "--output-format", "text", "--allowedTools", ""],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        if result.returncode != 0:
+            log(f"qa gate error: claude exit {result.returncode}")
+            return None
+        resp = result.stdout.strip().lower()
+        if resp.startswith("yes"):
+            return "pass"
+        elif resp.startswith("no"):
+            return "rejected"
+        else:
+            log(f"qa gate ambiguous: {result.stdout.strip()[:80]}")
+            return "ambiguous"
+    except subprocess.TimeoutExpired:
+        log("qa gate timeout (30s)")
+        return None
+    except Exception as exc:
+        log(f"qa gate error: {exc}")
+        return None
+
+
 def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, dry: bool = False) -> dict | None:
     """Generate a blog post. Returns post dict or None if skipped."""
     if post_type == "daily":
@@ -447,6 +499,8 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
     if dry:
         log(f"DRY RUN — skipping Claude call for {post_type}")
         return None
+
+    _gen_start = time.monotonic()
 
     # Call Claude via session manager
     try:
@@ -485,6 +539,19 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
     if not title:
         title = f"SPARK {post_type.title()} — {target_date.astimezone(HOBART_TZ).strftime('%d %b %Y')}"
 
+    # QA gate
+    qa_result = "pass"
+    if os.environ.get("PX_BLOG_QA", "1") != "0":
+        qa_result = _qa_gate(body)
+        if qa_result == "rejected":
+            log(f"QA rejected {post_type}: {title[:60]}")
+            return None
+        if qa_result is None:
+            log(f"QA gate error for {post_type} — publishing anyway (safety net)")
+            qa_result = "error_pass"
+
+    duration_s = round(time.monotonic() - _gen_start, 1)
+
     period_start, period_end = _period_bounds(post_type, target_date)
     utc_now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -493,12 +560,15 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         "type": post_type,
         "title": title,
         "body": body,
+        "source": "scheduled",
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
         "ts": utc_now,
         "model": model_used,
         "word_count": len(body.split()),
         "salience": 0.7,
+        "qa_result": qa_result,
+        "duration_s": duration_s,
     }
 
     if post_type == "daily":
@@ -542,6 +612,8 @@ def run_once(*, dry: bool = False) -> int:
             "type": post_type,
             "title": post["title"],
             "word_count": post["word_count"],
+            "qa_result": post.get("qa_result", "unknown"),
+            "duration_s": post.get("duration_s", 0),
         })
 
         log(f"generated {post_type}: {post['title'][:60]}")
