@@ -145,7 +145,7 @@ section {
   min-height: 100vh;
   overflow-x: hidden;
 }
-section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); }
+section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); min-height: auto; }
 @media (max-width: 480px) {
   section { padding-left: 0.75rem; padding-right: 0.75rem; }
 }
