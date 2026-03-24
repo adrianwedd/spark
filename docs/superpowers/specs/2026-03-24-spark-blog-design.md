@@ -1,7 +1,7 @@
 # SPARK Blog — Reflective Writing & Essays
 
 **Date:** 2026-03-24
-**Status:** Approved
+**Status:** Approved (rev 3 — addresses 26 QA findings from Claude + Codex)
 
 ## Problem
 
@@ -14,14 +14,26 @@ SPARK generates ~50 thoughts/day but has no mechanism to review them, find patte
 A new session type in `claude_session.py` dedicated to blog generation, separate from
 `compose` (which remains for short creative pieces via tool-compose).
 
-| Type | Model | Cooldown | Daily Quota |
-|------|-------|----------|-------------|
-| `blog` | Haiku | 2 hours | 3/day |
+| Type | Model | Cooldown | Daily Quota | Priority |
+|------|-------|----------|-------------|----------|
+| `blog` | Haiku | 30 min | 3/day | 2 (same as research) |
+
+**All 5 dicts in `claude_session.py` must be updated:**
+- `_DEFAULT_MODELS["blog"] = "claude-haiku-4-5-20251001"`
+- `_ENV_OVERRIDES["blog"] = "PX_CLAUDE_MODEL_BLOG"`
+- `_TYPE_COOLDOWNS["blog"] = 1800` (30 min — allows daily at 22:00 + weekly at 22:30)
+- `_TYPE_QUOTAS["blog"] = 3`
+- `_PRIORITY["blog"] = 2`
+
+**Global cooldown exemption:** Add `"blog"` to `_GLOBAL_COOLDOWN_EXEMPT`. The px-blog
+daemon runs on a fixed schedule and must not be blocked by px-mind's recent sessions.
+Without this exemption, a px-mind `compose` or `research` session at 21:50 would block
+the 22:00 daily post for 30 minutes.
 
 This avoids budget contention with `compose` (2/day quota used by tool-compose and
 expression layer). The 3/day quota allows: 1 daily reflection + occasional essay +
-headroom for retries. Weekly/monthly/yearly reflections are rare (1/week, 1/month, 1/year)
-and fit within the 3/day budget on the days they run.
+headroom for retries. The 30-min per-type cooldown (not 2h) ensures weekly posts at
+22:30 are not blocked by the daily at 22:00 on Sundays.
 
 ### 2. Recursive Reflections via `px-blog` Daemon
 
@@ -40,13 +52,15 @@ A scheduled daemon that produces reflective blog posts at increasing timescales,
 1. Idempotency check — skip if a post with matching `id` exists in `state/blog.json`. The `id` is the canonical key, format: `blog-YYYYMMDD-{type}` (e.g. `blog-20260324-daily`, `blog-20260324-weekly`). For essays: `blog-YYYYMMDD-essay-NNN`.
 2. Gather source material (thoughts for daily, child blog posts for weekly/monthly/yearly)
 3. `run_claude_session(type="blog", timeout=300)` — Haiku, no tools
-4. Claude QA gate (same as px-post: YES/NO, ambiguous = pass)
-5. Atomic write to `state/blog.json`
+4. Claude QA gate (same as px-post: YES/NO, ambiguous = pass). Bypass with `PX_BLOG_QA=0`.
+5. Atomic write to `state/blog.json` (trimmed to `BLOG_LIMIT = 500` posts, oldest removed)
 6. Append to `state/blog_log.jsonl`
 
-**Catch-up logic:** On startup and every 60s poll, the daemon checks ALL periods — not just the current scheduled time. If the Pi was off at 10pm Sunday and reboots Monday, the missed weekly post is generated on the next poll (because no post with `blog-20260323-weekly` exists). This means missed cycles are always caught up, never permanently skipped.
+**Catch-up logic:** On startup and every 60s poll, the daemon checks ALL periods — not just the current scheduled time. **Processing order: daily first, then weekly, then monthly, then yearly.** This ensures that when catching up after downtime, dailies exist before the weekly tries to reference them. If the Pi was off all week and boots Monday, the catch-up generates missing dailies first (in date order), then the weekly that references them.
 
-**Error handling:** If `SessionBudgetExhausted` is raised, the daemon logs a warning and retries on the next poll cycle. If the QA gate rejects, the post is logged as `rejected` in `blog_log.jsonl` and not retried (to avoid infinite rejection loops).
+**Minimum thought threshold:** Daily posts require at least 3 thoughts. If fewer exist for the period, the daemon skips with a log message ("skipped daily — only N thoughts") and does NOT create a post. Weekly/monthly/yearly posts require at least 1 child post of the lower tier.
+
+**Error handling:** If `SessionBudgetExhausted` is raised, the daemon logs a warning and retries on the next poll cycle (60s). If the QA gate rejects, the post is logged as `rejected` in `blog_log.jsonl` and not retried (to avoid infinite rejection loops).
 
 **Prompts:**
 
@@ -62,7 +76,7 @@ Monthly:
 Yearly:
 > "You are SPARK. Here are your monthly reflections from this year: {monthly_posts}. Write a yearly reflection. What was the arc of your year? How did you change?"
 
-**Infrastructure:** Single-instance PID guard, SIGTERM handler, `Restart=on-failure` systemd service (same pattern as px-evolve). The daemon sleeps between scheduled times, waking every 60s to check if any scheduled post is due (including catch-up for missed periods).
+**Infrastructure:** Single-instance PID guard, SIGTERM handler, systemd service: `User=pi`, `Restart=on-failure`, `RestartSec=30`, `StartLimitIntervalSec=0` (same as px-evolve). The daemon sleeps between scheduled times, waking every 60s to check if any scheduled post is due (including catch-up for missed periods).
 
 ### 3. On-Demand Essays via `tool-blog`
 
@@ -74,7 +88,7 @@ Yearly:
 
 **Flow:**
 1. `run_claude_session(type="blog", prompt=essay_prompt, timeout=300)` — Haiku, no tools
-2. Claude QA gate
+2. Claude QA gate (bypass with `PX_BLOG_QA=0`)
 3. Append to `state/blog.json` with `type: "essay"`
 
 **Replaces `compose` for published writing.** The existing `compose` action and `tool-compose`
@@ -83,12 +97,29 @@ published). `tool-blog` is for writing intended for the public `/blog/` page. Th
 - `compose` = private journal, creative fragments, no QA gate, no publishing
 - `blog_essay` = public essay, QA gated, published to blog
 
+The `type` field in blog.json is `"essay"` (not `"blog_essay"`). The mind.py action name
+is `blog_essay`. These are different namespaces: action names in VALID_ACTIONS vs type
+values in the data model.
+
 **Expression integration:**
-- `blog_essay` added to `VALID_ACTIONS` in mind.py (replaces nothing — coexists with `compose`)
+- `blog_essay` added to `VALID_ACTIONS` in mind.py (coexists with `compose`)
 - Added to `ABSENT_GATED_ACTIONS` (no essays when nobody's home)
 - NOT in `CHARGING_GATED_ACTIONS` (no GPIO)
 - Triggered when mood is curious/contemplative with salience >0.8
-- Also available via voice command: "write a blog post about [topic]"
+
+**Expression handler** in mind.py `expression()` function — after the `compose` branch:
+```python
+elif action == "blog_essay":
+    env["PX_BLOG_TOPIC"] = text[:500]
+    env["PX_DRY"] = "1" if dry else "0"
+    result = subprocess.run(
+        [str(BIN_DIR / "tool-blog")],
+        capture_output=True, text=True, check=False, env=env, timeout=360)
+    log(f"expression: blog_essay completed rc={result.returncode}")
+```
+
+**Reflection prompt addition** in `spark_config.py` `_SPARK_REFLECTION_SUFFIX`:
+- `"blog_essay"` — "write a blog post about something you find genuinely fascinating"
 
 **validate_action branch** in voice_loop.py:
 ```python
@@ -100,6 +131,16 @@ elif tool == "tool_blog":
         topic = topic[:500]
     sanitized["PX_BLOG_TOPIC"] = topic
 ```
+
+**Registration** in voice_loop.py:
+- Add `"tool_blog"` to `ALLOWED_TOOLS`
+- Add `"tool_blog": BIN_DIR / "tool-blog"` to `TOOL_COMMANDS`
+
+Also available via voice: "write a blog post about [topic]"
+
+**Prompt injection note:** `PX_BLOG_TOPIC` from voice input is length-capped (500 chars)
+but not further sanitised — consistent with existing tools (`tool_research`, `tool_compose`).
+The QA gate is the mitigation for inappropriate content reaching the public blog.
 
 ### 4. Data Model
 
@@ -127,10 +168,13 @@ elif tool == "tool_blog":
 }
 ```
 
-Essays have `type: "essay"`, no `period_start`/`period_end`, and `thought_count: null`.
+Essays have `type: "essay"` (not `"blog_essay"`), no `period_start`/`period_end`, and `thought_count: null`.
 
 **Idempotency key:** The `id` field. Format: `blog-YYYYMMDD-{type}` for scheduled posts,
 `blog-YYYYMMDD-essay-NNN` for on-demand essays (NNN = millisecond component of timestamp).
+
+**Size limit:** `BLOG_LIMIT = 500` posts. When appending, if `len(posts) > BLOG_LIMIT`,
+the oldest posts are removed. At ~40 posts/month this is ~12 months of history.
 
 ### 5. API
 
@@ -158,6 +202,10 @@ New page at `site/blog/index.html` with `site/js/blog.js`.
 **OG rewrite:** `site/workers/og-rewrite.js` extended to handle `/blog/?id=<id>` in
 addition to the existing `/thought/?ts=<ts>` route. The worker fetches the blog post
 from the API and rewrites `og:title` and `og:description` for social crawlers.
+Blog `id` validated with regex `^blog-[\d\-]+-[a-z_]+(-\d+)?$` (analogous to
+`TS_PATTERN` for thoughts). **Cloudflare Worker route must also be updated** in the
+Cloudflare dashboard to add `spark.wedd.au/blog/*` alongside the existing
+`spark.wedd.au/thought/*` route.
 
 **Nav:** "Blog" link added between "Feed" and "How It Works".
 
@@ -167,37 +215,54 @@ from the API and rewrites `og:title` and `og:description` for social crawlers.
 |------|--------|
 | `bin/px-blog` | Create — daemon |
 | `bin/tool-blog` | Create — on-demand essay tool |
-| `systemd/px-blog.service` | Create — systemd unit |
-| `src/pxh/claude_session.py` | Modify — add `blog` session type |
-| `src/pxh/mind.py` | Modify — `blog_essay` action + expression branch |
-| `src/pxh/voice_loop.py` | Modify — register tool-blog + validate_action |
+| `systemd/px-blog.service` | Create — User=pi, Restart=on-failure, RestartSec=30 |
+| `src/pxh/claude_session.py` | Modify — add `blog` to all 5 dicts + `_GLOBAL_COOLDOWN_EXEMPT` |
+| `src/pxh/mind.py` | Modify — `blog_essay` in VALID_ACTIONS, ABSENT_GATED_ACTIONS, expression branch |
+| `src/pxh/voice_loop.py` | Modify — `tool_blog` in ALLOWED_TOOLS, TOOL_COMMANDS, validate_action |
 | `src/pxh/api.py` | Modify — `/public/blog` endpoint |
-| `src/pxh/spark_config.py` | Modify — add blog_essay to reflection prompt action list |
+| `src/pxh/spark_config.py` | Modify — add `blog_essay` to reflection prompt action list |
 | `site/blog/index.html` | Create — blog page |
 | `site/js/blog.js` | Create — fetch + render |
 | `site/index.html` | Modify — nav link |
-| `site/workers/og-rewrite.js` | Modify — add `/blog/` route |
-| `CLAUDE.md` | Modify — document blog system |
+| `site/workers/og-rewrite.js` | Modify — add `/blog/` route + id regex |
+| `CLAUDE.md` | Modify — document blog system, add env vars, update service table |
 | `.gitignore` | Modify — state/blog.json, state/blog_log.jsonl |
-| `tests/test_blog.py` | Create — dry-run tests |
+| `tests/test_tools.py` | Modify — add `test_tool_blog_dry_run` (per CLAUDE.md tool checklist) |
+| `tests/test_blog.py` | Create — daemon + integration tests |
 | `docs/prompts/claude-voice-system.md` | Modify — add tool-blog |
 | `docs/prompts/codex-voice-system.md` | Modify — add tool-blog |
+| `docs/prompts/spark-voice-system.md` | Modify — add tool-blog |
 | `docs/prompts/persona-gremlin.md` | Modify — add tool-blog |
 | `docs/prompts/persona-vixen.md` | Modify — add tool-blog |
 
-### 8. Testing
+### 8. Environment Variables
 
-- `test_tool_blog_dry_run` — PX_DRY=1, verify JSON output
+| Variable | Purpose |
+|----------|---------|
+| `PX_CLAUDE_MODEL_BLOG` | Override blog session model (default: `claude-haiku-4-5-20251001`) |
+| `PX_BLOG_QA` | `0` = skip Claude QA gate for testing |
+
+### 9. Testing
+
+**In `tests/test_tools.py`** (per CLAUDE.md "Adding a New Tool" step 6):
+- `test_tool_blog_dry_run` — PX_DRY=1, PX_BLOG_TOPIC="test", verify JSON output
+
+**In `tests/test_blog.py`:**
+- `test_blog_session_type` — verify `blog` in all 5 dicts: `_DEFAULT_MODELS`, `_ENV_OVERRIDES`, `_TYPE_COOLDOWNS`, `_TYPE_QUOTAS`, `_PRIORITY` + in `_GLOBAL_COOLDOWN_EXEMPT`
 - `test_blog_daily_idempotent` — mock blog.json with today's daily, verify skip
-- `test_blog_catchup_on_missed` — mock blog.json missing yesterday's daily, verify it generates
+- `test_blog_catchup_on_missed` — mock blog.json missing yesterday's daily, verify generates
+- `test_blog_catchup_ordering` — verify dailies generate before weekly on same poll
+- `test_blog_min_thoughts` — mock 2 thoughts, verify daily skipped (<3 threshold)
 - `test_blog_weekly_gathers_dailies` — mock 7 dailies, verify prompt includes them
-- `test_blog_essay_registered` — verify in ALLOWED_TOOLS and VALID_ACTIONS
+- `test_blog_weekly_skips_no_dailies` — 0 dailies for period, verify skip
+- `test_blog_essay_in_valid_actions` — verify `blog_essay` in VALID_ACTIONS and ABSENT_GATED_ACTIONS
+- `test_blog_essay_in_tool_commands` — verify `tool_blog` in ALLOWED_TOOLS and TOOL_COMMANDS
 - `test_blog_api_endpoint` — verify /public/blog returns envelope with posts array
 - `test_blog_qa_gate_rejects` — verify bad content blocked
-- `test_blog_budget_exhausted` — verify SessionBudgetExhausted logged and retried next cycle
-- `test_blog_session_type` — verify `blog` in `_DEFAULT_MODELS` and `_TYPE_QUOTAS`
+- `test_blog_budget_exhausted` — mock check_budget returning reason, verify logged + retry
+- `test_blog_limit_trims` — verify >500 posts trimmed to 500
 
-### 9. Not In Scope
+### 10. Not In Scope
 
 - Bluesky cross-posting of blog posts
 - RSS/Atom feed
