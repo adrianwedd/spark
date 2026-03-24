@@ -7,11 +7,16 @@
   --warm-text: #2d2d2d;
   --warm-muted: #8a7060;
 
-  --dark-bg: #0d0f12;
-  --dark-accent: #4ade80;
-  --dark-text: #e2e8f0;
-  --dark-muted: #64748b;
-  --dark-code-bg: #111318;
+  --dark-bg: #1a181c;
+  --dark-accent: #c48b6e;
+  --dark-accent-hover: #d49e82;
+  --dark-accent-muted: #9a6d52;
+  --dark-text: #e2ddd8;
+  --dark-muted: #968e96;
+  --dark-code-bg: #24212a;
+  --dark-border: #3d3844;
+  --dark-surface: #24212a;
+  --dark-glow: rgba(196, 139, 110, 0.08);
 
   --nav-height: 56px;
   --radius: 16px;
@@ -36,7 +41,7 @@ body {
   padding: 0 1.5rem;
   gap: 1.5rem;
   z-index: 100;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  border-bottom: 1px solid var(--dark-border);
 }
 
 #main-nav .logo {
@@ -185,6 +190,15 @@ section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); }
 /* Live card inner layout */
 .live-meta { display: flex; gap: 1rem; margin-top: 0.75rem; font-size: 0.8rem; opacity: 0.5; }
 .live-label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.5; margin-bottom: 0.5rem; }
+
+/* Section transition — gradient divider between warm and dark */
+.section-divider {
+  height: 1px;
+  background: linear-gradient(to right, transparent, var(--dark-border, #3d3844) 25%,
+              var(--dark-accent-muted, #9a6d52) 50%, var(--dark-border, #3d3844) 75%, transparent);
+  opacity: 0.4;
+  margin: 0;
+}
 
 /* Accessibility: respect reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {

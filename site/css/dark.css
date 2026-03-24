@@ -9,6 +9,7 @@
   color: var(--dark-accent);
   margin-bottom: 1.5rem;
   letter-spacing: -0.02em;
+  text-shadow: 0 0 40px var(--dark-glow);
 }
 
 [data-theme="dark"] h3 {
@@ -29,7 +30,7 @@
   font-size: 0.8rem;
   overflow-x: auto;
   line-height: 1.5;
-  border: 1px solid rgba(74, 222, 128, 0.15);
+  border: 1px solid rgba(196, 139, 110, 0.15);
   max-width: 100%;
 }
 @media (max-width: 640px) {
@@ -50,11 +51,15 @@
 
 /* Tool collapse */
 [data-theme="dark"] details {
-  border-bottom: 1px solid rgba(255,255,255,0.06);
+  border-bottom: 1px solid var(--dark-border);
 }
 [data-theme="dark"] details summary {
   color: var(--dark-accent);
   font-family: monospace;
+  transition: color 0.2s ease;
+}
+[data-theme="dark"] details summary:hover {
+  color: var(--dark-accent-hover);
 }
 
 /* Roadmap */
@@ -74,39 +79,48 @@
 /* ── Live Dashboard — Dark Theme Overrides ────────────────────── */
 
 [data-theme="dark"] .band-world {
-  background: rgba(255,255,255,0.03);
+  background: rgba(255,255,255,0.02);
 }
 
 [data-theme="dark"] .pulse-circle {
   background: var(--dark-accent);
   color: var(--dark-bg);
+  box-shadow: 0 0 40px var(--dark-glow), 0 0 80px var(--dark-glow);
 }
 
 [data-theme="dark"] .metric-tile {
-  background: #1a1d22;
-  box-shadow: 0 1px 6px rgba(0,0,0,0.3);
+  background: var(--dark-surface);
+  border: 1px solid var(--dark-border);
+  box-shadow: none;
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+[data-theme="dark"] .metric-tile:hover {
+  border-color: var(--dark-accent-muted);
+  box-shadow: 0 0 12px var(--dark-glow);
 }
 
 [data-theme="dark"] .metric-bar-wrap {
-  background: rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.08);
 }
 
 [data-theme="dark"] .metric-bar { background: var(--dark-accent); }
 
 [data-theme="dark"] .toggle-btn {
-  border-color: var(--dark-muted);
+  border-color: var(--dark-border);
   color: var(--dark-muted);
 }
 [data-theme="dark"] .toggle-btn:hover {
-  color: var(--dark-text);
-  border-color: var(--dark-text);
+  color: var(--dark-accent);
+  border-color: var(--dark-accent);
 }
 
 [data-theme="dark"] .services-strip,
 [data-theme="dark"] .race-strip {
-  background: rgba(255,255,255,0.04);
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--dark-border);
+  border-radius: 8px;
 }
-[data-theme="dark"] .time-period-badge { background: rgba(255,255,255,0.08); }
+[data-theme="dark"] .time-period-badge { background: var(--dark-surface); border: 1px solid var(--dark-border); }
 [data-theme="dark"] .period-night { background: #1e1b4b; color: #a5b4fc; }
 [data-theme="dark"] .section-eyebrow,
 [data-theme="dark"] .services-strip-label,
@@ -117,15 +131,16 @@
 [data-theme="dark"] .proximity-cm,
 [data-theme="dark"] .wx-metric-val { color: var(--dark-text); }
 [data-theme="dark"] .world-col {
-  background: rgba(255,255,255,0.05);
-  border-color: rgba(255,255,255,0.08);
+  background: var(--dark-surface);
+  border-color: var(--dark-border);
 }
-[data-theme="dark"] .wx-metric-row { border-bottom-color: rgba(255,255,255,0.06); }
-[data-theme="dark"] .weather-headline { border-bottom-color: rgba(255,255,255,0.07); }
-[data-theme="dark"] .proximity-bar-track { background: rgba(255,255,255,0.1); }
+[data-theme="dark"] .wx-metric-row { border-bottom-color: var(--dark-border); }
+[data-theme="dark"] .weather-headline { border-bottom-color: var(--dark-border); }
+[data-theme="dark"] .proximity-bar-track { background: rgba(255,255,255,0.08); }
 [data-theme="dark"] .carousel-quote { color: var(--dark-text); }
 [data-theme="dark"] .carousel-meta  { color: var(--dark-muted); }
-[data-theme="dark"] .carousel-dot   { background: rgba(255,255,255,0.2); }
+[data-theme="dark"] .carousel-dot   { background: var(--dark-accent-muted); opacity: 0.4; }
+[data-theme="dark"] .carousel-dot.active { opacity: 1; }
 
 /* ── Site footer (dark theme) ─────────────────── */
 .site-footer {
@@ -133,7 +148,7 @@
   text-align: center;
   font-size: 0.85rem;
   background: var(--dark-bg);
-  border-top: 1px solid rgba(255,255,255,0.08);
+  border-top: 1px solid var(--dark-border);
 }
 .site-footer-links {
   display: flex;
@@ -147,7 +162,7 @@
   text-decoration: none;
   font-weight: 500;
 }
-.site-footer-links a:hover { text-decoration: underline; }
+.site-footer-links a:hover { text-decoration: underline; color: var(--dark-accent-hover); }
 .site-footer-credit {
   margin: 0;
   color: var(--dark-muted);
