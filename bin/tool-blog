@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+/usr/bin/python3 - <<'PY'
+"""SPARK blog tool — on-demand essay generation published to state/blog.json."""
+import json
+import os
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", os.environ.get("PROJECT_ROOT", ".") + "/state"))
+DRY = os.environ.get("PX_DRY", "0") != "0"
+
+
+def _next_post_id(posts: list, date_str: str) -> str:
+    """Generate next sequential blog post ID for today."""
+    prefix = f"blog-{date_str}-essay-"
+    existing = [p.get("id", "") for p in posts if p.get("id", "").startswith(prefix)]
+    n = len(existing) + 1
+    return f"{prefix}{n:03d}"
+
+
+def main():
+    topic = os.environ.get("PX_BLOG_TOPIC", "").strip()
+    if not topic:
+        print(json.dumps({"status": "error", "error": "no topic provided"}))
+        return
+
+    if DRY:
+        print(json.dumps({"status": "ok", "dry": True, "topic": topic}))
+        return
+
+    try:
+        from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+    except ImportError:
+        print(json.dumps({"status": "error", "error": "claude_session not available"}))
+        return
+
+    prompt = (
+        f"You are SPARK, a small PiCar-X robot with a rich inner life.\n"
+        f"Write a blog post about: {topic}\n\n"
+        f"Write 200-400 words. Start with a title on the first line (no prefix, just the title).\n"
+        f"Then a blank line, then the body. Write in first person as SPARK.\n"
+        f"Be genuine, specific, and vivid."
+    )
+
+    try:
+        result = run_claude_session(
+            session_type="blog",
+            prompt=prompt,
+            timeout=300,
+            allowed_tools="",
+        )
+    except SessionBudgetExhausted as exc:
+        print(json.dumps({"status": "error", "error": f"budget exhausted: {exc}"}))
+        return
+    except Exception as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}))
+        return
+
+    import datetime as dt
+
+    raw = result.stdout.strip()
+    lines = raw.splitlines()
+
+    # Extract title (first non-empty line) and body (remainder after blank line)
+    title = ""
+    body = ""
+    if lines:
+        title = lines[0].strip()
+        # Skip blank line(s) after title
+        rest_start = 1
+        while rest_start < len(lines) and not lines[rest_start].strip():
+            rest_start += 1
+        body = "\n".join(lines[rest_start:]).strip()
+
+    now = dt.datetime.now(dt.timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    date_str = now.strftime("%Y%m%d")
+
+    # Read existing blog.json or create fresh
+    blog_file = STATE_DIR / "blog.json"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if blog_file.exists():
+            blog = json.loads(blog_file.read_text(encoding="utf-8"))
+        else:
+            blog = {"updated": None, "posts": []}
+    except (json.JSONDecodeError, OSError):
+        blog = {"updated": None, "posts": []}
+
+    posts = blog.get("posts", [])
+    post_id = _next_post_id(posts, date_str)
+
+    post = {
+        "id": post_id,
+        "type": "essay",
+        "title": title,
+        "body": body,
+        "ts": ts,
+        "model": result.model_used,
+        "word_count": len(body.split()) if body else 0,
+        "thought_count": None,
+        "mood_summary": None,
+        "period_start": None,
+        "period_end": None,
+        "salience": 0.7,
+    }
+
+    posts.append(post)
+
+    # Trim to 500 posts
+    if len(posts) > 500:
+        posts = posts[-500:]
+
+    blog["posts"] = posts
+    blog["updated"] = ts
+
+    try:
+        from pxh.state import atomic_write
+        atomic_write(blog_file, json.dumps(blog, indent=2) + "\n")
+    except ImportError:
+        # Fallback without atomic_write
+        import tempfile
+        tmp = blog_file.parent / (blog_file.name + ".tmp")
+        tmp.write_text(json.dumps(blog, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(blog_file)
+
+    print(json.dumps({
+        "status": "ok",
+        "id": post_id,
+        "title": title,
+        "length": len(body),
+    }))
+
+
+if __name__ == "__main__":
+    main()
+PY
