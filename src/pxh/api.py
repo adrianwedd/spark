@@ -379,17 +379,24 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         sample["wind_kmh"] = None
         sample["humidity_pct"] = None
 
-    # Salience + mood_val from latest thought (persona-scoped)
-    _MOOD_VAL = {"peaceful": 1, "content": 2, "contemplative": 2, "curious": 3, "active": 4, "excited": 5}
+    # Salience + mood from latest thought (persona-scoped)
+    _MOOD_VAL = {
+        "peaceful": 1, "content": 1, "bored": 0, "lonely": 1,
+        "contemplative": 2, "mischievous": 3, "grumpy": 3, "anxious": 3,
+        "curious": 3, "alert": 4, "playful": 4, "excited": 5, "active": 4,
+    }
     _thoughts_path = state_dir / (f"thoughts-{persona}.jsonl" if persona else "thoughts.jsonl")
     try:
         lines = _thoughts_path.read_text().strip().splitlines()
         last = json.loads(lines[-1]) if lines else {}
+        mood_str = (last.get("mood") or "").lower()
         sample["salience"] = last.get("salience")
-        sample["mood_val"] = _MOOD_VAL.get((last.get("mood") or "").lower())
+        sample["mood_val"] = _MOOD_VAL.get(mood_str)
+        sample["mood"] = mood_str or None
     except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
         sample["salience"] = None
         sample["mood_val"] = None
+        sample["mood"] = None
 
     # WiFi signal
     sample["wifi_dbm"] = _read_wifi_dbm()
@@ -397,7 +404,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
     return sample
 
 
-_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct", "wifi_dbm", "rain_24h_mm")
+_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct", "wifi_dbm", "rain_24h_mm", "mood")
 
 
 def _history_worker() -> None:
