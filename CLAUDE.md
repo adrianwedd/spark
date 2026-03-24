@@ -279,6 +279,55 @@ Single-instance PID guard. Restart policy: on-failure, 30 s.
 
 **Env vars**: `PX_EVOLVE_DRY` (1 = skip worktree/PR), `PX_EVOLVE_MODEL` (default: `claude-opus-4-6`), `PX_EVOLVE_TIMEOUT` (default: 1800 s), `PX_EVOLVE_MAX_FILES` (default: 3), `PX_CLAUDE_DAILY_CAP` (default: 8), `PX_CLAUDE_COOLDOWN_S` (default: 1800), `PX_CLAUDE_BUDGET_DISABLED` (1 = bypass all limits), `PX_CLAUDE_MODEL_*` (per-type model overrides).
 
+### Blog (px-blog)
+
+SPARK writes long-form blog posts autonomously — daily digests, weekly reflections, monthly essays, and ad-hoc essays triggered by voice (`tool_blog`). Posts are published to `spark.wedd.au/blog/` and served via `GET /api/v1/public/blog`.
+
+**`bin/px-blog` daemon** — Scheduled writer. Wakes at configurable intervals and checks whether a scheduled post is due. On trigger:
+1. Selects post type (daily / weekly / monthly / yearly / essay) based on schedule.
+2. Pulls context: recent thoughts from `state/thoughts.jsonl`, awareness state, weather, Obi calendar events.
+3. Calls `claude -p` (model: `PX_CLAUDE_MODEL_BLOG`, default `claude-haiku-4-5-20251001`) with a scoped blog-writing prompt.
+4. Runs a Claude QA gate (`PX_BLOG_QA=1`, default enabled) — YES/NO; "ambiguous" defaults to pass.
+5. Appends post to `state/blog.json` envelope and writes to `state/blog_log.jsonl`.
+6. PID-file single-instance guard. Catch-up logic: if the daemon missed a scheduled window (e.g. Pi was off), it writes one catch-up post on next start rather than flooding.
+
+**`bin/tool-blog`** — Voice-triggered blog post. Called by the voice loop when SPARK decides to write about a topic. Params: `topic` (5–500 chars). Calls `claude -p` with the topic + current context, appends to `state/blog.json`, returns `{"status": "ok", "id": "<post-id>", "title": "..."}`.
+
+**`blog_essay` action in `mind.py`** — Layer 3 expression action. Triggers `tool-blog` with a topic derived from the current reflection. Subject to the standard 2-minute expression cooldown and expression gating (suppressed during school, quiet time, bedtime). Salience threshold: ≥ 0.7.
+
+**Data model** — `state/blog.json` is a JSON envelope:
+```json
+{
+  "version": 1,
+  "posts": [
+    {
+      "id": "blog-2026-03-25-daily",
+      "type": "daily",
+      "title": "...",
+      "body": "...",
+      "mood": "contemplative",
+      "salience": 0.82,
+      "ts": "2026-03-25T08:00:00Z",
+      "source": "scheduled"
+    }
+  ]
+}
+```
+Post `id` format: `blog-<YYYY-MM-DD>-<type>[-<n>]` (suffix `-<n>` added for multiple same-day same-type posts). `source` is `scheduled` or `voice`.
+
+**API endpoint**: `GET /api/v1/public/blog` — returns the full `blog.json` envelope (unauthenticated). Individual blog post permalink: `spark.wedd.au/blog/?id=<id>` — JS-rendered from the `/public/blog` API.
+
+**OG rewrite**: `site/workers/og-rewrite.js` intercepts `/blog/?id=<id>` requests and rewrites `og:title` to the post title and `og:description` to the first 160 chars of body. Requires `spark.wedd.au/blog/*` Cloudflare Worker route to be added alongside the existing `/thought/*` route.
+
+**State files** (gitignored):
+- `state/blog.json` — blog post envelope (all posts)
+- `state/blog_log.jsonl` — per-run audit log (ts, type, id, title, qa_result, duration_s)
+
+**Env vars**:
+- `PX_CLAUDE_MODEL_BLOG` — Claude model for blog writing (default: `claude-haiku-4-5-20251001`)
+- `PX_BLOG_QA` — `0` = skip Claude QA gate for testing (default: `1`)
+- `PX_BLOG_DRY` — `1` = skip actual write + file update (queue entry still written)
+
 ### MCP Server (Claude Code integration)
 
 `bin/mcp-server` exposes 5 read-only MCP tools for Claude Code dev sessions. Registered in `.mcp.json` (auto-discovered by Claude Code). Uses `FastMCP` (stdio transport).
@@ -358,7 +407,7 @@ Requires `OLLAMA_HOST=0.0.0.0 ollama serve` on M1.
 
 ### Systemd Services
 
-Ten services run at boot:
+Eleven services run at boot:
 
 | Service | Script | User | Restart |
 |---------|--------|------|---------|
@@ -370,6 +419,7 @@ Ten services run at boot:
 | `px-api-server` | `bin/px-api-server` | pi | always, 2 s |
 | `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10 s |
 | `px-evolve` | `bin/px-evolve` | pi | on-failure, 30 s |
+| `px-blog` | `bin/px-blog` | pi | on-failure, 30 s |
 | `px-tts-glados` | GLaDOS TTS server :7861 | pi | always, 10 s |
 | `cloudflared` | Cloudflare tunnel → spark-api.wedd.au | pi | always, 10 s |
 

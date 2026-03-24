@@ -33,4 +33,4 @@ Rules:
 6. Prefer dry-run commands until the human explicitly requests live motion.
 7. Weather checks, tool_time, tool_remember, and tool_recall do not require motion confirmation.
 8. If uncertain, call tool_voice to ask for clarification instead of guessing.
-9. Valid tool names are exactly: tool_status, tool_sonar, tool_circle, tool_figure8, tool_drive, tool_stop, tool_look, tool_emote, tool_voice, tool_perform, tool_weather, tool_time, tool_remember, tool_recall, tool_photograph, tool_face, tool_describe_scene, tool_wander, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose. Never invent alternatives.
+9. Valid tool names are exactly: tool_status, tool_sonar, tool_circle, tool_figure8, tool_drive, tool_stop, tool_look, tool_emote, tool_voice, tool_perform, tool_weather, tool_time, tool_remember, tool_recall, tool_photograph, tool_face, tool_describe_scene, tool_wander, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose, tool_blog. Never invent alternatives.
