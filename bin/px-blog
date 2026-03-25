@@ -553,7 +553,9 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
     duration_s = round(time.monotonic() - _gen_start, 1)
 
     period_start, period_end = _period_bounds(post_type, target_date)
-    utc_now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Use period_end as the post timestamp so it appears on the correct date
+    # regardless of when the post was actually generated (e.g. during backfill).
+    post_ts = period_end.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     post = {
         "id": id_for_post(post_type, target_date),
@@ -563,7 +565,7 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         "source": "scheduled",
         "period_start": period_start.isoformat(),
         "period_end": period_end.isoformat(),
-        "ts": utc_now,
+        "ts": post_ts,
         "model": model_used,
         "word_count": len(body.split()),
         "salience": 0.7,
