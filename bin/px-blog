@@ -622,10 +622,94 @@ def run_once(*, dry: bool = False) -> int:
     return generated
 
 
+def run_backfill(*, dry: bool = False) -> int:
+    """Generate all missing dailies from thought history, then weeklies from dailies."""
+    blog_data = load_blog()
+    generated = 0
+
+    # Find all dates with thoughts
+    thought_dates = set()
+    if THOUGHTS_FILE.exists():
+        for line in THOUGHTS_FILE.read_text(encoding="utf-8").strip().splitlines():
+            try:
+                t = json.loads(line)
+                ts = dt.datetime.fromisoformat(t["ts"].replace("Z", "+00:00"))
+                thought_dates.add(ts.astimezone(HOBART_TZ).date())
+            except (json.JSONDecodeError, KeyError, ValueError):
+                continue
+
+    # Generate missing dailies (oldest first)
+    for day in sorted(thought_dates):
+        target = dt.datetime(day.year, day.month, day.day, 22, 0, tzinfo=HOBART_TZ)
+        pid = id_for_post("daily", target)
+        if post_exists(blog_data.get("posts", []), pid):
+            log(f"backfill: {pid} already exists, skipping")
+            continue
+
+        log(f"backfill: generating {pid}")
+        post = generate_post("daily", target, blog_data, dry=dry)
+        if post:
+            post["source"] = "backfill"
+            blog_data.setdefault("posts", []).append(post)
+            save_blog(blog_data)
+            append_blog_log({
+                "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "id": post["id"], "type": "daily", "title": post["title"],
+                "word_count": post["word_count"],
+                "qa_result": post.get("qa_result", "backfill"),
+                "duration_s": post.get("duration_s", 0),
+            })
+            log(f"backfill: generated daily: {post['title'][:60]}")
+            generated += 1
+
+    # Now generate missing weeklies from accumulated dailies
+    blog_data = load_blog()  # reload with new dailies
+    dailies = [p for p in blog_data.get("posts", []) if p.get("type") == "daily"]
+    if dailies:
+        # Find distinct weeks (ISO week)
+        weeks = set()
+        for p in dailies:
+            try:
+                ps = dt.datetime.fromisoformat(p["period_start"])
+                iso_year, iso_week, _ = ps.date().isocalendar()
+                weeks.add((iso_year, iso_week))
+            except (KeyError, ValueError):
+                continue
+
+        for iso_year, iso_week in sorted(weeks):
+            # Sunday of that week
+            sun = dt.date.fromisocalendar(iso_year, iso_week, 7)
+            target = dt.datetime(sun.year, sun.month, sun.day, 22, 30, tzinfo=HOBART_TZ)
+            pid = id_for_post("weekly", target)
+            if post_exists(blog_data.get("posts", []), pid):
+                log(f"backfill: {pid} already exists, skipping")
+                continue
+
+            log(f"backfill: generating {pid}")
+            post = generate_post("weekly", target, blog_data, dry=dry)
+            if post:
+                post["source"] = "backfill"
+                blog_data.setdefault("posts", []).append(post)
+                save_blog(blog_data)
+                append_blog_log({
+                    "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "id": post["id"], "type": "weekly", "title": post["title"],
+                    "word_count": post["word_count"],
+                    "qa_result": post.get("qa_result", "backfill"),
+                    "duration_s": post.get("duration_s", 0),
+                })
+                log(f"backfill: generated weekly: {post['title'][:60]}")
+                generated += 1
+
+    log(f"backfill complete: {generated} posts generated")
+    return generated
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="SPARK blog daemon")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
+    parser.add_argument("--backfill", action="store_true", help="Generate all missing posts from history")
     parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL)
     args = parser.parse_args(argv)
 
@@ -657,6 +741,12 @@ def main(argv: list[str]) -> int:
             pass
 
     log(f"starting pid={my_pid} dry={dry} once={args.once}")
+
+    if args.backfill:
+        count = run_backfill(dry=dry)
+        log(f"backfill: {count} posts")
+        _safe_unlink_pid()
+        return 0
 
     if args.once:
         count = run_once(dry=dry)
