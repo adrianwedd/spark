@@ -8,14 +8,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import pxh.mind
 from pxh.mind import call_llm, _reset_state
 
 
 @pytest.fixture(autouse=True)
-def _clean_mind_state():
+def _clean_mind_state(tmp_path):
+    old_log = getattr(pxh.mind, "LOG_FILE", None)
+    pxh.mind.LOG_FILE = tmp_path / "px-mind.log"
     _reset_state()
     yield
     _reset_state()
+    if old_log is not None:
+        pxh.mind.LOG_FILE = old_log
 
 
 def _fake_ollama_cm(text: str):

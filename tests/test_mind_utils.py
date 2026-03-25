@@ -740,20 +740,25 @@ def _thought(action, mood="curious", text="test thought", salience=0.5):
 
 @pytest.fixture(autouse=False)
 def _mock_awareness_and_battery(tmp_path):
-    """Stub AWARENESS_FILE and BATTERY_FILE so expression() gates don't block."""
+    """Stub AWARENESS_FILE, BATTERY_FILE, and LOG_FILE so expression() gates don't
+    block and log output stays isolated from the production px-mind.log."""
     old_aw = getattr(pxh.mind, "AWARENESS_FILE", None)
     old_bat = getattr(pxh.mind, "BATTERY_FILE", None)
+    old_log = getattr(pxh.mind, "LOG_FILE", None)
     aw_file = tmp_path / "awareness.json"
     bat_file = tmp_path / "battery.json"
     aw_file.write_text(_json.dumps({"obi_mode": "calm"}))
     bat_file.write_text(_json.dumps({"pct": 80, "charging": False}))
     pxh.mind.AWARENESS_FILE = aw_file
     pxh.mind.BATTERY_FILE = bat_file
+    pxh.mind.LOG_FILE = tmp_path / "px-mind.log"
     yield
     if old_aw is not None:
         pxh.mind.AWARENESS_FILE = old_aw
     if old_bat is not None:
         pxh.mind.BATTERY_FILE = old_bat
+    if old_log is not None:
+        pxh.mind.LOG_FILE = old_log
 
 
 def test_expression_play_sound_calls_tool(_mock_awareness_and_battery):

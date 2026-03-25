@@ -402,9 +402,16 @@ def idle_loop(args) -> None:
                         log(f"sonar read unexpected: {exc}")
                         dist = None
                     try:
-                        SONAR_LIVE_FILE.write_text(
-                            json.dumps({"ts": time.time(), "distance_cm": dist})
+                        import tempfile as _tmp
+                        _data = json.dumps({"ts": time.time(), "distance_cm": dist})
+                        _fd, _tmp_path = _tmp.mkstemp(
+                            dir=str(SONAR_LIVE_FILE.parent), suffix=".tmp"
                         )
+                        with os.fdopen(_fd, "w", encoding="utf-8") as _f:
+                            _f.write(_data)
+                            _f.flush()
+                            os.fsync(_f.fileno())
+                        os.replace(_tmp_path, str(SONAR_LIVE_FILE))
                     except Exception as exc:
                         log(f"sonar_live.json write failed: {exc}")
                     if dist is not None and dist < PROX_THRESH:
