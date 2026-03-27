@@ -34,13 +34,18 @@ LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-alive.log"))
 PID_FILE = Path(os.environ.get("PX_ALIVE_PID", LOG_DIR / "px-alive.pid"))
 
-GAZE_MIN_S   = 10
-GAZE_MAX_S   = 25
-SCAN_MIN_S   = 180
-SCAN_MAX_S   = 480
-PROX_THRESH  = 35.0   # cm
-PROX_HOLD_S  = 3.0    # seconds consistently close before reacting
-PROX_CHECK_S = 5.0    # how often to actually open Picarx for sonar
+GAZE_MIN_S        = 10
+GAZE_MAX_S        = 25
+GAZE_MIN_NIGHT_S  = 90    # much slower gaze at night — Obi asleep, no audience
+GAZE_MAX_NIGHT_S  = 240
+SCAN_MIN_S        = 180
+SCAN_MAX_S        = 480
+PROX_THRESH       = 35.0  # cm
+PROX_HOLD_S       = 3.0   # seconds consistently close before reacting
+PROX_REACT_COOL_S = 300.0 # min seconds between proximity reacts (pan changes sweep sonar)
+PROX_CHECK_S      = 5.0   # how often to actually open Picarx for sonar
+OBI_DAY_START     = 7     # hour (Hobart) — Obi's waking hours
+OBI_DAY_END       = 20    # hour (Hobart)
 PAN_RANGE    = (-65, 65)
 TILT_RANGE   = (-15, 35)
 EASE_SPEED   = 20     # steps per second
@@ -322,13 +327,18 @@ def read_mood() -> dict:
 
 def idle_loop(args) -> None:
     cur_pan, cur_tilt = 0, 0
-    next_gaze = time.monotonic() + random.uniform(GAZE_MIN_S, GAZE_MAX_S)
+    _night_now = not (OBI_DAY_START <= dt.datetime.now().hour < OBI_DAY_END)
+    next_gaze = time.monotonic() + random.uniform(
+        GAZE_MIN_NIGHT_S if _night_now else GAZE_MIN_S,
+        GAZE_MAX_NIGHT_S if _night_now else GAZE_MAX_S,
+    )
     next_scan = time.monotonic() + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
     next_prox = time.monotonic() + PROX_CHECK_S
     next_mood_check = time.monotonic() + MOOD_CHECK_S
     cur_mood_behavior = MOOD_BEHAVIOR["content"]
     prox_near_since: float | None = None
     prox_was_close: bool = True      # assume close on startup so first check doesn't fire on a static wall
+    prox_last_react: float = 0.0     # monotonic time of last proximity react (cooldown guard)
     spark_last_greet: float = 0.0    # monotonic time of last SPARK greeting
     i2c_ok_after: float = 0.0  # monotonic time after which I2C retries are allowed
     face_tracking = not args.no_face
@@ -393,6 +403,7 @@ def idle_loop(args) -> None:
                 sys.exit(0)
 
             now = time.monotonic()
+            is_night = not (OBI_DAY_START <= dt.datetime.now().hour < OBI_DAY_END)
 
             # Skip all hardware if in I2C backoff period
             if now < i2c_ok_after:
@@ -442,7 +453,9 @@ def idle_loop(args) -> None:
                         # 8s on a static wall or desk edge that's permanently nearby).
                         if prox_near_since is None and not prox_was_close:
                             prox_near_since = now
-                        elif prox_near_since is not None and now - prox_near_since >= PROX_HOLD_S:
+                        elif (prox_near_since is not None
+                              and now - prox_near_since >= PROX_HOLD_S
+                              and now - prox_last_react >= PROX_REACT_COOL_S):
                             try:
                                 _fp = json.loads(FRIGATE_FILE.read_text())
                                 _fp_ts = _fp.get("ts") if isinstance(_fp, dict) else None
@@ -457,6 +470,7 @@ def idle_loop(args) -> None:
                             ease(get_px(), cur_pan, cur_tilt, target_pan, 5, 0.5)
                             cur_pan, cur_tilt = target_pan, 5
                             prox_near_since = None
+                            prox_last_react = now
                             next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
                             # SPARK greeting — speak only when SPARK persona active + cooldown ok
                             if (read_session_persona() == "spark"
@@ -501,8 +515,8 @@ def idle_loop(args) -> None:
                         # Recently lost face — hold position, don't drift yet
                         face_tracked = True
 
-                # --- Slow idle scan (physical sweep only — proactive speech is handled by px-mind) ---
-                if not face_tracked and now >= next_scan:
+                # --- Slow idle scan (suppressed at night — looks broken when Obi is asleep) ---
+                if not face_tracked and not is_night and now >= next_scan:
                     log("idle scan: sweeping pan")
                     angles = list(range(PAN_RANGE[0], PAN_RANGE[1] + 1, 15)) + \
                              list(range(PAN_RANGE[1], PAN_RANGE[0] - 1, -15))
@@ -518,9 +532,19 @@ def idle_loop(args) -> None:
                     log("idle scan: sweep complete")
                     next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
                     next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
+                elif not face_tracked and is_night and now >= next_scan:
+                    # Reschedule without sweeping so the timer doesn't pile up
+                    next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
 
                 # --- Gaze drift (only when not tracking a face) ---
                 elif not face_tracked and now >= next_gaze:
+                    # Night: slow right down so SPARK barely moves while Obi is asleep
+                    if is_night:
+                        gaze_min = GAZE_MIN_NIGHT_S
+                        gaze_max = GAZE_MAX_NIGHT_S
+                    else:
+                        gaze_min = cur_mood_behavior.get("gaze_min", GAZE_MIN_S)
+                        gaze_max = cur_mood_behavior.get("gaze_max", GAZE_MAX_S)
                     target_pan  = random.randint(*PAN_RANGE)
                     # Apply mood tilt bias (positive = head up/alert, negative = drooping)
                     tilt_bias = cur_mood_behavior.get("tilt_bias", 0)
@@ -533,8 +557,6 @@ def idle_loop(args) -> None:
                     log(f"gaze drift: ({cur_pan},{cur_tilt}) → ({target_pan},{target_tilt}) over {duration:.1f}s")
                     ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt, duration)
                     cur_pan, cur_tilt = target_pan, target_tilt
-                    gaze_min = cur_mood_behavior.get("gaze_min", GAZE_MIN_S)
-                    gaze_max = cur_mood_behavior.get("gaze_max", GAZE_MAX_S)
                     next_gaze = now + random.uniform(gaze_min, gaze_max)
 
             except OSError as exc:
