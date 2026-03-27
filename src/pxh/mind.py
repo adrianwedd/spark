@@ -187,16 +187,24 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
     close      = sonar_cm is not None and sonar_cm < 35
     very_close = sonar_cm is not None and sonar_cm < 20
 
-    # HA presence: if HA confirms no one home → absent regardless of time
+    # HA presence: suppress absent logic only when Obi specifically is confirmed home.
+    # Adrian being home at night shouldn't prevent nighttime silence — Obi is SPARK's
+    # audience.  If no one at all is home, immediately return absent.
     ha_someone_home = False
     ha = awareness.get("ha_presence")
     if isinstance(ha, dict) and isinstance(ha.get("people"), list):
         people = ha["people"]
         if people:  # only trust HA when it has at least one tracked person
-            if any(p.get("home") for p in people):
-                ha_someone_home = True   # HA confirms someone home — skip absent returns
-            else:
-                return "absent"
+            if not any(p.get("home") for p in people):
+                return "absent"   # HA confirms nobody home
+            # Only set ha_someone_home (= suppress absent) when Obi is specifically home.
+            # During daytime ANY presence is fine; at night we care about Obi specifically.
+            obi_home = any(
+                p.get("home") for p in people
+                if p.get("name", "").lower() in ("obi", "obiwedd")
+            )
+            if obi_home or is_day:
+                ha_someone_home = True  # Obi home (or daytime) — skip absent returns
         # empty list → HA may have a config issue; fall through to other signals
 
     # Fast sonar signal: physically very close + loud
@@ -568,7 +576,7 @@ def read_sonar(dry: bool) -> float | None:
     try:
         data = json.loads(sonar_live.read_text())
         age = time.time() - float(data.get("ts", 0))
-        if age < 15:
+        if age < 25:  # 25s: covers 10s systemd RestartSec + ~5s Picarx acquisition
             val = data.get("distance_cm")
             return float(val) if val is not None else None
         log(f"sonar_live.json stale ({age:.0f}s) — falling back to tool-sonar")

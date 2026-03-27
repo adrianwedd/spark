@@ -190,7 +190,10 @@ def spark_greet(dry: bool) -> None:
     env["PX_VOICE_RATE"] = "120"
     if dry:
         env["PX_DRY"] = "1"
-    _subprocess.run([str(tool_voice)], env=env, capture_output=True, check=False)
+    try:
+        _subprocess.run([str(tool_voice)], env=env, capture_output=True, check=False, timeout=8)
+    except Exception:
+        pass  # voice busy or timed out — greet silently skipped, px-alive keeps running
 
 
 def make_px():
@@ -325,6 +328,7 @@ def idle_loop(args) -> None:
     next_mood_check = time.monotonic() + MOOD_CHECK_S
     cur_mood_behavior = MOOD_BEHAVIOR["content"]
     prox_near_since: float | None = None
+    prox_was_close: bool = True      # assume close on startup so first check doesn't fire on a static wall
     spark_last_greet: float = 0.0    # monotonic time of last SPARK greeting
     i2c_ok_after: float = 0.0  # monotonic time after which I2C retries are allowed
     face_tracking = not args.no_face
@@ -362,6 +366,22 @@ def idle_loop(args) -> None:
     signal.signal(signal.SIGUSR1, _on_yield)
 
     log(f"idle loop started (persistent Picarx handle, sonar every {PROX_CHECK_S:.0f}s)")
+
+    # Write a startup heartbeat so px-mind doesn't see a stale file during the
+    # Picarx acquisition window (takes ~5s), avoiding the tool-sonar fallback
+    # that would immediately send SIGUSR1 and kill us before we do anything useful.
+    try:
+        import tempfile as _tmp_start
+        _startup_data = json.dumps({"ts": time.time(), "distance_cm": None})
+        _fd_s, _tmp_s = _tmp_start.mkstemp(dir=str(SONAR_LIVE_FILE.parent), suffix=".tmp")
+        os.chmod(_tmp_s, 0o644)
+        with os.fdopen(_fd_s, "w", encoding="utf-8") as _fs:
+            _fs.write(_startup_data)
+            _fs.flush()
+            os.fsync(_fs.fileno())
+        os.replace(_tmp_s, str(SONAR_LIVE_FILE))
+    except Exception as _se:
+        log(f"startup sonar_live.json write failed: {_se}")
 
     try:
         while True:
@@ -407,6 +427,7 @@ def idle_loop(args) -> None:
                         _fd, _tmp_path = _tmp.mkstemp(
                             dir=str(SONAR_LIVE_FILE.parent), suffix=".tmp"
                         )
+                        os.chmod(_tmp_path, 0o644)  # world-readable: px-mind runs as pi, not root
                         with os.fdopen(_fd, "w", encoding="utf-8") as _f:
                             _f.write(_data)
                             _f.flush()
@@ -414,10 +435,14 @@ def idle_loop(args) -> None:
                         os.replace(_tmp_path, str(SONAR_LIVE_FILE))
                     except Exception as exc:
                         log(f"sonar_live.json write failed: {exc}")
-                    if dist is not None and dist < PROX_THRESH:
-                        if prox_near_since is None:
+                    is_close = dist is not None and dist < PROX_THRESH
+                    if is_close:
+                        # Only start the hold timer on a fresh approach (not when the
+                        # obstacle was already close last check — avoids firing every
+                        # 8s on a static wall or desk edge that's permanently nearby).
+                        if prox_near_since is None and not prox_was_close:
                             prox_near_since = now
-                        elif now - prox_near_since >= PROX_HOLD_S:
+                        elif prox_near_since is not None and now - prox_near_since >= PROX_HOLD_S:
                             try:
                                 _fp = json.loads(FRIGATE_FILE.read_text())
                                 _fp_ts = _fp.get("ts") if isinstance(_fp, dict) else None
@@ -440,6 +465,7 @@ def idle_loop(args) -> None:
                                 spark_last_greet = now
                     else:
                         prox_near_since = None
+                    prox_was_close = is_close
 
                 # --- Face tracking (overrides gaze drift when a face is detected) ---
                 face_tracked = False
