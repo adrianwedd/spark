@@ -276,6 +276,20 @@ section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); }
   pointer-events: none;
 }
 
+/* ── Scroll entrance animations ── */
+@media (prefers-reduced-motion: no-preference) {
+  .animate-ready {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  .animate-in {
+    opacity: 1;
+    transform: translateY(0);
+    transition: opacity 0.4s cubic-bezier(0.25, 0.1, 0.25, 1),
+                transform 0.4s cubic-bezier(0.25, 0.1, 0.25, 1);
+  }
+}
+
 /* Accessibility: respect reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
