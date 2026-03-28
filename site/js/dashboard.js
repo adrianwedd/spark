@@ -44,6 +44,17 @@ window.SparkDashboard = (function () {
     if (heroDot) heroDot.classList.add('green');
     if (heroLabel) heroLabel.textContent = 'Online';
 
+    // Mood duration
+    var durationEl = document.getElementById('mood-duration');
+    if (durationEl && state.mood && state.last_spoken_ts) {
+      var moodSince = new Date(state.last_spoken_ts);
+      var nowMs = Date.now();
+      var diffMin = Math.round((nowMs - moodSince.getTime()) / 60000);
+      if (diffMin < 1) durationEl.textContent = state.mood + ' just now';
+      else if (diffMin < 60) durationEl.textContent = state.mood + ' for ' + diffMin + ' min';
+      else durationEl.textContent = state.mood + ' for ' + Math.round(diffMin / 60) + 'h';
+    }
+
     const mood = (state.mood || '').toLowerCase();
     const moodColor = _moodColor(mood) || '#c48b6e';
     const pulse = $('mood-pulse');

@@ -108,6 +108,15 @@
   .hero-status { justify-content: center; }
 }
 
+.mood-duration {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: var(--text-small);
+  font-weight: 500;
+  color: var(--dark-muted);
+  text-align: center;
+  margin-top: 0.5rem;
+}
+
 /* ── Thought Carousel — dark overrides ───────────────────────── */
 
 [data-theme="dark"] .carousel-slide {
