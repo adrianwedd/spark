@@ -10,10 +10,11 @@ window.SparkCharts = (function () {
     const W = canvas.width, H = canvas.height;
     ctx.clearRect(0, 0, W, H);
 
-    const BAR_COUNT = 40;
-    const BAR_W = Math.floor(W / BAR_COUNT) - 1;
-    const MAX_H = H - 4;
-    const BASE_H = 3;
+    var BAR_COUNT = 32;
+    var BAR_W = 3;
+    var GAP = 1;
+    var MAX_H = H - 4;
+    var BASE_H = 2;
 
     // Deterministic pseudo-random seeded from rms
     let s = Math.round(rms || 0) + 1;
@@ -26,49 +27,66 @@ window.SparkCharts = (function () {
     ctx.fillStyle = getComputedStyle(document.documentElement)
       .getPropertyValue('--spark-accent').trim() || '#c48b6e';
 
-    for (let i = 0; i < BAR_COUNT; i++) {
-      const barH = BASE_H + Math.round(rand() * MAX_H * amplitude);
-      ctx.fillRect(i * (BAR_W + 1), H - barH, Math.max(1, BAR_W), barH);
+    ctx.globalAlpha = 0.6;
+    for (var i = 0; i < BAR_COUNT; i++) {
+      var barH = BASE_H + Math.round(rand() * MAX_H * amplitude);
+      var x = i * (BAR_W + GAP);
+      var y = H - barH;
+      if (ctx.roundRect) {
+        ctx.beginPath();
+        ctx.roundRect(x, y, BAR_W, barH, [2, 2, 0, 0]);
+        ctx.fill();
+      } else {
+        ctx.fillRect(x, y, BAR_W, barH);
+      }
     }
+    ctx.globalAlpha = 1.0;
   }
 
   // ── Sparkline ────────────────────────────────────────────────────────────
   function drawSparkline(canvas, points, field) {
     if (!canvas || !points || points.length < 2) return;
-    const ctx = canvas.getContext('2d');
-    const W = canvas.width, H = canvas.height;
+    var ctx = canvas.getContext('2d');
+    var W = canvas.width, H = canvas.height;
     ctx.clearRect(0, 0, W, H);
 
-    const vals = points.map(p => p[field]).filter(v => v !== null && v !== undefined);
+    var vals = points.map(function (p) { return p[field]; }).filter(function (v) { return v !== null && v !== undefined; });
     if (vals.length < 2) return;
 
-    const minV = Math.min(...vals);
-    const maxV = Math.max(...vals);
-    const range = maxV - minV || 1;
+    var minV = Math.min.apply(null, vals);
+    var maxV = Math.max.apply(null, vals);
+    var range = maxV - minV || 1;
 
-    const toX = i => (i / (points.length - 1)) * (W - 4) + 2;
-    const toY = v => H - 4 - ((v - minV) / range) * (H - 8);
+    function toX(i) { return (i / (points.length - 1)) * (W - 4) + 2; }
+    function toY(v) { return H - 4 - ((v - minV) / range) * (H - 8); }
+
+    var accent = getComputedStyle(document.documentElement)
+      .getPropertyValue('--spark-accent').trim() || '#c48b6e';
 
     ctx.beginPath();
-    ctx.strokeStyle = getComputedStyle(document.documentElement)
-      .getPropertyValue('--spark-accent').trim() || '#c48b6e';
+    ctx.strokeStyle = accent;
     ctx.lineWidth = 1.5;
     ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
 
-    let first = true;
-    points.forEach((p, i) => {
-      const v = p[field];
+    var lastX, lastY, first = true;
+    points.forEach(function (p, i) {
+      var v = p[field];
       if (v === null || v === undefined) return;
-      if (first) { ctx.moveTo(toX(i), toY(v)); first = false; }
-      else ctx.lineTo(toX(i), toY(v));
+      var x = toX(i), y = toY(v);
+      if (first) { ctx.moveTo(x, y); first = false; }
+      else ctx.lineTo(x, y);
+      lastX = x; lastY = y;
     });
     ctx.stroke();
 
-    // Range labels
-    ctx.fillStyle = '#999';
-    ctx.font = '9px sans-serif';
-    ctx.fillText(minV.toFixed(0), 2, H - 1);
-    ctx.fillText(maxV.toFixed(0), 2, 9);
+    // Terminal dot — 4px circle at the end
+    if (lastX !== undefined) {
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 2, 0, Math.PI * 2);
+      ctx.fillStyle = accent;
+      ctx.fill();
+    }
   }
 
   // ── Mood colour helper (reads from CSS custom properties in colors.css) ──
