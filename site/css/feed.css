@@ -15,12 +15,6 @@ body {
   padding-bottom: 3rem;
 }
 
-.container {
-  max-width: 680px;
-  margin: 0 auto;
-  padding: 0 1.25rem;
-}
-
 /* ── Feed header ────────────────────────────────── */
 
 .feed-header {
