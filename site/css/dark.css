@@ -6,11 +6,11 @@
 /* ── Hero (home section) ──────────────────────────────────────── */
 
 [data-theme="dark"]#home h1 {
-  font-family: 'Courier Prime', 'Courier New', monospace;
-  font-size: clamp(2.5rem, 6vw, 4rem);
-  font-weight: 700;
-  line-height: 1.1;
-  letter-spacing: -0.03em;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: var(--text-display);
+  font-weight: 800;
+  line-height: 1.05;
+  letter-spacing: -0.04em;
   color: var(--dark-accent);
   text-shadow: 0 0 60px var(--dark-glow);
 }
@@ -58,17 +58,19 @@
 }
 
 [data-theme="dark"] h2 {
-  font-family: 'Courier Prime', 'Courier New', monospace;
-  font-size: 1.5rem;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-size: var(--text-title);
+  font-weight: 700;
   color: var(--dark-accent);
   margin-bottom: 1.5rem;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.025em;
   text-shadow: 0 0 40px var(--dark-glow);
 }
 
 [data-theme="dark"] h3 {
   font-family: 'Courier Prime', 'Courier New', monospace;
-  font-size: 1rem;
+  font-size: var(--text-body);
+  font-weight: 400;
   color: var(--dark-muted);
   text-transform: uppercase;
   letter-spacing: 0.08em;
