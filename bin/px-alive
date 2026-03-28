@@ -455,7 +455,8 @@ def idle_loop(args) -> None:
                             prox_near_since = now
                         elif (prox_near_since is not None
                               and now - prox_near_since >= PROX_HOLD_S
-                              and now - prox_last_react >= PROX_REACT_COOL_S):
+                              and now - prox_last_react >= PROX_REACT_COOL_S
+                              and not is_night):  # no servo movement or speech at night
                             try:
                                 _fp = json.loads(FRIGATE_FILE.read_text())
                                 _fp_ts = _fp.get("ts") if isinstance(_fp, dict) else None
@@ -538,26 +539,25 @@ def idle_loop(args) -> None:
 
                 # --- Gaze drift (only when not tracking a face) ---
                 elif not face_tracked and now >= next_gaze:
-                    # Night: slow right down so SPARK barely moves while Obi is asleep
                     if is_night:
-                        gaze_min = GAZE_MIN_NIGHT_S
-                        gaze_max = GAZE_MAX_NIGHT_S
+                        # Night: freeze all servo movement — Obi is asleep
+                        next_gaze = now + random.uniform(GAZE_MIN_NIGHT_S, GAZE_MAX_NIGHT_S)
                     else:
                         gaze_min = cur_mood_behavior.get("gaze_min", GAZE_MIN_S)
                         gaze_max = cur_mood_behavior.get("gaze_max", GAZE_MAX_S)
-                    target_pan  = random.randint(*PAN_RANGE)
-                    # Apply mood tilt bias (positive = head up/alert, negative = drooping)
-                    tilt_bias = cur_mood_behavior.get("tilt_bias", 0)
-                    tilt_lo = max(TILT_RANGE[0], TILT_RANGE[0] + tilt_bias)
-                    tilt_hi = min(TILT_RANGE[1], TILT_RANGE[1] + tilt_bias)
-                    if tilt_lo > tilt_hi:
-                        tilt_lo, tilt_hi = tilt_hi, tilt_lo  # guard against inverted range
-                    target_tilt = random.randint(tilt_lo, tilt_hi)
-                    duration    = random.uniform(3.5, 7.0)
-                    log(f"gaze drift: ({cur_pan},{cur_tilt}) → ({target_pan},{target_tilt}) over {duration:.1f}s")
-                    ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt, duration)
-                    cur_pan, cur_tilt = target_pan, target_tilt
-                    next_gaze = now + random.uniform(gaze_min, gaze_max)
+                        target_pan  = random.randint(*PAN_RANGE)
+                        # Apply mood tilt bias (positive = head up/alert, negative = drooping)
+                        tilt_bias = cur_mood_behavior.get("tilt_bias", 0)
+                        tilt_lo = max(TILT_RANGE[0], TILT_RANGE[0] + tilt_bias)
+                        tilt_hi = min(TILT_RANGE[1], TILT_RANGE[1] + tilt_bias)
+                        if tilt_lo > tilt_hi:
+                            tilt_lo, tilt_hi = tilt_hi, tilt_lo  # guard against inverted range
+                        target_tilt = random.randint(tilt_lo, tilt_hi)
+                        duration    = random.uniform(3.5, 7.0)
+                        log(f"gaze drift: ({cur_pan},{cur_tilt}) → ({target_pan},{target_tilt}) over {duration:.1f}s")
+                        ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt, duration)
+                        cur_pan, cur_tilt = target_pan, target_tilt
+                        next_gaze = now + random.uniform(gaze_min, gaze_max)
 
             except OSError as exc:
                 log(f"I2C error (will retry in {I2C_BACKOFF_S}s): {exc}")
