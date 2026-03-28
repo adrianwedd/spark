@@ -15,6 +15,99 @@
   text-shadow: 0 0 60px var(--dark-glow);
 }
 
+/* ── Hero grid ──────────────────────────────────────────────── */
+.hero-grid {
+  display: grid;
+  grid-template-columns: 1fr 0.7fr;
+  gap: 3rem;
+  align-items: center;
+}
+
+.hero-mood-sentence {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: var(--text-subtitle);
+  font-weight: 600;
+  color: var(--dark-text);
+  margin: 1rem 0 0.5rem;
+  line-height: 1.4;
+}
+
+.hero-credit {
+  font-size: var(--text-small);
+  font-weight: 500;
+  color: var(--dark-muted);
+  margin: 0 0 1.5rem;
+}
+
+.hero-cta {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.btn-ghost {
+  display: inline-block;
+  padding: 0.6rem 1.5rem;
+  border: 1px solid var(--dark-accent);
+  border-radius: var(--radius-sm);
+  color: var(--dark-accent);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: var(--text-small);
+  font-weight: 500;
+  text-decoration: none;
+  transition: background var(--transition), color var(--transition);
+}
+.btn-ghost:hover {
+  background: var(--dark-accent);
+  color: var(--dark-bg);
+}
+.btn-ghost:focus-visible {
+  outline: 2px solid var(--dark-accent);
+  outline-offset: 2px;
+}
+
+.hero-img {
+  width: 100%;
+  height: auto;
+  border-radius: var(--radius-lg);
+  box-shadow: 0 0 60px var(--spark-glow);
+  filter: contrast(1.05) brightness(1.02);
+}
+
+.hero-status {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+  justify-content: center;
+}
+
+.status-dot-hero {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ef4444;
+  display: inline-block;
+}
+.status-dot-hero.green { background: var(--dark-accent); }
+
+.hero-online-label {
+  font-size: var(--text-xs);
+  color: var(--dark-muted);
+}
+
+@media (max-width: 700px) {
+  .hero-grid {
+    grid-template-columns: 1fr;
+    gap: 2rem;
+    text-align: center;
+  }
+  .hero-photo { order: 2; }
+  .hero-img { max-width: 280px; margin: 0 auto; display: block; }
+  .hero-cta { justify-content: center; flex-direction: column; align-items: center; }
+  .hero-status { justify-content: center; }
+}
+
 /* ── Thought Carousel — dark overrides ───────────────────────── */
 
 [data-theme="dark"] .carousel-slide {

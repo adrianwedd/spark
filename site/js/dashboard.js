@@ -22,6 +22,28 @@ window.SparkDashboard = (function () {
   };
 
   function renderPresence(state) {
+    // Hero mood sentence
+    var heroSentence = document.getElementById('hero-mood-sentence');
+    if (heroSentence && state.mood) {
+      var sentence = 'Feeling ' + state.mood + '.';
+      var thought = state.last_thought || '';
+      if (thought.length <= 80 && thought.length > 0) {
+        sentence += ' ' + thought;
+      } else if (thought.length > 80) {
+        var firstSentence = thought.split(/[.!?]/)[0];
+        if (firstSentence && firstSentence.length <= 80) {
+          sentence += ' ' + firstSentence + '.';
+        }
+      }
+      heroSentence.textContent = sentence;
+    }
+
+    // Hero status dot
+    var heroDot = document.getElementById('status-dot-hero');
+    var heroLabel = document.getElementById('hero-online-label');
+    if (heroDot) heroDot.classList.add('green');
+    if (heroLabel) heroLabel.textContent = 'Online';
+
     const mood = (state.mood || '').toLowerCase();
     const moodColor = _moodColor(mood) || '#c48b6e';
     const pulse = $('mood-pulse');

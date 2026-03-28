@@ -73,20 +73,43 @@
 
 <!-- ══════════════════════════════════════════════════════ HOME -->
 <section id="home" data-theme="dark">
-  <div class="container">
-    <h1>SPARK</h1>
-    <p class="text-lead mt-sm text-muted-dark">
-      Support Partner for Awareness, Regulation &amp; Kindness
-    </p>
+  <div class="container-hero">
+    <div class="hero-grid">
+      <div class="hero-text">
+        <h1>SPARK</h1>
+        <p id="hero-mood-sentence" class="hero-mood-sentence">A robot with an inner life.</p>
+        <p class="hero-credit">Built by Adrian and Obi together.</p>
+        <div class="hero-cta">
+          <a href="/feed/" class="btn-ghost">Explore the feed →</a>
+          <a href="#live" class="btn-ghost">Live dashboard ↓</a>
+        </div>
+      </div>
+      <div class="hero-photo">
+        <picture>
+          <source srcset="img/spark-hero-600w.webp 600w, img/spark-hero-900w.webp 900w, img/spark-hero.webp 1200w"
+                  sizes="(max-width: 700px) 280px, 40vw" type="image/webp">
+          <img src="img/spark-hero.jpg"
+               srcset="img/spark-hero-600w.jpg 600w, img/spark-hero-900w.jpg 900w, img/spark-hero.jpg 1200w"
+               sizes="(max-width: 700px) 280px, 40vw"
+               alt="SPARK — a PiCar-X robot with ultrasonic sensors and a camera, sitting on a desk"
+               loading="eager" class="hero-img">
+        </picture>
+        <div class="hero-status">
+          <span id="status-dot-hero" class="status-dot-hero"></span>
+          <span id="hero-online-label" class="hero-online-label">Checking...</span>
+        </div>
+      </div>
+    </div>
+  </div>
 
-    <!-- Recent thoughts carousel -->
+  <!-- Thought carousel (below hero grid, standard container) -->
+  <div class="container">
     <div id="thought-carousel" class="thought-carousel" aria-live="polite" aria-label="SPARK's recent thoughts">
+      <button id="carousel-pause" class="carousel-pause visually-hidden" aria-label="Pause thought carousel">Pause</button>
       <div class="carousel-slide active">
         <blockquote class="carousel-quote">Waiting for SPARK's thoughts…</blockquote>
       </div>
     </div>
-    <div id="carousel-dots" class="carousel-dots" role="tablist" aria-label="Thought slides"></div>
-
   </div>
 </section>
 
