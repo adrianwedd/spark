@@ -290,29 +290,60 @@
 
 /* ── Site footer (dark theme) ─────────────────── */
 .site-footer {
-  padding: 2.5rem 1.25rem;
-  text-align: center;
-  font-size: 0.85rem;
+  padding: 4rem 1.25rem 2.5rem;
+  text-align: left;
+  font-size: var(--text-small);
   background: var(--dark-bg);
   border-top: 1px solid var(--dark-border);
 }
-.site-footer-links {
+.footer-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  margin-bottom: 2rem;
+}
+.footer-heading {
+  font-family: 'Courier Prime', monospace;
+  font-size: var(--text-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dark-muted);
+  margin: 0 0 0.75rem;
+}
+.site-footer .footer-links {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.site-footer .footer-links a {
+  color: var(--dark-accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+.site-footer .footer-links a:hover { text-decoration: underline; color: var(--dark-accent-hover); }
+.site-footer-credit {
+  margin: 0;
+  color: var(--dark-muted);
+  font-weight: 300;
+  text-align: center;
+}
+@media (max-width: 480px) {
+  .footer-grid { grid-template-columns: 1fr; gap: 1.5rem; }
+}
+.site-footer-links-row {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   gap: 0.5rem 1.5rem;
   margin-bottom: 1rem;
 }
-.site-footer-links a {
+.site-footer-links-row a {
   color: var(--dark-accent);
   text-decoration: none;
   font-weight: 500;
 }
-.site-footer-links a:hover { text-decoration: underline; color: var(--dark-accent-hover); }
-.site-footer-credit {
-  margin: 0;
-  color: var(--dark-muted);
-}
+.site-footer-links-row a:hover { text-decoration: underline; color: var(--dark-accent-hover); }
 
 /* Machine band collapsible */
 .machine-details { margin-bottom: 0.75rem; }
