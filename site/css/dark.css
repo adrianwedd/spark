@@ -111,11 +111,11 @@
 /* ── Thought Carousel — dark overrides ───────────────────────── */
 
 [data-theme="dark"] .carousel-slide {
-  background: var(--dark-surface);
-  border: 1px solid var(--dark-border);
-  border-left: 3px solid var(--spark-accent, var(--dark-accent));
-  border-radius: var(--radius);
+  background: transparent;
+  border: none;
+  border-radius: 0;
   box-shadow: none;
+  padding: 1rem 0;
 }
 
 /* Suppress warm bubble tails and their reserved space */

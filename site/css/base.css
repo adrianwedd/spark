@@ -212,6 +212,17 @@ section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); }
 .container-narrow { max-width: 680px; margin: 0 auto; padding: 0 1.25rem; }
 .null-value::after { content: "—"; opacity: 0.4; }
 .hidden { display: none; }
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* Spacing helpers */
 .mt-sm  { margin-top: 0.75rem; }

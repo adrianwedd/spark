@@ -225,6 +225,7 @@
 
   let _carouselTimer = null;
   let _carouselIdx   = 0;
+  var _carouselPaused = false;
 
   async function fetchThoughts() {
     try {
@@ -243,8 +244,17 @@
       const data = await fetchWithTimeout(window.SPARK_CONFIG.FALLBACK_GITHUB + '/feed.json');
       if (data && data.posts && data.posts.length) {
         _buildCarousel(data.posts.slice(-20).reverse());
+        return;
       }
-    } catch (_) {}
+    } catch (_) {
+      // Offline — try localStorage cache
+      try {
+        var cached = JSON.parse(localStorage.getItem('spark_feed_cache'));
+        if (cached && cached.posts && cached.posts.length) {
+          _renderThoughts(cached.posts.slice(-5).reverse());
+        }
+      } catch (e) {}
+    }
   }
 
   function _buildCarousel(thoughts) {
@@ -405,9 +415,10 @@
     if (_carouselTimer) clearInterval(_carouselTimer);
     if (count > 1) {
       _carouselTimer = setInterval(() => {
+        if (_carouselPaused) return;
         _carouselIdx = (_carouselIdx + 1) % count;
         _showSlide(_carouselIdx);
-      }, 10_000);
+      }, 8_000);
     }
   }
 
@@ -417,6 +428,24 @@
   prefetchHistory();
   poll();
   fetchThoughts();
+
+  // Carousel pause on hover/focus (WCAG 2.2.2)
+  var _carouselEl = document.getElementById('thought-carousel');
+  var _pauseBtn = document.getElementById('carousel-pause');
+  if (_carouselEl) {
+    _carouselEl.addEventListener('mouseenter', function () { _carouselPaused = true; });
+    _carouselEl.addEventListener('mouseleave', function () { _carouselPaused = false; });
+    _carouselEl.addEventListener('focusin', function () { _carouselPaused = true; });
+    _carouselEl.addEventListener('focusout', function () { _carouselPaused = false; });
+  }
+  if (_pauseBtn) {
+    _pauseBtn.addEventListener('click', function () {
+      _carouselPaused = !_carouselPaused;
+      _pauseBtn.textContent = _carouselPaused ? 'Resume' : 'Pause';
+      _pauseBtn.setAttribute('aria-label', _carouselPaused ? 'Resume thought carousel' : 'Pause thought carousel');
+    });
+  }
+
   var pollTimer      = setInterval(poll, POLL_MS);
   var waveformTimer  = setInterval(tickWaveform, 2_000);
   var dotTimer       = setInterval(_updateDot, 10_000);
