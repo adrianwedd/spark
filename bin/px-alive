@@ -34,8 +34,8 @@ LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-alive.log"))
 PID_FILE = Path(os.environ.get("PX_ALIVE_PID", LOG_DIR / "px-alive.pid"))
 
-GAZE_MIN_S        = 10
-GAZE_MAX_S        = 25
+GAZE_MIN_S        = 20
+GAZE_MAX_S        = 50
 GAZE_MIN_NIGHT_S  = 90    # much slower gaze at night — Obi asleep, no audience
 GAZE_MAX_NIGHT_S  = 240
 SCAN_MIN_S        = 180
@@ -48,7 +48,7 @@ OBI_DAY_START     = 7     # hour (Hobart) — Obi's waking hours
 OBI_DAY_END       = 20    # hour (Hobart)
 PAN_RANGE    = (-65, 65)
 TILT_RANGE   = (-15, 35)
-EASE_SPEED   = 20     # steps per second
+EASE_SPEED   = 15     # steps per second (lower = slower step rate, more servo settle time)
 
 # Face tracking
 FACE_TRACK_GAIN_PAN  = 0.15   # proportional gain for pan (higher = faster response)
@@ -524,10 +524,10 @@ def idle_loop(args) -> None:
                     for a in angles:
                         if _yield_requested:
                             break
-                        ease(p, cur_pan, cur_tilt, a, cur_tilt, 0.6)
+                        ease(p, cur_pan, cur_tilt, a, cur_tilt, 1.5)
                         cur_pan = a
-                        time.sleep(0.2)
-                    ease(p, cur_pan, cur_tilt, 0, 0, 0.8)
+                        time.sleep(0.3)
+                    ease(p, cur_pan, cur_tilt, 0, 0, 2.0)
                     cur_pan, cur_tilt = 0, 0
                     log("idle scan: sweep complete")
                     next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
@@ -553,7 +553,7 @@ def idle_loop(args) -> None:
                     if tilt_lo > tilt_hi:
                         tilt_lo, tilt_hi = tilt_hi, tilt_lo  # guard against inverted range
                     target_tilt = random.randint(tilt_lo, tilt_hi)
-                    duration    = random.uniform(0.8, 2.2)
+                    duration    = random.uniform(3.5, 7.0)
                     log(f"gaze drift: ({cur_pan},{cur_tilt}) → ({target_pan},{target_tilt}) over {duration:.1f}s")
                     ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt, duration)
                     cur_pan, cur_tilt = target_pan, target_tilt

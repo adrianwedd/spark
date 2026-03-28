@@ -3,6 +3,59 @@
   color: var(--dark-text);
 }
 
+/* ── Hero (home section) ──────────────────────────────────────── */
+
+#home h1 {
+  font-family: 'Courier Prime', 'Courier New', monospace;
+  font-size: clamp(2.5rem, 6vw, 4rem);
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  color: var(--dark-accent);
+  text-shadow: 0 0 60px var(--dark-glow);
+}
+
+/* ── Thought Carousel — dark overrides ───────────────────────── */
+
+[data-theme="dark"] .carousel-slide {
+  background: var(--dark-surface);
+  border: 1px solid var(--dark-border);
+  border-left: 3px solid var(--spark-accent, var(--dark-accent));
+  border-radius: var(--radius);
+  box-shadow: none;
+}
+
+/* Suppress warm bubble tails and their reserved space */
+[data-theme="dark"] .thought-carousel {
+  padding-bottom: 2.5rem;
+}
+
+[data-theme="dark"] .carousel-slide::before,
+[data-theme="dark"] .carousel-slide::after {
+  content: none;
+}
+
+[data-theme="dark"] .carousel-quote {
+  color: var(--dark-text);
+}
+
+[data-theme="dark"] .carousel-meta {
+  color: var(--dark-muted);
+}
+
+[data-theme="dark"] .carousel-dot {
+  background: var(--dark-border);
+}
+
+[data-theme="dark"] .carousel-dot.active {
+  background: var(--spark-accent, var(--dark-accent));
+  transform: scale(1.35);
+}
+
+[data-theme="dark"] .carousel-mood-badge {
+  background: var(--spark-accent, var(--dark-accent)); /* fallback: copper */
+}
+
 [data-theme="dark"] h2 {
   font-family: 'Courier Prime', 'Courier New', monospace;
   font-size: 1.5rem;
@@ -26,7 +79,7 @@
   background: var(--dark-code-bg);
   color: var(--dark-accent);
   padding: 1.5rem;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   font-size: 0.8rem;
   overflow-x: auto;
   line-height: 1.5;
@@ -39,7 +92,7 @@
 
 /* Code blocks (highlight.js) */
 [data-theme="dark"] pre code.hljs {
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   font-size: 0.8rem;
   overflow-x: auto;
   max-width: 100%;
@@ -83,9 +136,9 @@
 }
 
 [data-theme="dark"] .pulse-circle {
-  background: var(--dark-accent);
+  background: var(--spark-accent);
   color: var(--dark-bg);
-  box-shadow: 0 0 40px var(--dark-glow), 0 0 80px var(--dark-glow);
+  box-shadow: 0 0 40px var(--spark-glow), 0 0 80px var(--spark-glow);
 }
 
 [data-theme="dark"] .metric-tile {
@@ -103,7 +156,7 @@
   background: rgba(255,255,255,0.08);
 }
 
-[data-theme="dark"] .metric-bar { background: var(--dark-accent); }
+[data-theme="dark"] .metric-bar { background: var(--spark-accent); }
 
 [data-theme="dark"] .toggle-btn {
   border-color: var(--dark-border);
@@ -118,7 +171,7 @@
 [data-theme="dark"] .race-strip {
   background: rgba(255,255,255,0.03);
   border: 1px solid var(--dark-border);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
 }
 [data-theme="dark"] .time-period-badge { background: var(--dark-surface); border: 1px solid var(--dark-border); }
 [data-theme="dark"] .period-night { background: #2e2a34; color: var(--dark-accent); }

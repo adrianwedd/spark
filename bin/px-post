@@ -59,10 +59,29 @@ def pick_hashtags(thought: str = "", mood: str = "") -> str:
     return f"{w} {r}"
 
 
+# Full 13-mood palette — mirrors colors.css --mood-* vars exactly
 MOOD_COLORS = {
-    'peaceful': '#4a9d8f', 'content': '#6b8e5e', 'contemplative': '#7b6fa0',
-    'curious': '#c48a3f', 'active': '#d46b4a', 'excited': '#d44a6b',
+    'peaceful':      '#4a9d8f',
+    'content':       '#6b8e5e',
+    'contemplative': '#7b6fa0',
+    'bored':         '#8a8a8a',
+    'lonely':        '#5b7ba5',
+    'curious':       '#c48a3f',
+    'mischievous':   '#8da000',
+    'grumpy':        '#c44040',
+    'anxious':       '#d4883a',
+    'alert':         '#00b8d4',
+    'playful':       '#c74dbd',
+    'excited':       '#d44a6b',
+    'active':        '#d46b4a',
 }
+
+# Card design tokens — mirror site/css/base.css --dark-* vars
+_CARD_BG      = '#1a181c'
+_CARD_TEXT    = '#e2ddd8'
+_CARD_COPPER  = '#c48b6e'
+_CARD_MUTED   = '#968e96'
+_CARD_BORDER  = '#3d3844'
 
 THOUGHT_IMAGE_DIR = STATE_DIR / "thought-images"
 
@@ -85,14 +104,17 @@ def generate_thought_card(thought_text: str, mood: str, ts: str) -> 'Path | None
             return out_path
 
         W, H = 1080, 1080
-        img = Image.new('RGB', (W, H), '#fdf6ec')
+
+        # ── Dark background (single fill — faster than row-by-row gradient) ──
+        img = Image.new('RGB', (W, H), _CARD_BG)
         draw = ImageDraw.Draw(img)
 
-        # Warm gradient background
-        for y in range(H):
-            t = y / H
-            draw.line([(0, y), (W, y)],
-                       fill=(int(253 - t * 20), int(246 - t * 28), int(236 - t * 35)))
+        # Mood colour for this card
+        mood_str = (mood or 'content').lower()
+        mc = MOOD_COLORS.get(mood_str, _CARD_COPPER)
+
+        # Mood-coloured top stripe (6 px) — gives each card a unique identity
+        draw.rectangle([0, 0, W, 6], fill=mc)
 
         # Fonts with fallbacks
         def _font(path, size):
@@ -101,8 +123,8 @@ def generate_thought_card(thought_text: str, mood: str, ts: str) -> 'Path | None
             except OSError:
                 return ImageFont.load_default()
 
-        font_mood = _font('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 16)
-        font_url = _font('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 14)
+        font_mood = _font('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 18)
+        font_url  = _font('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 16)
 
         # Adaptive font size based on text length
         n = len(thought_text)
@@ -119,7 +141,7 @@ def generate_thought_card(thought_text: str, mood: str, ts: str) -> 'Path | None
 
         font_quote = _font('/usr/share/fonts/opentype/urw-base35/NimbusMonoPS-Italic.otf', font_sz)
         deco_sz = int(font_sz * 1.8)
-        font_deco = _font('/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', deco_sz)
+        font_deco       = _font('/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', deco_sz)
         font_deco_close = _font('/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf', int(deco_sz * 0.6))
 
         ix, iw = 100, W - 100
@@ -133,28 +155,28 @@ def generate_thought_card(thought_text: str, mood: str, ts: str) -> 'Path | None
             lines[-1] = lines[-1][:wrap_w - 3] + '...'
         line_h = int(font_sz * 1.4)
 
-        # Total block: open quote + text + close quote
-        open_h = int(deco_sz * 0.55)
-        text_h = len(lines) * line_h
+        # Total block height: open quote + text lines + close quote
+        open_h  = int(deco_sz * 0.55)
+        text_h  = len(lines) * line_h
         close_h = int(deco_sz * 0.35)
-        total = open_h + text_h + close_h
+        total   = open_h + text_h + close_h
 
         # Golden ratio vertical placement (0.38 from top)
-        badge_zone = 80
+        badge_zone = 100
         usable_top, usable_bottom = 60, H - 60 - badge_zone
-        usable = usable_bottom - usable_top
+        usable  = usable_bottom - usable_top
         block_y = usable_top + int((usable - total) * 0.38)
 
-        # Opening quote mark — accent coral
-        draw.text((ix - 15, block_y), chr(8220), fill='#e8875a', font=font_deco)
+        # Opening quote mark — copper accent
+        draw.text((ix - 15, block_y), chr(8220), fill=_CARD_COPPER, font=font_deco)
 
-        # Thought text
+        # Thought text — off-white on dark
         text_y = block_y + open_h
         for line in lines:
-            draw.text((ix + 10, text_y), line, fill='#2d2d2d', font=font_quote)
+            draw.text((ix + 10, text_y), line, fill=_CARD_TEXT, font=font_quote)
             text_y += line_h
 
-        # Closing quote mark — smaller, after last word
+        # Closing quote mark — copper, smaller, after last word
         try:
             lb = draw.textbbox((0, 0), lines[-1], font=font_quote)
             last_w = lb[2] - lb[0]
@@ -162,31 +184,29 @@ def generate_thought_card(thought_text: str, mood: str, ts: str) -> 'Path | None
             last_w = len(lines[-1]) * int(font_sz * 0.6)
         cx = min(ix + 10 + last_w + 8, iw - int(deco_sz * 0.4))
         cy = text_y - line_h + int(font_sz * 0.4)
-        draw.text((cx, cy), chr(8221), fill='#e8875a', font=font_deco_close)
+        draw.text((cx, cy), chr(8221), fill=_CARD_COPPER, font=font_deco_close)
 
-        # Bottom bar: mood badge left, green dot + URL right
-        bar_y = H - 75
-        mood_str = (mood or 'content').lower()
-        mc = MOOD_COLORS.get(mood_str, '#6b8e5e')
-        try:
-            mb = draw.textbbox((0, 0), mood_str, font=font_mood)
-            mtw = mb[2] - mb[0]
-        except AttributeError:
-            mtw = len(mood_str) * 9
-        draw.rounded_rectangle([ix, bar_y, ix + mtw + 40, bar_y + 30],
-                                radius=15, fill='#ffffff', outline='#e8e0d4')
-        draw.ellipse([ix + 10, bar_y + 9, ix + 20, bar_y + 19], fill=mc)
-        draw.text((ix + 27, bar_y + 6), mood_str, fill=mc, font=font_mood)
+        # ── Bottom bar ───────────────────────────────────────────────────────
+        bar_y   = H - 90
+        sep_y   = bar_y - 16
 
+        # Thin separator line
+        draw.line([(ix, sep_y), (iw, sep_y)], fill=_CARD_BORDER, width=1)
+
+        # Left: mood dot + mood name in mood colour, uppercase monospace
+        dot_r = 6
+        dot_cx, dot_cy = ix + dot_r, bar_y + 12
+        draw.ellipse([dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r], fill=mc)
+        draw.text((ix + dot_r * 2 + 8, bar_y + 2), mood_str.upper(), fill=mc, font=font_mood)
+
+        # Right: spark.wedd.au in copper
         url = 'spark.wedd.au'
         try:
-            ub = draw.textbbox((0, 0), url, font=font_url)
+            ub  = draw.textbbox((0, 0), url, font=font_url)
             utw = ub[2] - ub[0]
         except AttributeError:
-            utw = len(url) * 8
-        dx = iw - utw - 18
-        draw.ellipse([dx, bar_y + 9, dx + 10, bar_y + 19], fill='#4ade80')
-        draw.text((dx + 15, bar_y + 7), url, fill='#a89888', font=font_url)
+            utw = len(url) * 9
+        draw.text((iw - utw, bar_y + 4), url, fill=_CARD_COPPER, font=font_url)
 
         img.save(str(out_path), 'PNG', optimize=True)
         log(f"thought card generated: {out_path.name}")

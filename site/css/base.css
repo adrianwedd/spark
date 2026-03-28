@@ -2,25 +2,48 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
+  /* ── Warm theme (legacy — phasing out in phases 3-5) ─────────────────── */
   --warm-bg: #fdf6ec;
   --warm-accent: #e8875a;
   --warm-text: #2d2d2d;
   --warm-muted: #8a7060;
 
-  --dark-bg: #1a181c;
-  --dark-accent: #c48b6e;
-  --dark-accent-hover: #d49e82;
-  --dark-accent-muted: #9a6d52;
-  --dark-text: #e2ddd8;
-  --dark-muted: #968e96;
-  --dark-code-bg: #24212a;
-  --dark-border: #3d3844;
-  --dark-surface: #24212a;
-  --dark-glow: rgba(196, 139, 110, 0.08);
+  /* ── Dark theme — primary palette (matches adrianwedd.com) ───────────── */
+  --dark-bg:            #1a181c;  /* near-black charcoal, slight warm undertone */
+  --dark-surface:       #24212a;  /* elevated surface (cards, panels) */
+  --dark-surface-raised:#2d2a36;  /* double-elevated (nested cards, tooltips) */
+  --dark-border:        #3d3844;  /* standard border */
+  --dark-border-subtle: rgba(255, 255, 255, 0.04); /* very soft dividers */
+  --dark-bg-glow-overlay: rgba(26, 24, 28, 0.04); /* dark-bg at 4% — for section-divider gradient */
+  --dark-text:          #e2ddd8;  /* off-white body text */
+  --dark-muted:         #968e96;  /* secondary text, labels */
+  --dark-code-bg:       #24212a;
 
-  --nav-height: 56px;
-  --radius: 16px;
-  --transition: 0.2s ease;
+  /* ── Copper accent (primary interactive — adrianwedd.com signature) ───── */
+  --dark-accent:        #c48b6e;
+  --dark-accent-hover:  #d49e82;
+  --dark-accent-muted:  #9a6d52;
+  --dark-glow:          rgba(196, 139, 110, 0.08);
+
+  /* ── Supporting accents (adrianwedd.com secondary/tertiary) ──────────── */
+  --slate:              #6e8ec4;  /* slate blue — secondary, data/systems feel */
+  --slate-muted:        #4d6a9a;
+  --sage:               #8eaa7e;  /* sage green — tertiary, quiet/considered */
+  --sage-muted:         #6a8060;
+
+  /* ── Dynamic mood accent — JS sets this to current --mood-* value ──────
+     All "active accent" elements reference --spark-accent, not --dark-accent
+     directly, so the whole UI shifts with SPARK's mood in real time.       */
+  --spark-accent:       var(--dark-accent);
+  --spark-glow:         var(--dark-glow);
+  --chat-bubble-color:  var(--dark-accent); /* chat panel accent — dark theme default; JS overrides per mood */
+
+  /* ── Layout & motion ─────────────────────────────────────────────────── */
+  --nav-height:   56px;
+  --radius-sm:     8px;
+  --radius:       12px;
+  --radius-lg:    20px;
+  --transition:   0.2s ease;
 }
 
 html { scroll-behavior: smooth; }
@@ -28,6 +51,8 @@ body {
   font-family: system-ui, -apple-system, sans-serif;
   line-height: 1.6;
   overflow-x: hidden;
+  background: var(--dark-bg);
+  color: var(--dark-text);
 }
 
 /* ── Nav ── */
@@ -151,7 +176,11 @@ section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); min-height:
 }
 
 /* ── Accessibility ── */
-:focus-visible { outline: 2px solid #c75a2a; outline-offset: 2px; }
+/* Default: copper (dark bg). Warm sections override with warm-accent to ensure
+   sufficient contrast on light backgrounds — some mood colors (#8a8a8a bored)
+   fail WCAG 1.4.11 Non-text Contrast 3:1 minimum against white cards. */
+:focus-visible { outline: 2px solid var(--spark-accent); outline-offset: 2px; }
+[data-theme="warm"] :focus-visible { outline-color: var(--dark-accent-muted); } /* #9a6d52 — ~4.3:1 on cream, passes WCAG 1.4.11 */
 
 /* ── Utility ── */
 .container { max-width: 900px; margin: 0 auto; padding: 0 1rem; overflow-x: hidden; }
@@ -206,7 +235,7 @@ section:first-of-type { padding-top: calc(var(--nav-height) + 5rem); min-height:
   left: 0;
   right: 0;
   height: 40px;
-  background: linear-gradient(to bottom, transparent, rgba(26, 24, 28, 0.04));
+  background: linear-gradient(to bottom, transparent, var(--dark-bg-glow-overlay));
   pointer-events: none;
 }
 

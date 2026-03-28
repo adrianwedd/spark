@@ -1,6 +1,7 @@
 [data-theme="warm"] {
   background: var(--warm-bg);
   color: var(--warm-text);
+  --radius: 16px; /* preserve warm card rounding — base.css reduced --radius to 12px for dark theme */
 }
 
 [data-theme="warm"] h1,
@@ -825,7 +826,7 @@ details > *:not(summary) { margin-top: 0.75rem; }
 .carousel-mood-badge[data-mood="excited"]       { background: var(--mood-excited); }
 .carousel-mood-badge[data-mood="alert"]         { background: var(--mood-alert); }
 .carousel-mood-badge[data-mood="playful"]       { background: var(--mood-playful); }
-.carousel-mood-badge[data-mood="mischievous"]   { background: var(--mood-mischievous); }
+.carousel-mood-badge[data-mood="mischievous"]   { background: var(--mood-mischievous); color: #1a181c; } /* dark text — #8da000 on white is only 2.9:1 */
 .carousel-mood-badge[data-mood="bored"]         { background: var(--mood-bored); }
 .carousel-mood-badge[data-mood="lonely"]        { background: var(--mood-lonely); }
 .carousel-mood-badge[data-mood="grumpy"]        { background: var(--mood-grumpy); }

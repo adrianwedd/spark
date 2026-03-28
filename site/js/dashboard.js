@@ -38,6 +38,26 @@ window.SparkDashboard = (function () {
       if (word) word.textContent = state.mood || '—';
     }
 
+    // Update --spark-accent and --spark-glow so all CSS accent references shift with mood
+    const root = document.documentElement;
+    if (moodColor && moodColor !== '#888') {
+      root.style.setProperty('--spark-accent', moodColor);
+      // Derive glow only from 6-char hex — named colors and 3-char shorthands would
+      // produce NaN channels and an invalid rgba() value that browsers silently ignore.
+      if (/^#[0-9a-fA-F]{6}$/.test(moodColor)) {
+        const r = parseInt(moodColor.slice(1,3),16);
+        const g = parseInt(moodColor.slice(3,5),16);
+        const b = parseInt(moodColor.slice(5,7),16);
+        root.style.setProperty('--spark-glow', `rgba(${r},${g},${b},0.10)`);
+      } else {
+        root.style.setProperty('--spark-glow', 'var(--dark-glow)');
+      }
+    } else {
+      // Offline / unknown mood: remove inline overrides, CSS fallback restores copper.
+      root.style.removeProperty('--spark-accent');
+      root.style.removeProperty('--spark-glow');
+    }
+
     _drawFavicon(moodColor);
 
     // State card — obi-mode badge

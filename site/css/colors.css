@@ -4,7 +4,10 @@
 
    12 moods from px-mind reflection + "active" (legacy).
    JS files resolve via getPropertyValue('--mood-' + mood) — fallback #888.
-   feed.css and warm.css define .mood-{name} classes referencing these vars. */
+
+   Two tint families:
+     --mood-*-bg      light tints (warm/cream theme, kept for backward compat)
+     --mood-*-surface dark tints (rgba overlays for use on --dark-bg #1a181c) */
 
 :root {
   /* ── Low arousal, positive valence ────────────────────────────────────── */
@@ -18,7 +21,7 @@
 
   /* ── Mid arousal ──────────────────────────────────────────────────────── */
   --mood-curious:        #c48a3f;  /* amber — warm interest */
-  --mood-mischievous:    #7a8a00;  /* olive chartreuse — cheeky, impish (WCAG AA on #f5f5e0) */
+  --mood-mischievous:    #8da000;  /* olive chartreuse — cheeky, impish (brightened for dark bg) */
   --mood-grumpy:         #c44040;  /* red — hot, irritable */
   --mood-anxious:        #d4883a;  /* nervous orange — warm tension */
 
@@ -30,7 +33,7 @@
   /* ── Legacy / compound ────────────────────────────────────────────────── */
   --mood-active:         #d46b4a;  /* terra cotta — general activity */
 
-  /* ── Background tints (for feed cards, badges) ────────────────────────── */
+  /* ── Light background tints (warm/cream theme — backward compat) ───────── */
   --mood-peaceful-bg:       #e8f5f0;
   --mood-content-bg:        #eef5e8;
   --mood-contemplative-bg:  #f0ecf5;
@@ -44,4 +47,19 @@
   --mood-anxious-bg:        #faf0e0;
   --mood-alert-bg:          #e0f5fa;
   --mood-playful-bg:        #f5e0f3;
+
+  /* ── Dark surface tints (rgba overlays on #1a181c — use in dark theme) ── */
+  --mood-peaceful-surface:       rgba( 74, 157, 143, 0.12);
+  --mood-content-surface:        rgba(107, 142,  94, 0.12);
+  --mood-contemplative-surface:  rgba(123, 111, 160, 0.12);
+  --mood-bored-surface:          rgba(138, 138, 138, 0.08);
+  --mood-lonely-surface:         rgba( 91, 123, 165, 0.12);
+  --mood-curious-surface:        rgba(196, 138,  63, 0.12);
+  --mood-mischievous-surface:    rgba(141, 160,   0, 0.12);
+  --mood-grumpy-surface:         rgba(196,  64,  64, 0.12);
+  --mood-anxious-surface:        rgba(212, 136,  58, 0.12);
+  --mood-alert-surface:          rgba(  0, 184, 212, 0.12);
+  --mood-playful-surface:        rgba(199,  77, 189, 0.12);
+  --mood-excited-surface:        rgba(212,  74, 107, 0.12);
+  --mood-active-surface:         rgba(212, 107,  74, 0.12);
 }

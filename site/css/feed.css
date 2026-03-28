@@ -1,8 +1,6 @@
-/* Feed + Thought permalink pages — warm theme */
+/* Feed + Thought permalink pages — dark theme */
 
 body {
-  background: var(--warm-bg);
-  color: var(--warm-text);
   min-height: 100vh;
   display: flex;
   flex-direction: column;
@@ -30,14 +28,17 @@ body {
 }
 
 .feed-header h1 {
-  font-family: 'Playfair Display', serif;
-  font-size: clamp(2rem, 5vw, 3rem);
+  font-family: 'Courier Prime', 'Courier New', monospace;
+  font-size: clamp(1.6rem, 5vw, 2.25rem);
+  font-weight: 700;
   margin: 0 0 0.5rem;
+  color: var(--dark-accent);
+  letter-spacing: -0.02em;
 }
 
 .feed-subtitle {
-  color: var(--warm-muted);
-  font-size: 1rem;
+  color: var(--dark-muted);
+  font-size: 0.95rem;
   line-height: 1.5;
   margin: 0;
 }
@@ -47,69 +48,39 @@ body {
 .feed-list {
   display: flex;
   flex-direction: column;
-  gap: 2rem;
+  gap: 1rem;
 }
 
-/* ── Thought bubble (feed cards + individual page) ── */
+/* ── Thought card (feed + individual page) ── */
 
 .feed-card,
 .thought-bubble {
   position: relative;
-  background: #fff;
-  border-radius: 32px;
-  padding: 1.75rem 2rem 1.5rem;
-  box-shadow:
-    0 4px 24px rgba(0,0,0,0.07),
-    0 1px 6px rgba(0,0,0,0.04);
+  background: var(--dark-surface);
+  border: 1px solid var(--dark-border);
+  border-left: 3px solid var(--spark-accent, var(--dark-accent));
+  border-radius: var(--radius);
+  padding: 1.5rem 1.75rem;
   text-decoration: none;
   color: inherit;
   display: block;
-  transition: box-shadow var(--transition), transform var(--transition);
-  margin-bottom: 1rem;
-}
-
-/* Bubble tail — two stacked circles, classic thought bubble */
-.feed-card::before,
-.feed-card::after,
-.thought-bubble::before,
-.thought-bubble::after {
-  content: '';
-  position: absolute;
-  background: #fff;
-  border-radius: 50%;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-}
-
-/* Larger circle */
-.feed-card::before,
-.thought-bubble::before {
-  width: 18px;
-  height: 18px;
-  bottom: -24px;
-  left: 32px;
-}
-
-/* Smaller circle */
-.feed-card::after,
-.thought-bubble::after {
-  width: 10px;
-  height: 10px;
-  bottom: -38px;
-  left: 24px;
+  transition: border-color var(--transition), box-shadow var(--transition), transform var(--transition);
+  margin-bottom: 0;
 }
 
 .feed-card:hover {
-  box-shadow: 0 6px 28px rgba(232, 135, 90, 0.1);
-  transform: translateY(-2px);
+  border-left-color: var(--dark-accent-hover);
+  box-shadow: 0 4px 20px var(--dark-glow);
+  transform: translateY(-1px);
 }
 
 .feed-card-quote {
   font-family: 'Courier Prime', monospace;
   font-style: italic;
-  font-size: clamp(1rem, 2.5vw, 1.25rem);
-  line-height: 1.6;
+  font-size: clamp(0.95rem, 2.5vw, 1.15rem);
+  line-height: 1.65;
   margin: 0 0 1rem;
-  color: var(--warm-text);
+  color: var(--dark-text);
 }
 
 .feed-card-meta {
@@ -117,7 +88,7 @@ body {
   align-items: center;
   gap: 0.75rem;
   font-size: 0.8rem;
-  color: var(--warm-muted);
+  color: var(--dark-muted);
 }
 
 /* ── Mood badge ─────────────────────────────────── */
@@ -142,34 +113,35 @@ body {
   background: currentColor;
 }
 
-.mood-peaceful      { color: var(--mood-peaceful); background: var(--mood-peaceful-bg); }
-.mood-content       { color: var(--mood-content); background: var(--mood-content-bg); }
-.mood-contemplative { color: var(--mood-contemplative); background: var(--mood-contemplative-bg); }
-.mood-curious       { color: var(--mood-curious); background: var(--mood-curious-bg); }
-.mood-active        { color: var(--mood-active); background: var(--mood-active-bg); }
-.mood-excited       { color: var(--mood-excited); background: var(--mood-excited-bg); }
-.mood-alert         { color: var(--mood-alert); background: var(--mood-alert-bg); }
-.mood-playful       { color: var(--mood-playful); background: var(--mood-playful-bg); }
-.mood-mischievous   { color: var(--mood-mischievous); background: var(--mood-mischievous-bg); }
-.mood-bored         { color: var(--mood-bored); background: var(--mood-bored-bg); }
-.mood-lonely        { color: var(--mood-lonely); background: var(--mood-lonely-bg); }
-.mood-grumpy        { color: var(--mood-grumpy); background: var(--mood-grumpy-bg); }
-.mood-anxious       { color: var(--mood-anxious); background: var(--mood-anxious-bg); }
+.mood-peaceful      { color: var(--mood-peaceful);      background: var(--mood-peaceful-surface); }
+.mood-content       { color: var(--mood-content);       background: var(--mood-content-surface); }
+.mood-contemplative { color: var(--mood-contemplative); background: var(--mood-contemplative-surface); }
+.mood-curious       { color: var(--mood-curious);       background: var(--mood-curious-surface); }
+.mood-active        { color: var(--mood-active);        background: var(--mood-active-surface); }
+.mood-excited       { color: var(--mood-excited);       background: var(--mood-excited-surface); }
+.mood-alert         { color: var(--mood-alert);         background: var(--mood-alert-surface); }
+.mood-playful       { color: var(--mood-playful);       background: var(--mood-playful-surface); }
+.mood-mischievous   { color: var(--mood-mischievous);   background: var(--mood-mischievous-surface); }
+.mood-bored         { color: var(--mood-bored);         background: var(--mood-bored-surface); }
+.mood-lonely        { color: var(--mood-lonely);        background: var(--mood-lonely-surface); }
+.mood-grumpy        { color: var(--mood-grumpy);        background: var(--mood-grumpy-surface); }
+.mood-anxious       { color: var(--mood-anxious);       background: var(--mood-anxious-surface); }
 
 /* ── Full thought page ──────────────────────────── */
 
 .thought-bubble {
-  padding: 2.5rem 2.25rem;
+  padding: 2rem 2.25rem;
   margin-bottom: 3rem;
+  border-left-width: 4px;
 }
 
 .thought-quote-full {
   font-family: 'Courier Prime', monospace;
   font-style: italic;
-  font-size: clamp(1.15rem, 3vw, 1.7rem);
-  line-height: 1.65;
+  font-size: clamp(1.1rem, 3vw, 1.55rem);
+  line-height: 1.7;
   margin: 0 0 1.5rem;
-  color: var(--warm-text);
+  color: var(--dark-text);
 }
 
 .thought-meta-full {
@@ -177,7 +149,7 @@ body {
   align-items: center;
   gap: 0.75rem;
   font-size: 0.85rem;
-  color: var(--warm-muted);
+  color: var(--dark-muted);
 }
 
 /* ── Breadcrumb (thought page) ──────────────────── */
@@ -185,15 +157,16 @@ body {
 .breadcrumb {
   margin-bottom: 1.5rem;
   font-size: 0.85rem;
-  color: var(--warm-muted);
+  color: var(--dark-muted);
 }
 
 .breadcrumb a {
-  color: var(--warm-accent);
+  color: var(--dark-accent);
   text-decoration: none;
 }
 
 .breadcrumb a:hover {
+  color: var(--dark-accent-hover);
   text-decoration: underline;
 }
 
@@ -208,7 +181,7 @@ body {
 .feed-empty {
   text-align: center;
   padding: 3rem 1rem;
-  color: var(--warm-muted);
+  color: var(--dark-muted);
   font-size: 1rem;
 }
 
@@ -222,8 +195,8 @@ body {
   padding: 2.5rem 0;
   text-align: center;
   font-size: 0.85rem;
-  color: var(--warm-muted);
-  border-top: 1px solid rgba(0,0,0,0.06);
+  color: var(--dark-muted);
+  border-top: 1px solid var(--dark-border);
 }
 
 .footer-links {
@@ -235,12 +208,13 @@ body {
 }
 
 .footer-links a {
-  color: var(--warm-accent);
+  color: var(--dark-accent);
   text-decoration: none;
   font-weight: 500;
 }
 
 .footer-links a:hover {
+  color: var(--dark-accent-hover);
   text-decoration: underline;
 }
 
@@ -248,50 +222,29 @@ body {
   margin: 0;
 }
 
-
 /* ── Responsive ─────────────────────────────────── */
 
 @media (max-width: 600px) {
   .thought-bubble {
-    padding: 1.75rem 1.25rem;
-    border-radius: 24px;
+    padding: 1.5rem 1.25rem;
     margin-bottom: 2.5rem;
   }
 
   .feed-card {
-    padding: 1.25rem 1rem;
-    border-radius: 24px;
+    padding: 1.1rem 1.1rem;
   }
-
-  /* Smaller bubble tails on mobile */
-  .feed-card::before,
-  .thought-bubble::before {
-    width: 14px;
-    height: 14px;
-    bottom: -20px;
-    left: 24px;
-  }
-
-  .feed-card::after,
-  .thought-bubble::after {
-    width: 8px;
-    height: 8px;
-    bottom: -32px;
-    left: 18px;
-  }
-
 }
 
 /* Date grouping labels */
 .feed-date-label {
   font-family: 'Courier Prime', monospace;
-  font-size: 0.8rem;
-  color: var(--warm-muted, #8a7060);
+  font-size: 0.75rem;
+  color: var(--dark-muted);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.08em;
   padding: 1.5rem 0 0.5rem;
   margin-top: 0.5rem;
-  border-bottom: 1px solid rgba(0,0,0,0.06);
+  border-bottom: 1px solid var(--dark-border-subtle, rgba(255,255,255,0.04));
 }
 .feed-date-label:first-child {
   padding-top: 0;
@@ -300,11 +253,12 @@ body {
 
 /* Blog card title */
 .blog-card-title {
-  font-family: 'Playfair Display', Georgia, serif;
-  font-size: 1.1rem;
-  font-weight: 600;
+  font-family: 'Courier Prime', monospace;
+  font-size: 1.05rem;
+  font-weight: 700;
   margin-bottom: 0.5rem;
-  color: var(--warm-text, #2d2d2d);
+  color: var(--dark-text);
+  letter-spacing: -0.01em;
 }
 
 /* Blog type badge */
@@ -317,25 +271,28 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  background: var(--warm-bg, #fdf6ec);
-  color: var(--warm-muted, #8a7060);
-  border: 1px solid rgba(0,0,0,0.08);
+  background: var(--dark-surface-raised, #2d2a36);
+  color: var(--dark-muted);
+  border: 1px solid var(--dark-border);
 }
-.blog-type-daily { border-color: var(--mood-content); color: var(--mood-content); }
-.blog-type-weekly { border-color: var(--mood-curious); color: var(--mood-curious); }
+.blog-type-daily   { border-color: var(--mood-content);       color: var(--mood-content); }
+.blog-type-weekly  { border-color: var(--mood-curious);       color: var(--mood-curious); }
 .blog-type-monthly { border-color: var(--mood-contemplative); color: var(--mood-contemplative); }
-.blog-type-yearly { border-color: var(--mood-excited); color: var(--mood-excited); }
-.blog-type-essay { border-color: var(--mood-playful); color: var(--mood-playful); }
+.blog-type-yearly  { border-color: var(--mood-excited);       color: var(--mood-excited); }
+.blog-type-essay   { border-color: var(--mood-playful);       color: var(--mood-playful); }
 
 /* Blog single-post view */
 .blog-back-link {
   display: inline-block;
-  color: var(--warm-accent, #e8875a);
+  color: var(--dark-accent);
   text-decoration: none;
   font-size: 0.85rem;
   margin-bottom: 1.5rem;
 }
-.blog-back-link:hover { text-decoration: underline; }
+.blog-back-link:hover {
+  color: var(--dark-accent-hover);
+  text-decoration: underline;
+}
 
 .blog-post-full {
   max-width: 680px;
@@ -343,38 +300,52 @@ body {
 }
 
 .blog-post-title {
-  font-family: 'Playfair Display', Georgia, serif;
-  font-size: clamp(1.5rem, 4vw, 2.25rem);
+  font-family: 'Courier Prime', monospace;
+  font-size: clamp(1.4rem, 4vw, 2rem);
+  font-weight: 700;
   line-height: 1.2;
   margin-bottom: 1rem;
-  color: var(--warm-text, #2d2d2d);
+  color: var(--dark-accent);
+  letter-spacing: -0.02em;
 }
 
 .blog-post-body {
   font-family: 'Courier Prime', monospace;
   font-size: 1rem;
-  line-height: 1.7;
-  color: var(--warm-text, #2d2d2d);
+  line-height: 1.75;
+  color: var(--dark-text);
 }
 .blog-post-body p {
   margin-bottom: 1rem;
+}
+
+/* Offline / cache banner */
+.feed-offline-banner {
+  background: var(--dark-surface);
+  color: var(--dark-muted);
+  text-align: center;
+  padding: 8px 16px;
+  font-size: 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--dark-border);
+  margin-bottom: 16px;
 }
 
 /* Load more button */
 .feed-load-more-btn {
   display: block;
   margin: 2rem auto;
-  padding: 0.75rem 2rem;
+  padding: 0.65rem 2rem;
   background: transparent;
-  color: var(--warm-text, #5a4a3a);
-  border: 1px solid var(--warm-muted, #c4b5a0);
-  border-radius: 24px;
+  color: var(--dark-muted);
+  border: 1px solid var(--dark-border);
+  border-radius: var(--radius-sm);
   font-family: 'Courier Prime', monospace;
-  font-size: 0.9rem;
+  font-size: 0.875rem;
   cursor: pointer;
-  transition: border-color 0.2s, color 0.2s;
+  transition: border-color var(--transition), color var(--transition);
 }
 .feed-load-more-btn:hover {
-  border-color: var(--warm-accent, #e8875a);
-  color: var(--warm-accent, #e8875a);
+  border-color: var(--dark-accent);
+  color: var(--dark-accent);
 }

@@ -105,7 +105,7 @@
     if (existing) return;
     var banner = document.createElement('div');
     banner.id = 'thought-offline-banner';
-    banner.style.cssText = 'background:#1e293b;color:#94a3b8;text-align:center;padding:8px 16px;font-size:0.85rem;border-radius:8px;margin-bottom:16px;';
+    banner.className = 'feed-offline-banner';
     banner.textContent = 'Showing snapshot data — SPARK\'s Pi is currently offline.';
     var card = document.getElementById('thought-card');
     card.parentNode.insertBefore(banner, card);
