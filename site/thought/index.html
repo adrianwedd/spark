@@ -52,7 +52,7 @@
 <div class="nav-backdrop" id="nav-backdrop"></div>
 
 <main class="thought-page">
-  <div class="container">
+  <div class="container-narrow">
 
     <nav class="breadcrumb" aria-label="Breadcrumb">
       <a href="/">SPARK</a> <span class="breadcrumb-sep" aria-hidden="true">/</span>
@@ -60,18 +60,29 @@
       <span>This thought</span>
     </nav>
 
-    <article id="thought-card" class="thought-bubble" hidden>
-      <blockquote id="thought-text" class="thought-quote-full"></blockquote>
-      <div class="thought-meta-full">
+    <article id="thought-card" class="thought-centrepiece" hidden>
+      <blockquote id="thought-text" class="thought-centrepiece-quote"></blockquote>
+      <hr class="thought-mood-rule">
+      <div class="thought-centrepiece-meta">
         <span id="thought-mood" class="mood-badge"></span>
         <time id="thought-time"></time>
       </div>
     </article>
 
+    <nav id="thought-nav" class="thought-prev-next" hidden>
+      <a id="thought-prev" href="#" class="thought-nav-link">&larr; Earlier thought</a>
+      <a id="thought-next" href="#" class="thought-nav-link">Later thought &rarr;</a>
+    </nav>
+
+    <div id="thought-share" class="thought-share" hidden>
+      <a id="thought-share-bsky" href="#" target="_blank" rel="noopener noreferrer" class="thought-share-link">Share on Bluesky</a>
+      <button id="thought-copy-link" class="thought-share-link">Copy link</button>
+    </div>
+
     <div id="thought-loading" class="feed-loading">Loading thought...</div>
 
     <div id="thought-not-found" class="feed-empty" hidden>
-      <p>This thought wasn't found. It may have scrolled off the feed.</p>
+      <p>This thought has drifted off the feed.</p>
       <p><a href="/feed/">Browse all thoughts</a></p>
     </div>
 

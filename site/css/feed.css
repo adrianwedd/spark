@@ -140,30 +140,78 @@ body {
 .mood-grumpy        { color: var(--mood-grumpy);        background: var(--mood-grumpy-surface); }
 .mood-anxious       { color: var(--mood-anxious);       background: var(--mood-anxious-surface); }
 
-/* ── Full thought page ──────────────────────────── */
+/* ── Thought centrepiece (permalink page) ──────────────── */
 
-.thought-bubble {
-  padding: 2rem 2.25rem;
-  margin-bottom: 3rem;
-  border-top-width: 4px;
+.thought-centrepiece {
+  text-align: center;
+  padding: 4rem 0;
+  max-width: 600px;
+  margin: 0 auto;
 }
 
-.thought-quote-full {
+.thought-centrepiece-quote {
   font-family: 'Courier Prime', monospace;
   font-style: italic;
-  font-size: clamp(1.1rem, 3vw, 1.55rem);
+  font-size: clamp(1.25rem, 3vw, 1.75rem);
   line-height: 1.7;
-  margin: 0 0 1.5rem;
   color: var(--dark-text);
+  margin: 0 0 2rem;
+  text-indent: -0.4em;
+  padding-left: 0.4em;
 }
 
-.thought-meta-full {
+.thought-mood-rule {
+  border: none;
+  border-top: 2px solid var(--dark-accent);
+  max-width: 120px;
+  margin: 0 auto 1.5rem;
+}
+
+.thought-centrepiece-meta {
   display: flex;
+  justify-content: center;
   align-items: center;
   gap: 0.75rem;
-  font-size: 0.85rem;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: var(--text-small);
+  font-weight: 500;
   color: var(--dark-muted);
 }
+
+.thought-prev-next {
+  display: flex;
+  justify-content: space-between;
+  padding: 1rem 0;
+  border-top: 1px solid var(--dark-border-subtle, rgba(255,255,255,0.04));
+}
+
+.thought-nav-link {
+  color: var(--dark-accent);
+  text-decoration: none;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: var(--text-small);
+  font-weight: 500;
+}
+.thought-nav-link:hover { color: var(--dark-accent-hover); text-decoration: underline; }
+
+.thought-share {
+  display: flex;
+  justify-content: center;
+  gap: 1.5rem;
+  padding: 1rem 0;
+  font-size: var(--text-xs);
+}
+
+.thought-share-link {
+  color: var(--dark-muted);
+  text-decoration: none;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: inherit;
+}
+.thought-share-link:hover { color: var(--dark-accent); }
 
 /* ── Breadcrumb (thought page) ──────────────────── */
 
@@ -238,11 +286,6 @@ body {
 /* ── Responsive ─────────────────────────────────── */
 
 @media (max-width: 600px) {
-  .thought-bubble {
-    padding: 1.5rem 1.25rem;
-    margin-bottom: 2.5rem;
-  }
-
   .feed-card {
     padding: 1.1rem 1.1rem;
   }
