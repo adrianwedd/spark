@@ -3153,8 +3153,15 @@ def main(argv) -> int:
     except (FileNotFoundError, ValueError, OSError):
         pass
     if _existing_pid and _existing_pid != os.getpid() and os.path.isdir(f"/proc/{_existing_pid}"):
-        log(f"another px-mind (pid={_existing_pid}) already running — exiting")
-        return 0
+        try:
+            _cmdline = Path(f"/proc/{_existing_pid}/cmdline").read_bytes().decode(errors="replace")
+        except OSError:
+            _cmdline = ""
+        if "px-mind" in _cmdline:
+            log(f"another px-mind (pid={_existing_pid}) already running — exiting")
+            return 0
+        else:
+            log(f"pid {_existing_pid} alive but not px-mind (recycled PID) — taking over")
     PID_FILE.write_text(str(os.getpid()))
     log(f"starting pid={os.getpid()} dry={args.dry_run} model={MODEL}")
 

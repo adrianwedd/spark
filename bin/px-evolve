@@ -449,8 +449,16 @@ def main(argv: list[str]) -> int:
         if pid_file.exists():
             old_pid = int(pid_file.read_text().strip())
             if old_pid != my_pid and Path(f"/proc/{old_pid}").exists():
-                log(f"another px-evolve instance is running (pid={old_pid})")
-                return 1
+                try:
+                    cmdline = Path(f"/proc/{old_pid}/cmdline").read_bytes().decode(errors="replace")
+                except OSError:
+                    cmdline = ""
+                if "px-evolve" in cmdline:
+                    log(f"another px-evolve instance is running (pid={old_pid})")
+                    return 1
+                else:
+                    log(f"pid {old_pid} alive but not px-evolve (recycled PID) — taking over")
+                    pid_file.unlink(missing_ok=True)
             else:
                 log(f"stale pid file removed (pid={old_pid})")
                 pid_file.unlink(missing_ok=True)

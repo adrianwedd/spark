@@ -300,6 +300,7 @@ def _save_exploration_meta(meta: dict) -> bool:
         fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             json.dump(meta, f, indent=2)
+        os.chmod(tmp, 0o644)
         os.replace(tmp, str(path))
         return True
     except Exception as exc:
@@ -358,6 +359,7 @@ def _flush_nav_entries(entries: list[dict], explore_id: str) -> None:
             try:
                 with os.fdopen(fd, "w") as f:
                     f.write("\n".join(existing) + "\n")
+                os.chmod(tmp, 0o644)
                 os.replace(tmp, str(path))
             except Exception:
                 try:
@@ -381,6 +383,10 @@ def _write_observation(entry: dict) -> None:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
+            try:
+                os.chmod(str(path), 0o644)
+            except OSError:
+                pass
     except Exception as exc:
         log(f"write_observation error: {exc}")
 
