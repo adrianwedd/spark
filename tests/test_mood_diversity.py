@@ -30,3 +30,29 @@ def test_angles_cover_all_moods():
         mood_counts[mood] = mood_counts.get(mood, 0) + 1
     for m in VALID_MOODS:
         assert mood_counts.get(m, 0) >= 2, f"Mood '{m}' has < 2 angles"
+
+
+def test_mood_fallback_is_random_not_content():
+    """Invalid/missing mood should pick randomly, not default to content."""
+    from pxh.mind import VALID_MOODS
+    from pxh.spark_config import _SYS_RNG
+    results = set()
+    for _ in range(100):
+        parsed_mood = "INVALID_MOOD"
+        if parsed_mood not in VALID_MOODS:
+            mood = _SYS_RNG.choice(sorted(VALID_MOODS))
+        results.add(mood)
+    assert len(results) >= 4, f"Fallback only produced {results}"
+
+
+def test_mood_alpha_increased():
+    """MOOD_ALPHA should be >= 0.5 (new mood gets majority weight)."""
+    from pxh.mind import MOOD_ALPHA
+    assert MOOD_ALPHA >= 0.5, f"MOOD_ALPHA={MOOD_ALPHA} is too sticky"
+
+
+def test_reflection_suffix_discourages_default_moods():
+    """Prompt suffix warns against defaulting to contemplative/content."""
+    from pxh.spark_config import _SPARK_REFLECTION_SUFFIX
+    assert "contemplative" in _SPARK_REFLECTION_SUFFIX.lower()
+    assert "default" in _SPARK_REFLECTION_SUFFIX.lower() or "habit" in _SPARK_REFLECTION_SUFFIX.lower()

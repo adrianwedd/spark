@@ -294,6 +294,7 @@ Rules:
 - "compose" — write a creative journal entry, letter, or observation.
 - "self_debug" — diagnose why your reflection layer is failing (only when errors persist).
 - "blog_essay" — write a blog post about something you find genuinely fascinating.
+- Your mood MUST match the emotional tone of the angle you chose. Do NOT default to "contemplative" or "content" out of habit — if the angle is about boredom, be bored; if it's about mischief, be mischievous.
 
 Output ONLY this JSON:
 {

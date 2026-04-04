@@ -391,7 +391,7 @@ MOOD_COORDS: dict[str, tuple[float, float]] = {
     "grumpy":       (-0.5,  0.4),
     "anxious":      (-0.3,  0.7),
 }
-MOOD_ALPHA = 0.3  # weight of new mood (0.7 = inertia from previous)
+MOOD_ALPHA = 0.55  # weight of new mood (0.45 = inertia from previous)
 
 # ── Time-of-day context for reflection ─────────────────────────────
 TIME_PERIOD_CONTEXT = {
@@ -2370,9 +2370,12 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     t0 = time.monotonic()
     if persona == "spark":
         angles = _pick_spark_angles()
-        formatted = "\n".join(f"- {a}" for a in angles)
+        formatted = "\n".join(f"- {text}" for text, _mood in angles)
+        target_mood = angles[0][1]
+        mood_hint = f"\n\nSuggested mood for this reflection: **{target_mood}**. You may choose a different mood if the thought genuinely leads elsewhere, but don't default to contemplative/content out of habit."
         system_prompt = (_SPARK_REFLECTION_PREFIX + formatted
-                         + _SPARK_REFLECTION_SUFFIX + _daytime_action_hint())
+                         + _SPARK_REFLECTION_SUFFIX + mood_hint
+                         + _daytime_action_hint())
     else:
         system_prompt = PERSONA_REFLECTION_SYSTEMS.get(persona, REFLECTION_SYSTEM)
 
@@ -2431,7 +2434,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     thought = {
         "ts": utc_timestamp(),
         "thought": str(parsed.get("thought", "")),
-        "mood": parsed.get("mood", "content") if parsed.get("mood") in VALID_MOODS else "content",
+        "mood": parsed.get("mood") if parsed.get("mood") in VALID_MOODS else _SYS_RNG.choice(sorted(VALID_MOODS)),
         "action": parsed.get("action", "wait") if parsed.get("action") in VALID_ACTIONS else "comment",
         "salience": max(0.0, min(1.0, float(parsed.get("salience", 0.5)))),
     }
