@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# bin/px-race-check — Pre-race hardware validation
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+DRY=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY=1 ;;
+    esac
+done
+
+exec /usr/bin/python3 - "$DRY" <<'PYEOF'
+import sys, json, os, pathlib
+
+dry = sys.argv[1] == "1"
+state_dir = pathlib.Path(os.environ.get("PX_STATE_DIR", "state"))
+
+checks = {}
+
+# 1. Calibration file exists and has surface refs
+cal_file = state_dir / "race_calibration.json"
+if cal_file.exists():
+    try:
+        cal = json.loads(cal_file.read_text())
+        if cal.get("track_ref") and cal.get("barrier_ref"):
+            checks["calibration"] = "ok"
+        else:
+            checks["calibration"] = "incomplete"
+    except Exception:
+        checks["calibration"] = "corrupt"
+else:
+    checks["calibration"] = "missing"
+
+# 2. Track profile exists
+track_file = state_dir / "race_track.json"
+if track_file.exists():
+    try:
+        profile = json.loads(track_file.read_text())
+        segs = profile.get("segments", [])
+        checks["profile"] = f"ok ({len(segs)} segments)" if segs else "empty"
+    except Exception:
+        checks["profile"] = "corrupt"
+else:
+    checks["profile"] = "missing"
+
+# 3. Battery check
+batt_file = state_dir / "battery.json"
+if batt_file.exists():
+    try:
+        batt = json.loads(batt_file.read_text())
+        pct = batt.get("battery_pct", 0)
+        checks["battery"] = f"ok ({pct}%)" if pct > 30 else f"low ({pct}%)"
+    except Exception:
+        checks["battery"] = "unknown"
+else:
+    checks["battery"] = "unknown"
+
+# 4. I2C bus (skip in dry mode)
+if dry:
+    checks["i2c"] = "skipped (dry)"
+else:
+    try:
+        import smbus2
+        bus = smbus2.SMBus(1)
+        bus.read_byte(0x14)  # PCA9685 default address
+        bus.close()
+        checks["i2c"] = "ok"
+    except Exception as e:
+        checks["i2c"] = f"error: {e}"
+
+# 5. px-alive status (should be running — we'll yield it before race)
+if dry:
+    checks["px_alive"] = "skipped (dry)"
+else:
+    import subprocess
+    r = subprocess.run(["systemctl", "is-active", "px-alive"], capture_output=True, text=True)
+    checks["px_alive"] = r.stdout.strip()
+
+ready = (
+    checks.get("calibration", "").startswith("ok")
+    and checks.get("battery", "").startswith(("ok", "unknown"))
+    and not checks.get("i2c", "").startswith("error")
+)
+
+result = {"checks": checks, "ready": ready}
+print(json.dumps(result))
+PYEOF
