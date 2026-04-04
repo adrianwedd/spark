@@ -835,6 +835,34 @@ async def public_race():
     return result
 
 
+@app.get("/api/v1/public/budget")
+async def public_budget():
+    """Claude session budget status — unauthenticated."""
+    try:
+        from pxh.claude_session import DAILY_CAP, _load_session_log, _today_entries
+
+        log_entries = _load_session_log()
+        today = _today_entries(log_entries)
+        sessions = [
+            {
+                "ts": e.get("ts"),
+                "type": e.get("type"),
+                "model": e.get("model"),
+                "duration_s": e.get("duration_s"),
+                "outcome": e.get("outcome"),
+            }
+            for e in today
+        ]
+        return {
+            "daily_cap": DAILY_CAP,
+            "used_today": len(today),
+            "remaining": max(0, DAILY_CAP - len(today)),
+            "sessions": sessions,
+        }
+    except Exception:
+        return {"daily_cap": 8, "used_today": 0, "remaining": 8, "sessions": []}
+
+
 @app.get("/api/v1/public/thought-image")
 async def thought_image(ts: str = Query(...)):
     """Serve a thought card PNG by timestamp. No auth required."""

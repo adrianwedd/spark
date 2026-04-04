@@ -932,3 +932,21 @@ class TestPublicChat:
                 json={"message": "Hi", "history": []},
             )
         assert resp.status_code == 429
+
+
+class TestPublicBudget:
+    def test_public_budget_ok(self, api_client):
+        """GET /api/v1/public/budget returns session budget info."""
+        r = api_client.get("/api/v1/public/budget")
+        assert r.status_code == 200
+        data = r.json()
+        assert "daily_cap" in data
+        assert "used_today" in data
+        assert "remaining" in data
+        assert "sessions" in data
+        assert isinstance(data["sessions"], list)
+
+    def test_public_budget_no_auth_required(self, api_client):
+        """Budget endpoint should not require authentication."""
+        r = api_client.get("/api/v1/public/budget")
+        assert r.status_code == 200
