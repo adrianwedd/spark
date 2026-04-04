@@ -66,6 +66,7 @@ ALLOWED_TOOLS = {
     "tool_research",
     "tool_compose",
     "tool_blog",
+    "tool_story",
 }
 
 TOOL_COMMANDS = {
@@ -111,6 +112,7 @@ TOOL_COMMANDS = {
     "tool_research":         BIN_DIR / "tool-research",
     "tool_compose":          BIN_DIR / "tool-compose",
     "tool_blog":             BIN_DIR / "tool-blog",
+    "tool_story":            BIN_DIR / "tool-story",
 }
 
 
@@ -691,6 +693,14 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if len(topic) > 500:
             topic = topic[:500]
         sanitized["PX_BLOG_TOPIC"] = topic
+    elif tool == "tool_story":
+        action = params.get("action", "read")
+        if action not in ("start", "add", "read", "finish"):
+            action = "read"
+        sanitized["TOOL_ACTION"] = action
+        text = params.get("text", "")[:500]
+        if text:
+            sanitized["TOOL_TEXT"] = text
     else:
         if params:
             raise VoiceLoopError("unexpected parameters for tool")

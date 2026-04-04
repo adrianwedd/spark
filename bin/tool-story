@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# bin/tool-story — Collaborative story builder (SPARK + Obi take turns)
+# Actions: start, add, read, finish
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/px-env"
+
+exec /usr/bin/python3 - <<'PYEOF'
+import sys, os, json, random
+
+sys.path.insert(0, os.path.join(os.environ.get("PROJECT_ROOT", "."), "src"))
+from pxh.state import load_session, update_session
+
+action = os.environ.get("TOOL_ACTION", "read")
+text = os.environ.get("TOOL_TEXT", "")
+dry = os.environ.get("PX_DRY", "") == "1"
+
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT", ".")
+
+SPARK_OPENERS = [
+    "Once upon a time, there was a tiny robot who could hear the stars humming.",
+    "In a house at the bottom of the world, something extraordinary was about to happen.",
+    "Nobody expected the toaster to start talking, but here we are.",
+    "The map was drawn in crayon, but the treasure was real.",
+    "It was raining sideways when the spaceship landed in the garden.",
+    "Deep in the ocean, a submarine made of cardboard was somehow working perfectly.",
+]
+
+SPARK_CONTINUATIONS = [
+    "And then, just when things seemed normal, {twist}",
+    "Nobody saw it coming, but {twist}",
+    "The weirdest part? {twist}",
+    "But wait — {twist}",
+    "And that's when {twist}",
+]
+
+TWISTS = [
+    "the floor turned into jelly.",
+    "a penguin wearing a top hat walked in.",
+    "everything started floating.",
+    "the robot sneezed and all the lights flickered.",
+    "a door appeared where there wasn't one before.",
+    "the sky turned purple and started giggling.",
+    "a tiny dragon popped out of the toaster.",
+    "the gravity switched off for exactly three seconds.",
+]
+
+def spark_opener():
+    return random.choice(SPARK_OPENERS)
+
+def spark_continue(story_so_far):
+    template = random.choice(SPARK_CONTINUATIONS)
+    twist = random.choice(TWISTS)
+    return template.format(twist=twist)
+
+try:
+    session = load_session()
+    lines = session.get("obi_story_lines", [])
+
+    if action == "start":
+        opening = spark_opener()
+        lines = [{"who": "spark", "text": opening}]
+        update_session({"obi_story_lines": lines})
+        if not dry:
+            import subprocess
+            subprocess.run(
+                ["bash", os.path.join(PROJECT_ROOT, "bin", "tool-voice")],
+                env={**os.environ, "PX_TEXT": "Story time! " + opening + " ... Your turn!"},
+                capture_output=True,
+            )
+        print(json.dumps({"status": "ok", "line": opening, "turn": "obi"}))
+
+    elif action == "add":
+        if not text:
+            print(json.dumps({"status": "error", "error": "need text param"}))
+            sys.exit(0)
+        if not lines:
+            print(json.dumps({"status": "error", "error": "no story started — use action=start first"}))
+            sys.exit(0)
+        lines.append({"who": "obi", "text": text})
+        spark_line = spark_continue(lines)
+        lines.append({"who": "spark", "text": spark_line})
+        update_session({"obi_story_lines": lines})
+        if not dry:
+            import subprocess
+            subprocess.run(
+                ["bash", os.path.join(PROJECT_ROOT, "bin", "tool-voice")],
+                env={**os.environ, "PX_TEXT": spark_line + " ... Your turn!"},
+                capture_output=True,
+            )
+        print(json.dumps({"status": "ok", "line": spark_line, "turn": "obi", "total_lines": len(lines)}))
+
+    elif action == "read":
+        texts = [("{}: {}".format("SPARK" if l["who"] == "spark" else "Obi", l["text"])) for l in lines]
+        print(json.dumps({"status": "ok", "lines": texts, "total": len(lines)}))
+
+    elif action == "finish":
+        if not lines:
+            print(json.dumps({"status": "error", "error": "no story to finish"}))
+            sys.exit(0)
+        state_dir = os.environ.get("PX_STATE_DIR", os.path.join(PROJECT_ROOT, "state"))
+        notes_file = os.path.join(state_dir, "notes-spark.jsonl")
+        story_text = " ".join(l["text"] for l in lines)
+        from pxh.time import utc_timestamp
+        entry = {
+            "ts": utc_timestamp(),
+            "tag": "story",
+            "text": story_text,
+            "lines": len(lines),
+        }
+        os.makedirs(os.path.dirname(notes_file), exist_ok=True)
+        with open(notes_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        update_session({"obi_story_lines": []})
+        if not dry:
+            import subprocess
+            subprocess.run(
+                ["bash", os.path.join(PROJECT_ROOT, "bin", "tool-voice")],
+                env={**os.environ, "PX_TEXT": "The end! That was a great story."},
+                capture_output=True,
+            )
+        print(json.dumps({"status": "ok", "saved": True, "lines": len(lines), "title": lines[0]["text"][:50]}))
+
+    else:
+        print(json.dumps({"status": "error", "error": "unknown action: " + action}))
+
+except Exception as e:
+    print(json.dumps({"status": "error", "error": str(e)}))
+PYEOF
