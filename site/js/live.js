@@ -61,12 +61,13 @@
   // ── Poll cycle ────────────────────────────────────────────────────────────
 
   async function poll() {
-    const [statusR, vitalsR, sonarR, awarenessR, servicesR] = await Promise.allSettled([
+    const [statusR, vitalsR, sonarR, awarenessR, servicesR, budgetR] = await Promise.allSettled([
       fetchWithTimeout(API + '/status'),
       fetchWithTimeout(API + '/vitals'),
       fetchWithTimeout(API + '/sonar'),
       fetchWithTimeout(API + '/awareness'),
       fetchWithTimeout(API + '/services'),
+      fetchWithTimeout(API + '/budget'),
     ]);
 
     let anySuccess = false;
@@ -99,6 +100,10 @@
     }
     if (servicesR.status === 'fulfilled') {
       state.services = servicesR.value;
+      anySuccess = true;
+    }
+    if (budgetR.status === 'fulfilled') {
+      state.budget = budgetR.value;
       anySuccess = true;
     }
 

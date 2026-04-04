@@ -416,6 +416,27 @@ window.SparkDashboard = (function () {
         dotsContainer.appendChild(row);
       }
     }
+
+    // Budget widget
+    var valBudget = $('val-budget');
+    if (valBudget && state.budget) {
+      var used = state.budget.used_today || 0;
+      var cap = state.budget.daily_cap || 8;
+      var remaining = state.budget.remaining != null ? state.budget.remaining : cap;
+      valBudget.textContent = '';
+      var span = document.createElement('span');
+      if (remaining <= 2) span.style.color = 'var(--mood-anxious)';
+      else if (remaining <= 4) span.style.color = 'var(--mood-alert)';
+      else span.style.color = 'var(--mood-content)';
+      span.textContent = used + '/' + cap;
+      valBudget.appendChild(span);
+      if (state.budget.sessions && state.budget.sessions.length > 0) {
+        var last = state.budget.sessions[state.budget.sessions.length - 1];
+        var small = document.createElement('small');
+        small.textContent = ' (last: ' + (last.type || '?') + ')';
+        valBudget.appendChild(small);
+      }
+    }
   }
 
   // ── Mood colour helper (reads from CSS custom properties in colors.css) ──
