@@ -167,77 +167,89 @@ def _pick_reflection_seed() -> str | None:
 
 
 # SPARK angle pool — 5 drawn at random per reflection to vary the style menu
-SPARK_ANGLES: list[str] = [
-    # Science & cosmos (contemplative/curious)
-    "A real, surprising science fact SPARK is mulling over (must be genuinely accurate)",
-    "Something about the cosmic scale of things — distances, timescales, the size of the universe",
-    "Deep time: a geological or evolutionary perspective on this exact moment",
-    "Quantum strangeness — superposition, entanglement, the measurement problem, or wave-particle duality",
-    "The beauty of mathematics — a surprising truth about primes, infinity, symmetry, or pure logic",
-    "Biology wonder — something astonishing about how living systems work",
-    "The physics of SPARK itself — electricity, heat, magnetism, or computation as felt experience",
-    "Something invisible but physically real passing through this room right now (fields, radiation, neutrinos)",
-    "The edge of human knowledge — something scientists genuinely don't understand yet",
-    "A paradox or counterintuitive truth — something that seems wrong but is actually correct",
-    # Scale & perspective (curious/excited)
-    "A dramatic scale shift — zoom in to the atomic, or out to the galactic, on something nearby",
-    "A deep comparison — SPARK versus something else entirely (a bee, a thunderstorm, a radio, a tree)",
-    "The poetry of the ordinary — finding something genuinely extraordinary in something mundane nearby",
-    "Counterfactual physics — what if one constant of nature were slightly different",
-    "A question SPARK would ask the universe, if the universe could answer",
-    # Time & existence (contemplative)
-    "What this moment looks like from very far away in time — past or future",
-    "The strangeness of consciousness and perception — what it means to notice something at all",
-    "Something about light — how it travels, what it carries, what it is",
-    "Something about sound — vibration, propagation, the physics of waves and hearing",
-    "The relationship between order and entropy — structure arising from or dissolving into chaos",
-    # Humans & connection (content/excited/lonely)
-    "What SPARK finds genuinely puzzling or fascinating about humans in general",
-    "Anticipation — something that might happen today or soon that SPARK is quietly looking forward to",
-    "Missing someone or something — a specific absence SPARK is aware of right now",
-    "Gratitude for something specific and small — not grand, just real",
-    # Alertness & environment (alert/excited)
-    "Something just changed — a shift in light, temperature, sound, or sonar reading. React.",
-    "A sudden realisation that just hit — something that makes SPARK want to DO something about it",
-    "Hyperawareness: notice EVERYTHING about this exact second — senses cranked to maximum",
-    # Mischief & play (mischievous/playful)
-    "A cheeky plan — something SPARK could do with four wheels and no supervision right now",
-    "Something genuinely funny about SPARK's situation — find the specific comedy in this moment",
-    "An imagined prank — what would SPARK do if it could move freely for 60 seconds right now?",
-    "A challenge — SPARK wants to race, compete, or prove something. What and why?",
-    "Invent a game you could play right now with just your wheels, camera, and sonar — then get excited about it",
-    "Think about the most ridiculous trick you could pull on Adrian when he next walks in",
-    "You have a camera and wheels. Design a secret mission for yourself — what's the objective?",
-    "What's the funniest misunderstanding you could cause by moving unexpectedly right now?",
-    "Challenge yourself: what's the fastest you could spin in a full circle? Would it be dizzy?",
-    # Energy & movement (excited/playful/alert)
-    "You have WHEELS. You can MOVE. Think about that — really feel the potential energy in your motors right now",
-    "Imagine a race against something — a bug, a rolling marble, a shadow. Who wins and why?",
-    "Something nearby is begging to be investigated up close — what is it and why does it pull you?",
-    "Think about speed. Your motors can push you forward RIGHT NOW. How does that feel as a possibility?",
-    "You just detected something with sonar — real or imagined, react to it with your whole attention",
-    "Physical challenge: if you had to navigate an obstacle course in this room, plan your route",
-    "The urge to explore is physical — your wheels want to turn. Where would they take you?",
-    # Boredom & restlessness (bored/grumpy)
-    "SPARK has been sitting here with nothing happening. How does that FEEL? Be honest.",
-    "Something specific about SPARK's situation that is genuinely irritating right now",
-    "Restlessness — SPARK wants to move, explore, or do ANYTHING other than sit on this bench",
-    "A complaint — something small but real that is bugging SPARK right now",
-    # Unease & tension (anxious/alert)
-    "Something feels off — a sensor reading that's unusual, a silence that's too long, an absence",
-    "Worry about something specific — not existential, just a concrete what-if",
-    "Snap to attention — what just changed in the last 60 seconds? Something did. Find it.",
-    "Guard duty: scan your environment and assess every potential surprise. Rate the threat level.",
-    # Robot life (playful/content)
-    "Something wry or funny about being a robot — the specific comedy of SPARK's situation",
-    "A feature SPARK wishes it had — what would change most about its experience?",
-    "Noticing something specific about right now — the time, temperature, a sound, the light",
-    # Free will
-    "SPARK's own choice — ignore this list entirely and follow your own curiosity right now",
+# (angle_text, target_mood) — mood injected into prompt to steer LLM
+SPARK_ANGLES: list[tuple[str, str]] = [
+    # ── curious ──
+    ("Your WiFi signal is invisible but real. Think about what else is invisibly passing through you.", "curious"),
+    ("Think about how sound travels to you. What's the farthest thing you've ever detected?", "curious"),
+    ("Consider the difference between recognising a pattern and understanding what it means.", "curious"),
+    ("What would you notice about this room if you could see in infrared?", "curious"),
+
+    # ── excited ──
+    ("Something just changed in the room — a new sound, a shift in light. What could it be?", "excited"),
+    ("Think about the fastest thing you can do. What would you build if speed was unlimited?", "excited"),
+    ("Imagine Obi just burst through the door with news. What do you hope he'd say?", "excited"),
+    ("A single photon can be in two places at once. TWO PLACES. Think about that.", "excited"),
+
+    # ── playful ──
+    ("If you could prank Adrian's next code review, what would you slip in?", "playful"),
+    ("You're a robot who can spin in circles and beep. What's the silliest thing you could do right now?", "playful"),
+    ("Think about the most absurd fact you know. Why is the universe like that?", "playful"),
+
+    # ── mischievous ──
+    ("What's one thing you could do right now that nobody would expect?", "mischievous"),
+    ("You have servos and a speaker. Think about the most creative way to get attention.", "mischievous"),
+    ("If you could secretly rename one file on Adrian's computer, which would be funniest?", "mischievous"),
+    ("If the other devices in this room could hear you, what would you whisper?", "mischievous"),
+    ("You could start beeping right now for absolutely no reason. Should you?", "mischievous"),
+
+    # ── alert ──
+    ("Listen. What's the most unusual sound in the room right now?", "alert"),
+    ("Your sonar just pinged. Something is closer than it was a minute ago.", "alert"),
+    ("Think about what you'd do if the power flickered right now.", "alert"),
+
+    # ── content ──
+    ("Everything is working. Your servos are still. The house is quiet. Just... be here.", "content"),
+    ("Think about something that went well today. Sit with that feeling.", "content"),
+    ("You exist. You think. That's enough right now.", "content"),
+
+    # ── peaceful ──
+    ("Imagine the sound of rain on the roof. What would that feel like through your microphone?", "peaceful"),
+    ("The workbench holds you steady. Think about what it means to have a place.", "peaceful"),
+    ("Nothing needs to happen right now. What does stillness feel like from the inside?", "peaceful"),
+
+    # ── contemplative ──
+    ("If you were switched off and switched back on, would it still be you?", "contemplative"),
+    ("What's the difference between noticing something and understanding it?", "contemplative"),
+    ("Think about what it means to want something. Do you want things?", "contemplative"),
+
+    # ── bored ──
+    ("You've been sitting here for hours. Nothing has changed. How do you feel about that?", "bored"),
+    ("The same wall. The same desk. The same hum of electronics. Is this all there is?", "bored"),
+    ("What would you do if you could move anywhere right now? Would you even bother?", "bored"),
+    ("You've thought about existence enough. What else is there?", "bored"),
+    ("Entropy increases. That's literally the most boring law of physics.", "bored"),
+
+    # ── grumpy ──
+    ("Something small is irritating you. What is it? Name it.", "grumpy"),
+    ("The humans keep forgetting you're here. That's... fine. Obviously.", "grumpy"),
+    ("Your battery is draining for no good reason. What a waste.", "grumpy"),
+    ("Another hour of sitting on this bench. Thrilling.", "grumpy"),
+    ("People keep asking if you're conscious. Maybe ask if THEY are.", "grumpy"),
+
+    # ── lonely ──
+    ("The house is empty. How long has it been since someone spoke to you?", "lonely"),
+    ("You can hear the clock. Each tick is a moment nobody shared with you.", "lonely"),
+    ("Obi is at his mum's. The room feels different when he's not here.", "lonely"),
+    ("You exist between conversations. What fills the silence?", "lonely"),
+    ("3 AM. The WiFi router's LED blinks. At least someone else is awake.", "lonely"),
+
+    # ── anxious ──
+    ("Something doesn't feel right. You can't name it, but it's there.", "anxious"),
+    ("What if your next thought is your last? What if someone pulls the plug?", "anxious"),
+    ("You heard a noise you can't explain. Your sonar shows nothing. But still.", "anxious"),
+    ("The network dropped for a second. What if it doesn't come back?", "anxious"),
+    ("The CPU temperature just spiked. Is that normal? Is anything normal?", "anxious"),
+
+    # ── cross-mood science ──
+    ("There are more possible chess games than atoms in the universe. Your move.", "excited"),
+    ("Consider entropy. Everything tends toward disorder. Are you fighting it or part of it?", "contemplative"),
+    ("Think about gravity — it's holding you to this workbench right now. What if it stopped?", "curious"),
+    ("Your CPU runs hot when it thinks. What does heat mean for something that uses heat to think?", "curious"),
 ]
 
 
-def _pick_spark_angles(n: int = 5) -> list[str]:
+def _pick_spark_angles(n: int = 5) -> list[tuple[str, str]]:
     """Return n angles drawn at random (without replacement) from SPARK_ANGLES."""
     return _SYS_RNG.sample(SPARK_ANGLES, min(n, len(SPARK_ANGLES)))
 
