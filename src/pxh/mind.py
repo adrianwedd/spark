@@ -955,41 +955,52 @@ def _format_routine_context(routines: dict | None) -> str:
 
 
 def _fetch_ha_context(dry: bool = False) -> dict | None:
-    """Query HA for office context: call detection, office light, media player.
-
-    Returns dict with boolean/string keys or None on error / dry / no token.
-    """
+    """Query HA for office context with a global 5s timeout."""
     if dry or not HA_TOKEN:
         if not HA_TOKEN:
             log("ha_context: skipped — no PX_HA_TOKEN")
         return None
-    if HA_DEBUG:
-        log(f"ha_context: fetching {len(HA_CONTEXT_ENTITIES)} entities...")
-    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
-    result: dict = {}
-    for key, entity_id in HA_CONTEXT_ENTITIES.items():
-        try:
-            req = urllib.request.Request(
-                f"{HA_HOST}/api/states/{entity_id}", headers=headers)
-            with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as r:
-                data = json.loads(r.read())
-            if key == "media_player":
-                result["media_playing"] = data["state"] == "playing"
-                result["media_title"] = data.get("attributes", {}).get("media_title", "")
-                if HA_DEBUG:
-                    log(f"ha_context: {entity_id} → state={data['state']}, title={result['media_title']!r}")
+
+    import concurrent.futures
+    def _do_fetch():
+        if HA_DEBUG:
+            log(f"ha_context: fetching {len(HA_CONTEXT_ENTITIES)} entities...")
+        headers = {"Authorization": f"Bearer {HA_TOKEN}", "Accept": "application/json"}
+        result: dict = {}
+        for key, entity_id in HA_CONTEXT_ENTITIES.items():
+            try:
+                req = urllib.request.Request(
+                    f"{HA_HOST}/api/states/{entity_id}", headers=headers)
+                with urllib.request.urlopen(req, timeout=HA_TIMEOUT_S) as r:
+                    data = json.loads(r.read())
+                if key == "media_player":
+                    result["media_playing"] = data["state"] == "playing"
+                    result["media_title"] = data.get("attributes", {}).get("media_title", "")
+                    if HA_DEBUG:
+                        log(f"ha_context: {entity_id} → state={data['state']}, title={result['media_title']!r}")
+                else:
+                    result[key] = data["state"] == "on"
+                    if HA_DEBUG:
+                        log(f"ha_context: {entity_id} → state={data['state']} (on={result[key]})")
+            except Exception as exc:
+                log(f"ha_context: {entity_id} error: {exc}")
+        if HA_DEBUG:
+            if result:
+                log(f"ha_context: result: {result}")
             else:
-                result[key] = data["state"] == "on"
-                if HA_DEBUG:
-                    log(f"ha_context: {entity_id} → state={data['state']} (on={result[key]})")
-        except Exception as exc:
-            log(f"ha_context: {entity_id} error: {exc}")
-    if HA_DEBUG:
-        if result:
-            log(f"ha_context: result: {result}")
-        else:
-            log("ha_context: no data returned")
-    return result if result else None
+                log("ha_context: no data returned")
+        return result if result else None
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_do_fetch)
+            return future.result(timeout=5)
+    except concurrent.futures.TimeoutError:
+        log("ha_context: global timeout (5s) — HA unreachable")
+        return None
+    except Exception as exc:
+        log(f"ha_context: unexpected error: {exc}")
+        return None
 
 
 def _format_ha_context(ctx: dict | None) -> str:
