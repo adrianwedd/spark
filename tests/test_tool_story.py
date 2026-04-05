@@ -85,3 +85,34 @@ def test_story_finish_without_start(isolated_project):
     env = dict(isolated_project["env"])
     r, out = _run_story("finish", extra_env=env)
     assert out["status"] == "error"
+
+
+def test_story_full_cycle(isolated_project):
+    """Full story cycle: start -> add -> add -> read -> finish."""
+    env = dict(isolated_project["env"])
+
+    # Start — creates 1 line (spark opener)
+    _, start_out = _run_story("start", extra_env=env)
+    assert start_out["status"] == "ok"
+    opening = start_out["line"]
+
+    # Add two lines — each add appends obi line + spark continuation = +2
+    _, add1 = _run_story("add", extra_env=env, text="Then a dinosaur appeared wearing sunglasses.")
+    assert add1["status"] == "ok"
+    assert add1["total_lines"] == 3  # opener + obi + spark
+
+    _, add2 = _run_story("add", extra_env=env, text="The dinosaur said 'cool beans' and flew away.")
+    assert add2["status"] == "ok"
+    assert add2["total_lines"] == 5
+
+    # Read — returns all lines with attribution prefixes
+    _, read_out = _run_story("read", extra_env=env)
+    assert read_out["total"] == 5
+    assert "SPARK:" in read_out["lines"][0]
+    assert "Obi:" in read_out["lines"][1]
+
+    # Finish — saves story and clears session
+    _, finish_out = _run_story("finish", extra_env=env)
+    assert finish_out["status"] == "ok"
+    assert finish_out["lines"] == 5
+    assert finish_out["saved"] is True
