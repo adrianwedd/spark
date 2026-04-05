@@ -131,10 +131,17 @@ class TestNonGpioLive:
         assert payload["dry"] is False
 
     def test_tool_play_sound(self):
-        payload = run_tool(
-            ["bin/tool-play-sound"],
-            live_env(PX_SOUND="beep"),
-        )
+        try:
+            payload = run_tool(
+                ["bin/tool-play-sound"],
+                live_env(PX_SOUND="beep"),
+            )
+        except subprocess.CalledProcessError as e:
+            if "Device or resource busy" in (e.stderr or ""):
+                pytest.skip("audio device busy — PulseAudio contention")
+            raise
+        if "Device or resource busy" in (payload.get("error") or ""):
+            pytest.skip("audio device busy — PulseAudio contention")
         assert payload["status"] == "ok"
         assert payload["sound"] == "beep"
         assert payload["dry"] is False
