@@ -292,6 +292,18 @@ def compute_mood_summary(thoughts_raw: list[dict]) -> str:
     return ", ".join(f"{m} ({c})" for m, c in sorted_moods[:5])
 
 
+def compute_dominant_mood(thoughts_raw: list[dict]) -> str:
+    """Return the single most common mood from thought entries, or 'content' if none."""
+    moods: dict[str, int] = {}
+    for entry in thoughts_raw:
+        mood = entry.get("mood", "")
+        if mood and mood != "unknown":
+            moods[mood] = moods.get(mood, 0) + 1
+    if not moods:
+        return "content"
+    return max(moods, key=moods.get)
+
+
 def _load_thoughts_raw(date: dt.datetime) -> list[dict]:
     """Load raw thought entries for a given date."""
     if not THOUGHTS_FILE.exists():
@@ -575,9 +587,17 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
 
     if post_type == "daily":
         post["mood_summary"] = compute_mood_summary(thoughts_raw)
+        post["mood"] = compute_dominant_mood(thoughts_raw)
         post["thought_count"] = len(source)
     else:
         post["child_count"] = len(source)
+        child_moods: dict[str, int] = {}
+        for child in source:
+            if isinstance(child, dict):
+                cm = child.get("mood", "")
+                if cm and cm != "unknown":
+                    child_moods[cm] = child_moods.get(cm, 0) + 1
+        post["mood"] = max(child_moods, key=child_moods.get) if child_moods else "content"
 
     return post
 

@@ -357,6 +357,28 @@ class TestBlogHelpers:
         assert "curious" in summary
         assert "3" in summary
 
+    def test_compute_dominant_mood(self, blog_mod):
+        """compute_dominant_mood returns the single most common mood."""
+        ns, _, _ = blog_mod
+        entries = [
+            {"mood": "curious"},
+            {"mood": "curious"},
+            {"mood": "content"},
+            {"mood": "playful"},
+        ]
+        assert ns["compute_dominant_mood"](entries) == "curious"
+
+    def test_compute_dominant_mood_empty(self, blog_mod):
+        """compute_dominant_mood returns 'content' when no moods present."""
+        ns, _, _ = blog_mod
+        assert ns["compute_dominant_mood"]([]) == "content"
+        assert ns["compute_dominant_mood"]([{"mood": "unknown"}]) == "content"
+
+    def test_compute_dominant_mood_exists_in_script(self):
+        """compute_dominant_mood function exists in bin/px-blog."""
+        content = _BLOG_SCRIPT.read_text()
+        assert "def compute_dominant_mood" in content, "compute_dominant_mood not found"
+
     def test_build_prompt_daily(self, blog_mod):
         ns, _, _ = blog_mod
         date = dt.datetime(2026, 3, 24, 22, 0, tzinfo=HOBART_TZ)
