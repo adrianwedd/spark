@@ -718,13 +718,26 @@ def record_utterance(stream, max_s: float, silence_s: float) -> bytes:
 
 
 def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice=None) -> str:
-    """Transcribe audio using the best available backend: sensevoice > whisper > sherpa > vosk."""
+    """Transcribe audio using the best available backend: sensevoice > whisper > sherpa > vosk.
+
+    If the primary backend returns empty (hallucination filtered), falls through
+    to the next backend instead of returning empty.
+    """
     if sensevoice is not None:
-        return transcribe_sensevoice(sensevoice, audio_bytes)
+        result = transcribe_sensevoice(sensevoice, audio_bytes)
+        if result.strip():
+            return result
+        log("stt: sensevoice returned empty — falling through to next backend")
     if whisper is not None:
-        return transcribe_whisper(whisper, audio_bytes)
+        result = transcribe_whisper(whisper, audio_bytes)
+        if result.strip():
+            return result
+        log("stt: whisper returned empty — falling through to next backend")
     if stt is not None:
-        return transcribe_sherpa(stt, audio_bytes)
+        result = transcribe_sherpa(stt, audio_bytes)
+        if result.strip():
+            return result
+        log("stt: sherpa returned empty — falling through to vosk")
     return transcribe(model, audio_bytes)
 
 
