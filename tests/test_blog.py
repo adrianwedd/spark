@@ -373,3 +373,13 @@ class TestBlogHelpers:
         prompt = ns["build_prompt"]("weekly", dailies, date)
         assert "weekly" in prompt.lower()
         assert "SPARK" in prompt
+
+
+def test_skip_backoff_is_reasonable():
+    """SKIP_BACKOFF_S should be <= 600s (10 min) not 3600s."""
+    blog_path = Path(__file__).parent.parent / "bin" / "px-blog"
+    content = blog_path.read_text()
+    match = re.search(r"SKIP_BACKOFF_S\s*=\s*(\d+)", content)
+    assert match, "SKIP_BACKOFF_S not found in px-blog"
+    backoff = int(match.group(1))
+    assert backoff <= 600, f"SKIP_BACKOFF_S={backoff} is too long (max 600)"

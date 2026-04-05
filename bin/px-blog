@@ -787,7 +787,7 @@ def main(argv: list[str]) -> int:
     except ImportError:
         _BudgetError = None
 
-    SKIP_BACKOFF_S = 3600  # 1 hour backoff when due posts lack source material
+    SKIP_BACKOFF_S = 300  # 5 min backoff when due posts lack source material
 
     try:
         while not _shutdown.is_set():
