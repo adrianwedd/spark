@@ -2491,11 +2491,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     return thought
 
 
-def _run_voice(env: dict, *, timeout: int = 45, label: str = "") -> subprocess.CompletedProcess:
+def _run_voice(env: dict, *, timeout: int = 30, label: str = "") -> subprocess.CompletedProcess:
     """Run tool-voice and log voice-lock contention if detected."""
+    voice_env = dict(env)
+    voice_env.setdefault("PX_VOICE_LOCK_TIMEOUT", "10")  # fast-fail for autonomous speech
     result = subprocess.run(
         [str(BIN_DIR / "tool-voice")],
-        capture_output=True, text=True, check=False, env=env, timeout=timeout,
+        capture_output=True, text=True, check=False, env=voice_env, timeout=timeout,
     )
     if result.returncode != 0:
         logged = False
