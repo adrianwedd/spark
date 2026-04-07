@@ -823,3 +823,18 @@ def test_backfill_idempotent(_cursor_env):
 
     feed = json.loads((tmp / "feed.json").read_text())
     assert len(feed["posts"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Watchdog
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_stale_detection():
+    """Watchdog helper detects stale loop."""
+    import time as _time
+    _check_watchdog = _POST["_check_watchdog"]
+    # Fresh timestamp — should not trigger
+    assert _check_watchdog(_time.monotonic(), 600) is False
+    # Stale timestamp — should trigger
+    assert _check_watchdog(_time.monotonic() - 700, 600) is True

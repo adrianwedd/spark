@@ -688,6 +688,13 @@ QUEUE_LIMIT = 200
 
 _qa_breaker = {"failures": 0, "open_until": 0.0, "threshold": 3, "cooldown": 300}
 
+WATCHDOG_STALE_S = 600  # 10 minutes — if main loop hasn't cycled, self-exit
+
+
+def _check_watchdog(last_cycle: float, max_stale: float) -> bool:
+    """Return True if the loop has been stale too long."""
+    return (time.monotonic() - last_cycle) > max_stale
+
 
 def _generate_post_id() -> str:
     return f"post-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{_SYS_RNG.randint(0, 999):03d}"
@@ -1021,9 +1028,13 @@ def main(argv: list[str]) -> int:
     last_flush = 0
 
     poll_count = 0
+    last_cycle = time.monotonic()
     try:
         while not _shutdown.is_set():
             poll_count += 1
+            if _check_watchdog(last_cycle, WATCHDOG_STALE_S):
+                log(f"watchdog: loop stale for {time.monotonic() - last_cycle:.0f}s — exiting for systemd restart")
+                break
             # Poll for new thoughts
             try:
                 new_thoughts = poll_new_thoughts(thoughts_file)
@@ -1039,13 +1050,16 @@ def main(argv: list[str]) -> int:
             except (json.JSONDecodeError, OSError):
                 pass
 
-            queued_count = 0
-            for entry in new_thoughts:
-                if qualifies(entry) and not is_duplicate(entry["thought"], feed_posts):
-                    queue_thought(entry)
-                    queued_count += 1
-            if new_thoughts or queued_count:
-                log(f"poll: {len(new_thoughts)} new thoughts, {queued_count} queued")
+            try:
+                queued_count = 0
+                for entry in new_thoughts:
+                    if qualifies(entry) and not is_duplicate(entry["thought"], feed_posts):
+                        queue_thought(entry)
+                        queued_count += 1
+                if new_thoughts or queued_count:
+                    log(f"poll: {len(new_thoughts)} new thoughts, {queued_count} queued")
+            except Exception as exc:
+                log(f"queue: CRASHED: {exc}")
 
             # Flush cycle
             now = time.monotonic()
@@ -1066,15 +1080,19 @@ def main(argv: list[str]) -> int:
                 if result.get("rejected"):
                     total_rejected += 1
 
-                write_health_status(
-                    queue_depth=len(_load_queue()),
-                    total_posted=total_posted,
-                    total_rejected=total_rejected,
-                    bluesky_ok=bluesky.available(),
-                    last_post_ts=last_post_ts,
-                )
+                try:
+                    write_health_status(
+                        queue_depth=len(_load_queue()),
+                        total_posted=total_posted,
+                        total_rejected=total_rejected,
+                        bluesky_ok=bluesky.available(),
+                        last_post_ts=last_post_ts,
+                    )
+                except Exception as exc:
+                    log(f"health status: CRASHED: {exc}")
                 last_flush = now
 
+            last_cycle = time.monotonic()
             _shutdown.wait(timeout=args.poll_interval)
     finally:
         _safe_unlink_pid()
