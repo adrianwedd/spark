@@ -321,7 +321,7 @@ def test_qa_response_whitespace():
         assert run_qa_gate("I wonder about the stars") == "pass"
 
 
-@pytest.fixture(autouse=False)
+@pytest.fixture(autouse=True)
 def _reset_qa_breaker():
     """Reset the circuit breaker state before and after each test."""
     breaker = _POST["_qa_breaker"]

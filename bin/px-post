@@ -335,6 +335,7 @@ def run_qa_gate(thought: str) -> str | None:
             return None
         else:
             # Cooldown elapsed — reset and retry
+            log(f"qa breaker: cooldown elapsed, retrying (was {_qa_breaker['failures']} consecutive failures)")
             _qa_breaker["failures"] = 0
 
     claude_bin = (os.environ.get("PX_CLAUDE_BIN")
