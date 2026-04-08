@@ -308,7 +308,8 @@ class RaceController:
     """Two-phase autonomous track racer: map then race with per-lap learning."""
 
     def __init__(self, px=None, state_dir: Path | None = None,
-                 dry: bool = False, max_speed: int = 50):
+                 dry: bool = False, max_speed: int = 50,
+                 install_signals: bool = True):
         self.px = px
         self.dry = dry
         self.max_speed = int(clamp(max_speed, MIN_RACE_SPEED, 60))
@@ -344,9 +345,10 @@ class RaceController:
             except Exception:
                 self.profile = None
 
-        # Install signal handlers
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
+        # Install signal handlers (skip when used as a library, e.g. from API server)
+        if install_signals:
+            signal.signal(signal.SIGTERM, self._handle_signal)
+            signal.signal(signal.SIGINT, self._handle_signal)
 
         # Mark as exploring so px-alive stays away (will be cleared in _handle_signal / run cleanup)
         self._set_exploring(True)

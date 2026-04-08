@@ -52,6 +52,8 @@ def log_usage(input_text: str, output_text: str) -> None:
             try:
                 with os.fdopen(fd, "w") as f:
                     json.dump(existing, f)
+                    f.flush()
+                    os.fsync(f.fileno())
                 os.replace(tmp, str(usage_file))
             except Exception:
                 try:
