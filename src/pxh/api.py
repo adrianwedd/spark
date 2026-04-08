@@ -561,13 +561,10 @@ async def health():
 async def public_status() -> Dict[str, Any]:
     """Live SPARK status: persona, mood, last thought. No auth required."""
     session = load_session()
-    persona = (session.get("persona") or "").strip().lower()
 
     state_dir = _public_state_dir()
-    if persona:
-        thoughts_path = state_dir / f"thoughts-{persona}.jsonl"
-    else:
-        thoughts_path = state_dir / "thoughts.jsonl"
+    # Always use SPARK's thoughts on the public site — never expose gremlin/vixen thoughts.
+    thoughts_path = state_dir / "thoughts-spark.jsonl"
 
     last = {}
     last_spoken = None
@@ -782,10 +779,9 @@ async def public_history(limit: int = Query(default=60, ge=1, le=2880)) -> list:
 @app.get("/api/v1/public/thoughts")
 async def public_thoughts(limit: int = Query(default=12, ge=1, le=50)) -> list:
     """Recent SPARK thoughts (newest first). No auth required."""
-    session = load_session()
-    persona = (session.get("persona") or "").strip().lower()
     state_dir = _public_state_dir()
-    thoughts_path = state_dir / (f"thoughts-{persona}.jsonl" if persona else "thoughts.jsonl")
+    # Always use SPARK's thoughts on the public site — never expose gremlin/vixen thoughts.
+    thoughts_path = state_dir / "thoughts-spark.jsonl"
     results = []
     try:
         lines = thoughts_path.read_text().strip().splitlines()
@@ -1079,13 +1075,17 @@ async def public_chat(req: PublicChatRequest, request: Request):
             content={"error": "I'm still here — just need a moment before we keep going."},
         )
 
+    def _sanitize_chat_text(text: str) -> str:
+        """Strip newlines and role-tag brackets to prevent prompt injection."""
+        return text.replace("\n", " ").replace("\r", " ").replace("[", "(").replace("]", ")")
+
     # Build structured prompt to prevent injection via history content
     history_block = "\n".join(
-        f"[{'USER' if item.role == 'user' else 'SPARK'}]: {item.text}"
+        f"[{'USER' if item.role == 'user' else 'SPARK'}]: {_sanitize_chat_text(item.text)}"
         for item in req.history
     )
     prompt = (history_block + "\n" if history_block else "") + \
-             f"[USER]: {req.message}\n[SPARK]:"
+             f"[USER]: {_sanitize_chat_text(req.message)}\n[SPARK]:"
     ctx = _build_public_context()
     if ctx:
         prompt = ctx + "\n\n" + prompt

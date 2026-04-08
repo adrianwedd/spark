@@ -908,8 +908,13 @@ class TestPublicChat:
             )
         assert resp.status_code == 504
 
-    def test_make_clean_env_strips_claude_vars(self):
-        """_make_clean_env strips CC session vars but preserves CLAUDE_API_KEY and safe vars."""
+    def test_make_clean_env_allowlist(self):
+        """_make_clean_env uses a strict allowlist — only safe vars pass through.
+
+        Secrets (CLAUDE_API_KEY, PX_API_TOKEN, PX_ADMIN_PIN, PX_HA_TOKEN,
+        PX_BSKY_APP_PASSWORD, CLAUDECODE, etc.) must be excluded so a prompt
+        injection attack cannot exfiltrate them via the public chat subprocess.
+        """
         from pxh.api import _make_clean_env
         dirty = {
             "CLAUDECODE": "1",
@@ -917,17 +922,24 @@ class TestPublicChat:
             "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
             "DISABLE_CLAUDE_CODE_PROTECTIONS": "1",
             "CLAUDE_API_KEY": "sk-ant-test",
+            "PX_API_TOKEN": "secret-token",
+            "PX_ADMIN_PIN": "1234",
+            "PX_HA_TOKEN": "ha-secret",
+            "PX_BSKY_APP_PASSWORD": "bsky-secret",
             "PATH": "/usr/bin",
             "HOME": "/home/pi",
         }
         with unittest.mock.patch.dict(os.environ, dirty, clear=True):
             clean = _make_clean_env()
+        # All secrets must be excluded
         assert "CLAUDECODE" not in clean
         assert "CLAUDE_CODE_ENTRYPOINT" not in clean
-        assert "CLAUDE_CODE_ENABLE_TELEMETRY" not in clean
-        assert "DISABLE_CLAUDE_CODE_PROTECTIONS" not in clean
-        # API key must survive — used for non-OAuth authentication
-        assert clean.get("CLAUDE_API_KEY") == "sk-ant-test"
+        assert "CLAUDE_API_KEY" not in clean, "API key must not be forwarded to public subprocess"
+        assert "PX_API_TOKEN" not in clean
+        assert "PX_ADMIN_PIN" not in clean
+        assert "PX_HA_TOKEN" not in clean
+        assert "PX_BSKY_APP_PASSWORD" not in clean
+        # Safe vars must pass through
         assert clean["PATH"] == "/usr/bin"
         assert clean["HOME"] == "/home/pi"
 
