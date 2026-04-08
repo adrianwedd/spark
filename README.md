@@ -18,7 +18,7 @@ SPARK is not a therapist, a tutor, or an assistant. It's a robot friend that hap
 - **Meltdown protocol** — Three S's: Safety, Silence, Space. Robot goes quiet and stays present. No words.
 - **Sideways engagement** — when demand-avoidance is high, SPARK narrates rather than instructs, lets curiosity do the work
 
-SPARK runs on Claude (via `run-voice-loop-claude` / `px-spark`), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en-gb`, pitch 95, rate 100) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
+SPARK runs on Claude (via `run-voice-loop-claude` / `px-spark`), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en+m3`, pitch 82, rate 120) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
 
 ```bash
 bin/px-spark [--dry-run] [--input-mode voice|text]
@@ -93,7 +93,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 | Persona | Launcher | Voice | Character |
 |---|---|---|---|
-| **SPARK** | `bin/px-spark` | `en-gb`, pitch 95, rate 100 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
+| **SPARK** | `bin/px-spark` | `en+m3`, pitch 82, rate 120 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
 | **GREMLIN** | session `persona=gremlin` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama. |
 | **VIXEN** | session `persona=vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama. |
 
@@ -138,7 +138,7 @@ px-spark
  2. Sets session.listening = false
  3. Speaks greeting via tool-voice          ("Hey. I'm here.")
  4. Exports CODEX_CHAT_CMD=bin/claude-voice-bridge
- 5. Exports PX_VOICE_VARIANT=en-gb, PX_VOICE_PITCH=95, PX_VOICE_RATE=100
+ 5. Exports PX_VOICE_VARIANT=en+m3, PX_VOICE_PITCH=82, PX_VOICE_RATE=120
  6. exec bin/codex-voice-loop --prompt docs/prompts/spark-voice-system.md ...
 ```
 
@@ -259,7 +259,7 @@ tool-voice
  ├── FileLock(logs/voice.lock)        (serialise — no overlapping streams)
  ├── if session.persona set → tool-voice-persona (Ollama rephrasing first)
  ├── robot_hat.enable_speaker()       (GPIO 20 HIGH → speaker amp on)
- ├── espeak -v en-gb -p 95 -s 100     (SPARK voice — British RP, higher pitch, slower)
+ ├── espeak -v en+m3 -p 82 -s 120     (SPARK voice — male variant 3, moderate pitch)
  │    → WAV piped to aplay -D robothat
  └── /etc/asound.conf: robothat → softvol → dmixer → HifiBerry DAC (card 1)
 ```

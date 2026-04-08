@@ -19,6 +19,23 @@ BIN_DIR      = PROJECT_ROOT / "bin"
 OUT          = STATE_DIR / "battery.json"
 TMP          = STATE_DIR / "battery.tmp"
 
+
+def _write_battery(data: dict) -> None:
+    """Write battery.json atomically with fsync for SD card durability."""
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(OUT))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 DEVICE       = os.environ.get("PX_VOICE_DEVICE", "")
 POLL_S       = 30         # check every 30s (was 60s — faster detection)
 
@@ -131,8 +148,7 @@ while True:
             prev_volts = volts
             # Still write state (with charging=False) so file stays fresh
             data = {"ts": ts, "volts": volts, "pct": pct, "charging": False}
-            TMP.write_text(json.dumps(data))
-            TMP.rename(OUT)
+            _write_battery(data)
             time.sleep(POLL_S)
             continue
 
@@ -163,8 +179,7 @@ while True:
 
         # Write state atomically
         data = {"ts": ts, "volts": volts, "pct": pct, "charging": charging}
-        TMP.write_text(json.dumps(data))
-        TMP.rename(OUT)
+        _write_battery(data)
 
     except Exception as exc:
         print(f"[battery-poll] error: {exc}", file=sys.stderr)

@@ -1,5 +1,6 @@
 [Unit]
 Description=SPARK social posting daemon
+Wants=network-online.target
 After=network-online.target px-mind.service
 
 [Service]

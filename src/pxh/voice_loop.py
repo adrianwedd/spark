@@ -698,7 +698,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if action not in ("start", "add", "read", "finish"):
             action = "read"
         sanitized["TOOL_ACTION"] = action
-        text = params.get("text", "")[:500]
+        text = str(params.get("text", ""))[:500]
         if text:
             sanitized["TOOL_TEXT"] = text
     else:

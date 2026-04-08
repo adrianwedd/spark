@@ -466,9 +466,13 @@ class RaceController:
                 self.px.set_cam_pan_angle(0)
             else:
                 left_cm, right_cm = quick3_scan(self.px)
-                center_cm = safe_ping(self.px) or 90.0
-                left_cm = left_cm or 90.0
-                right_cm = right_cm or 90.0
+                center_cm = safe_ping(self.px)
+                if center_cm is None:
+                    center_cm = 90.0
+                if left_cm is None:
+                    left_cm = 90.0
+                if right_cm is None:
+                    right_cm = 90.0
 
             # Grayscale
             if self.dry:
@@ -724,8 +728,10 @@ class RaceController:
                     self.px.set_cam_pan_angle(0)
                 else:
                     left_cm, right_cm = quick3_scan(self.px)
-                    left_cm = left_cm or 90.0
-                    right_cm = right_cm or 90.0
+                    if left_cm is None:
+                        left_cm = 90.0
+                    if right_cm is None:
+                        right_cm = 90.0
                     sonar_blend_age = 0.0
                     center_error = right_cm - left_cm  # positive = closer on right = drift left
                     sonar_correction = pd_sonar.update(center_error, dt)

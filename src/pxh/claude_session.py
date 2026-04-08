@@ -244,15 +244,16 @@ def _log_session(
 
 
 def _append_session_entry(entry: dict) -> None:
-    """Read existing log, append entry, write atomically."""
-    existing = ""
-    if SESSION_LOG.exists():
-        existing = SESSION_LOG.read_text(encoding="utf-8")
-    new_content = existing.rstrip("\n")
-    if new_content:
-        new_content += "\n"
-    new_content += json.dumps(entry) + "\n"
-    atomic_write(SESSION_LOG, new_content)
+    """Append a single entry to the session log under lock."""
+    SESSION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = str(SESSION_LOG) + ".lock"
+    if FileLock is not None:
+        with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+            with SESSION_LOG.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+    else:
+        with SESSION_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def run_claude_session(

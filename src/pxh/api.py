@@ -1009,10 +1009,18 @@ def _build_public_context() -> str:
     try:
         thoughts_path = _public_state_dir() / "thoughts-spark.jsonl"
         if thoughts_path.exists():
-            last = thoughts_path.read_text().strip().splitlines()[-1]
-            mood = _j.loads(last).get("mood", "")
-            if mood:
-                lines.append(f"SPARK's current mood: {mood}")
+            # Read only the last line instead of the entire file
+            with thoughts_path.open("rb") as _tf:
+                _tf.seek(0, 2)  # seek to end
+                _fsize = _tf.tell()
+                _chunk = min(_fsize, 4096)
+                _tf.seek(_fsize - _chunk)
+                _tail = _tf.read().decode("utf-8", errors="replace")
+                _last_lines = _tail.strip().splitlines()
+                if _last_lines:
+                    mood = _j.loads(_last_lines[-1]).get("mood", "")
+                    if mood:
+                        lines.append(f"SPARK's current mood: {mood}")
     except Exception as exc:
         _log.debug("mood context unavailable: %s", exc)
     try:
@@ -1756,6 +1764,8 @@ def _save_pin_state() -> None:
     try:
         with os.fdopen(tmp_fd, "w") as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, str(path))
     except Exception as exc:
         logging.getLogger("pxh.api").warning("pin state write failed: %s", exc)

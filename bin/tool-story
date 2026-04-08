@@ -109,8 +109,10 @@ try:
             "lines": len(lines),
         }
         os.makedirs(os.path.dirname(notes_file), exist_ok=True)
-        with open(notes_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        from filelock import FileLock
+        with FileLock(notes_file + ".lock", timeout=10):
+            with open(notes_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
         update_session({"obi_story_lines": []})
         if not dry:
             import subprocess
