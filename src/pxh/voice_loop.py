@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 from pxh.utils import clamp
 
 from .logging import log_event
-from .state import load_session, update_session, ensure_session
+from .state import load_session, update_session, ensure_session, tail_lines
 from .time import utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -336,9 +336,9 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
     thoughts_file = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state"))) / _thoughts_name
     if thoughts_file.exists():
         try:
-            lines = thoughts_file.read_text(encoding="utf-8").strip().splitlines()
+            lines = tail_lines(thoughts_file, n=3)
             recent_thoughts = []
-            for line in lines[-3:]:
+            for line in lines:
                 try:
                     t = json.loads(line)
                     recent_thoughts.append({
@@ -361,9 +361,9 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
     exploration_file = state_dir / "exploration.jsonl"
     if exploration_file.exists():
         try:
-            lines = exploration_file.read_text(encoding="utf-8").strip().splitlines()
+            lines = tail_lines(exploration_file, n=10)
             recent_obs = []
-            for line in lines[-10:]:
+            for line in lines:
                 try:
                     entry = json.loads(line)
                     if entry.get("type") == "observation" and entry.get("landmark"):

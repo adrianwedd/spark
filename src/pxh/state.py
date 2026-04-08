@@ -55,6 +55,21 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
+def tail_lines(path: "Path", n: int = 10, chunk_size: int = 8192) -> list:
+    """Read the last n lines of a file efficiently by seeking from the end."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            read_size = min(size, chunk_size)
+            f.seek(size - read_size)
+            data = f.read().decode("utf-8", errors="replace")
+            lines = data.strip().splitlines()
+            return lines[-n:]
+    except (FileNotFoundError, OSError):
+        return []
+
+
 def rotate_log(path: Path, max_bytes: int = 5_000_000) -> None:
     """Rotate log file by keeping the last half of lines when it exceeds max_bytes.
 
@@ -147,6 +162,20 @@ def load_session() -> Dict[str, Any]:
             data = default_state()
             atomic_write(path, json.dumps(data, indent=2) + "\n")
             return data
+
+
+def load_session_readonly() -> Dict[str, Any]:
+    """Read session.json without acquiring the FileLock.
+
+    Safe for read-only callers (public API) because writes use atomic
+    os.replace — readers always see a complete file. May return slightly
+    stale data during a concurrent write, which is acceptable for display.
+    """
+    path = session_path()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default_state()
 
 
 def save_session(data: Dict[str, Any]) -> None:

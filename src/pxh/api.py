@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .state import load_session, update_session
+from .state import load_session, load_session_readonly, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
     ALLOWED_TOOLS,
@@ -421,7 +421,7 @@ def _history_worker() -> None:
     while True:
         _time.sleep(30)
         try:
-            _persona = (load_session().get("persona") or "").strip().lower()
+            _persona = (load_session_readonly().get("persona") or "").strip().lower()
             sample = _collect_history_sample(_public_state_dir(), _persona)
             # Forward-fill fields that change slowly (weather, battery) so sparklines
             # don't go blank between BOM/battery poll cycles.
@@ -560,7 +560,7 @@ async def health():
 @app.get("/api/v1/public/status")
 async def public_status() -> Dict[str, Any]:
     """Live SPARK status: persona, mood, last thought. No auth required."""
-    session = load_session()
+    session = load_session_readonly()
     persona = session.get("persona", "")
 
     state_dir = _public_state_dir()
@@ -785,8 +785,8 @@ async def public_thoughts(limit: int = Query(default=12, ge=1, le=50)) -> list:
     thoughts_path = state_dir / "thoughts-spark.jsonl"
     results = []
     try:
-        lines = thoughts_path.read_text().strip().splitlines()
-        for line in reversed(lines[-50:]):
+        lines = tail_lines(thoughts_path, n=50)
+        for line in reversed(lines):
             try:
                 t = json.loads(line)
                 results.append({
@@ -1300,6 +1300,14 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
                 _set_job(job_id, {"status": "error", "tool": tool, "error": str(exc)})
             except Exception as exc:
                 _set_job(job_id, {"status": "error", "tool": tool, "error": f"{type(exc).__name__}: {exc}"})
+            else:
+                try:
+                    update_session(fields={
+                        "last_action": tool,
+                        "last_action_ts": utc_timestamp(),
+                    })
+                except Exception:
+                    pass  # non-critical
 
         asyncio.create_task(_run_async())
         return JSONResponse(
@@ -1326,6 +1334,15 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
             status_code=403,
             content={"status": "blocked", "detail": "motion not confirmed safe"},
         )
+
+    if rc == 0:
+        try:
+            update_session(fields={
+                "last_action": tool,
+                "last_action_ts": utc_timestamp(),
+            })
+        except Exception:
+            pass  # non-critical
 
     return JSONResponse(
         status_code=200,
@@ -1403,8 +1420,15 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                 content={"status": "already_running", "detail": "stop current race first"},
             )
 
+    # Parse request body (all actions may carry a dry field)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    dry = _resolve_dry(body.get("dry"))
+
     # Build command
-    dry = _resolve_dry(None)
     cmd = ["/usr/bin/python3", "-m", "pxh.race"]
 
     if action == "calibrate_gate":
@@ -1415,11 +1439,6 @@ async def race_action(action: str, request: Request) -> JSONResponse:
         if dry:
             cmd.append("--dry-run")
     elif action == "race":
-        body = {}
-        try:
-            body = await request.json()
-        except Exception:
-            pass
         laps = max(1, min(100, int(body.get("laps", 3))))
         max_speed = max(10, min(60, int(body.get("max_speed", 50))))
         cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
@@ -1884,8 +1903,7 @@ async def tail_log(service: str, lines: int = Query(default=100, ge=1, le=2000))
     log_path = log_dir / f"{service}.log"
     if not log_path.exists():
         return JSONResponse(content={"lines": [], "service": service})
-    text = log_path.read_text(errors="replace")
-    tail = text.splitlines()[-lines:]
+    tail = tail_lines(log_path, n=lines, chunk_size=65536)
     tail = [_sanitize_log_line(l) for l in tail]
     return JSONResponse(content={"lines": tail, "service": service})
 
