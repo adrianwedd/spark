@@ -233,12 +233,7 @@ def _log_session(
     }
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if FileLock is not None:
-        with FileLock(SESSION_LOCK, timeout=LOCK_TIMEOUT_S):
-            _append_session_entry(entry)
-    else:
-        _append_session_entry(entry)
+    _append_session_entry(entry)
 
     return session_id
 
