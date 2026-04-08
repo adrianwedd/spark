@@ -142,11 +142,20 @@ def _pan_from_frigate(presence: dict | None) -> int:
 
 def ease(px, from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration: float) -> None:
     steps = max(2, int(duration * EASE_SPEED))
+    prev_pan, prev_tilt = from_pan, from_tilt
     for i in range(steps + 1):
         # Sine ease-in-out: smooth acceleration/deceleration
         t = 0.5 - 0.5 * math.cos(math.pi * i / steps)
-        px.set_cam_pan_angle(int(round(from_pan  + (to_pan  - from_pan)  * t)))
-        px.set_cam_tilt_angle(int(round(from_tilt + (to_tilt - from_tilt) * t)))
+        new_pan  = int(round(from_pan  + (to_pan  - from_pan)  * t))
+        new_tilt = int(round(from_tilt + (to_tilt - from_tilt) * t))
+        # Only write I2C when the angle actually changed — redundant writes
+        # cause servo micro-jitter as the MCU briefly interrupts PWM
+        if new_pan != prev_pan:
+            px.set_cam_pan_angle(new_pan)
+            prev_pan = new_pan
+        if new_tilt != prev_tilt:
+            px.set_cam_tilt_angle(new_tilt)
+            prev_tilt = new_tilt
         if i < steps:
             time.sleep(duration / steps)
 
