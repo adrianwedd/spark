@@ -561,6 +561,7 @@ async def health():
 async def public_status() -> Dict[str, Any]:
     """Live SPARK status: persona, mood, last thought. No auth required."""
     session = load_session()
+    persona = session.get("persona", "")
 
     state_dir = _public_state_dir()
     # Always use SPARK's thoughts on the public site — never expose gremlin/vixen thoughts.

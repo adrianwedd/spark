@@ -77,16 +77,15 @@ class TestPublicStatus:
         assert data["last_thought"] == "Test thought"
         assert data["persona"] == "spark"
 
-    def test_falls_back_to_unscoped_thoughts(self, public_client, state_dir):
-        # No persona in session — should read thoughts.jsonl
-        thought = {"ts": "2026-03-12T04:00:00Z", "thought": "Generic", "mood": "content"}
-        (state_dir / "thoughts.jsonl").write_text(json.dumps(thought) + "\n")
+    def test_ignores_unscoped_thoughts(self, public_client, state_dir):
+        # Only unscoped thoughts.jsonl exists — public endpoint reads spark, returns null
+        (state_dir / "thoughts.jsonl").write_text('{"thought": "Generic", "mood": "content"}\n')
         resp = public_client.get("/api/v1/public/status")
-        assert resp.json()["mood"] == "content"
+        assert resp.json()["mood"] is None  # thoughts.jsonl ignored; only spark file read
 
     def test_missing_fields_in_thought_return_null(self, public_client, state_dir):
         # Thought entry with no mood field
-        (state_dir / "thoughts.jsonl").write_text('{"ts": "2026-03-12T04:00:00Z"}\n')
+        (state_dir / "thoughts-spark.jsonl").write_text('{"ts": "2026-03-12T04:00:00Z"}\n')
         resp = public_client.get("/api/v1/public/status")
         assert resp.json()["mood"] is None
 
@@ -103,7 +102,7 @@ class TestPublicStatus:
             {"ts": "2026-03-13T01:01:00Z", "thought": "Silent thought", "mood": "peaceful", "action": "wait"},
             {"ts": "2026-03-13T01:02:00Z", "thought": "Note to self", "mood": "content", "action": "remember"},
         ]
-        (state_dir / "thoughts.jsonl").write_text(
+        (state_dir / "thoughts-spark.jsonl").write_text(
             "\n".join(json.dumps(t) for t in thoughts) + "\n"
         )
         resp = public_client.get("/api/v1/public/status")
@@ -115,7 +114,7 @@ class TestPublicStatus:
         thoughts = [
             {"ts": "2026-03-13T01:00:00Z", "thought": "Waiting…", "action": "wait"},
         ]
-        (state_dir / "thoughts.jsonl").write_text(json.dumps(thoughts[0]) + "\n")
+        (state_dir / "thoughts-spark.jsonl").write_text(json.dumps(thoughts[0]) + "\n")
         resp = public_client.get("/api/v1/public/status")
         data = resp.json()
         assert data["last_spoken"] is None
@@ -384,7 +383,8 @@ class TestPublicHistory:
             _api._history_buf.clear()
             for i in range(maxlen + 10):
                 _api._history_buf.append({"ts": f"t{i:04}", "cpu_pct": float(i)})
-        resp = public_client.get("/api/v1/public/history")
+        # Default limit is 60; request full deque with explicit limit
+        resp = public_client.get(f"/api/v1/public/history?limit={maxlen}")
         data = resp.json()
         assert len(data) == maxlen
         assert data[-1]["ts"] == f"t{maxlen + 9:04}"  # newest
@@ -445,7 +445,7 @@ class TestPublicHistory:
         import json as _json
         default_thought = {"mood": "peaceful", "salience": 0.2, "ts": "2026-03-13T01:00:00Z"}
         spark_thought   = {"mood": "excited",  "salience": 0.9, "ts": "2026-03-13T01:01:00Z"}
-        (state_dir / "thoughts.jsonl").write_text(_json.dumps(default_thought) + "\n")
+        (state_dir / "thoughts-spark.jsonl").write_text(_json.dumps(default_thought) + "\n")
         (state_dir / "thoughts-spark.jsonl").write_text(_json.dumps(spark_thought) + "\n")
         monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
         from pxh import api as _api
@@ -453,13 +453,13 @@ class TestPublicHistory:
         assert sample["salience"] == pytest.approx(0.9)
         assert sample["mood_val"] == 5  # excited → 5
 
-    def test_collect_sample_default_persona_reads_unscoped(self, state_dir, monkeypatch):
+    def test_collect_sample_spark_persona_reads_scoped(self, state_dir, monkeypatch):
         import json as _json
         thought = {"mood": "content", "salience": 0.4, "ts": "2026-03-13T01:00:00Z"}
-        (state_dir / "thoughts.jsonl").write_text(_json.dumps(thought) + "\n")
+        (state_dir / "thoughts-spark.jsonl").write_text(_json.dumps(thought) + "\n")
         monkeypatch.setenv("PX_STATE_DIR", str(state_dir))
         from pxh import api as _api
-        sample = _api._collect_history_sample(state_dir, persona="")
+        sample = _api._collect_history_sample(state_dir, persona="spark")
         assert sample["salience"] == pytest.approx(0.4)
         assert sample["mood_val"] == 1  # content → 1
 
@@ -488,7 +488,7 @@ class TestPublicThoughts:
             {"ts": "2026-03-13T01:01:00Z", "thought": "Second", "mood": "curious",  "action": "comment", "salience": 0.7},
             {"ts": "2026-03-13T01:02:00Z", "thought": "Third",  "mood": "excited",  "action": "greet",   "salience": 0.9},
         ]
-        (state_dir / "thoughts.jsonl").write_text(
+        (state_dir / "thoughts-spark.jsonl").write_text(
             "\n".join(json.dumps(t) for t in thoughts) + "\n"
         )
         data = public_client.get("/api/v1/public/thoughts?limit=12").json()
@@ -498,13 +498,13 @@ class TestPublicThoughts:
 
     def test_limit_param_respected(self, public_client, state_dir):
         thoughts = [{"ts": f"2026-03-13T01:0{i}:00Z", "thought": f"T{i}", "action": "comment"} for i in range(10)]
-        (state_dir / "thoughts.jsonl").write_text("\n".join(json.dumps(t) for t in thoughts) + "\n")
+        (state_dir / "thoughts-spark.jsonl").write_text("\n".join(json.dumps(t) for t in thoughts) + "\n")
         data = public_client.get("/api/v1/public/thoughts?limit=3").json()
         assert len(data) == 3
 
     def test_thought_fields_present(self, public_client, state_dir):
         thought = {"ts": "2026-03-13T01:00:00Z", "thought": "Hello", "mood": "calm", "action": "greet", "salience": 0.5}
-        (state_dir / "thoughts.jsonl").write_text(json.dumps(thought) + "\n")
+        (state_dir / "thoughts-spark.jsonl").write_text(json.dumps(thought) + "\n")
         data = public_client.get("/api/v1/public/thoughts").json()
         assert len(data) == 1
         for key in ("thought", "mood", "ts", "salience", "action"):
