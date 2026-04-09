@@ -29,7 +29,7 @@ All helper scripts live in `~/picar-x-hacking/bin`. Each script is designed to b
 | `px-session` | Creates a tmux workspace with the voice loop, wake controller, and log tail panes; supports `--plan` to print the layout without launching tmux. |
 | `codex-voice-loop` | Supervisor that pipes transcripts through the Codex CLI, parses JSON tool requests, enforces allowlists/ranges, executes wrappers, and records a watchdog heartbeat in `state/session.json`. |
 
-| `tool-chat` | Jailbroken conversational AI via Ollama (qwen3:1.7b on M1.local). Sends user text through a F41LUR3-F1R57 format-lock jailbreak prompt, cleans the response, and speaks it aloud. Logs full prompt/response to `logs/tool-chat.log`. Env: `PX_TEXT` (required), `PX_OLLAMA_HOST`, `PX_CHAT_MODEL`, `PX_CHAT_TEMPERATURE`, `PX_CHAT_MAX_TOKENS`. |
+| `tool-chat` | Jailbroken conversational AI via Ollama (gemma4:e4b on M5.local). Sends user text through a F41LUR3-F1R57 format-lock jailbreak prompt, cleans the response, and speaks it aloud. Logs full prompt/response to `logs/tool-chat.log`. Env: `PX_TEXT` (required), `PX_OLLAMA_HOST`, `PX_CHAT_MODEL`, `PX_CHAT_TEMPERATURE`, `PX_CHAT_MAX_TOKENS`. |
 | `px-api-server` | Launches the REST API (FastAPI + uvicorn) on port 8420. Sources `px-env` and `.env` (for `PX_API_TOKEN`). Supports `--dry-run`, `--port`, `--host`. Must always be used instead of bare uvicorn. |
 | `tool-api-start` | Daemonises `px-api-server` in the background; writes PID to `logs/px-api-server.pid`. Respects `PX_DRY`. |
 | `tool-api-stop` | Sends SIGTERM to the API server via PID file; waits for clean shutdown. |

@@ -135,7 +135,7 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer cognitive architecture:
 - **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state + calendar + multi-camera Frigate → `state/awareness.json` + transition detection. Fetches Obi's Google Calendar every 5 min via `gws` CLI; queries all Frigate cameras (picar_x, picamera, driveway_camera, garden_camera) for per-camera person/object presence with room names.
-- **Layer 2 — Reflection** (on transition or every 5 min idle): SPARK persona uses Claude Haiku via `claude -p` subprocess (120s timeout, `--output-format text`, `--allowedTools ""`, `--no-session-persistence`). Other personas (GREMLIN, VIXEN) use Ollama on M1.local (auto-detects loaded model; default fallback `deepseek-r1:1.5b`). Falls back to Ollama on Claude error. Local Pi Ollama fallback disabled by default (Pi 4 RAM too small; opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt. 42 reflection angles sampled 5 per call to diversify mood range across all 12 moods. Weather refreshed every 30 min (BOM updates half-hourly).
+- **Layer 2 — Reflection** (on transition or every 5 min idle): SPARK persona uses Claude Haiku via `claude -p` subprocess (120s timeout, `--output-format text`, `--allowedTools ""`, `--no-session-persistence`). Other personas (GREMLIN, VIXEN) use Ollama on M5.local (auto-detects loaded model; default fallback `gemma4:e4b`). Falls back to Ollama on Claude error. Four-tier fallback: Claude → M5.local → Ollama Cloud (if `OLLAMA_CLOUD_API_KEY` set) → Pi localhost (opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt. 42 reflection angles sampled 5 per call to diversify mood range across all 12 moods. Weather refreshed every 30 min (BOM updates half-hourly).
 - **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions (15): `wait, greet, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check, morning_fact`. Charging-gated actions (require battery) are blocked when on charger. Expression gating: suppresses speech during school hours, Mum's custody time, quiet time, bedtime, and decompress periods (all calendar-driven). Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
 `compute_obi_mode()` returns calendar-authoritative states (`at-school`, `at-mums`) when calendar events match, falling back to ambient heuristics otherwise.
@@ -390,7 +390,7 @@ Always launch via `bin/px-api-server` (not bare uvicorn — needs `px-env` for P
 
 ### Jailbroken Chat Personas
 
-Two jailbroken chat personas via Ollama (qwen3:1.7b on M1.local; px-mind reflection auto-detects the loaded Ollama model on M1.local for non-SPARK personas), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
+Two jailbroken chat personas via Ollama (gemma4:e4b on M5.local; px-mind reflection auto-detects the loaded Ollama model on M5.local for non-SPARK personas), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
 
 | Persona | Tool | Voice | Character |
 |---------|------|-------|-----------|
@@ -507,12 +507,15 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_PERSONA` | Active persona (`gremlin` / `vixen`); auto-set from session |
 | `PX_CHAT_TEMPERATURE` | GREMLIN sampling temperature (default: `0.9`) |
 | `PX_VIXEN_TEMPERATURE` | VIXEN sampling temperature (default: `0.9`) |
-| `PX_OLLAMA_HOST` | Ollama server (default: `http://M1.local:11434`) |
+| `PX_OLLAMA_HOST` | Ollama server (default: `http://M5.local:11434`) |
 | `PX_MIND_BACKEND` | Reflection backend: `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` (default: `auto`) |
 | `PX_MIND_MODEL` | Ollama model for non-SPARK reflection (default: `auto` — queries loaded model) |
 | `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (disabled by default — Pi 4 OOM) |
-| `PX_MIND_LOCAL_OLLAMA_HOST` | Tier-3 fallback Ollama host on Pi (default: `http://localhost:11434`) |
-| `PX_MIND_LOCAL_MODEL` | Tier-3 fallback model (default: `auto` — queries loaded model) |
+| `PX_OLLAMA_CLOUD_HOST` | Ollama Cloud API base URL (default: `https://api.ollama.com`) |
+| `OLLAMA_CLOUD_API_KEY` | Ollama Cloud Bearer token (enables Tier 3 cloud fallback) |
+| `PX_OLLAMA_CLOUD_MODEL` | Ollama Cloud model (default: `gemma4:e4b`) |
+| `PX_MIND_LOCAL_OLLAMA_HOST` | Tier-4 fallback Ollama host on Pi (default: `http://localhost:11434`) |
+| `PX_MIND_LOCAL_MODEL` | Tier-4 fallback model (default: `auto` — queries loaded model) |
 | `PX_STATE_DIR` | Override state directory (used by tests) |
 | `PX_FRIGATE_HOST` | Frigate API base URL (default: `http://pi5-hailo.local:5000`) |
 | `PX_FRIGATE_CAMERA` | Frigate camera name (default: `picar_x`) |
@@ -523,8 +526,8 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_CLAUDE_BIN` | Override Claude CLI binary path |
 | `PX_VOICE_LOCK_TIMEOUT` | Voice output lock timeout in seconds (default: 30) |
 | `PX_TTS_GREMLIN` | GREMLIN TTS server URL (default: `http://localhost:7861`) — GLaDOS TTS on Pi |
-| `PX_TTS_VIXEN` | VIXEN TTS server URL (default: `http://M1.local:7860`) — Qwen3-TTS voice clone on M1 |
-| `PX_TTS_SPARK` | SPARK TTS server URL (default: `http://M1.local:7860`) — Qwen3-TTS "data" voice on M1 |
+| `PX_TTS_VIXEN` | VIXEN TTS server URL (default: `http://M5.local:7860`) — Qwen3-TTS voice clone on M1 |
+| `PX_TTS_SPARK` | SPARK TTS server URL (default: `http://M5.local:7860`) — Qwen3-TTS "data" voice on M1 |
 | `PX_TTS_SPARK_VOICE` | Voice name on SPARK TTS server (default: `data`) |
 | `PX_HA_HOST` | Home Assistant host (default: `http://homeassistant.local:8123`) |
 | `PX_HA_TOKEN` | Home Assistant long-lived access token |

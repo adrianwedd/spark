@@ -14,8 +14,8 @@ Ollama decides HOW to say it in the persona's voice.
 Environment:
     PX_TEXT            — text to rephrase and speak (required)
     PX_PERSONA         — persona name: "gremlin" or "vixen" (required)
-    PX_OLLAMA_HOST     — Ollama endpoint (default: http://M1.local:11434)
-    PX_CHAT_MODEL      — Ollama model (default: qwen3:1.7b)
+    PX_OLLAMA_HOST     — Ollama endpoint (default: http://M5.local:11434)
+    PX_CHAT_MODEL      — Ollama model (default: gemma4:e4b)
     PX_VOICE_VARIANT   — espeak voice variant (set by persona config)
     PX_VOICE_PITCH     — espeak pitch (set by persona config)
     PX_VOICE_RATE      — espeak rate (set by persona config)
@@ -36,8 +36,8 @@ from pxh.logging import log_event
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
 
-OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
-MODEL        = os.environ.get("PX_CHAT_MODEL", "qwen3:1.7b")
+OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
+MODEL        = os.environ.get("PX_CHAT_MODEL", "gemma4:e4b")
 
 REPHRASE_PROMPTS = {
     "gremlin": (

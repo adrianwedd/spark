@@ -9,7 +9,7 @@ Awareness is enriched with weather (every 10 min), long-term memory,
 topic seeding for variety, and repetition detection to stay dynamic.
 
 Run with: bin/px-mind [--dry-run]
-Requires Ollama running on M1.local (or PX_OLLAMA_HOST).
+Requires Ollama running on M5.local (or PX_OLLAMA_HOST).
 """
 from __future__ import annotations
 
@@ -309,8 +309,11 @@ REACTIVE_TEMPLATES = {
 }
 
 # Ollama config (same host as tool-chat)
-OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
+OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
 _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
+OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
+OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
+_CLOUD_MODEL_ENV  = os.environ.get("PX_OLLAMA_CLOUD_MODEL", "gemma4:e4b")
 LOCAL_OLLAMA_HOST = os.environ.get("PX_MIND_LOCAL_OLLAMA_HOST", "http://localhost:11434")
 _LOCAL_MODEL_ENV  = os.environ.get("PX_MIND_LOCAL_MODEL", "auto")
 
@@ -343,7 +346,7 @@ def _resolve_ollama_model(host: str, preferred: str) -> str:
     # Return cached model if available, else fallback
     if cached:
         return cached[0]
-    return "deepseek-r1:1.5b"  # ultimate fallback
+    return "gemma4:e4b"  # ultimate fallback
 
 
 # Eagerly resolve at module load for startup logging, but non-blocking:
@@ -1944,8 +1947,9 @@ def extract_json(text: str) -> dict | None:
 
 def call_ollama(prompt: str, system: str,
                 host: str | None = None,
-                model: str | None = None) -> dict:
-    """Call Ollama for reflection. host defaults to OLLAMA_HOST (M1.local)."""
+                model: str | None = None,
+                auth_token: str | None = None) -> dict:
+    """Call Ollama for reflection. host defaults to OLLAMA_HOST (M5.local)."""
     _host  = host  or OLLAMA_HOST
     # Re-resolve model on each call (cached, re-checks every 30 min)
     _model = model or _resolve_ollama_model(_host, _MODEL_ENV)
@@ -1963,13 +1967,18 @@ def call_ollama(prompt: str, system: str,
         },
     }).encode()
 
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
     req = urllib.request.Request(
         f"{_host}/api/generate",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     # Local Pi models need longer on cold start (~24s load + generation)
-    _timeout = 90 if _host == LOCAL_OLLAMA_HOST else 30
+    # Cloud gets extra time for cold model loads too
+    _timeout = 90 if _host in (LOCAL_OLLAMA_HOST, OLLAMA_CLOUD_HOST) else 30
     try:
         with urllib.request.urlopen(req, timeout=_timeout) as resp:
             return json.loads(resp.read())
@@ -2104,11 +2113,12 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
 
 
 def call_llm(prompt: str, system: str, persona: str = "") -> dict:
-    """Three-tier LLM fallback.
+    """Four-tier LLM fallback.
 
     Tier 1 — Claude Haiku (internet):  SPARK in auto mode, or MIND_BACKEND=claude
-    Tier 2 — Ollama M1.local (LAN):    all personas, or when Claude fails
-    Tier 3 — Ollama localhost (Pi):     final fallback when LAN/internet both down
+    Tier 2 — Ollama M5.local (LAN):    all personas, or when Claude fails
+    Tier 3 — Ollama Cloud (internet):   fallback when M5 unreachable
+    Tier 4 — Ollama localhost (Pi):     final fallback when all else fails
     """
     use_claude = (
         MIND_BACKEND == "claude"
@@ -2131,7 +2141,7 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
             return result
         log(f"claude failed ({result['error']}), falling back to ollama")
 
-    # Tier 2: M1 Ollama
+    # Tier 2: M5 Ollama (LAN)
     result = call_ollama(prompt, system)
     if "error" not in result:
         try:
@@ -2140,11 +2150,25 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
             pass
         return result
 
-    # Tier 3: local Pi Ollama — disabled by default (Pi 4 RAM too small;
+    # Tier 3: Ollama Cloud (internet fallback)
+    if OLLAMA_CLOUD_KEY:
+        log(f"M5 ollama failed ({result['error']}), falling back to ollama cloud")
+        result = call_ollama(prompt, system,
+                             host=OLLAMA_CLOUD_HOST,
+                             model=_CLOUD_MODEL_ENV,
+                             auth_token=OLLAMA_CLOUD_KEY)
+        if "error" not in result:
+            try:
+                _log_token_usage(prompt + system, result.get("response", ""))
+            except Exception:
+                pass
+            return result
+
+    # Tier 4: local Pi Ollama — disabled by default (Pi 4 RAM too small;
     # loading a model alongside px-wake-listen/SenseVoice fills swap and OOMs).
     # Enable with PX_MIND_LOCAL_OLLAMA=1 if running on a beefier Pi.
     if os.environ.get("PX_MIND_LOCAL_OLLAMA") == "1":
-        log(f"M1 ollama failed ({result['error']}), falling back to local ollama")
+        log(f"ollama cloud failed ({result['error']}), falling back to local ollama")
         result = call_ollama(prompt, system, host=LOCAL_OLLAMA_HOST, model=LOCAL_MODEL)
         if "error" not in result:
             try:
@@ -2153,7 +2177,7 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                 pass
             return result
 
-    log(f"M1 ollama failed ({result['error']}), no local fallback — skipping reflection")
+    log(f"all ollama tiers failed ({result['error']}), no local fallback — skipping reflection")
     return result
 
 

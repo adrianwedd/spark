@@ -1885,9 +1885,9 @@ _LOG_ALLOWLIST = {
 def _sanitize_log_line(line: str) -> str:
     """Strip paths, model names, and backend addresses from log output."""
     line = _re.sub(r"/home/\S+/", "<path>/", line)
-    # Redact Ollama/model backend addresses (e.g. http://M1.local:11434)
+    # Redact Ollama/model backend addresses (e.g. http://M5.local:11434)
     line = _re.sub(r"https?://\S+:\d{4,5}", "<backend>", line)
-    # Redact model identifiers (e.g. deepseek-r1:1.5b, llama3.2:latest)
+    # Redact model identifiers (e.g. gemma4:e4b, llama3.2:latest)
     # Avoid matching port numbers like :8420 — require model name prefix (letters/hyphens before colon)
     line = _re.sub(r"\b[a-z][a-z0-9._-]+:(?:[0-9]+\.?[0-9]*[a-z]*|latest)\b", "<model>", line)
     return line

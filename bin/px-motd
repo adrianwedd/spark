@@ -428,7 +428,7 @@ def section_connectivity() -> list[str]:
     """Quick TCP checks to external dependencies — parallel."""
     from concurrent.futures import ThreadPoolExecutor
     checks = [
-        ("M1 Ollama",  "M1.local",             11434),
+        ("M5 Ollama",  "M5.local",             11434),
         ("Frigate",    "pi5-hailo.local",       5000),
         ("Home Asst",  "homeassistant.local",   8123),
     ]

@@ -14,8 +14,8 @@ local models respond best to strong character immersion + few-shot examples.
 
 Environment:
     PX_TEXT              — user input text (required)
-    PX_OLLAMA_HOST       — Ollama endpoint (default: http://M1.local:11434)
-    PX_CHAT_MODEL        — model name (default: qwen3:1.7b)
+    PX_OLLAMA_HOST       — Ollama endpoint (default: http://M5.local:11434)
+    PX_CHAT_MODEL        — model name (default: gemma4:e4b)
     PX_CHAT_TEMPERATURE  — sampling temperature (default: 0.9)
     PX_CHAT_MAX_TOKENS   — max response tokens (default: 2000)
     PX_DRY               — dry-run mode
@@ -37,8 +37,8 @@ from pxh.state import load_session, update_session
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
 
-OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M1.local:11434")
-MODEL        = os.environ.get("PX_CHAT_MODEL", "qwen3:1.7b")
+OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
+MODEL        = os.environ.get("PX_CHAT_MODEL", "gemma4:e4b")
 TEMPERATURE  = float(os.environ.get("PX_CHAT_TEMPERATURE", "0.9"))
 MAX_TOKENS   = int(os.environ.get("PX_CHAT_MAX_TOKENS", "2000"))
 

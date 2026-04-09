@@ -84,7 +84,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 **Cognitive Loop (`px-mind`)** — The subconscious. Runs continuously in the background:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session state + time of day. Detects transitions.
-- **Layer 2 — Reflection** (on transition or every 5min idle): Claude Haiku via persistent tmux session (SPARK persona) or Ollama deepseek-r1:1.5b on M1.local (others). Generates a thought with mood, suggested action, and salience score.
+- **Layer 2 — Reflection** (on transition or every 5min idle): Claude Haiku via persistent tmux session (SPARK persona) or Ollama gemma4:e4b on M5.local (others). Generates a thought with mood, suggested action, and salience score.
 - **Layer 3 — Expression** (2 min cooldown): dispatches to tools — speak, look around, remember something important. Photo capture (`tool-describe-scene`) is on-request only, not autonomous.
 
 **Idle-Alive (`px-alive`)** — The autonomic nervous system. Keeps the robot looking alive when nothing else is happening: random gaze drifts every 10–25s, pan sweeps every 3–8min, proximity reaction at <35cm. Holds a persistent Picarx handle; yields GPIO via SIGUSR1 when tools need the servos.
@@ -288,7 +288,7 @@ px-mind (every cycle, ~60s)
  │    │    • awareness snapshot
  │    │    • last 3 moods + actions from thoughts-spark.jsonl (not full thought text)
  │    │    • random topic seed from 20 creative prompts (science, wonder, universe)
- │    ├── LLM call: Claude Haiku via tmux session (SPARK) or Ollama deepseek-r1:1.5b (others, temperature=1.3)
+ │    ├── LLM call: Claude Haiku via tmux session (SPARK) or Ollama gemma4:e4b (others, temperature=1.3)
  │    ├── anti-repetition check via difflib (>75% similarity = suppress)
  │    ├── parse JSON: {thought, mood, action, salience}
  │    ├── append to state/thoughts-spark.jsonl
@@ -456,7 +456,7 @@ bin/px-spark --dry-run
 - PiCar-X chassis with pan/tilt camera mount
 - USB microphone (for wake word detection)
 - HifiBerry DAC or Robot HAT speaker output
-- Ollama running on a network host (default: `M1.local`) for cognitive reflection
+- Ollama running on a network host (default: `M5.local`) for cognitive reflection
 
 ### Services (Auto-start on Boot)
 
@@ -726,7 +726,7 @@ sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (requir
 | `CODEX_CHAT_CMD` | Override LLM CLI command | set by launcher |
 | `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout | `30` |
 | `PX_PERSONA` | Active persona (`spark` / `vixen` / `gremlin`) | from session |
-| `PX_OLLAMA_HOST` | Ollama server for cognitive reflection | `http://M1.local:11434` |
+| `PX_OLLAMA_HOST` | Ollama server for cognitive reflection | `http://M5.local:11434` |
 
 ---
 

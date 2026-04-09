@@ -97,12 +97,12 @@ def main() -> int:
 
     # Network TTS routing by persona
     # GREMLIN → GLaDOS TTS on Pi (localhost:7861)
-    # VIXEN → Qwen3-TTS on M1.local (M1.local:7860) — voice "vixen"
-    # SPARK → Qwen3-TTS on M1.local (M1.local:7860) — voice "data"
+    # VIXEN → Qwen3-TTS on M5.local (M5.local:7860) — voice "vixen"
+    # SPARK → Qwen3-TTS on M5.local (M5.local:7860) — voice "data"
     _TTS_HOSTS = {
         "gremlin": os.environ.get("PX_TTS_GREMLIN", "http://localhost:7861"),
-        "vixen": os.environ.get("PX_TTS_VIXEN", "http://M1.local:7860"),
-        "spark": os.environ.get("PX_TTS_SPARK", "http://M1.local:7860"),
+        "vixen": os.environ.get("PX_TTS_VIXEN", "http://M5.local:7860"),
+        "spark": os.environ.get("PX_TTS_SPARK", "http://M5.local:7860"),
     }
 
     # Voice name on the TTS server (may differ from persona name)
@@ -126,9 +126,9 @@ def main() -> int:
         url = f"{host}/synthesize?text={urllib.parse.quote(text)}&voice={voice}"
         try:
             result = subprocess.run(
-                ["curl", "-s", "--connect-timeout", "5", "--max-time", "120",
+                ["curl", "-s", "--connect-timeout", "5", "--max-time", "15",
                  "-o", "-", url],
-                capture_output=True, timeout=130,
+                capture_output=True, timeout=20,
             )
             if result.returncode == 0 and len(result.stdout) > 100:
                 return result.stdout
