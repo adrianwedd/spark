@@ -513,7 +513,7 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (disabled by default — Pi 4 OOM) |
 | `PX_OLLAMA_CLOUD_HOST` | Ollama Cloud API base URL (default: `https://api.ollama.com`) |
 | `OLLAMA_CLOUD_API_KEY` | Ollama Cloud Bearer token (enables Tier 3 cloud fallback) |
-| `PX_OLLAMA_CLOUD_MODEL` | Ollama Cloud model (default: `gemma4:e4b`) |
+| `PX_OLLAMA_CLOUD_MODEL` | Ollama Cloud model (default: `gemma3:4b`) |
 | `PX_MIND_LOCAL_OLLAMA_HOST` | Tier-4 fallback Ollama host on Pi (default: `http://localhost:11434`) |
 | `PX_MIND_LOCAL_MODEL` | Tier-4 fallback model (default: `auto` — queries loaded model) |
 | `PX_STATE_DIR` | Override state directory (used by tests) |

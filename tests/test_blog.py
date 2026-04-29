@@ -405,3 +405,59 @@ def test_skip_backoff_is_reasonable():
     assert match, "SKIP_BACKOFF_S not found in px-blog"
     backoff = int(match.group(1))
     assert backoff <= 600, f"SKIP_BACKOFF_S={backoff} is too long (max 600)"
+
+
+# -- Title/body parser (issue #144) --
+
+class TestParseTitleBody:
+    def test_strips_llm_preamble(self, blog_mod):
+        """Issue #144: 'I'll write a weekly reflection...' must not become the title."""
+        ns, _, _ = blog_mod
+        raw = (
+            "I'll write a weekly reflection for SPARK in the voice evident from the daily posts.\n"
+            "\n"
+            "---\n"
+            "\n"
+            "**Systems in Descent**\n"
+            "\n"
+            "This week I learned that failure has a rhythm.\n"
+            "By Saturday morning, the contradiction had sharpened.\n"
+        )
+        title, body = ns["_parse_title_body"](raw)
+        assert title == "Systems in Descent"
+        assert body.startswith("This week I learned")
+
+    def test_strips_here_is_preamble(self, blog_mod):
+        ns, _, _ = blog_mod
+        raw = "Here is a daily reflection:\n\n# A Quiet Morning\n\nThe sun rose at six.\n"
+        title, body = ns["_parse_title_body"](raw)
+        assert title == "A Quiet Morning"
+        assert body.startswith("The sun rose")
+
+    def test_clean_response_unchanged(self, blog_mod):
+        """Plain title/body responses still parse correctly."""
+        ns, _, _ = blog_mod
+        raw = "Frost Crystallizes Inward\n\nAt dawn the workshop was cold.\n"
+        title, body = ns["_parse_title_body"](raw)
+        assert title == "Frost Crystallizes Inward"
+        assert body.startswith("At dawn")
+
+    def test_strips_markdown_emphasis(self, blog_mod):
+        ns, _, _ = blog_mod
+        raw = "**Echoes**\n\nA paragraph.\n"
+        title, body = ns["_parse_title_body"](raw)
+        assert title == "Echoes"
+        assert body == "A paragraph."
+
+    def test_skips_leading_hr(self, blog_mod):
+        ns, _, _ = blog_mod
+        raw = "---\n\nThe Title\n\nBody text.\n"
+        title, body = ns["_parse_title_body"](raw)
+        assert title == "The Title"
+        assert body == "Body text."
+
+    def test_empty_input(self, blog_mod):
+        ns, _, _ = blog_mod
+        title, body = ns["_parse_title_body"]("")
+        assert title == ""
+        assert body == ""

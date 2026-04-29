@@ -313,7 +313,7 @@ OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
 _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
 OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
-_CLOUD_MODEL_ENV  = os.environ.get("PX_OLLAMA_CLOUD_MODEL", "gemma4:e4b")
+_CLOUD_MODEL_ENV  = os.environ.get("PX_OLLAMA_CLOUD_MODEL", "gemma3:4b")
 LOCAL_OLLAMA_HOST = os.environ.get("PX_MIND_LOCAL_OLLAMA_HOST", "http://localhost:11434")
 _LOCAL_MODEL_ENV  = os.environ.get("PX_MIND_LOCAL_MODEL", "auto")
 

@@ -76,6 +76,57 @@ def log(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Title/body parser
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_PREAMBLE_PATTERNS = (
+    _re.compile(r"^(?:i'?ll|i\s+will|here(?:'s| is)|let me|sure[,.]|okay[,.]?|of course|certainly[,.]?)\b", _re.I),
+    _re.compile(r"^(?:title|here(?:'s| is)\s+(?:a\s+|the\s+)?(?:title|reflection|post|essay))[:.]", _re.I),
+)
+_HR_LINE = _re.compile(r"^[-*_]{3,}\s*$")
+
+
+def _parse_title_body(raw_text: str) -> tuple[str, str]:
+    """Extract (title, body) from an LLM blog response.
+
+    Skips leading blank lines, markdown HRs (---), and preamble sentences
+    ("I'll write...", "Here's a reflection...") before treating the next
+    non-skip line as the title. The remainder is body.
+
+    Title may be wrapped in `**...**`, `# ...`, or `## ...` — those markers
+    are stripped. If no usable title is found, returns ("", body).
+    """
+    candidates = raw_text.splitlines()
+    i = 0
+    while i < len(candidates):
+        line = candidates[i].strip()
+        if not line or _HR_LINE.match(line):
+            i += 1
+            continue
+        if any(p.match(line) for p in _PREAMBLE_PATTERNS):
+            i += 1
+            continue
+        break
+    if i >= len(candidates):
+        return "", ""
+    title = candidates[i].strip()
+    # Strip markdown emphasis/heading markers from the title.
+    title = title.strip("#").strip()
+    if title.startswith("**") and title.endswith("**") and len(title) > 4:
+        title = title[2:-2].strip()
+    body = "\n".join(candidates[i + 1 :]).strip()
+    # If body still starts with an HR (common after **Title** on its own line),
+    # strip it.
+    body_lines = body.splitlines()
+    while body_lines and (not body_lines[0].strip() or _HR_LINE.match(body_lines[0].strip())):
+        body_lines.pop(0)
+    body = "\n".join(body_lines).strip()
+    return title, body
+
+
+# ---------------------------------------------------------------------------
 # Atomic file helpers
 # ---------------------------------------------------------------------------
 
@@ -544,10 +595,10 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         log(f"empty response for {post_type}")
         return None
 
-    # Parse title (first line) + body (rest)
-    lines = raw_text.split("\n", 1)
-    title = lines[0].strip().strip("#").strip()
-    body = lines[1].strip() if len(lines) > 1 else ""
+    # Parse title + body. Strip LLM preamble lines ("I'll write...", "Here is...",
+    # markdown HR `---`, blank lines) before extracting the title. Without this,
+    # the parser eats the model's meta-commentary as the title (issue #144).
+    title, body = _parse_title_body(raw_text)
 
     if not body:
         log(f"empty body for {post_type} — LLM returned title only")
