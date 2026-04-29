@@ -82,15 +82,34 @@ def tail_lines(path: "Path", n: int = 10, chunk_size: int = 8192) -> list:
 def rotate_log(path: Path, max_bytes: int = 5_000_000) -> None:
     """Rotate log file by keeping the last half of lines when it exceeds max_bytes.
 
-    Uses atomic_write for SD card durability. Silently handles missing files
-    and write errors.
+    Uses atomic_write for SD card durability and a sibling FileLock so concurrent
+    appenders don't lose tail entries between the read and the os.replace
+    (issue #149). Silently handles missing files and write errors.
     """
+    if FileLock is None:
+        # Best-effort fallback when filelock isn't available; legacy behavior.
+        try:
+            if not path.exists() or path.stat().st_size <= max_bytes:
+                return
+            lines = path.read_text(encoding="utf-8").splitlines()
+            half = len(lines) // 2
+            atomic_write(path, "\n".join(lines[half:]) + "\n")
+        except Exception:
+            pass
+        return
     try:
         if not path.exists() or path.stat().st_size <= max_bytes:
             return
-        lines = path.read_text(encoding="utf-8").splitlines()
-        half = len(lines) // 2
-        atomic_write(path, "\n".join(lines[half:]) + "\n")
+        lock_path = str(path) + ".rotlock"
+        # Short timeout — if we can't acquire, another process is rotating
+        # (or appending heavily); skip this round, try again next cycle.
+        with FileLock(lock_path, timeout=2):
+            # Re-check size under the lock — another rotator may have already run.
+            if not path.exists() or path.stat().st_size <= max_bytes:
+                return
+            lines = path.read_text(encoding="utf-8").splitlines()
+            half = len(lines) // 2
+            atomic_write(path, "\n".join(lines[half:]) + "\n")
     except Exception:
         pass  # log rotation failure is not fatal
 

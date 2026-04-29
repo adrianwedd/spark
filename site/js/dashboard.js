@@ -194,18 +194,20 @@ window.SparkDashboard = (function () {
       }
     }
 
-    // Who's home card — only show people who are actually home
+    // Who's home card — only show people who are actually home.
+    // The public API hardcodes ha_presence=null for privacy; in that case hide
+    // the section entirely rather than imply an outage (issue #152).
     const haList = $('ha-presence-list');
+    const haLabel = $('ha-presence-label');
     if (haList) {
       const ha = state.ha_presence;
       while (haList.firstChild) haList.removeChild(haList.firstChild);
       if (ha == null) {
-        // API withholds presence for privacy — don't claim "No one home"
-        const li = document.createElement('li');
-        li.className = 'ha-person-item ha-person-unknown';
-        li.textContent = 'Presence offline';
-        haList.appendChild(li);
+        haList.hidden = true;
+        if (haLabel) haLabel.hidden = true;
       } else {
+        haList.hidden = false;
+        if (haLabel) haLabel.hidden = false;
         const home = (ha && Array.isArray(ha.people)) ? ha.people.filter(p => p.home) : [];
         if (home.length === 0) {
           const li = document.createElement('li');

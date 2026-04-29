@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
@@ -61,6 +61,14 @@ _RATE_MAX_MSGS = 10       # messages per window per IP
 _RATE_PRUNE_EVERY = 100   # prune stale IPs every N calls
 _rate_limit_calls = 0
 
+# Separate, more permissive limiter for unauthenticated telemetry reads
+# (issue #151). Dashboard polls 6 endpoints every 30s ≈ 12/min; allow 120/min
+# per IP so legitimate clients are unaffected and only abusive volume is shed.
+_public_rate_store: dict[str, list[float]] = defaultdict(list)
+_public_rate_lock = threading.Lock()
+_PUBLIC_RATE_WINDOW_S = 60
+_PUBLIC_RATE_MAX = 120
+
 
 def _check_rate_limit(ip: str) -> bool:
     """Return True if request is allowed, False if rate-limited."""
@@ -90,6 +98,32 @@ def _check_rate_limit(ip: str) -> bool:
             )
             for k in sorted_ips[:len(_rate_limit_store) - 10000]:
                 del _rate_limit_store[k]
+        return True
+
+
+def _check_public_rate_limit(ip: str) -> bool:
+    """Return True if a public-telemetry request is allowed, False if shed."""
+    now = _time.monotonic()
+    with _public_rate_lock:
+        bucket = _public_rate_store[ip]
+        # Drop entries outside the window
+        i = 0
+        for i, t in enumerate(bucket):
+            if now - t < _PUBLIC_RATE_WINDOW_S:
+                break
+        else:
+            i = len(bucket)
+        if i:
+            del bucket[:i]
+        if len(bucket) >= _PUBLIC_RATE_MAX:
+            return False
+        bucket.append(now)
+        # Bound memory: prune empty buckets opportunistically
+        if len(_public_rate_store) > 10000:
+            stale = [k for k, v in _public_rate_store.items()
+                     if not v or now - v[-1] > _PUBLIC_RATE_WINDOW_S]
+            for k in stale[:len(_public_rate_store) - 10000]:
+                del _public_rate_store[k]
         return True
 
 
@@ -257,6 +291,32 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(SecurityHeadersMiddleware)
+
+
+from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
+
+
+class PublicRateLimitMiddleware(_BaseHTTPMiddleware):
+    """Per-IP rate limit on unauthenticated /public/ reads (issue #151).
+
+    Skips /public/chat (already rate-limited at a stricter rate inside the
+    handler) and any path containing /thought-image/ (cached by Cloudflare,
+    high natural volume from social crawlers).
+    """
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if path.startswith("/api/v1/public/") and "/chat" not in path and "thought-image" not in path:
+            ip = _get_client_ip(request)
+            if not _check_public_rate_limit(ip):
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "rate limit exceeded"},
+                )
+        return await call_next(request)
+
+
+app.add_middleware(PublicRateLimitMiddleware)
 
 _THERMAL_ZONE = Path("/sys/class/thermal/thermal_zone0/temp")
 
@@ -1437,27 +1497,35 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                 content={"status": "already_running", "detail": "stop current race first"},
             )
 
-    # Parse request body (all actions may carry a dry field)
-    body = {}
+    # Parse request body (all actions may carry a dry field). Validate via
+    # RaceRequest so bad JSON shapes return 422 instead of crashing the route
+    # with a 500 from int() on a non-numeric value (issue #150).
+    raw_body: dict = {}
     try:
-        body = await request.json()
+        raw_body = await request.json()
     except Exception:
         pass
-    dry = _resolve_dry(body.get("dry"))
+    try:
+        parsed = RaceRequest(**raw_body) if raw_body else RaceRequest()
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from None
+    dry = _resolve_dry(parsed.dry)
 
-    # Build command
-    cmd = ["/usr/bin/python3", "-m", "pxh.race"]
+    # Launch via bin/px-race so yield_alive runs *before* Picarx() is constructed
+    # (issue #145). The bash launcher sources px-env, sends SIGUSR1 to px-alive,
+    # waits for it to exit + 2s lgpiod settle, then delegates to `python -m pxh.race`.
+    px_race = str(PROJECT_ROOT / "bin" / "px-race")
+    cmd: list[str] = [px_race]
 
     if action == "calibrate_gate":
-        # Non-interactive gate-only calibration for dashboard
         cmd.extend(["--calibrate", "--dry-run"] if dry else ["--calibrate"])
     elif action == "map":
         cmd.append("--map")
         if dry:
             cmd.append("--dry-run")
     elif action == "race":
-        laps = max(1, min(100, int(body.get("laps", 3))))
-        max_speed = max(10, min(60, int(body.get("max_speed", 50))))
+        laps = max(1, min(100, parsed.laps))
+        max_speed = max(10, min(60, parsed.max_speed))
         cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
         if dry:
             cmd.append("--dry-run")
@@ -1467,33 +1535,40 @@ async def race_action(action: str, request: Request) -> JSONResponse:
     _set_job(job_id, {"status": "running", "action": f"race_{action}"})
 
     def _run_race():
+        # Hold a local reference to the popen — never re-read the global after
+        # spawn (issue #146). Stop endpoint nulls the global; reading
+        # _race_proc.returncode after that would raise AttributeError.
         global _race_proc
+        proc: subprocess.Popen | None = None
         try:
             env = os.environ.copy()
             env.setdefault("PYTHONPATH", str(PROJECT_ROOT / "src"))
             with _race_proc_lock:
-                _race_proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     env=env, cwd=str(PROJECT_ROOT),
                 )
-            stdout, stderr = _race_proc.communicate(timeout=600)
+                _race_proc = proc
+            stdout, stderr = proc.communicate(timeout=600)
             _set_job(job_id, {
-                "status": "complete" if _race_proc.returncode == 0 else "error",
+                "status": "complete" if proc.returncode == 0 else "error",
                 "action": f"race_{action}",
-                "returncode": _race_proc.returncode,
+                "returncode": proc.returncode,
                 "stdout": (stdout or b"").decode(errors="replace")[-4096:],
                 "stderr": (stderr or b"").decode(errors="replace")[-2048:],
             })
         except subprocess.TimeoutExpired:
-            with _race_proc_lock:
-                if _race_proc:
-                    _race_proc.kill()
+            if proc:
+                proc.kill()
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "timeout"})
         except Exception as exc:
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": str(exc)})
         finally:
             with _race_proc_lock:
-                _race_proc = None
+                # Only clear the global if it still points at our proc — avoids
+                # racing with a subsequent race start that wrote a new value.
+                if _race_proc is proc:
+                    _race_proc = None
 
     _executor.submit(_run_race)
     return JSONResponse(

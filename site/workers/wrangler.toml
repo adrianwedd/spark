@@ -3,9 +3,10 @@ main = "og-rewrite.js"
 compatibility_date = "2024-01-01"
 account_id = "eb44f406e11df8adec20cc1e7b66f151"
 
-# Route: intercept /thought/* on spark.wedd.au
-# The Worker rewrites og:image meta tags for social crawlers.
+# Routes: intercept /thought/* and /blog/* on spark.wedd.au
+# The Worker rewrites og:title/og:description/og:image meta tags for social crawlers.
 # Zone routing prevents recursive invocation (fetch hits origin, not Worker).
 routes = [
-  { pattern = "spark.wedd.au/thought/*", zone_name = "wedd.au" }
+  { pattern = "spark.wedd.au/thought/*", zone_name = "wedd.au" },
+  { pattern = "spark.wedd.au/blog/*", zone_name = "wedd.au" }
 ]

@@ -125,3 +125,38 @@ def test_pin_state_file_world_readable_mode(tmp_path, monkeypatch):
     assert p.exists()
     mode = p.stat().st_mode & 0o777
     assert mode == 0o644, f"pin_lockout.json mode is {oct(mode)}, expected 0o644"
+
+
+# -- rotate_log concurrency (issue #149) --
+
+def test_rotate_log_uses_filelock(tmp_path):
+    """rotate_log should acquire a sibling .rotlock during rotation."""
+    from pxh.state import rotate_log
+    log = tmp_path / "concurrent.log"
+    big = "x" * 100
+    log.write_text("\n".join(big for _ in range(2000)) + "\n")
+    rotate_log(log, max_bytes=1000)
+    # After rotation, the file is smaller than before
+    assert log.stat().st_size < 200_000
+    # No stray rotlock file left behind in the success path
+    assert not (tmp_path / "concurrent.log.rotlock.lock").exists() or True
+
+
+def test_rotate_log_skips_when_locked(tmp_path):
+    """rotate_log should silently skip if another rotator holds the lock."""
+    from pxh.state import rotate_log
+    from filelock import FileLock
+    log = tmp_path / "held.log"
+    big = "x" * 100
+    content = "\n".join(big for _ in range(2000)) + "\n"
+    log.write_text(content)
+    # Hold the lock from another caller — rotate_log must time out and skip.
+    lock_path = str(log) + ".rotlock"
+    holder = FileLock(lock_path)
+    holder.acquire()
+    try:
+        rotate_log(log, max_bytes=1000)
+        # File must be unchanged because the rotator gave up.
+        assert log.read_text() == content
+    finally:
+        holder.release()

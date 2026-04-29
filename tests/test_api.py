@@ -1114,6 +1114,45 @@ class TestRaceEndpoint:
             f"Unexpected job status: {last_status}"
         )
 
+    def test_race_invokes_bin_px_race_for_yield_alive(self, api_client, auth_headers):
+        """Issue #145: race must spawn bin/px-race (which calls yield_alive),
+        not python -m pxh.race directly."""
+        from unittest.mock import patch, MagicMock
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.communicate.return_value = (b"", b"")
+        captured = []
+
+        def fake_popen(cmd, **kwargs):
+            captured.append(cmd)
+            return mock_proc
+
+        with patch("pxh.api.subprocess.Popen", side_effect=fake_popen):
+            resp = api_client.post(
+                "/api/v1/race/map", headers=auth_headers, json={"dry": True}
+            )
+        assert resp.status_code == 202
+        import time
+        deadline = time.monotonic() + 5.0
+        while not captured and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert captured
+        cmd = captured[0]
+        assert cmd[0].endswith("/bin/px-race"), (
+            f"Race must launch via bin/px-race for yield_alive; got cmd[0]={cmd[0]}"
+        )
+
+    def test_race_invalid_body_returns_422(self, api_client, auth_headers):
+        """Issue #150: malformed race body must return 422, not 500."""
+        resp = api_client.post(
+            "/api/v1/race/race",
+            headers=auth_headers,
+            json={"laps": "not-an-int"},
+        )
+        assert resp.status_code == 422
+
     def test_race_stop_terminates_running_process(self, api_client, auth_headers):
         """POST /api/v1/race/stop when a race is running terminates it."""
         import pxh.api as api_mod

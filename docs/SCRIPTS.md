@@ -1354,7 +1354,7 @@ Uses `datetime.now(timezone.utc)` (not the deprecated `utcnow()`).
 10. Update session and log transcript entry.
 11. If `--exit-on-stop` and tool was `tool_stop`, break.
 
-**Watchdog thread:** Only started in voice mode (`--input-mode voice`). Uses a `queue.Queue` for heartbeats. If no heartbeat for `watchdog_timeout` seconds, calls `os._exit(1)` (hard exit, bypasses finally blocks). In text mode (slow typists), no watchdog.
+**Watchdog thread:** Only started in voice mode (`--input-mode voice`). Uses a `queue.Queue` for heartbeats; the watchdog drains the queue to empty each iteration so producers (multiple per turn) don't accumulate. If no heartbeat for `watchdog_timeout` seconds, sends `SIGTERM` to itself for a clean shutdown (finally blocks run); only forces `os._exit(1)` if SIGTERM doesn't terminate within a 5-second grace window. In text mode (slow typists), no watchdog.
 
 **Security:** `capture_voice_input` rejects shell metacharacters (`|`, `;`, `&&`, `||`, `>`, `<`) in `--transcriber-cmd` to prevent injection.
 

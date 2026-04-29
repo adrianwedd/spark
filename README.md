@@ -117,7 +117,7 @@ Boot
  ├── px-api-server.service      (pi)     — REST API + SPARK web dashboard on port 8420
  ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via Claude, posts to Bluesky + local feed
  ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration (stops px-alive to claim libcamera)
- └── cloudflared.service        (pi)     — Cloudflare Tunnel (api.spark.wedd.au → localhost:8420)
+ └── cloudflared.service        (pi)     — Cloudflare Tunnel (spark-api.wedd.au → localhost:8420)
 ```
 
 **`px-alive`** runs as root (GPIO access) and immediately calls `Picarx()`, claiming GPIO5 via `reset_mcu()`. It never releases this handle. All other processes that need servos must signal px-alive with `SIGUSR1` (via the `yield_alive` function in `px-env`) to make it exit cleanly. systemd restarts it after 10 seconds. The PCA9685 PWM chip retains the last servo position between restarts, so the robot head stays still.

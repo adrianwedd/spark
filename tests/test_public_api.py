@@ -553,3 +553,35 @@ class TestPublicServices:
         data = resp.json()
         assert "services" in data
         assert isinstance(data["services"], list)
+
+
+class TestPublicRateLimit:
+    def test_burst_returns_429(self, public_client):
+        """Issue #151: /public/* endpoints rate-limit at 120 req/min per IP."""
+        # Reset the public rate store between runs
+        from pxh import api as api_mod
+        with api_mod._public_rate_lock:
+            api_mod._public_rate_store.clear()
+
+        # 120 should pass, 121st should be 429
+        for i in range(120):
+            r = public_client.get("/api/v1/public/status")
+            assert r.status_code == 200, f"Request {i+1} failed unexpectedly"
+        r = public_client.get("/api/v1/public/status")
+        assert r.status_code == 429
+        assert "rate limit" in r.json().get("detail", "").lower()
+
+    def test_chat_endpoint_not_double_limited(self, public_client):
+        """Public rate limiter must skip /public/chat — that handler has its own limiter."""
+        from pxh import api as api_mod
+        with api_mod._public_rate_lock:
+            api_mod._public_rate_store.clear()
+
+        # Many GETs against telemetry, then a chat request — the public middleware
+        # must not block /public/chat regardless of the telemetry bucket.
+        for _ in range(120):
+            public_client.get("/api/v1/public/status")
+        # The chat endpoint will reject with its own logic (likely 4xx for invalid
+        # body), but it must NOT be 429 from the public middleware.
+        r = public_client.post("/api/v1/public/chat", json={})
+        assert r.status_code != 429

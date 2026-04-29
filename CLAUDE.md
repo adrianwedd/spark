@@ -338,14 +338,14 @@ All read-only — no motion, no audio, no state mutation. Phase 1 of #36.
 
 ### Site (spark.wedd.au)
 
-Static site hosted on **Cloudflare Pages** (auto-deploys from `master` branch, `site/` directory). Three pages: landing (`/`), thought feed (`/feed/`), thought permalink (`/thought/?ts=`).
+Static site hosted on **Cloudflare Pages** (auto-deploys from `master` branch, `site/` directory). Four pages: landing (`/`), thought feed (`/feed/`), thought permalink (`/thought/?ts=`), and blog (`/blog/`, with per-post permalinks at `/blog/?id=...`).
 
 Key frontend infrastructure:
 - **`site/css/colors.css`** — Single-source mood colour palette (CSS custom properties, Scheme B). All 12 moods + legacy "active" have `--mood-*` foreground and `--mood-*-bg` tint variants. All JS/CSS reference these vars instead of hardcoded hex. JS files use `getComputedStyle().getPropertyValue('--mood-' + mood)` for dynamic resolution.
 - **`site/js/config.js`** — Single API base URL (`window.SPARK_CONFIG.API_BASE`). All JS files use this instead of hardcoded URLs.
 - **`site/js/dashboard.js`** — DOM updates for the three-band live dashboard. Race status widget (calibration, profile, live telemetry), time-of-day period badge, 12-mood pulse animations (slow/mid/fast by arousal), mood-coloured favicon.
-- **`site/js/live.js`** — Polling orchestrator. Fetches 6 endpoints every 30s (status, vitals, sonar, awareness, services, race). 12-mood arousal map for sparkline charting. Visibility-aware (pauses when tab hidden).
-- **`site/workers/og-rewrite.js`** — Cloudflare Worker that intercepts `/thought/?ts=...` requests and rewrites `og:image` meta tags server-side with per-thought card URLs. Social crawlers (Bluesky, Twitter) don't execute JS, so client-side OG updates are invisible without this. XSS-sanitized (ISO timestamp regex + HTML attribute escaping). Route: `spark.wedd.au/thought/*`.
+- **`site/js/live.js`** — Polling orchestrator. Fetches 6 endpoints every 30s (status, vitals, sonar, awareness, services, budget). 12-mood arousal map for sparkline charting. Visibility-aware (pauses when tab hidden). Per-IP rate-limited at 120 req/min by `PublicRateLimitMiddleware` in `api.py`.
+- **`site/workers/og-rewrite.js`** — Cloudflare Worker that intercepts `/thought/?ts=...` and `/blog/?id=...` requests and rewrites `og:image`/`og:title`/`og:description` meta tags server-side. Social crawlers (Bluesky, Twitter) don't execute JS, so client-side OG updates are invisible without this. XSS-sanitized (ISO timestamp regex + HTML attribute escaping). Routes: `spark.wedd.au/thought/*` and `spark.wedd.au/blog/*`.
 
 ### REST API
 
