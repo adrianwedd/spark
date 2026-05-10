@@ -3,7 +3,7 @@
   "name": "SPARK",
   "version": "1.0.0",
   "codeowners": [],
-  "dependencies": [],
+  "dependencies": ["conversation"],
   "documentation": "https://github.com/adrianwedd/spark",
   "integration_type": "service",
   "iot_class": "local_polling",

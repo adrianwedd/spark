@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to SPARK",
+        "description": "Enter the URL of the SPARK API (running on the PiCar-X).",
+        "data": {
+          "spark_url": "SPARK API URL"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to SPARK — check the URL and that px-api-server is running."
+    },
+    "abort": {
+      "already_configured": "SPARK is already configured."
+    }
+  }
+}
