@@ -4,10 +4,9 @@ import aiohttp
 from homeassistant.components.conversation import ConversationEntity, ConversationInput, ConversationResult
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import intent
+from homeassistant.helpers import device_registry as dr, intent
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import CONF_URL, DOMAIN
 
@@ -15,7 +14,7 @@ from .const import CONF_URL, DOMAIN
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     async_add_entities([SparkConversationEntity(hass, entry)])
 
@@ -23,22 +22,22 @@ async def async_setup_entry(
 class SparkConversationEntity(ConversationEntity):
     _attr_has_entity_name = True
     _attr_name = None
-    _attr_supported_languages = ["en"]
+
+    @property
+    def supported_languages(self) -> list[str]:
+        return ["en"]
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self._entry = entry
         self._attr_unique_id = entry.entry_id
         self._url = entry.data[CONF_URL]
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        return DeviceInfo(
-            identifiers={(DOMAIN, self._entry.entry_id)},
+        self._attr_device_info = dr.DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
             name="SPARK",
             manufacturer="PiCar-X",
             model="Robot Assistant",
-            entry_type=DeviceEntryType.SERVICE,
+            entry_type=dr.DeviceEntryType.SERVICE,
         )
 
     async def async_process(self, user_input: ConversationInput) -> ConversationResult:
