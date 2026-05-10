@@ -246,17 +246,48 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
     sched = SCHEDULE[post_type]
 
     if post_type == "daily":
-        # Scan back up to DAILY_CATCHUP_DAYS, returning the oldest unwritten day
-        # first so catch-up is chronological after a power outage or offline period.
+        # Scan forward from the day after the last written/skipped daily post.
+        # This ensures catch-up only covers the actual gap after an outage, not
+        # arbitrary old unwritten days from before the daemon existed.
         target_time = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-        for days_back in range(DAILY_CATCHUP_DAYS, -1, -1):
-            candidate = now - dt.timedelta(days=days_back)
-            # Don't generate today's post until after the scheduled time
-            if days_back == 0 and now < target_time:
+        posts = blog_data.get("posts", [])
+        skipped = blog_data.get("skipped", [])
+
+        # Find the most recent daily post or skip date
+        last_daily_date = None
+        for p in posts:
+            if p.get("type") != "daily":
                 continue
+            try:
+                ts = dt.datetime.fromisoformat(p["period_start"]).astimezone(HOBART_TZ)
+                d = ts.date()
+                if last_daily_date is None or d > last_daily_date:
+                    last_daily_date = d
+            except (KeyError, ValueError):
+                continue
+        for pid in skipped:
+            # pid format: blog-YYYYMMDD-daily
+            try:
+                d = dt.date(int(pid[5:9]), int(pid[9:11]), int(pid[11:13]))
+                if last_daily_date is None or d > last_daily_date:
+                    last_daily_date = d
+            except (ValueError, IndexError):
+                continue
+
+        # Scan from the day after last post up to yesterday (or today post-schedule)
+        start = (last_daily_date + dt.timedelta(days=1)) if last_daily_date else (now - dt.timedelta(days=DAILY_CATCHUP_DAYS)).date()
+        today = now.date()
+        candidate_date = start
+        while candidate_date <= today:
+            candidate = dt.datetime(candidate_date.year, candidate_date.month, candidate_date.day,
+                                    sched["hour"], sched["minute"], tzinfo=HOBART_TZ)
+            # Don't generate today's post until after the scheduled time
+            if candidate_date == today and now < target_time:
+                break
             pid = id_for_post("daily", candidate)
             if not post_exists(blog_data, pid):
                 return True, candidate
+            candidate_date += dt.timedelta(days=1)
         return False, None
 
     elif post_type == "weekly":
