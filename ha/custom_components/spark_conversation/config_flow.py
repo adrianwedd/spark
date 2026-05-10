@@ -36,10 +36,11 @@ class SparkConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={CONF_URL: url},
                 )
 
+        suggested_url = (user_input or {}).get(CONF_URL, DEFAULT_URL)
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
-                vol.Required(CONF_URL, default=DEFAULT_URL): str,
+                vol.Required(CONF_URL, default=suggested_url): str,
             }),
             errors=errors,
         )
