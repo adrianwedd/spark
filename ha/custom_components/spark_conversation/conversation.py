@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import aiohttp
 from homeassistant.components.conversation import ConversationEntity, ConversationInput, ConversationResult
 from homeassistant.config_entries import ConfigEntry
@@ -50,10 +51,15 @@ class SparkConversationEntity(ConversationEntity):
                 json={"message": user_input.text},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                resp.raise_for_status()
                 data = await resp.json()
             reply = data.get("reply") or "I'm here — just went quiet for a moment."
+        except asyncio.TimeoutError:
+            reply = "SPARK took too long to respond."
         except aiohttp.ClientConnectorError:
             reply = "I can't reach SPARK right now — it may be offline."
+        except aiohttp.ClientResponseError:
+            reply = "SPARK returned an error response."
         except Exception:
             reply = "Something went wrong reaching SPARK."
 

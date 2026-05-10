@@ -14,7 +14,9 @@ class SparkConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input=None):
         errors = {}
         if user_input is not None:
-            url = user_input[CONF_URL].rstrip("/")
+            url = user_input[CONF_URL].strip().rstrip("/")
+            if not url.startswith(("http://", "https://")):
+                url = f"http://{url}"
             try:
                 session = async_get_clientsession(self.hass)
                 async with session.get(

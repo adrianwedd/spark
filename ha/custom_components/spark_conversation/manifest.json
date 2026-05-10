@@ -5,8 +5,8 @@
   "codeowners": [],
   "dependencies": ["conversation"],
   "documentation": "https://github.com/adrianwedd/spark",
-  "integration_type": "service",
-  "iot_class": "local_polling",
+  "integration_type": "hub",
+  "iot_class": "local_push",
   "requirements": [],
   "config_flow": true
 }
