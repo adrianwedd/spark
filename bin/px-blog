@@ -49,6 +49,8 @@ HOBART_TZ = ZoneInfo("Australia/Hobart")
 BLOG_LIMIT = 500
 MIN_THOUGHTS_FOR_DAILY = 3
 POLL_INTERVAL = 60
+# How many days back to scan for unwritten daily posts (handles power outages)
+DAILY_CATCHUP_DAYS = 30
 
 # Schedule (Hobart time)
 SCHEDULE = {
@@ -155,14 +157,15 @@ def atomic_write(path: Path, content: str) -> None:
 def load_blog() -> dict:
     """Read BLOG_FILE, return default structure if missing/corrupt."""
     if not BLOG_FILE.exists():
-        return {"updated": None, "posts": []}
+        return {"updated": None, "posts": [], "skipped": []}
     try:
         data = json.loads(BLOG_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or "posts" not in data:
-            return {"updated": None, "posts": []}
+            return {"updated": None, "posts": [], "skipped": []}
+        data.setdefault("skipped", [])
         return data
     except (json.JSONDecodeError, OSError):
-        return {"updated": None, "posts": []}
+        return {"updated": None, "posts": [], "skipped": []}
 
 
 def save_blog(data: dict) -> None:
@@ -182,9 +185,14 @@ def append_blog_log(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def post_exists(posts: list, post_id: str) -> bool:
-    """Idempotency check."""
-    return any(p.get("id") == post_id for p in posts)
+def post_exists(blog_data: dict | list, post_id: str) -> bool:
+    """Idempotency check — checks both published posts and skipped records."""
+    if isinstance(blog_data, list):
+        # Legacy callers passing posts list directly
+        return any(p.get("id") == post_id for p in blog_data)
+    posts = blog_data.get("posts", [])
+    skipped = blog_data.get("skipped", [])
+    return any(p.get("id") == post_id for p in posts) or post_id in skipped
 
 
 # ---------------------------------------------------------------------------
@@ -238,18 +246,17 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
     sched = SCHEDULE[post_type]
 
     if post_type == "daily":
-        # Target: today at 22:00 Hobart. If it's before 22:00, check yesterday.
-        target_today = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-        if now >= target_today:
-            # Past 10pm today — generate today's daily
-            pid = id_for_post("daily", now)
-            if not post_exists(blog_data.get("posts", []), pid):
-                return True, now
-        # Also check yesterday (catch-up for overnight or missed)
-        yesterday = now - dt.timedelta(days=1)
-        pid_yesterday = id_for_post("daily", yesterday)
-        if not post_exists(blog_data.get("posts", []), pid_yesterday):
-            return True, yesterday
+        # Scan back up to DAILY_CATCHUP_DAYS, returning the oldest unwritten day
+        # first so catch-up is chronological after a power outage or offline period.
+        target_time = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
+        for days_back in range(DAILY_CATCHUP_DAYS, -1, -1):
+            candidate = now - dt.timedelta(days=days_back)
+            # Don't generate today's post until after the scheduled time
+            if days_back == 0 and now < target_time:
+                continue
+            pid = id_for_post("daily", candidate)
+            if not post_exists(blog_data, pid):
+                return True, candidate
         return False, None
 
     elif post_type == "weekly":
@@ -680,10 +687,23 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
             continue
 
         pid = id_for_post(post_type, target_date)
-        if post_exists(blog_data.get("posts", []), pid):
+        if post_exists(blog_data, pid):
             continue
 
         log(f"generating {post_type} post: {pid}")
+
+        # For daily posts with insufficient thoughts, record a skip so the
+        # catch-up loop can advance to the next day (avoids infinite retry
+        # on offline/quiet days after a power outage).
+        if post_type == "daily":
+            thoughts = gather_thoughts(target_date)
+            if len(thoughts) < MIN_THOUGHTS_FOR_DAILY:
+                log(f"skipping {pid}: only {len(thoughts)} thoughts (offline or quiet day) — marking skipped")
+                blog_data.setdefault("skipped", []).append(pid)
+                save_blog(blog_data)
+                had_skips = True
+                continue
+
         post = generate_post(post_type, target_date, blog_data, dry=dry)
         if post is None:
             had_skips = True
@@ -728,7 +748,7 @@ def run_backfill(*, dry: bool = False) -> int:
     for day in sorted(thought_dates):
         target = dt.datetime(day.year, day.month, day.day, 22, 0, tzinfo=HOBART_TZ)
         pid = id_for_post("daily", target)
-        if post_exists(blog_data.get("posts", []), pid):
+        if post_exists(blog_data, pid):
             log(f"backfill: {pid} already exists, skipping")
             continue
 
@@ -767,7 +787,7 @@ def run_backfill(*, dry: bool = False) -> int:
             sun = dt.date.fromisocalendar(iso_year, iso_week, 7)
             target = dt.datetime(sun.year, sun.month, sun.day, 22, 30, tzinfo=HOBART_TZ)
             pid = id_for_post("weekly", target)
-            if post_exists(blog_data.get("posts", []), pid):
+            if post_exists(blog_data, pid):
                 log(f"backfill: {pid} already exists, skipping")
                 continue
 

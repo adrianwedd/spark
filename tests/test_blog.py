@@ -144,19 +144,18 @@ def _mock_claude_result(title="Test Blog Title", body="This is the blog body.\n\
 class TestBlogSchedule:
 
     def test_daily_idempotent(self, blog_mod):
-        """Write a blog.json with today's + yesterday's daily, verify is_due returns False."""
+        """Write posts for all days in the catchup window, verify is_due returns False."""
         ns, state_dir, _ = blog_mod
         now = dt.datetime.now(HOBART_TZ)
-        yesterday = now - dt.timedelta(days=1)
+        catchup_days = ns["DAILY_CATCHUP_DAYS"]
 
-        # Write today's + yesterday's daily (catch-up checks both)
-        today_post = _make_daily_post(now)
-        yesterday_post = _make_daily_post(yesterday)
-        _write_blog_with_posts(state_dir, [yesterday_post, today_post])
+        # Fill the entire lookback window so no day is unwritten
+        posts = [_make_daily_post(now - dt.timedelta(days=d)) for d in range(catchup_days + 1)]
+        _write_blog_with_posts(state_dir, posts)
 
         blog_data = ns["load_blog"]()
         due, _ = ns["is_due"]("daily", blog_data)
-        assert not due, "Daily should not be due when today's post already exists"
+        assert not due, "Daily should not be due when all catchup days already have posts"
 
     def test_catchup_on_missed(self, blog_mod):
         """Verify generate_post works for a date with enough thoughts."""
@@ -170,6 +169,49 @@ class TestBlogSchedule:
         assert post is not None
         assert post["type"] == "daily"
         assert post["thought_count"] == 5
+
+    def test_offline_recovery_skips_empty_days(self, blog_mod):
+        """After a power outage, days with 0 thoughts are recorded as skipped so
+        the catch-up loop can advance past them to days with content."""
+        ns, state_dir, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        catchup_days = ns["DAILY_CATCHUP_DAYS"]
+
+        # Simulate: Spark was running fine before the outage (days 6..catchup_days have posts),
+        # then offline days 5..1 (0 thoughts), came back today.
+        # Only day 5 (first day of outage) has thoughts — rest are empty.
+        five_days_ago = now - dt.timedelta(days=5)
+        _write_thoughts(state_dir, five_days_ago, count=5)
+
+        # Pre-populate posts for all days outside the outage window
+        existing_posts = [
+            _make_daily_post(now - dt.timedelta(days=d))
+            for d in range(6, catchup_days + 1)
+        ]
+        _write_blog_with_posts(state_dir, existing_posts)
+
+        blog_data = ns["load_blog"]()
+
+        # is_due should find the oldest unwritten day within the window (5 days ago)
+        due, target = ns["is_due"]("daily", blog_data)
+        assert due
+        assert target.astimezone(HOBART_TZ).date() == five_days_ago.astimezone(HOBART_TZ).date()
+
+        # Each run_once call processes one day (generate or skip); run enough iterations
+        # to flush the full backlog: 1 real post (day 5) + 4 skips (days 4..1).
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                for _ in range(6):
+                    ns["run_once"](dry=False)
+
+        blog_data = ns["load_blog"]()
+        pid_5 = ns["id_for_post"]("daily", five_days_ago)
+        assert ns["post_exists"](blog_data, pid_5), "Day with thoughts should be generated"
+        # Empty days (4..1) should be skipped, not blocking forever
+        for days_back in range(1, 5):
+            pid = ns["id_for_post"]("daily", now - dt.timedelta(days=days_back))
+            assert ns["post_exists"](blog_data, pid), f"Empty day {days_back}d ago should be marked skipped"
+        assert len(blog_data["skipped"]) >= 4, "4 empty days should be in skipped list"
 
     def test_catchup_ordering(self, blog_mod):
         """On a scheduled day, dailies should be processed before weeklies."""
@@ -304,13 +346,13 @@ class TestBlogHelpers:
     def test_load_blog_missing(self, blog_mod):
         ns, _, _ = blog_mod
         data = ns["load_blog"]()
-        assert data == {"updated": None, "posts": []}
+        assert data == {"updated": None, "posts": [], "skipped": []}
 
     def test_load_blog_corrupt(self, blog_mod):
         ns, state_dir, _ = blog_mod
         (state_dir / "blog.json").write_text("NOT JSON")
         data = ns["load_blog"]()
-        assert data == {"updated": None, "posts": []}
+        assert data == {"updated": None, "posts": [], "skipped": []}
 
     def test_save_and_load_roundtrip(self, blog_mod):
         ns, state_dir, _ = blog_mod
