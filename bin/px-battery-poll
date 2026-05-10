@@ -29,6 +29,7 @@ def _write_battery(data: dict) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, str(OUT))
+        os.chmod(str(OUT), 0o644)
     except Exception:
         try:
             os.unlink(tmp)
