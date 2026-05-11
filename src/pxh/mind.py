@@ -113,6 +113,11 @@ FRIGATE_WINDOW_S       = 90    # look for events in the last 90 seconds
 FRIGATE_MIN_SCORE      = 0.60  # ignore detections below this confidence
 FRIGATE_TIMEOUT_S      = 2     # short timeout — must not stall the awareness loop
 FRIGATE_FILE           = STATE_DIR / "frigate_presence.json"
+FINDMYHUB_FILE         = STATE_DIR / "findmyhub.json"
+FINDMYHUB_STALE_S      = 900   # treat as stale after 15 min (cron runs every 5 min)
+# Approximate home coordinates for distance calculation
+HOME_LAT               = float(os.environ.get("PX_HOME_LAT", "-43.13567"))
+HOME_LON               = float(os.environ.get("PX_HOME_LON", "147.11840"))
 
 HA_HOST                = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")
 HA_TOKEN               = os.environ.get("PX_HA_TOKEN", "")
@@ -713,7 +718,7 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
 def _fetch_ha_presence(dry: bool = False) -> dict | None:
     """Query Home Assistant for person presence.
 
-    Returns {people: [{name, state, home}]} or None on error.
+    Returns {people: [{name, state, home, lat?, lon?, gps_accuracy_m?}]} or None on error.
     None means HA unreachable or token not configured.
     Raises urllib.error.HTTPError with code 401/403 on auth failure — caller clears cache.
     """
@@ -735,15 +740,20 @@ def _fetch_ha_presence(dry: bool = False) -> dict | None:
     for entity_id in HA_PEOPLE:
         try:
             s = _get(f"/api/states/{entity_id}")
-            name = s["attributes"].get("friendly_name") or entity_id.split(".")[-1].title()
+            attrs = s.get("attributes", {})
+            name = attrs.get("friendly_name") or entity_id.split(".")[-1].title()
             state = s["state"]  # "home" / "away" / "unknown" / zone name
-            result["people"].append({
-                "name": name,
-                "state": state,
-                "home": state == "home",
-            })
+            entry: dict = {"name": name, "state": state, "home": state == "home"}
+            lat = attrs.get("latitude")
+            lon = attrs.get("longitude")
+            if lat is not None and lon is not None:
+                entry["lat"] = round(lat, 5)
+                entry["lon"] = round(lon, 5)
+                entry["gps_accuracy_m"] = attrs.get("gps_accuracy")
+            result["people"].append(entry)
             if HA_DEBUG:
-                log(f"ha_presence: {entity_id} → {name}={state}")
+                loc = f", lat={lat:.4f} lon={lon:.4f}" if lat is not None else ""
+                log(f"ha_presence: {entity_id} → {name}={state}{loc}")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 raise   # re-raise so caller can clear the stale cache
@@ -759,6 +769,62 @@ def _fetch_ha_presence(dry: bool = False) -> dict | None:
     if HA_DEBUG:
         log("ha_presence: no people found")
     return None
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(a))
+
+
+def _enrich_tracker(raw: dict, name: str) -> dict | None:
+    """Add distance_km, at_home, age_s to a raw tracker entry. Returns None on error."""
+    try:
+        if "error" in raw:
+            return None
+        lat, lon = raw["lat"], raw["lon"]
+        distance_km = _haversine_km(HOME_LAT, HOME_LON, lat, lon)
+        age_s = time.time() - raw["ts"]
+        return {
+            "lat":        round(lat, 5),
+            "lon":        round(lon, 5),
+            "accuracy_m": round(raw.get("accuracy_m", 0)),
+            "ts":         raw["ts"],
+            "age_s":      round(age_s),
+            "distance_km": round(distance_km, 2),
+            "at_home":    distance_km < 0.15,
+        }
+    except Exception as exc:
+        log(f"findmyhub: {name} enrich error: {exc}")
+        return None
+
+
+def _read_findmyhub() -> dict:
+    """Read state/findmyhub.json (written by M5.local cron via GoogleFindMyTools).
+
+    Returns {tracker_name: enriched_dict} for trackers with fresh, valid data.
+    File-level staleness is checked against FINDMYHUB_STALE_S; per-tracker errors
+    are silently dropped so one bad tracker doesn't block the others.
+    """
+    try:
+        if not FINDMYHUB_FILE.exists():
+            return {}
+        data = json.loads(FINDMYHUB_FILE.read_text(encoding="utf-8"))
+        file_age_s = time.time() - data.get("ts", 0)
+        if file_age_s > FINDMYHUB_STALE_S:
+            log(f"findmyhub: file stale ({file_age_s:.0f}s old), ignoring")
+            return {}
+        result = {}
+        for name, raw in data.get("trackers", {}).items():
+            enriched = _enrich_tracker(raw, name)
+            if enriched:
+                result[name] = enriched
+        return result
+    except Exception as exc:
+        log(f"findmyhub: read error: {exc}")
+        return {}
 
 
 def _fetch_ha_sleep(dry: bool = False) -> dict | None:
@@ -1753,6 +1819,11 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         if upcoming:
             awareness["next_event"] = upcoming[0]
 
+    # Enrich with Find Hub tracker locations (written by M5.local cron via GoogleFindMyTools)
+    findmyhub = _read_findmyhub()
+    if findmyhub:
+        awareness["findmyhub"] = findmyhub
+
     # Enrich with HA sleep data
     if _cached_ha_sleep:
         awareness["ha_sleep"] = _cached_ha_sleep
@@ -2283,6 +2354,10 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if obi_mode != "unknown":
         context_parts.append(f"Household activity level: {obi_mode}")
 
+    # Find Hub tracker data is in awareness["findmyhub"] for voice queries (Obi can ask where
+    # people are). Specific locations are intentionally excluded from reflection context to
+    # prevent them appearing in SPARK's thoughts or social posts.
+
     # Multi-camera presence (Frigate)
     frigate_data = awareness.get("frigate") or {}
     rooms_with_people = frigate_data.get("rooms_with_people", [])
@@ -2302,12 +2377,16 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     ha = awareness.get("ha_presence")
     if ha and ha.get("people"):
         home_names  = [p["name"] for p in ha["people"] if p.get("home")]
-        away_names  = [p["name"] for p in ha["people"] if not p.get("home") and p["state"] not in ("unknown", "unavailable")]
+        away_people = [p for p in ha["people"] if not p.get("home") and p["state"] not in ("unknown", "unavailable")]
         unknown_names = [p["name"] for p in ha["people"] if p["state"] in ("unknown", "unavailable")]
         parts = []
-        if home_names:  parts.append(f"{', '.join(home_names)} home")
-        if away_names:  parts.append(f"{', '.join(away_names)} away")
-        if unknown_names: parts.append(f"{', '.join(unknown_names)} unknown")
+        if home_names:
+            parts.append(f"{', '.join(home_names)} home")
+        for p in away_people:
+            zone = p["state"] if p["state"] not in ("not_home", "away") else "away"
+            parts.append(f"{p['name']} {zone}")
+        if unknown_names:
+            parts.append(f"{', '.join(unknown_names)} unknown")
         if parts:
             context_parts.append(f"Who's home (from Home Assistant): {'; '.join(parts)}")
 

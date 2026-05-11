@@ -360,8 +360,44 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
         except Exception:
             print("[voice-loop] failed to read thoughts for prompt context", file=sys.stderr)
 
-    # Inject recent exploration observations
+    # Inject Find Hub tracker locations for voice queries (Obi can ask where people are).
+    # These are never in SPARK's thoughts or posts — voice-only context.
     state_dir = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
+    findmyhub_file = state_dir / "findmyhub.json"
+    if findmyhub_file.exists():
+        try:
+            import time as _time
+            hub = json.loads(findmyhub_file.read_text(encoding="utf-8"))
+            file_age = _time.time() - hub.get("ts", 0)
+            if file_age < 900:
+                TRACKER_LABELS = {
+                    "adrian":      "Adrian (via keys tracker)",
+                    "obi_chipolo": "Obi (via Chipolo tracker)",
+                    "laura":       "Obi's mum Laura (via keys tracker)",
+                }
+                HOME_LAT_VL = float(os.environ.get("PX_HOME_LAT", "-43.13567"))
+                HOME_LON_VL = float(os.environ.get("PX_HOME_LON", "147.11840"))
+                import math as _math
+                loc_lines = []
+                for key, raw in hub.get("trackers", {}).items():
+                    if "error" in raw:
+                        continue
+                    label = TRACKER_LABELS.get(key, key)
+                    lat, lon = raw["lat"], raw["lon"]
+                    dlat = _math.radians(lat - HOME_LAT_VL)
+                    dlon = _math.radians(lon - HOME_LON_VL)
+                    a = _math.sin(dlat/2)**2 + _math.cos(_math.radians(HOME_LAT_VL)) * _math.cos(_math.radians(lat)) * _math.sin(dlon/2)**2
+                    dist_km = 6371 * 2 * _math.asin(_math.sqrt(a))
+                    age_min = int((_time.time() - raw["ts"]) / 60)
+                    location = "at home" if dist_km < 0.15 else f"{dist_km:.1f}km from home"
+                    loc_lines.append(f"  {label}: {location} (last seen {age_min}min ago, ±{raw.get('accuracy_m', '?'):.0f}m)")
+                if loc_lines:
+                    context_sections.append("Tracker locations (use when directly asked — do not volunteer):")
+                    context_sections.extend(loc_lines)
+        except Exception as exc:
+            print(f"[voice-loop] failed to read findmyhub.json: {exc}", file=sys.stderr)
+
+    # Inject recent exploration observations
     exploration_file = state_dir / "exploration.jsonl"
     if exploration_file.exists():
         try:
