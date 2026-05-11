@@ -328,6 +328,31 @@ Post `id` format: `blog-<YYYY-MM-DD>-<type>[-<n>]` (suffix `-<n>` added for mult
 - `PX_BLOG_QA` — `0` = skip Claude QA gate for testing (default: `1`)
 - `PX_BLOG_DRY` — `1` = skip actual write + file update (queue entry still written)
 
+### Home Assistant Integration
+
+Custom conversation component at `ha/custom_components/spark_conversation/` routes Nest Mini / Nest Hub Max voice commands through SPARK's `/api/v1/public/chat` API.
+
+**Deployed to:** `/homeassistant/custom_components/spark_conversation/` on `homeassistant.local`.
+**HA 2026.x quirks:** `supported_languages` must be a `@property`; config entries require v1.5 schema fields (`created_at`, `modified_at`, `discovery_keys`, `subentries`); use `AddConfigEntryEntitiesCallback` not `AddEntitiesCallback`.
+**Pending:** Assign SPARK Assist pipeline to Nest devices in HA Settings → Voice assistants (browser required).
+
+### Location Awareness (Google Find Hub)
+
+`~/GoogleFindMyTools/query_findmyhub.py` on M5.local queries three Chipolo trackers non-interactively via Google's Find Hub API (E2EE decryption). Auth cached in `~/GoogleFindMyTools/Auth/secrets.json`.
+
+**Cron on M5.local** (`*/5 * * * *`): runs query, SSH-pushes result to `state/findmyhub.json` on Pi.
+
+**Trackers:** `obi_chipolo` (Obi's Chipolo POP), `adrian` (Adrian's keys), `laura` (Laura's LK Keys).
+
+**Privacy rule:** Location data is in `awareness["findmyhub"]` and voice loop context only — explicitly excluded from reflection context so specific locations never appear in SPARK's thoughts or social posts. Obi can ask "where's dad?" in conversation; SPARK answers.
+
+**Auth refresh** (if tokens expire):
+```bash
+cd ~/GoogleFindMyTools && venv/bin/python3 -c "import builtins; builtins.input=lambda*a,**k:''; from KeyBackup.shared_key_retrieval import get_shared_key; get_shared_key()"
+```
+
+**Home coordinates:** `PX_HOME_LAT` / `PX_HOME_LON` env vars (defaults: `-43.13567`, `147.11840`). At-home threshold: 150m.
+
 ### MCP Server (Claude Code integration)
 
 `bin/mcp-server` exposes 5 read-only MCP tools for Claude Code dev sessions. Registered in `.mcp.json` (auto-discovered by Claude Code). Uses `FastMCP` (stdio transport).
@@ -537,6 +562,8 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 | `PX_POST_QA` | `0` = skip Claude QA gate for testing |
 | `PX_POST_MIN_SALIENCE` | Minimum salience for social posting (default: `0.7`) |
 | `PX_HA_DEBUG` | `1` = verbose HA fetch logging (per-entity, calendar, routines); errors always logged |
+| `PX_HOME_LAT` | Home latitude for Find Hub distance calculations (default: `-43.13567`) |
+| `PX_HOME_LON` | Home longitude for Find Hub distance calculations (default: `147.11840`) |
 | `PX_EVOLVE_DRY` | `1` = skip worktree creation and PR (queue entry still written) |
 | `PX_EVOLVE_MODEL` | Claude model for evolution proposals (default: `claude-opus-4-6`) |
 | `PX_EVOLVE_TIMEOUT` | Claude subprocess timeout in seconds (default: `1800`) |
