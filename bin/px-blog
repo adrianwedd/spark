@@ -83,9 +83,13 @@ def log(msg: str) -> None:
 
 import re as _re
 
-_PREAMBLE_PATTERNS = (
-    _re.compile(r"^(?:i'?ll|i\s+will|here(?:'s| is)|let me|sure[,.]|okay[,.]?|of course|certainly[,.]?)\b", _re.I),
-    _re.compile(r"^(?:title|here(?:'s| is)\s+(?:a\s+|the\s+)?(?:title|reflection|post|essay))[:.]", _re.I),
+_PREAMBLE_SKIP = _re.compile(
+    r"^(?:i'?ll|i\s+will|here(?:'s| is)|let me|sure[,.]|okay[,.]?|of course|certainly[,.]?)\b",
+    _re.I,
+)
+_TITLE_PREFIX = _re.compile(
+    r"^(?:title|here(?:'s| is)\s+(?:a\s+|the\s+)?(?:title|reflection|post|essay))[:.]\s*",
+    _re.I,
 )
 _HR_LINE = _re.compile(r"^[-*_]{3,}\s*$")
 
@@ -95,30 +99,50 @@ def _parse_title_body(raw_text: str) -> tuple[str, str]:
 
     Skips leading blank lines, markdown HRs (---), and preamble sentences
     ("I'll write...", "Here's a reflection...") before treating the next
-    non-skip line as the title. The remainder is body.
+    non-skip line as the title. Lines starting with "Title:" or "Here's a title:"
+    have the prefix stripped and the remainder used as the title. The remainder
+    is body.
 
     Title may be wrapped in `**...**`, `# ...`, or `## ...` — those markers
     are stripped. If no usable title is found, returns ("", body).
     """
     candidates = raw_text.splitlines()
     i = 0
+    title = ""
     while i < len(candidates):
         line = candidates[i].strip()
         if not line or _HR_LINE.match(line):
             i += 1
             continue
-        if any(p.match(line) for p in _PREAMBLE_PATTERNS):
+        # Check title-prefix BEFORE preamble-skip so "Here's a title: X"
+        # extracts "X" rather than skipping the whole line.
+        m = _TITLE_PREFIX.match(line)
+        if m:
+            title = line[m.end():].strip()
+            i += 1
+            break
+            continue
+        if _PREAMBLE_SKIP.match(line):
             i += 1
             continue
+        m = _TITLE_PREFIX.match(line)
+        if m:
+            title = line[m.end():].strip()
+            i += 1
+            break
         break
-    if i >= len(candidates):
+    if i >= len(candidates) and not title:
         return "", ""
-    title = candidates[i].strip()
+    if not title:
+        title = candidates[i].strip()
+        i += 1
     # Strip markdown emphasis/heading markers from the title.
     title = title.strip("#").strip()
     if title.startswith("**") and title.endswith("**") and len(title) > 4:
         title = title[2:-2].strip()
-    body = "\n".join(candidates[i + 1 :]).strip()
+    # Sanitise: collapse newlines, limit length.
+    title = title.replace("\n", " ").replace("\r", " ").strip()[:200]
+    body = "\n".join(candidates[i:]).strip()
     # If body still starts with an HR (common after **Title** on its own line),
     # strip it.
     body_lines = body.splitlines()

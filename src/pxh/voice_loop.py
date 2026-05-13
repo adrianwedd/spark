@@ -169,18 +169,14 @@ class VoiceLoopError(Exception):
     """Domain-specific errors."""
 
 
-def watchdog_thread_func(heartbeat_q: queue.Queue, timeout: float) -> None:
-    """Monitors a queue for heartbeats and exits if they become stale.
-    Drains the queue fully each iteration so producers (multiple per turn)
-    don't accumulate unbounded between watchdog wakeups."""
+def watchdog_thread_func(heartbeat_lock: threading.Lock, heartbeat_val: list, timeout: float) -> None:
+    """Monitors heartbeat timestamp and exits if it becomes stale.
+    heartbeat_val is a mutable list [float] shared with the main loop —
+    only the latest timestamp matters, so no queue is needed."""
     last_heartbeat = time.monotonic()
     while True:
-        # Drain to empty — keep only the most recent heartbeat.
-        while True:
-            try:
-                last_heartbeat = heartbeat_q.get_nowait()
-            except queue.Empty:
-                break
+        with heartbeat_lock:
+            last_heartbeat = heartbeat_val[0]
 
         stale_time = time.monotonic() - last_heartbeat
         if stale_time > timeout:
@@ -804,18 +800,18 @@ def supervisor_loop(args: argparse.Namespace) -> None:
     ensure_session()
     system_prompt = read_prompt(Path(args.prompt))
 
-    heartbeat_q: queue.Queue | None = None
+    heartbeat_lock = threading.Lock()
+    heartbeat_val: list = [time.monotonic()]
     if args.input_mode != "text":
-        heartbeat_q = queue.Queue()
         watchdog = threading.Thread(
-            target=watchdog_thread_func, args=(heartbeat_q, args.watchdog_timeout), daemon=True
+            target=watchdog_thread_func, args=(heartbeat_lock, heartbeat_val, args.watchdog_timeout), daemon=True
         )
         watchdog.start()
 
     turn = 0
     while turn < args.max_turns:
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
         session = load_session()
 
         listening_enabled = session.get("listening", False)
@@ -824,8 +820,8 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             continue
 
         turn += 1
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
         if args.input_mode == "text":
             user_text = capture_text_input()
         else:
@@ -835,8 +831,8 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             print("[voice-loop] No input, exiting.")
             break
 
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
         # Use persona prompt if one is active in session
         active_persona = (session.get("persona") or "").lower().strip()
         if active_persona and active_persona in PERSONA_PROMPTS:
@@ -850,11 +846,11 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         prompt = build_model_prompt(current_prompt, session, user_text)
         prompt_excerpt = prompt[:800]
 
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
         rc, stdout, stderr = run_codex(args.codex_cmd, prompt)
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
         if rc == 0 and stdout.strip():
             try:
                 from .token_log import log_usage
@@ -888,15 +884,15 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             print(f"[voice-loop] Invalid action: {exc}")
             continue
 
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
         try:
             rc_tool, tool_stdout, tool_stderr = execute_tool(tool, env_overrides, args.dry_run)
         except VoiceLoopError as exc:
             print(f"[voice-loop] Execution error: {exc}")
             continue
-        if heartbeat_q is not None:
-            heartbeat_q.put(time.monotonic())
+        with heartbeat_lock:
+            heartbeat_val[0] = time.monotonic()
 
         tool_payload = parse_tool_payload(tool_stdout)
         session_update = {
@@ -943,8 +939,8 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         if tool == "tool_weather":
             summary = tool_payload.get("summary") if isinstance(tool_payload, dict) else None
             if summary:
-                if heartbeat_q is not None:
-                    heartbeat_q.put(time.monotonic())
+                with heartbeat_lock:
+                    heartbeat_val[0] = time.monotonic()
                 try:
                     rc_voice, voice_stdout, voice_stderr = execute_tool(
                         "tool_voice",
@@ -967,8 +963,8 @@ def supervisor_loop(args: argparse.Namespace) -> None:
                         "stdout": voice_stdout[-1000:],
                         "stderr": voice_stderr[-1000:],
                     }
-                if heartbeat_q is not None:
-                    heartbeat_q.put(time.monotonic())
+                with heartbeat_lock:
+                    heartbeat_val[0] = time.monotonic()
 
         if voice_result is not None:
             transcript_entry["voice_result"] = voice_result

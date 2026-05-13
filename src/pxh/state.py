@@ -58,7 +58,12 @@ def atomic_write(path: Path, content: str) -> None:
 def tail_lines(path: "Path", n: int = 10, chunk_size: int = 8192) -> list:
     """Read the last n lines of a file by seeking backward in chunks until
     n+1 newlines are accumulated or BOF is reached. Handles lines longer than
-    chunk_size and n larger than fits in one chunk."""
+    chunk_size and n larger than fits in one chunk.
+
+    Note: uses .splitlines() which silently drops a trailing empty line for
+    files ending in ``\\n`` (POSIX convention). Callers that need exact line
+    counts should be aware that the result may contain up to 1 fewer line
+    than ``n`` when the file ends with a newline (issue #140)."""
     if n <= 0:
         return []
     try:
@@ -79,12 +84,13 @@ def tail_lines(path: "Path", n: int = 10, chunk_size: int = 8192) -> list:
         return []
 
 
-def rotate_log(path: Path, max_bytes: int = 5_000_000) -> None:
+def rotate_log(path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | None" = None) -> None:
     """Rotate log file by keeping the last half of lines when it exceeds max_bytes.
 
-    Uses atomic_write for SD card durability and a sibling FileLock so concurrent
-    appenders don't lose tail entries between the read and the os.replace
-    (issue #149). Silently handles missing files and write errors.
+    Uses atomic_write for SD card durability. Callers should hold the .rotlock
+    across the append + rotate to prevent TOCTOU races (issue #149). Pass the
+    held lock via held_lock to skip re-acquisition (FileLock is not reentrant).
+    Silently handles missing files and write errors.
     """
     if FileLock is None:
         # Best-effort fallback when filelock isn't available; legacy behavior.
@@ -97,19 +103,22 @@ def rotate_log(path: Path, max_bytes: int = 5_000_000) -> None:
         except Exception:
             pass
         return
-    try:
+
+    def _rotate_inner() -> None:
         if not path.exists() or path.stat().st_size <= max_bytes:
             return
-        lock_path = str(path) + ".rotlock"
-        # Short timeout — if we can't acquire, another process is rotating
-        # (or appending heavily); skip this round, try again next cycle.
-        with FileLock(lock_path, timeout=2):
-            # Re-check size under the lock — another rotator may have already run.
-            if not path.exists() or path.stat().st_size <= max_bytes:
-                return
-            lines = path.read_text(encoding="utf-8").splitlines()
-            half = len(lines) // 2
-            atomic_write(path, "\n".join(lines[half:]) + "\n")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        half = len(lines) // 2
+        atomic_write(path, "\n".join(lines[half:]) + "\n")
+
+    try:
+        if held_lock is not None:
+            # Caller already holds the lock — rotate directly.
+            _rotate_inner()
+        else:
+            lock_path = str(path) + ".rotlock"
+            with FileLock(lock_path, timeout=2):
+                _rotate_inner()
     except Exception:
         pass  # log rotation failure is not fatal
 

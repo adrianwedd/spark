@@ -620,9 +620,9 @@ def test_can_explore_corrupt_meta_fails_safe(explore_state):
 
 
 def test_valid_actions_includes_new_actions():
-    """All 21 actions must be present in VALID_ACTIONS."""
+    """All 22 actions must be present in VALID_ACTIONS."""
     expected = {
-        "wait", "greet", "comment", "remember", "look_at",
+        "wait", "greet", "greet_arrival", "comment", "remember", "look_at",
         "weather_comment", "scan", "explore",
         "play_sound", "photograph", "emote", "look_around",
         "time_check", "calendar_check", "morning_fact",

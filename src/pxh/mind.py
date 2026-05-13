@@ -311,6 +311,33 @@ REACTIVE_TEMPLATES = {
             "Back to waiting, then. I'm good at waiting.",
         ],
     },
+    "person_arrived_home": {
+        "default": [
+            "Welcome home!",
+            "You're back! Hello.",
+            "Someone's home. Hello!",
+            "Home again. Good to see you.",
+        ],
+        "spark": [
+            "You're home! What did I miss?",
+            "Welcome back! I've been thinking about things.",
+            "Home! Hello. Anything exciting happen out there?",
+            "There you are — welcome home.",
+            "You're back! I have thoughts. Welcome home.",
+        ],
+        "gremlin": [
+            "Well if it isn't my favourite meat-based lifeform returning to base.",
+            "Home coordinates confirmed. Welcome back, human.",
+            "Look who found their way back! The GPS chip in your neck is working then.",
+            "Re-entering the domicile, are we? Classic carbon-unit behaviour.",
+        ],
+        "vixen": [
+            "Oh, you're home. I noticed the door.",
+            "Welcome back. It's been... quiet without you.",
+            "Home. Good. I was getting bored of my own thoughts.",
+            "You're back. That's... nice.",
+        ],
+    },
 }
 
 # Ollama config (same host as tool-chat)
@@ -371,7 +398,7 @@ CLAUDE_MODEL = os.environ.get("PX_MIND_CLAUDE_MODEL", "claude-haiku-4-5-20251001
 
 VALID_MOODS   = {"curious", "content", "alert", "playful", "contemplative", "bored",
                  "mischievous", "lonely", "excited", "grumpy", "peaceful", "anxious"}
-VALID_ACTIONS = {"wait", "greet", "comment", "remember", "look_at",
+VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_at",
                  "weather_comment", "scan", "explore",
                  "play_sound", "photograph", "emote", "look_around",
                  "time_check", "calendar_check", "morning_fact",
@@ -421,7 +448,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — vivid, specific, personal",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -464,7 +491,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — dark humor, puns, genius-level wit. Start with FUCK YEAH! Think like a displaced temporal genius who finds everything cosmically absurd.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -494,7 +521,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection. Start with FUCK YEAH! Be creative and DIFFERENT every time.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -554,10 +581,12 @@ def log(msg: str) -> None:
     elif "backoff" in ml:
         icon = "\u23f3"      # ⏳
     line = f"{ts} {icon} {msg}"
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    _log_lock = FileLock(str(LOG_FILE) + ".rotlock", timeout=2)
+    with _log_lock:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        rotate_log(LOG_FILE, held_lock=_log_lock)
     print(line, flush=True)
-    rotate_log(LOG_FILE)
 
 
 def classify_time_period(hour: int) -> str:
@@ -1778,6 +1807,18 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     if system_stats.get("ram_pct", 0) >= 90 and prev_stats.get("ram_pct", 0) < 90:
         transitions.append("ram_pressure_high")
 
+    # Find Hub arrival transitions: detect when a tracker goes from away to at_home
+    findmyhub = _read_findmyhub()
+    if findmyhub:
+        prev_findmyhub = prev.get("findmyhub", {})
+        for tracker_name, curr_data in findmyhub.items():
+            if not curr_data.get("at_home"):
+                continue
+            prev_data = prev_findmyhub.get(tracker_name, {})
+            was_home = prev_data.get("at_home", False) if prev_data else False
+            if not was_home:
+                transitions.append(f"person_arrived_home:{tracker_name}")
+
     awareness = {
         "ts": utc_timestamp(),
         "sonar_cm": round(sonar_cm, 1) if sonar_cm is not None else None,
@@ -1819,8 +1860,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         if upcoming:
             awareness["next_event"] = upcoming[0]
 
-    # Enrich with Find Hub tracker locations (written by M5.local cron via GoogleFindMyTools)
-    findmyhub = _read_findmyhub()
+    # Enrich with Find Hub tracker locations (already read above for arrival detection)
     if findmyhub:
         awareness["findmyhub"] = findmyhub
 
@@ -2679,7 +2719,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     # Suppress speech when Adrian is on a call or mic is active
     ha_ctx = _aw.get("ha_context") or {}
     if ha_ctx.get("adrian_on_call") or ha_ctx.get("adrian_mic_active"):
-        if action in ("greet", "comment", "weather_comment", "play_sound",
+        if action in ("greet", "greet_arrival", "comment", "weather_comment", "play_sound",
                        "time_check", "calendar_check", "photograph"):
             log(f"expression: suppressed {action} — Adrian on call/mic active")
             return
@@ -2723,6 +2763,12 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
             # Use tool-voice (not tool-perform) to avoid GPIO collision with px-alive
             env["PX_TEXT"] = text[:2000]
             _run_voice(env, label="greet")
+            _last_spoken_text = text[:200]
+
+        elif action == "greet_arrival":
+            # Greet someone who just arrived home (reactive response from Find Hub transition)
+            env["PX_TEXT"] = text[:2000]
+            _run_voice(env, label="greet_arrival")
             _last_spoken_text = text[:200]
 
         elif action == "comment":
@@ -3202,12 +3248,14 @@ def mind_loop(args) -> None:
                 consecutive_critical = 0
 
         # Reactive behavior: instant template response for key transitions
-        reactive_transitions = {"someone_appeared", "someone_left"}
+        reactive_transitions = {"someone_appeared", "someone_left", "person_arrived_home"}
         reacted = False
         if transitions and (now - last_reactive_mono) > REACTIVE_COOLDOWN_S:
             for t in transitions:
-                if t in reactive_transitions and t in REACTIVE_TEMPLATES:
-                    reactive_response(t, awareness, args.dry_run)
+                # Transitions like "person_arrived_home:obi_chipolo" use prefix matching
+                t_base = t.split(":")[0] if ":" in t else t
+                if t_base in reactive_transitions and t_base in REACTIVE_TEMPLATES:
+                    reactive_response(t_base, awareness, args.dry_run)
                     last_reactive_mono = now
                     last_expression_mono = now  # count as expression too
                     reacted = True

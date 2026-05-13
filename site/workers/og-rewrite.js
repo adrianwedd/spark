@@ -22,7 +22,13 @@ const TS_PATTERN = /^[\d\-T:+.Z]+$/;
 const BLOG_ID_PATTERN = /^blog-[\dw\-]+-[a-z_]+(-\d+)?$/;
 
 function escapeHtmlAttr(s) {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '&#39;')
+    .replace(/[\r\n]+/g, ' ');
 }
 
 /**

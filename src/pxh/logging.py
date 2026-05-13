@@ -37,17 +37,23 @@ _LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per log file
 def log_event(name: str, payload: Mapping[str, Any]) -> None:
     """Append a structured log entry under logs/tool-<name>.log."""
     log_path = LOG_DIR / f"tool-{name}.log"
-    lock_path = LOG_DIR / f"tool-{name}.log.lock"
+    lock_path = str(LOG_DIR / f"tool-{name}.log") + ".rotlock"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "ts": utc_timestamp(),
         **payload,
     }
-    import contextlib
-    lock = FileLock(lock_path) if FileLock is not None else contextlib.nullcontext()
-    with lock:
+    if FileLock is None:
         with log_path.open("a", encoding="utf-8") as handle:
             json.dump(record, handle)
             handle.write("\n")
         from .state import rotate_log  # late import to avoid circular dependency
         rotate_log(log_path, max_bytes=_LOG_MAX_BYTES)
+    else:
+        from .state import rotate_log  # late import to avoid circular dependency
+        _lock = FileLock(lock_path, timeout=2)
+        with _lock:
+            with log_path.open("a", encoding="utf-8") as handle:
+                json.dump(record, handle)
+                handle.write("\n")
+            rotate_log(log_path, max_bytes=_LOG_MAX_BYTES, held_lock=_lock)
