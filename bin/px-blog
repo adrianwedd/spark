@@ -119,17 +119,18 @@ def _parse_title_body(raw_text: str) -> tuple[str, str]:
         m = _TITLE_PREFIX.match(line)
         if m:
             title = line[m.end():].strip()
+            if title:
+                title = title.strip("#").strip()
+                if title.startswith("**") and title.endswith("**") and len(title) > 4:
+                    title = title[2:-2].strip()
+                i += 1
+                break
+            # Empty title after prefix (e.g. "Title:\n\nActual Title") — skip prefix line
             i += 1
-            break
             continue
         if _PREAMBLE_SKIP.match(line):
             i += 1
             continue
-        m = _TITLE_PREFIX.match(line)
-        if m:
-            title = line[m.end():].strip()
-            i += 1
-            break
         break
     if i >= len(candidates) and not title:
         return "", ""

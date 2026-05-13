@@ -31,7 +31,7 @@ import urllib.request
 import wave as _wave
 from pathlib import Path
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 from pxh.logging import log_event
 from pxh.spark_config import (
     _pick_spark_angles, _pick_reflection_seed,
@@ -581,11 +581,16 @@ def log(msg: str) -> None:
     elif "backoff" in ml:
         icon = "\u23f3"      # ⏳
     line = f"{ts} {icon} {msg}"
-    _log_lock = FileLock(str(LOG_FILE) + ".rotlock", timeout=2)
-    with _log_lock:
+    try:
+        _log_lock = FileLock(str(LOG_FILE) + ".rotlock", timeout=2)
+        with _log_lock:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            rotate_log(LOG_FILE, held_lock=_log_lock)
+    except FileLockTimeout:
+        # Log contention — write without rotation rather than crashing
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-        rotate_log(LOG_FILE, held_lock=_log_lock)
     print(line, flush=True)
 
 
@@ -1807,17 +1812,19 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     if system_stats.get("ram_pct", 0) >= 90 and prev_stats.get("ram_pct", 0) < 90:
         transitions.append("ram_pressure_high")
 
-    # Find Hub arrival transitions: detect when a tracker goes from away to at_home
+    # Find Hub arrival transitions: detect when a tracker goes from away to at_home.
+    # Only trigger when the tracker had a known previous state (not missing) and
+    # was previously away — avoids false arrivals on daemon restart.
     findmyhub = _read_findmyhub()
     if findmyhub:
-        prev_findmyhub = prev.get("findmyhub", {})
-        for tracker_name, curr_data in findmyhub.items():
-            if not curr_data.get("at_home"):
-                continue
-            prev_data = prev_findmyhub.get(tracker_name, {})
-            was_home = prev_data.get("at_home", False) if prev_data else False
-            if not was_home:
-                transitions.append(f"person_arrived_home:{tracker_name}")
+        prev_findmyhub = prev.get("findmyhub")
+        if prev_findmyhub is not None:
+            for tracker_name, curr_data in findmyhub.items():
+                if not curr_data.get("at_home"):
+                    continue
+                prev_data = prev_findmyhub.get(tracker_name)
+                if prev_data is not None and not prev_data.get("at_home"):
+                    transitions.append(f"person_arrived_home:{tracker_name}")
 
     awareness = {
         "ts": utc_timestamp(),

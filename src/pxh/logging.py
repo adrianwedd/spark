@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 try:
-    from filelock import FileLock
+    from filelock import FileLock, Timeout as FileLockTimeout
 except ImportError:
     FileLock = None
+    FileLockTimeout = None
 
 from .time import utc_timestamp
 
@@ -51,9 +52,15 @@ def log_event(name: str, payload: Mapping[str, Any]) -> None:
         rotate_log(log_path, max_bytes=_LOG_MAX_BYTES)
     else:
         from .state import rotate_log  # late import to avoid circular dependency
-        _lock = FileLock(lock_path, timeout=2)
-        with _lock:
+        try:
+            _lock = FileLock(lock_path, timeout=2)
+            with _lock:
+                with log_path.open("a", encoding="utf-8") as handle:
+                    json.dump(record, handle)
+                    handle.write("\n")
+                rotate_log(log_path, max_bytes=_LOG_MAX_BYTES, held_lock=_lock)
+        except FileLockTimeout:
+            # Log contention — write without rotation rather than crashing
             with log_path.open("a", encoding="utf-8") as handle:
                 json.dump(record, handle)
                 handle.write("\n")
-            rotate_log(log_path, max_bytes=_LOG_MAX_BYTES, held_lock=_lock)
