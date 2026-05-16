@@ -877,6 +877,31 @@ def _read_findmyhub() -> dict:
         return {}
 
 
+def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
+    """Update the in-memory _last_known_findmyhub cache with the current fresh
+    read and return any away→home transitions detected against the cached
+    previous state (issue #156).
+
+    Cache starts empty, so the first time we see a tracker no arrival fires
+    even if at_home=true — preserves the daemon-restart guard. The cache is
+    only mutated when ``findmyhub`` is non-empty, so stale-file windows do
+    not erase the prior "away" baseline."""
+    global _last_known_findmyhub
+    transitions: list[str] = []
+    if not findmyhub:
+        return transitions
+    for tracker_name, curr_data in findmyhub.items():
+        prev_data = _last_known_findmyhub.get(tracker_name)
+        if (
+            curr_data.get("at_home")
+            and prev_data is not None
+            and not prev_data.get("at_home")
+        ):
+            transitions.append(f"person_arrived_home:{tracker_name}")
+        _last_known_findmyhub[tracker_name] = curr_data
+    return transitions
+
+
 def _fetch_ha_sleep(dry: bool = False) -> dict | None:
     """Fetch Adrian's sleep data from HA Pixel Watch. Returns None if unavailable."""
     if dry or not HA_TOKEN:
@@ -1649,6 +1674,12 @@ _last_spoken_text: str = ""
 _last_morning_fact_date: str = ""
 _mood_history: list[str] = []
 _last_reactive_phrases: dict = {}  # key="transition:persona", value=recent phrase list (max 3)
+
+# Per-tracker cache of the most recent fresh Find Hub read (issue #156). Survives
+# stale-file windows so an away→home arrival isn't lost if the M5.local push
+# fails for a few ticks. Empty on daemon start — preserves the restart guard
+# (no false arrivals before we've ever seen a fresh "away" state).
+_last_known_findmyhub: dict = {}
 _consecutive_reflection_failures: int = 0
 _reflection_offline_spoken: bool = False
 
@@ -1828,19 +1859,9 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     if system_stats.get("ram_pct", 0) >= 90 and prev_stats.get("ram_pct", 0) < 90:
         transitions.append("ram_pressure_high")
 
-    # Find Hub arrival transitions: detect when a tracker goes from away to at_home.
-    # Only trigger when the tracker had a known previous state (not missing) and
-    # was previously away — avoids false arrivals on daemon restart.
+    # Find Hub arrival transitions — see _detect_findmyhub_arrivals (issue #156).
     findmyhub = _read_findmyhub()
-    if findmyhub:
-        prev_findmyhub = prev.get("findmyhub")
-        if prev_findmyhub is not None:
-            for tracker_name, curr_data in findmyhub.items():
-                if not curr_data.get("at_home"):
-                    continue
-                prev_data = prev_findmyhub.get(tracker_name)
-                if prev_data is not None and not prev_data.get("at_home"):
-                    transitions.append(f"person_arrived_home:{tracker_name}")
+    transitions.extend(_detect_findmyhub_arrivals(findmyhub))
 
     awareness = {
         "ts": utc_timestamp(),
@@ -2143,6 +2164,7 @@ def _reset_state():
     global _consecutive_reflection_failures, _reflection_offline_spoken
     global _mood_v, _mood_a
     global _time_period_start_mono, _last_image_cleanup
+    global _last_known_findmyhub
 
     _battery_history = []
     _battery_glitch_count = 0
@@ -2173,6 +2195,7 @@ def _reset_state():
     _mood_a = 0.0
     _time_period_start_mono = 0.0
     _last_image_cleanup = 0.0
+    _last_known_findmyhub = {}
 
 
 

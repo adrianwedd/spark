@@ -1147,3 +1147,69 @@ def test_format_introspection_empty():
     """_format_introspection handles empty dict gracefully."""
     result = _format_introspection({})
     assert "No introspection data" in result
+
+
+# ---------------------------------------------------------------------------
+# Find Hub arrival detection (issue #156)
+# ---------------------------------------------------------------------------
+
+
+def test_findmyhub_arrival_first_seen_no_transition():
+    """First-ever read of a tracker — even at_home — fires no arrival.
+    Preserves the daemon-restart guard: cache starts empty."""
+    from pxh.mind import _detect_findmyhub_arrivals
+    transitions = _detect_findmyhub_arrivals({"obi": {"at_home": True}})
+    assert transitions == []
+
+
+def test_findmyhub_arrival_away_then_home_fires():
+    """Classic transition: tracker seen away, then later at_home → arrival."""
+    from pxh.mind import _detect_findmyhub_arrivals
+    _detect_findmyhub_arrivals({"obi": {"at_home": False}})
+    transitions = _detect_findmyhub_arrivals({"obi": {"at_home": True}})
+    assert transitions == ["person_arrived_home:obi"]
+
+
+def test_findmyhub_arrival_already_home_no_transition():
+    """Tracker stays at_home across reads — no spurious arrival."""
+    from pxh.mind import _detect_findmyhub_arrivals
+    _detect_findmyhub_arrivals({"obi": {"at_home": True}})
+    transitions = _detect_findmyhub_arrivals({"obi": {"at_home": True}})
+    assert transitions == []
+
+
+def test_findmyhub_arrival_survives_stale_gap():
+    """Issue #156 regression: a stale-file window between the away read and
+    the at_home read must not drop the arrival. Stale ticks pass {} into the
+    helper; the in-memory cache should retain the prior away state."""
+    from pxh.mind import _detect_findmyhub_arrivals
+    # Tick 1: fresh away read populates the cache.
+    _detect_findmyhub_arrivals({"obi": {"at_home": False}})
+    # Ticks 2-5: file stale → helper called with empty dict, cache unchanged.
+    for _ in range(4):
+        assert _detect_findmyhub_arrivals({}) == []
+    # Tick 6: fresh at_home read → arrival fires against the cached away state.
+    transitions = _detect_findmyhub_arrivals({"obi": {"at_home": True}})
+    assert transitions == ["person_arrived_home:obi"]
+
+
+def test_findmyhub_arrival_independent_trackers():
+    """Each tracker's arrival is independent."""
+    from pxh.mind import _detect_findmyhub_arrivals
+    _detect_findmyhub_arrivals({
+        "obi": {"at_home": False},
+        "adrian": {"at_home": True},
+    })
+    # obi arrives; adrian was already home and stays home → no transition.
+    transitions = _detect_findmyhub_arrivals({
+        "obi": {"at_home": True},
+        "adrian": {"at_home": True},
+    })
+    assert transitions == ["person_arrived_home:obi"]
+
+
+def test_findmyhub_arrival_empty_input_returns_empty():
+    """Empty findmyhub yields no transitions and doesn't crash."""
+    from pxh.mind import _detect_findmyhub_arrivals
+    assert _detect_findmyhub_arrivals({}) == []
+    assert _detect_findmyhub_arrivals(None) == []  # type: ignore[arg-type]
