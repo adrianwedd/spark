@@ -1,7 +1,6 @@
 """Pre-race hardware validation tests."""
 import subprocess
 import json
-import os
 
 
 def test_race_check_dry_run(isolated_project):

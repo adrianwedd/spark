@@ -1,8 +1,6 @@
 """Tests for px-evolve daemon queue processing."""
 import json
 import os
-import time
-from pathlib import Path
 
 import pytest
 

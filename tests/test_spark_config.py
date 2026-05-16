@@ -54,7 +54,10 @@ def test_pick_reflection_seed_returns_string_or_none():
     results = [_pick_reflection_seed() for _ in range(50)]
     strings = [r for r in results if r is not None]
     nones = [r for r in results if r is None]
-    # Should get a mix (20% free-will = None)
+    # Should get a mix (20% free-will = None) — guarantee both classes
+    # appear over a 50-sample run so we'd catch a regression that pinned
+    # the function to always-seed or always-None.
     assert len(strings) > 0
+    assert len(nones) > 0
     assert all(isinstance(s, str) for s in strings)
     assert all(s in TOPIC_SEEDS for s in strings)

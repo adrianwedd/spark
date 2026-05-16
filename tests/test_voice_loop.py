@@ -1,4 +1,3 @@
-import json
 import pytest
 from pxh.voice_loop import build_model_prompt, validate_action, VoiceLoopError
 

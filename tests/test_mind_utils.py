@@ -3,10 +3,8 @@ from __future__ import annotations
 
 import datetime as _dt
 import json as _json
-import os
 import time as _time
 import urllib.error
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -34,7 +32,6 @@ from pxh.mind import (
     ABSENT_GATED_ACTIONS,
     BATTERY_GLITCH_CONFIRMS,
     BATTERY_MAX_DROP_PER_TICK,
-    BIN_DIR,
     CHARGING_GATED_ACTIONS,
     HOBART_TZ,
     MOOD_TO_EMOTE,

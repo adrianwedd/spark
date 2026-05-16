@@ -4,15 +4,16 @@ from __future__ import annotations
 import io
 import json
 import os
+import random as _test_random
 import subprocess
-import sys
-import types
 import urllib.error
 import urllib.request
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 import pytest
+
+_SYS_RNG = _test_random.SystemRandom()
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -78,7 +79,6 @@ def _make_line(thought="hello", salience=0.8, action="comment"):
 
 def _patch_state_dir(mod_globals, tmp_path):
     """Point the module's STATE_DIR and CURSOR_FILE at tmp_path."""
-    import importlib
     # _POST dict holds the globals of the exec'd module; mutate in place.
     _POST["STATE_DIR"] = tmp_path
     _POST["CURSOR_FILE"] = tmp_path / "px-post-cursor.json"
@@ -557,11 +557,6 @@ def _make_queue_entry(thought="test thought", posted=None, qa_result="pass", ent
     }
 
 
-# Need _SYS_RNG for test helpers
-import random as _test_random
-_SYS_RNG = _test_random.SystemRandom()
-
-
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
 def test_flush_empty_queue_returns_dict(_cursor_env):
     """flush_queue() on an empty queue returns a dict with processed: 0."""
@@ -637,7 +632,7 @@ def test_flush_max_one_per_cycle(_cursor_env):
     assert result["posted"] is True
 
     # All 3 entries should have feed=ok (batched in pass 1)
-    saved = [json.loads(l) for l in queue_file.read_text().strip().splitlines()]
+    saved = [json.loads(line) for line in queue_file.read_text().strip().splitlines()]
     posted_count = sum(1 for e in saved if e["posted"]["feed"] == "ok")
     assert posted_count == 3  # all fed in one pass
 

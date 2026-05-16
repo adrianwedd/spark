@@ -1,5 +1,4 @@
 import json
-import os
 import pytest
 import sys
 from pathlib import Path
@@ -425,7 +424,7 @@ class TestSafety:
         """
         from pxh.race import RaceController, TrackProfile
         from unittest.mock import MagicMock, patch
-        import tempfile, time
+        import tempfile
         from pathlib import Path
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,7 +447,6 @@ class TestSafety:
             }
 
             sleep_calls = []
-            original_sleep = time.sleep
 
             def tracking_sleep(duration):
                 sleep_calls.append(duration)
@@ -511,7 +509,7 @@ class TestRaceControllerCalibrate:
         mock_px = MagicMock()
         mock_px.get_distance.return_value = 90.0
         mock_px.get_grayscale_data.return_value = [400, 410, 405]
-        rc = RaceController(px=mock_px, state_dir=tmp_path, dry=True)
+        RaceController(px=mock_px, state_dir=tmp_path, dry=True)
         exploring_path = tmp_path / "exploring.json"
         assert exploring_path.exists()
         data = json.loads(exploring_path.read_text())

@@ -1,5 +1,7 @@
 """Story builder tool tests."""
-import json, os, subprocess
+import json
+import os
+import subprocess
 
 
 def test_session_has_story_field(isolated_project, monkeypatch):
@@ -94,7 +96,7 @@ def test_story_full_cycle(isolated_project):
     # Start — creates 1 line (spark opener)
     _, start_out = _run_story("start", extra_env=env)
     assert start_out["status"] == "ok"
-    opening = start_out["line"]
+    assert start_out["line"]  # opener line is non-empty
 
     # Add two lines — each add appends obi line + spark continuation = +2
     _, add1 = _run_story("add", extra_env=env, text="Then a dinosaur appeared wearing sunglasses.")

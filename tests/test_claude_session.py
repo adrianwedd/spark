@@ -4,8 +4,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import time
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
 
@@ -214,7 +212,7 @@ class TestRateLimiting:
 
 class TestRunSession:
     def test_budget_exhausted_raises(self, tmp_path):
-        sd = _make_state_dir(tmp_path)
+        _make_state_dir(tmp_path)
         import pxh.claude_session as cs
         with patch.object(cs, "check_budget", return_value="test block reason"):
             with pytest.raises(cs.SessionBudgetExhausted):

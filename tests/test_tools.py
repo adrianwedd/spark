@@ -827,13 +827,13 @@ def test_tool_gws_sheets_log_missing_id(isolated_project):
 @pytest.mark.skipif(not __import__("importlib").util.find_spec("fastapi"), reason="fastapi not installed")
 def test_session_history_clear(isolated_project, monkeypatch):
     """POST /api/v1/session/history/clear should wipe history and return count."""
-    import os
     monkeypatch.setenv("PX_API_TOKEN", "testtoken")
     monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
 
     # Import after env is patched so the module uses the right session path
     from fastapi.testclient import TestClient
-    import importlib, pxh.api as _api_mod
+    import importlib
+    import pxh.api as _api_mod
     importlib.reload(_api_mod)
 
     # Seed some history

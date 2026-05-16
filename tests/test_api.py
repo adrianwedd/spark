@@ -727,7 +727,6 @@ class TestPinVerify:
     def test_pin_lockout_persists_across_restart(self, api_client):
         """PIN lockout state survives a simulated restart (reload from file)."""
         import pxh.api as api
-        import time as _t
 
         with unittest.mock.patch.dict(os.environ, {"PX_ADMIN_PIN": "9999"}):
             # Accumulate 3 failures to trigger lockout
@@ -1051,7 +1050,7 @@ class TestRaceEndpoint:
 
     def test_race_dry_field_honored(self, api_client, auth_headers):
         """POST /api/v1/race/map with dry:true includes --dry-run in the command."""
-        from unittest.mock import patch, MagicMock, call
+        from unittest.mock import patch, MagicMock
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = 0

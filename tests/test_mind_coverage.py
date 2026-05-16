@@ -4,10 +4,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
-import time
-import urllib.error
 from contextlib import ExitStack
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,7 +21,6 @@ from pxh.mind import (
     reflection,
     HOBART_TZ,
     VALID_MOODS,
-    SALIENCE_THRESHOLD,
 )
 
 

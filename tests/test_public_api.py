@@ -162,7 +162,8 @@ class TestPublicVitals:
 
     def test_psutil_failure_returns_null_cpu_ram_disk(self, public_client, monkeypatch):
         # Simulate psutil unavailable — cpu/ram/disk should be null, not a 500
-        import builtins, sys
+        import builtins
+        import sys
         monkeypatch.delitem(sys.modules, 'psutil', raising=False)
         real_import = builtins.__import__
         def mock_import(name, *args, **kwargs):

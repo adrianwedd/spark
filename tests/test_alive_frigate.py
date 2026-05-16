@@ -5,7 +5,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent
 

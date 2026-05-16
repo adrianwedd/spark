@@ -1,5 +1,4 @@
 """Tests for px-alive idle-alive daemon (dry-run only — no GPIO)."""
-import json
 import subprocess
 from pathlib import Path
 
