@@ -1342,7 +1342,7 @@ Uses `datetime.now(timezone.utc)` (not the deprecated `utcnow()`).
 | `--watchdog-timeout S` | `30.0` | Stale heartbeat threshold |
 
 **Turn cycle (supervisor_loop):**
-1. Push heartbeat to watchdog queue.
+1. Update heartbeat: take `heartbeat_lock`, write `time.monotonic()` into `heartbeat_val[0]`.
 2. Load `session.json`; if voice mode and `listening=false`, sleep 0.5s and retry.
 3. Capture input: `input("You> ")` (text) or run `--transcriber-cmd` (voice).
 4. Build prompt: `system_prompt + state highlights + recent history + user_text`.
@@ -1354,7 +1354,7 @@ Uses `datetime.now(timezone.utc)` (not the deprecated `utcnow()`).
 10. Update session and log transcript entry.
 11. If `--exit-on-stop` and tool was `tool_stop`, break.
 
-**Watchdog thread:** Only started in voice mode (`--input-mode voice`). Uses a `queue.Queue` for heartbeats; the watchdog drains the queue to empty each iteration so producers (multiple per turn) don't accumulate. If no heartbeat for `watchdog_timeout` seconds, sends `SIGTERM` to itself for a clean shutdown (finally blocks run); only forces `os._exit(1)` if SIGTERM doesn't terminate within a 5-second grace window. In text mode (slow typists), no watchdog.
+**Watchdog thread:** Only started in voice mode (`--input-mode voice`). Heartbeat state is a `threading.Lock` + a 1-element list `heartbeat_val: list[float]`; the producer overwrites the slot under the lock each turn, the watchdog reads it under the lock each tick. No accumulating queue — only the latest timestamp matters (issue #142 refactor: queue.Queue → lock + mutable list). If no heartbeat for `watchdog_timeout` seconds, sends `SIGTERM` to itself for a clean shutdown (so `finally` blocks run, FileLocks release, atexit handlers fire); falls back to `os._exit(1)` only if SIGTERM doesn't terminate within a 5-second grace window. In text mode (slow typists), no watchdog.
 
 **Security:** `capture_voice_input` rejects shell metacharacters (`|`, `;`, `&&`, `||`, `>`, `<`) in `--transcriber-cmd` to prevent injection.
 

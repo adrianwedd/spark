@@ -19,10 +19,10 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (562 tests)
+python -m pytest                          # full suite (716 tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
-python -m pytest -m "not live"           # skip hardware tests (82 tests)
+python -m pytest -m "not live"           # skip hardware tests (deselects 25, runs 691)
 sudo .venv/bin/python -m pytest tests/test_tools_live.py -v -s  # live hardware tests
 ```
 
@@ -40,7 +40,7 @@ Test environment variables (set automatically via `conftest.py` `isolated_projec
 
 - **`state.py`** — Thread-safe session management via `FileLock` (10 s timeout — raises `filelock.Timeout` on deadlock). Key functions: `load_session()`, `save_session()`, `update_session()`, `ensure_session()`, `atomic_write()`, `rotate_log()`. **Important**: `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant. `atomic_write()` uses `mkstemp` + `fsync` + `os.replace` for SD card durability. `rotate_log()` keeps last half of lines when file exceeds 5 MB, using `atomic_write()` for durability.
 - **`mind.py`** — Cognitive loop daemon (`bin/px-mind` is a thin launcher). Three-layer architecture: awareness (sensors + state), reflection (LLM thought generation), expression (speech/action dispatch). 3,300+ lines extracted from the original bin/px-mind heredoc. See [Cognitive Loop](#cognitive-loop-px-mind) below.
-- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. `execute_tool()` accepts an optional `timeout` parameter — `subprocess.run` kills the child on `TimeoutExpired`. Watchdog thread (default 30 s) sends SIGTERM + 5 s grace period (instead of `os._exit(1)`) on stall; only active in voice input mode.
+- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist; 44 tools) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. `execute_tool()` accepts an optional `timeout` parameter — `subprocess.run` kills the child on `TimeoutExpired`. Watchdog thread (default 30 s) sends SIGTERM on stall to trigger Python's normal shutdown path (FileLock release, atexit handlers), then falls back to `os._exit(1)` after a 5 s grace if SIGTERM didn't terminate. Only active in voice input mode.
 - **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe. PIN rate limiting is per-IP (v2 schema in `state/pin_lockout.json`) with file-based persistence across API restarts, 1000-IP hard cap with two-phase eviction. `X-Forwarded-For` only trusted from localhost (Cloudflare tunnel). Rate limit store capped at 10k IPs with oldest-first eviction. PIN verify returns short-lived session tokens (4h TTL) instead of the raw Bearer token. Device reboot/shutdown requires two-step nonce confirmation.
 - **`logging.py`** — Structured JSON log emission to `logs/tool-<event>.log`. Uses late import of `rotate_log` from state.py to avoid circular dependency.
 - **`time.py`** — UTC timestamp helper (`datetime.now(timezone.utc)`, not deprecated `utcnow`).
@@ -136,7 +136,7 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 Three-layer cognitive architecture:
 - **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state + calendar + multi-camera Frigate → `state/awareness.json` + transition detection. Fetches Obi's Google Calendar every 5 min via `gws` CLI; queries all Frigate cameras (picar_x, picamera, driveway_camera, garden_camera) for per-camera person/object presence with room names.
 - **Layer 2 — Reflection** (on transition or every 5 min idle): SPARK persona uses Claude Haiku via `claude -p` subprocess (120s timeout, `--output-format text`, `--allowedTools ""`, `--no-session-persistence`). Other personas (GREMLIN, VIXEN) use Ollama on M5.local (auto-detects loaded model; default fallback `gemma4:e4b`). Falls back to Ollama on Claude error. Four-tier fallback: Claude → M5.local → Ollama Cloud (if `OLLAMA_CLOUD_API_KEY` set) → Pi localhost (opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt. 42 reflection angles sampled 5 per call to diversify mood range across all 12 moods. Weather refreshed every 30 min (BOM updates half-hourly).
-- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember. Valid actions (15): `wait, greet, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check, morning_fact`. Charging-gated actions (require battery) are blocked when on charger. Expression gating: suppresses speech during school hours, Mum's custody time, quiet time, bedtime, and decompress periods (all calendar-driven). Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember and the cognitive tools (introspect, evolve, research, compose, self_debug, blog_essay). Valid actions (22): `wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check, morning_fact, introspect, evolve, research, compose, self_debug, blog_essay`. Charging-gated actions (require battery) are blocked when on charger. `greet_arrival` fires when a Find Hub `person_arrived_home:*` transition is emitted (see Location Awareness below). Expression gating: suppresses speech during school hours, Mum's custody time, quiet time, bedtime, and decompress periods (all calendar-driven). Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
 
 `compute_obi_mode()` returns calendar-authoritative states (`at-school`, `at-mums`) when calendar events match, falling back to ambient heuristics otherwise.
 
@@ -346,6 +346,8 @@ Custom conversation component at `ha/custom_components/spark_conversation/` rout
 
 **Privacy rule:** Location data is in `awareness["findmyhub"]` and voice loop context only — explicitly excluded from reflection context so specific locations never appear in SPARK's thoughts or social posts. Obi can ask "where's dad?" in conversation; SPARK answers.
 
+**Arrival detection:** `_detect_findmyhub_arrivals()` in `mind.py` compares each fresh read against a module-level `_last_known_findmyhub` cache rather than the previous awareness snapshot. This survives transient M5.local→Pi push outages: when the file goes stale, `_read_findmyhub()` returns `{}` and the cache is left untouched, so the prior "away" baseline is still there when fresh data returns and an at_home reading correctly fires `person_arrived_home:<tracker>` (issue #156). The cache starts empty so the daemon-restart guard (no false arrivals before a real "away" is observed) is preserved.
+
 **Auth refresh** (if tokens expire):
 ```bash
 cd ~/GoogleFindMyTools && venv/bin/python3 -c "import builtins; builtins.input=lambda*a,**k:''; from KeyBackup.shared_key_retrieval import get_shared_key; get_shared_key()"
@@ -382,32 +384,40 @@ bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 **Auth**: Bearer token from `.env` (`PX_API_TOKEN`), or session token from PIN verify. Only `/api/v1/health` and `/api/v1/public/*` are unauthenticated.
 
 **Public endpoints** (no auth):
-- `GET /api/v1/health`
-- `GET /api/v1/public/status` — live status snapshot
+- `GET /api/v1/health` — degraded → 503 when `thoughts-spark.jsonl` >1h or `awareness.json` >5m stale; body has per-check `status` + `age_s`
+- `GET /api/v1/public/status` — live status snapshot; `persona` always hardcoded to `"spark"` (no gremlin/vixen leak)
 - `GET /api/v1/public/vitals` — CPU/RAM/disk/battery
 - `GET /api/v1/public/sonar` — latest sonar reading
-- `GET /api/v1/public/awareness` — Layer 1 awareness state
+- `GET /api/v1/public/awareness` — Layer 1 awareness state (HA presence stripped for privacy)
 - `GET /api/v1/public/history` — ring buffer of vitals readings
 - `GET /api/v1/public/thoughts` — recent SPARK thoughts
 - `GET /api/v1/public/services` — service status
 - `GET /api/v1/public/feed` — social posting feed
+- `GET /api/v1/public/blog` — full blog envelope
 - `GET /api/v1/public/race` — race telemetry (calibration status, profile summary, live telemetry with 10s staleness filter)
+- `GET /api/v1/public/budget` — Claude session budget aggregate (`daily_cap`, `used_today`, `remaining`); per-session detail is authenticated-only
+- `GET /api/v1/public/thought-image` — thought card PNG by `ts=` query
 - `POST /api/v1/public/chat` — rate-limited public chat (10 msg/10min per IP)
 - `POST /api/v1/pin/verify` — PIN auth, returns session token (4h TTL)
 
+All `/api/v1/public/*` routes (except `/chat`, which has its own stricter limit, and `/thought-image/`, which is Cloudflare-cached) are subject to `PublicRateLimitMiddleware` at 120 req/min per IP.
+
 **Authenticated endpoints**:
 - `POST /api/v1/tool` — execute a tool
+- `POST /api/v1/chat` — one voice-loop turn via the LLM
 - `GET /api/v1/session` — session state (history truncated to last 10)
 - `PATCH /api/v1/session` — update session (safety fields require confirm:true)
 - `POST /api/v1/session/history/clear` — wipe conversation history
+- `GET /api/v1/awareness` — full Layer 1 awareness payload including HA presence
+- `GET /api/v1/budget` — Claude session budget with per-session detail (`ts`, `type`, `model`, `duration_s`, `outcome`)
 - `GET /api/v1/tools` — list allowed tools
 - `GET /api/v1/jobs/{id}` — async job status
-- `GET /api/v1/photos/{filename}` — captured photos
+- `GET /photos/{filename}` — captured photos (note: not under `/api/v1/`)
 - `GET /api/v1/logs/{service}` — tail logs (capped at 100 lines, paths sanitized)
 - `GET /api/v1/services` — full service list with status
 - `POST /api/v1/services/{name}/{action}` — systemd control (stop/restart require confirm:true)
-- `POST /api/v1/race/{action}` — race control (map/race/stop/status; runs as async job)
-- `POST /api/v1/device/{action}` — reboot/shutdown (requires confirm:true)
+- `POST /api/v1/race/{action}` — race control (map/race/stop/status/calibrate_gate; runs as async job; body parsed via `RaceRequest` pydantic — bad shapes return 422 not 500)
+- `POST /api/v1/device/{action}` — reboot/shutdown (two-step: returns nonce, must confirm via `POST /api/v1/device/confirm` within 60 s)
 
 **Async**: `tool_wander` returns 202 with `job_id`; poll via `/jobs/{id}`
 
