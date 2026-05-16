@@ -1589,7 +1589,7 @@ class ChatRequest(BaseModel):
 _DEFAULT_PROMPT_PATH = PROJECT_ROOT / "docs" / "prompts" / "spark-voice-system.md"
 _CODEX_CMD = os.environ.get(
     "CODEX_CHAT_CMD",
-    "codex exec --model gpt-5-codex --full-auto -",
+    "codex exec --full-auto -",
 )
 
 

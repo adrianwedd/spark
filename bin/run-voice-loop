@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/px-env"
 if [ -n "${CODEX_CHAT_CMD:-}" ]; then
   export CODEX_CHAT_CMD
 else
-  export CODEX_CHAT_CMD="codex exec --model gpt-5-codex --full-auto -"
+  export CODEX_CHAT_CMD="codex exec --full-auto -"
 fi
 
 exec "$SCRIPT_DIR/codex-voice-loop" "$@"

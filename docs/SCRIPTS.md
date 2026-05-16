@@ -843,7 +843,7 @@ This is the generic entry point; use one of the `run-voice-loop-*` wrappers whic
 
 ### bin/run-voice-loop
 
-**Purpose:** Launch the Codex CLI voice loop. Sets `CODEX_CHAT_CMD` to `"codex exec --model gpt-5-codex --full-auto -"` if not already set in the environment.
+**Purpose:** Launch the Codex CLI voice loop. Sets `CODEX_CHAT_CMD` to `"codex exec --full-auto -"` if not already set in the environment.
 
 **Usage:**
 ```bash

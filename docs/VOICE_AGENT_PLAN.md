@@ -37,7 +37,7 @@
 - Ensure log rotation strategy later if needed (currently manual).
 
 ### 5. Codex CLI Integration
-- Environment variable `CODEX_CHAT_CMD` to be set to the full CLI command (e.g., `codex exec --model gpt-5-codex --full-auto -`). The supervisor already pipes prompts through stdin.
+- Environment variable `CODEX_CHAT_CMD` to be set to the full CLI command (e.g., `codex exec --full-auto -`). The supervisor already pipes prompts through stdin.
 - Create helper script (`bin/run-codex`) to wrap the command with appropriate environment exports for easier tmux startup.
 
 ### 6. Future Enhancements

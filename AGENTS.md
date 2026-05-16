@@ -1,7 +1,7 @@
 # Agent Operations Guide
 
 ## Voice Automation Flow
-- Use `bin/run-voice-loop` to launch the Codex supervisor. By default it streams prompts through `codex exec --model gpt-5-codex --full-auto -`; override `CODEX_CHAT_CMD` before launch if you need a different model or options.
+- Use `bin/run-voice-loop` to launch the Codex supervisor. By default it streams prompts through `codex exec --full-auto -`; override `CODEX_CHAT_CMD` before launch if you need a different model or options.
 - The loop reads `state/session.json` for context. Flip `listening: true` with `bin/px-wake --set on` (or `--keyboard`) before speaking; the loop idles until that flag is raised.
 - Audio feedback is produced through `tool-voice` (`espeak` fallback). Logs are appended to `logs/tool-voice-loop.log` and `logs/tool-voice-transcript.log`. Inspect quick stats with `bin/px-voice-report --json`.
 

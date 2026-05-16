@@ -106,7 +106,7 @@ The loop automatically speaks weather summaries using `espeak` (or another playe
 
 1. Configure the Codex CLI command (override only if needed; `bin/run-voice-loop` sets a sensible default):
    ```bash
-   export CODEX_CHAT_CMD="codex exec --model gpt-5-codex --full-auto -"
+   export CODEX_CHAT_CMD="codex exec --full-auto -"
    ```
 2. (Optional) Select an audio player for spoken responses:
    ```bash
@@ -118,7 +118,7 @@ The loop automatically speaks weather summaries using `espeak` (or another playe
    ```bash
    bin/run-voice-loop --dry-run --auto-log
    ```
-   `bin/run-voice-loop` sets up `CODEX_CHAT_CMD` automatically (defaults to `codex exec --model gpt-5-codex --full-auto -`). Override the variable before launch if you need a different Codex command.
+   `bin/run-voice-loop` sets up `CODEX_CHAT_CMD` automatically (defaults to `codex exec --full-auto -`). Override the variable before launch if you need a different Codex command.
    Type a prompt at `You>` and the supervisor will call the Codex CLI, parse the JSON tool request, and execute the corresponding wrapper in dry-run mode.
 5. When moving beyond dry-run, manually flip `confirm_motion_allowed` to `true` in `state/session.json` *after* confirming the car is on blocks. The wrappers will refuse motion otherwise.
 6. Use `--exit-on-stop` if you want the loop to terminate after a successful `tool-stop` invocation. Turn-by-turn transcripts live in `logs/tool-voice-transcript.log`; they include the prompt excerpt, Codex action, tool results, and auto-generated speech status.
@@ -166,7 +166,7 @@ See `docs/ROADMAP.md` for upcoming automation goals, including REST control surf
 # Agent Operations Guide
 
 ## Voice Automation Flow
-- Use `bin/run-voice-loop` to launch the Codex supervisor. By default it streams prompts through `codex exec --model gpt-5-codex --full-auto -`; override `CODEX_CHAT_CMD` before launch if you need a different model or options.
+- Use `bin/run-voice-loop` to launch the Codex supervisor. By default it streams prompts through `codex exec --full-auto -`; override `CODEX_CHAT_CMD` before launch if you need a different model or options.
 - The loop reads `state/session.json` for context. Flip `listening: true` with `bin/px-wake --set on` (or `--keyboard`) before speaking; the loop idles until that flag is raised.
 - Audio feedback is produced through `tool-voice` (`espeak` fallback). Logs are appended to `logs/tool-voice-loop.log` and `logs/tool-voice-transcript.log`. Inspect quick stats with `bin/px-voice-report --json`.
 
@@ -316,7 +316,7 @@ Each initiative doc captures scope, milestones, dependencies, and verification s
 - Ensure log rotation strategy later if needed (currently manual).
 
 ### 5. Codex CLI Integration
-- Environment variable `CODEX_CHAT_CMD` to be set to the full CLI command (e.g., `codex exec --model gpt-5-codex --full-auto -`). The supervisor already pipes prompts through stdin.
+- Environment variable `CODEX_CHAT_CMD` to be set to the full CLI command (e.g., `codex exec --full-auto -`). The supervisor already pipes prompts through stdin.
 - Create helper script (`bin/run-codex`) to wrap the command with appropriate environment exports for easier tmux startup.
 
 ### 6. Future Enhancements
@@ -368,7 +368,7 @@ All helper scripts live in `~/picar-x-hacking/bin`. Each script is designed to b
 | `px-dance` | Performs a demo routine (voice intro, circle, figure-eight, finale) respecting `PX_DRY` for rehearsals. |
 | `px-frigate-stream` | Streams the camera to Frigate/go2rtc using `rpicam-vid` + `ffmpeg` (RTSP push). |
 | `tool-weather` | Fetches the latest Bureau of Meteorology observation for the configured product/station (default Grove AWS), falling back from HTTPS to FTP when required and producing a conversational summary for Codex/voice playback. Override with `PX_WEATHER_PRODUCT`, `PX_WEATHER_STATION`, or `PX_WEATHER_URL`. |
-| `run-voice-loop` | Convenience launcher that exports `CODEX_CHAT_CMD` (default `codex exec --model gpt-5-codex --full-auto -`) and executes `codex-voice-loop` with supplied flags. |
+| `run-voice-loop` | Convenience launcher that exports `CODEX_CHAT_CMD` (default `codex exec --full-auto -`) and executes `codex-voice-loop` with supplied flags. |
 | `run-voice-loop-ollama` | Wrapper that pins `CODEX_CHAT_CMD` to `bin/codex-ollama`, defaults `CODEX_OLLAMA_MODEL` to `deepseek-coder:1.3b`, and applies the tuned env overrides (`CODEX_OLLAMA_TEMPERATURE=0.2`, `CODEX_OLLAMA_NUM_PREDICT=64`). |
 | `codex-ollama` | Reads a Codex prompt from stdin, posts it to the local Ollama HTTP API, normalises tool JSON, and honours `CODEX_OLLAMA_MODEL`, `CODEX_OLLAMA_TEMPERATURE`, and `CODEX_OLLAMA_NUM_PREDICT`. |
 | `px-voice-report` | Summarises `logs/tool-voice-transcript.log` (tool counts, voice success/failure, battery warnings) in text or JSON form. |

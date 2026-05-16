@@ -217,7 +217,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--codex-cmd",
-        default=os.environ.get("CODEX_CHAT_CMD", "codex exec --model gpt-5-codex --full-auto -"),
+        default=os.environ.get("CODEX_CHAT_CMD", "codex exec --full-auto -"),
         help="Command used to invoke the Codex CLI",
     )
     parser.add_argument(
