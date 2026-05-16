@@ -52,6 +52,9 @@ LOG_DIR      = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 LOG_FILE     = Path(os.environ.get("PX_MIND_LOG", LOG_DIR / "px-mind.log"))
 PID_FILE     = Path(os.environ.get("PX_MIND_PID", LOG_DIR / "px-mind.pid"))
 
+# Throttle rotlock-timeout warnings: one stderr line per 60 s
+_last_log_timeout_warn: float = 0.0
+
 AWARENESS_FILE = STATE_DIR / "awareness.json"
 MOOD_FILE      = STATE_DIR / "mood.json"
 AMBIENT_FILE   = STATE_DIR / "ambient_sound.json"
@@ -581,16 +584,29 @@ def log(msg: str) -> None:
     elif "backoff" in ml:
         icon = "\u23f3"      # ⏳
     line = f"{ts} {icon} {msg}"
+    # First try short timeout; retry once with a longer timeout before giving
+    # up. An unlocked append would race with the rotator's os.replace and
+    # silently lose the line, so on real contention we drop the entry to
+    # stderr (throttled) instead of corrupting the log.
     try:
-        _log_lock = FileLock(str(LOG_FILE) + ".rotlock", timeout=2)
-        with _log_lock:
+        try:
+            _log_lock = FileLock(str(LOG_FILE) + ".rotlock", timeout=2)
+            _log_lock.acquire()
+        except FileLockTimeout:
+            _log_lock = FileLock(str(LOG_FILE) + ".rotlock", timeout=10)
+            _log_lock.acquire()
+        try:
             with LOG_FILE.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
             rotate_log(LOG_FILE, held_lock=_log_lock)
+        finally:
+            _log_lock.release()
     except FileLockTimeout:
-        # Log contention — write without rotation rather than crashing
-        with LOG_FILE.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        global _last_log_timeout_warn
+        now_m = time.monotonic()
+        if now_m - _last_log_timeout_warn >= 60.0:
+            _last_log_timeout_warn = now_m
+            print(f"[px-mind] rotlock timeout — dropped log line", file=sys.stderr)
     print(line, flush=True)
 
 

@@ -90,18 +90,13 @@ def rotate_log(path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | No
     Uses atomic_write for SD card durability. Callers should hold the .rotlock
     across the append + rotate to prevent TOCTOU races (issue #149). Pass the
     held lock via held_lock to skip re-acquisition (FileLock is not reentrant).
-    Silently handles missing files and write errors.
     """
-    if FileLock is None:
-        # Best-effort fallback when filelock isn't available; legacy behavior.
-        try:
-            if not path.exists() or path.stat().st_size <= max_bytes:
-                return
-            lines = path.read_text(encoding="utf-8").splitlines()
-            half = len(lines) // 2
-            atomic_write(path, "\n".join(lines[half:]) + "\n")
-        except Exception:
-            pass
+    # Fast-path size check before any lock acquisition — avoids hitting the
+    # filesystem for FileLock on every tiny log append.
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return
+    except OSError:
         return
 
     def _rotate_inner() -> None:
@@ -111,16 +106,30 @@ def rotate_log(path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | No
         half = len(lines) // 2
         atomic_write(path, "\n".join(lines[half:]) + "\n")
 
+    if FileLock is None:
+        # Best-effort fallback when filelock isn't available; legacy behavior.
+        try:
+            _rotate_inner()
+        except OSError as exc:
+            _log.warning("rotate_log: %s: %s", path, exc)
+        return
+
     try:
         if held_lock is not None:
             # Caller already holds the lock — rotate directly.
             _rotate_inner()
         else:
+            from filelock import Timeout as _FLTimeout
             lock_path = str(path) + ".rotlock"
-            with FileLock(lock_path, timeout=2):
-                _rotate_inner()
-    except Exception:
-        pass  # log rotation failure is not fatal
+            try:
+                with FileLock(lock_path, timeout=2):
+                    _rotate_inner()
+            except _FLTimeout:
+                # Another rotator owns the lock — they'll handle it.
+                return
+    except OSError as exc:
+        # Disk full, permissions, etc. — surface but don't crash the caller.
+        _log.warning("rotate_log: %s: %s", path, exc)
 
 
 STATE_DIR = PROJECT_ROOT / "state"

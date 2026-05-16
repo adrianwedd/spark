@@ -120,9 +120,6 @@ def _parse_title_body(raw_text: str) -> tuple[str, str]:
         if m:
             title = line[m.end():].strip()
             if title:
-                title = title.strip("#").strip()
-                if title.startswith("**") and title.endswith("**") and len(title) > 4:
-                    title = title[2:-2].strip()
                 i += 1
                 break
             # Empty title after prefix (e.g. "Title:\n\nActual Title") — skip prefix line
@@ -141,8 +138,8 @@ def _parse_title_body(raw_text: str) -> tuple[str, str]:
     title = title.strip("#").strip()
     if title.startswith("**") and title.endswith("**") and len(title) > 4:
         title = title[2:-2].strip()
-    # Sanitise: collapse newlines, limit length.
-    title = title.replace("\n", " ").replace("\r", " ").strip()[:200]
+    # Cap title length. splitlines() already stripped newlines, so no \n/\r cleanup needed.
+    title = title.strip()[:200]
     body = "\n".join(candidates[i:]).strip()
     # If body still starts with an HR (common after **Title** on its own line),
     # strip it.
