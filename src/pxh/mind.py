@@ -356,6 +356,14 @@ _LOCAL_MODEL_ENV  = os.environ.get("PX_MIND_LOCAL_MODEL", "auto")
 _resolved_models: dict[str, tuple[str, float]] = {}  # host → (model, resolved_at_mono)
 _MODEL_CACHE_TTL = 1800  # 30 min
 
+# Network failure cache: skip DNS+connect for hosts that recently failed.
+# Key is host URL prefix (e.g. "http://M5.local:11434"), value is monotonic
+# deadline after which the host should be retried. Suppresses the mDNS hang
+# (typically 15-20 s) that occurs when .local names are queried on a dead network,
+# since Python's urllib timeout covers the socket but not the DNS lookup.
+_host_failure_until: dict[str, float] = {}
+_HOST_FAILURE_BACKOFF_S = 60  # retry offline hosts after 60 s
+
 
 def _resolve_ollama_model(host: str, preferred: str) -> str:
     """Resolve 'auto' to the first loaded model on the Ollama host.
@@ -1680,6 +1688,9 @@ _last_reactive_phrases: dict = {}  # key="transition:persona", value=recent phra
 # (no false arrivals before we've ever seen a fresh "away" state).
 _last_known_findmyhub: dict = {}
 _consecutive_reflection_failures: int = 0
+# HA host offline flag: when set, awareness_tick skips all HA fetches until expired.
+# Set by the first HA network error in the tick; cleared automatically on expiry.
+_ha_offline_until: float = 0.0
 _reflection_offline_spoken: bool = False
 
 # Mood momentum: running (valence, arousal) blend
@@ -1731,8 +1742,19 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     mins_interaction = minutes_since_event(history, interaction_events)
     mins_speech = minutes_since_event(history, speech_events)
 
+    # HA fetch block — all calls share the homeassistant.local host, so a single
+    # network failure sets _ha_offline_until to skip the remaining calls this tick
+    # and avoid redundant mDNS hangs (DNS lookup is not subject to urllib timeout).
+    global _ha_offline_until
+    _ha_online = now_mono >= _ha_offline_until
+
+    def _mark_ha_offline(exc: Exception) -> None:
+        global _ha_offline_until
+        _ha_offline_until = time.monotonic() + _HOST_FAILURE_BACKOFF_S
+        log(f"ha: network error — skipping HA for {_HOST_FAILURE_BACKOFF_S}s: {exc}")
+
     # Refresh HA presence periodically
-    if (now_mono - _last_ha_fetch) > HA_INTERVAL_S:
+    if _ha_online and (now_mono - _last_ha_fetch) > HA_INTERVAL_S:
         try:
             ha = _fetch_ha_presence(dry)
             if ha is not None:
@@ -1746,11 +1768,11 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             else:
                 log(f"ha_presence: HTTP {exc.code}, keeping cache")
         except Exception as exc:
-            log(f"ha_presence: network error: {exc}, keeping cache")
+            _mark_ha_offline(exc)
         _last_ha_fetch = now_mono
 
     # Refresh HA calendar periodically
-    if (now_mono - _last_ha_calendar_fetch) > HA_CALENDAR_INTERVAL_S:
+    if _ha_online and (now_mono - _last_ha_calendar_fetch) > HA_CALENDAR_INTERVAL_S:
         try:
             cal = _fetch_ha_calendar(dry)
             if cal is not None:
@@ -1760,11 +1782,11 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
                 _cached_ha_calendar = None
                 log(f"ha_calendar: auth failure ({exc.code}), cache cleared")
         except Exception as exc:
-            log(f"ha_calendar: fetch failed: {exc}")
+            _mark_ha_offline(exc)
         _last_ha_calendar_fetch = now_mono
 
     # Refresh HA sleep data periodically (hourly — doesn't change intraday)
-    if (now_mono - _last_ha_sleep_fetch) > HA_SLEEP_INTERVAL_S:
+    if _ha_online and (now_mono - _last_ha_sleep_fetch) > HA_SLEEP_INTERVAL_S:
         try:
             sleep = _fetch_ha_sleep(dry)
             if sleep is not None:
@@ -1772,21 +1794,21 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             else:
                 _cached_ha_sleep = None  # sensor returned 0 or unavailable
         except Exception as exc:
-            log(f"ha_sleep: network error: {exc}, keeping cache")
+            _mark_ha_offline(exc)
         _last_ha_sleep_fetch = now_mono
 
     # Refresh HA routines (meds, water) periodically
-    if (now_mono - _last_ha_routines_fetch) > HA_ROUTINES_INTERVAL_S:
+    if _ha_online and (now_mono - _last_ha_routines_fetch) > HA_ROUTINES_INTERVAL_S:
         try:
             routines = _fetch_ha_routines(dry)
             if routines is not None:
                 _cached_ha_routines = routines
         except Exception as exc:
-            log(f"ha_routines: fetch failed: {exc}")
+            _mark_ha_offline(exc)
         _last_ha_routines_fetch = now_mono
 
     # Refresh HA context (call detection, office light, media) frequently
-    if (now_mono - _last_ha_context_fetch) > HA_CONTEXT_INTERVAL_S:
+    if _ha_online and (now_mono - _last_ha_context_fetch) > HA_CONTEXT_INTERVAL_S:
         try:
             ha_ctx = _fetch_ha_context(dry)
             if ha_ctx is not None:
@@ -1794,7 +1816,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             else:
                 _cached_ha_context = None  # sensors all unavailable — clear cache
         except Exception as exc:
-            log(f"ha_context: fetch failed: {exc}")
+            _mark_ha_offline(exc)
         _last_ha_context_fetch = now_mono
 
     # Refresh weather periodically
@@ -2105,6 +2127,12 @@ def call_ollama(prompt: str, system: str,
                 auth_token: str | None = None) -> dict:
     """Call Ollama for reflection. host defaults to OLLAMA_HOST (M5.local)."""
     _host  = host  or OLLAMA_HOST
+    # Skip hosts that failed recently — avoids the mDNS hang on dead networks
+    # (Python's urllib timeout covers the socket but not DNS resolution, which
+    # can block 15-20 s per .local lookup on a fully offline network).
+    _now = time.monotonic()
+    if _host_failure_until.get(_host, 0) > _now:
+        return {"error": f"ollama {_host} skipped (offline backoff)"}
     # Re-resolve model on each call (cached, re-checks every 30 min)
     _model = model or _resolve_ollama_model(_host, _MODEL_ENV)
 
@@ -2141,9 +2169,11 @@ def call_ollama(prompt: str, system: str,
             return {"error": f"ollama model '{_model}' not found on {_host} (404)"}
         return {"error": f"ollama HTTP {exc.code} on {_host}: {exc}"}
     except urllib.error.URLError as exc:
+        _host_failure_until[_host] = time.monotonic() + _HOST_FAILURE_BACKOFF_S
         reason = str(exc.reason) if hasattr(exc, 'reason') else str(exc)
         return {"error": f"ollama unreachable ({_host}): {reason}"}
     except Exception as exc:
+        _host_failure_until[_host] = time.monotonic() + _HOST_FAILURE_BACKOFF_S
         return {"error": str(exc)}
 
 
@@ -2164,6 +2194,7 @@ def _reset_state():
     global _mood_v, _mood_a
     global _time_period_start_mono, _last_image_cleanup
     global _last_known_findmyhub
+    global _ha_offline_until, _host_failure_until
 
     _battery_history = []
     _battery_glitch_count = 0
@@ -2195,6 +2226,8 @@ def _reset_state():
     _time_period_start_mono = 0.0
     _last_image_cleanup = 0.0
     _last_known_findmyhub = {}
+    _ha_offline_until = 0.0
+    _host_failure_until.clear()
 
 
 
@@ -2224,11 +2257,11 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
              "--no-session-persistence",
              "--output-format", "text",
              "--allowedTools", ""],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=60,
             env=env, cwd=str(STATE_DIR / "spark-reflect"),
         )
     except subprocess.TimeoutExpired:
-        return {"error": "claude subprocess timeout (120s)"}
+        return {"error": "claude subprocess timeout (60s)"}
     except Exception as exc:
         return {"error": f"claude subprocess failed: {exc}"}
 
