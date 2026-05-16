@@ -443,8 +443,8 @@ source .venv/bin/activate
 # 4. Dry-run a tool to verify the setup
 PX_DRY=1 bin/tool-status
 
-# 5. Run tests (105 dry-run, no hardware needed)
-python -m pytest tests/
+# 5. Run tests (691 dry-run, no hardware needed)
+python -m pytest tests/ -m "not live"
 
 # 6. Launch SPARK (Claude voice companion)
 bin/px-spark --dry-run
@@ -693,7 +693,8 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/                           # 450 tests (dry-run, no hardware)
+python -m pytest tests/                           # 716 tests total (25 require live hardware)
+python -m pytest tests/ -m "not live"             # 691 tests (dry-run, no hardware)
 python -m pytest tests/test_tools.py -v
 python -m pytest tests/test_api.py -v
 sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (require Pi)
@@ -762,7 +763,7 @@ picar-x-hacking/
 │   ├── css/colors.css            # Mood colour palette (CSS vars)
 │   ├── js/config.js              # API base URL config
 │   └── workers/og-rewrite.js     # Cloudflare Worker for OG images
-├── tests/                        # 450 tests
+├── tests/                        # 716 tests (25 require live hardware)
 ├── docs/prompts/
 │   ├── spark-voice-system.md     # SPARK persona (child companion)
 │   ├── claude-voice-system.md    # Default Claude voice loop
