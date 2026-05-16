@@ -62,7 +62,7 @@ _RATE_PRUNE_EVERY = 100   # prune stale IPs every N calls
 _rate_limit_calls = 0
 
 # Separate, more permissive limiter for unauthenticated telemetry reads
-# (issue #151). Dashboard polls 6 endpoints every 30s ≈ 12/min; allow 120/min
+# (issue #150). Dashboard polls 6 endpoints every 30s ≈ 12/min; allow 120/min
 # per IP so legitimate clients are unaffected and only abusive volume is shed.
 _public_rate_store: dict[str, list[float]] = defaultdict(list)
 _public_rate_lock = threading.Lock()
@@ -297,7 +297,7 @@ from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
 
 
 class PublicRateLimitMiddleware(_BaseHTTPMiddleware):
-    """Per-IP rate limit on unauthenticated /public/ reads (issue #151).
+    """Per-IP rate limit on unauthenticated /public/ reads (issue #150).
 
     Skips /public/chat (already rate-limited at a stricter rate inside the
     handler) and any path containing /thought-image/ (cached by Cloudflare,
@@ -1499,7 +1499,7 @@ async def race_action(action: str, request: Request) -> JSONResponse:
 
     # Parse request body (all actions may carry a dry field). Validate via
     # RaceRequest so bad JSON shapes return 422 instead of crashing the route
-    # with a 500 from int() on a non-numeric value (issue #150).
+    # with a 500 from int() on a non-numeric value (issue #151).
     raw_body: dict = {}
     try:
         raw_body = await request.json()

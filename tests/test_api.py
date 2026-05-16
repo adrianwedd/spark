@@ -278,35 +278,33 @@ class TestAsyncJobs:
 # -- Motion gate --
 
 class TestMotionGate:
-    def test_motion_blocked_returns_403(self, api_client, auth_headers):
-        """Motion tool returns 403 when confirm_motion_allowed is False.
+    def test_motion_blocked_returns_403(self, api_client, auth_headers, monkeypatch):
+        """API maps tool rc=2 (motion blocked) to HTTP 403.
 
-        Temporarily disable FORCE_DRY and clear PX_DRY from the process
-        environment so the tool subprocess runs in live mode and hits the gate.
+        Mocks execute_tool so the test exercises only the API's status-code
+        contract — the underlying bin/tool-drive behaviour is covered by the
+        Pi-only live-tool tests. Also clears FORCE_DRY so the live code path
+        is taken (dry mode short-circuits before execute_tool is called).
         """
-        import os
         from pxh import api as api_mod
 
-        saved_force_dry = api_mod.FORCE_DRY
-        saved_px_dry = os.environ.get("PX_DRY")
-        os.environ["PX_DRY"] = "0"   # explicit live mode so motion gate is reached
-        api_mod.FORCE_DRY = False
-        try:
-            resp = api_client.post(
-                "/api/v1/tool",
-                headers=auth_headers,
-                json={"tool": "tool_drive",
-                      "params": {"direction": "forward", "speed": 20, "duration": 1.0},
-                      "dry": False},
-            )
-            assert resp.status_code == 403
-            assert resp.json()["status"] == "blocked"
-        finally:
-            api_mod.FORCE_DRY = saved_force_dry
-            if saved_px_dry is not None:
-                os.environ["PX_DRY"] = saved_px_dry
-            else:
-                os.environ.pop("PX_DRY", None)
+        monkeypatch.setattr(api_mod, "FORCE_DRY", False)
+        monkeypatch.setenv("PX_DRY", "0")
+
+        def fake_execute(tool, env_overrides, dry, timeout):
+            return 2, '{"status":"blocked","reason":"motion not confirmed safe"}', ""
+
+        monkeypatch.setattr(api_mod, "execute_tool", fake_execute)
+
+        resp = api_client.post(
+            "/api/v1/tool",
+            headers=auth_headers,
+            json={"tool": "tool_drive",
+                  "params": {"direction": "forward", "speed": 20, "duration": 1.0},
+                  "dry": False},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["status"] == "blocked"
 
     def test_patch_confirm_motion_allowed(self, api_client, auth_headers):
         """PATCH /session can set confirm_motion_allowed (with confirm: true)."""
