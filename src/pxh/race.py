@@ -440,7 +440,6 @@ class RaceController:
         self._set_exploring(True)
 
         track_ref = self.calibration.get("track_ref", [400, 410, 405])
-        barrier_ref = self.calibration.get("barrier_ref", [700, 710, 705])
         track_width_cm = float(self.calibration.get("track_width_cm", 88))
 
         samples: list[dict] = []
@@ -528,7 +527,6 @@ class RaceController:
             return profile
 
         # Group consecutive samples of same type into segments
-        seg_start_t = samples[0]["t"]
         seg_type = samples[0]["type"]
         seg_samples: list[dict] = [samples[0]]
 

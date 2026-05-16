@@ -19,7 +19,6 @@ try:
 except ImportError:
     FileLock = None
 
-from .state import atomic_write
 
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent

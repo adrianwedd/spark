@@ -10,7 +10,7 @@ def __getattr__(name: str):
     """Lazy re-exports — only imported on first access."""
     _state_names = {"load_session", "save_session", "update_session", "ensure_session"}
     if name in _state_names:
-        from .state import load_session, save_session, update_session, ensure_session
+        from .state import load_session, save_session, update_session, ensure_session  # noqa: F401
         return locals()[name]
     if name == "log_event":
         from .logging import log_event

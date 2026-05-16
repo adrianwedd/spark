@@ -32,7 +32,6 @@ import wave as _wave
 from pathlib import Path
 
 from filelock import FileLock, Timeout as FileLockTimeout
-from pxh.logging import log_event
 from pxh.spark_config import (
     _pick_spark_angles, _pick_reflection_seed,
     _SPARK_REFLECTION_PREFIX, _SPARK_REFLECTION_SUFFIX,
@@ -606,7 +605,7 @@ def log(msg: str) -> None:
         now_m = time.monotonic()
         if now_m - _last_log_timeout_warn >= 60.0:
             _last_log_timeout_warn = now_m
-            print(f"[px-mind] rotlock timeout — dropped log line", file=sys.stderr)
+            print("[px-mind] rotlock timeout — dropped log line", file=sys.stderr)
     print(line, flush=True)
 
 
@@ -2351,11 +2350,6 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     # Pick a topic seed (or None = free-will mode) using OS entropy RNG
     topic_seed = _pick_reflection_seed()
 
-    # Build what we last said (for anti-repetition)
-    last_thought_text = ""
-    if recent_thoughts:
-        last_thought_text = recent_thoughts[-1].get("thought", "")
-
     # Feed moods only (not full thought text) to avoid re-seeding repetition
     recent_moods = [t.get("mood", "?") for t in recent_thoughts]
     recent_actions = [t.get("action", "?") for t in recent_thoughts]
@@ -2389,7 +2383,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         context_parts.append("Recent conversations:\n" + "\n".join(convo_lines))
 
     if notes:
-        context_parts.append(f"Your long-term memories:\n" + "\n".join(f"  - {n}" for n in notes))
+        context_parts.append("Your long-term memories:\n" + "\n".join(f"  - {n}" for n in notes))
 
     if _last_spoken_text:
         context_parts.append(f"What you said last time (DO NOT repeat this): \"{_last_spoken_text}\"")
@@ -3088,7 +3082,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 diag_context = f"Reflection failures detected. Awareness: {json.dumps(_aw)[:2000]}"
                 try:
                     recent_log = (LOG_DIR / "px-mind.log").read_text(encoding="utf-8").splitlines()[-50:]
-                    diag_context += f"\n\nRecent log:\n" + "\n".join(recent_log)
+                    diag_context += "\n\nRecent log:\n" + "\n".join(recent_log)
                 except Exception:
                     pass
 

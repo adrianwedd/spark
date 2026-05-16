@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import os
-import queue
 import shlex
 import signal
 import subprocess
@@ -549,7 +547,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     elif tool == "tool_drive":
         direction = str(params.get("direction", "forward")).lower()
         if direction not in ("forward", "backward"):
-            raise VoiceLoopError(f"tool_drive direction must be 'forward' or 'backward'")
+            raise VoiceLoopError("tool_drive direction must be 'forward' or 'backward'")
         speed    = int(clamp(_num(params.get("speed",    30), "speed"),  0,   60))
         duration = clamp(_num(params.get("duration", 1.0), "duration"),     0.1, 10.0)
         steer    = int(clamp(_num(params.get("steer",     0), "steer"), -35,  35))
@@ -628,7 +626,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         valid_actions = {"ask", "record"}
         act = str(params.get("action", "ask")).lower()
         if act not in valid_actions:
-            raise VoiceLoopError(f"tool_checkin action must be 'ask' or 'record'")
+            raise VoiceLoopError("tool_checkin action must be 'ask' or 'record'")
         sanitized["PX_CHECKIN_ACTION"] = act
         if act == "record":
             mood = str(params.get("mood", "")).lower().strip()
@@ -678,7 +676,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         valid_actions = {"ask", "record"}
         act = str(params.get("action", "ask")).lower()
         if act not in valid_actions:
-            raise VoiceLoopError(f"tool_sensory_check action must be 'ask' or 'record'")
+            raise VoiceLoopError("tool_sensory_check action must be 'ask' or 'record'")
         sanitized["PX_SENSORY_ACTION"] = act
         if act == "record":
             issue = str(params.get("issue", "")).lower().strip()[:80]

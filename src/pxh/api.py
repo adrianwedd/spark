@@ -677,7 +677,6 @@ async def public_status() -> Dict[str, Any]:
 @app.get("/api/v1/public/vitals")
 async def public_vitals() -> Dict[str, Any]:
     """System vitals: CPU, RAM, temp, battery, disk. No auth required."""
-    import time as _time
 
     cpu_pct = None
     ram_pct = None
@@ -1986,7 +1985,7 @@ async def tail_log(service: str, lines: int = Query(default=100, ge=1, le=2000))
     if not log_path.exists():
         return JSONResponse(content={"lines": [], "service": service})
     tail = tail_lines(log_path, n=lines, chunk_size=65536)
-    tail = [_sanitize_log_line(l) for l in tail]
+    tail = [_sanitize_log_line(line) for line in tail]
     return JSONResponse(content={"lines": tail, "service": service})
 
 
