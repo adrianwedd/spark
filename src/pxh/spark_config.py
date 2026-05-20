@@ -11,7 +11,7 @@ _SYS_RNG = random.SystemRandom()
 
 # ── Expression / reflection constants ──────────────────────────────
 SALIENCE_THRESHOLD     = 0.75  # auto-remember only high-quality thoughts (raised from 0.7)
-EXPRESSION_COOLDOWN_S  = 120   # min 2 min between spontaneous speech (was 30s)
+EXPRESSION_COOLDOWN_S  = 1800  # min 30 min between spontaneous speech (was 2 min)
 WEATHER_INTERVAL_S     = 1800  # refresh weather every 30 min (BOM updates half-hourly)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
 

@@ -2304,23 +2304,50 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
 def call_llm(prompt: str, system: str, persona: str = "") -> dict:
     """Four-tier LLM fallback.
 
-    Tier 1 — Claude Haiku (internet):  SPARK in auto mode, or MIND_BACKEND=claude
-    Tier 2 — Ollama M5.local (LAN):    all personas, or when Claude fails
-    Tier 3 — Ollama Cloud (internet):   fallback when M5 unreachable
-    Tier 4 — Ollama localhost (Pi):     final fallback when all else fails
+    Tier 1 — Ollama M5.local (LAN):   primary for all personas incl. SPARK (when reachable)
+    Tier 2 — Claude Haiku (internet): SPARK fallback when M5 unreachable, or MIND_BACKEND=claude
+    Tier 3 — Ollama Cloud (internet): fallback when M5 unreachable and Claude fails
+    Tier 4 — Ollama localhost (Pi):   final fallback when all else fails
     """
-    use_claude = (
-        MIND_BACKEND == "claude"
-        or (MIND_BACKEND == "auto" and persona == "spark")
-    )
-    if use_claude:
+    spark_auto = MIND_BACKEND == "auto" and persona == "spark"
+
+    # Tier 1: M5 Ollama (LAN) — primary for all personas including SPARK
+    if MIND_BACKEND != "claude":
+        result = call_ollama(prompt, system)
+        if "error" not in result:
+            try:
+                _log_token_usage(prompt + system, result.get("response", ""))
+            except Exception:
+                pass
+            return result
+
+        # Tier 2: Claude Haiku — SPARK fallback when M5 is unreachable
+        if spark_auto:
+            log(f"M5 ollama failed ({result['error']}), falling back to claude")
+            try:
+                claude_result = call_claude_haiku(prompt, system)
+            except Exception as exc:
+                try:
+                    log(f"claude crashed ({exc}), continuing to cloud ollama")
+                except Exception:
+                    pass
+                claude_result = {"error": str(exc)}
+            if "error" not in claude_result:
+                try:
+                    _log_token_usage(prompt + system, claude_result.get("response", ""))
+                except Exception:
+                    pass
+                return claude_result
+            log(f"claude failed ({claude_result['error']}), falling back to ollama cloud")
+    else:
+        # MIND_BACKEND=claude: Claude is primary
         try:
             result = call_claude_haiku(prompt, system)
         except Exception as exc:
             try:
                 log(f"claude crashed ({exc}), falling back to ollama")
             except Exception:
-                pass  # disk full — don't let logging block fallback
+                pass
             result = {"error": str(exc)}
         if "error" not in result:
             try:
@@ -2329,15 +2356,13 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                 pass
             return result
         log(f"claude failed ({result['error']}), falling back to ollama")
-
-    # Tier 2: M5 Ollama (LAN)
-    result = call_ollama(prompt, system)
-    if "error" not in result:
-        try:
-            _log_token_usage(prompt + system, result.get("response", ""))
-        except Exception:
-            pass
-        return result
+        result = call_ollama(prompt, system)
+        if "error" not in result:
+            try:
+                _log_token_usage(prompt + system, result.get("response", ""))
+            except Exception:
+                pass
+            return result
 
     # Tier 3: Ollama Cloud (internet fallback)
     if OLLAMA_CLOUD_KEY:
@@ -2366,7 +2391,7 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                 pass
             return result
 
-    log(f"all ollama tiers failed ({result['error']}), no local fallback — skipping reflection")
+    log(f"all tiers failed ({result['error']}), skipping reflection")
     return result
 
 
