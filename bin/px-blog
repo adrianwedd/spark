@@ -954,14 +954,23 @@ def main(argv: list[str]) -> int:
                     _shutdown.wait(timeout=args.poll_interval)
             except Exception as exc:
                 if _BudgetError and isinstance(exc, _BudgetError):
-                    # Budget exhausted — sleep until 5 min past midnight (next reset window)
-                    now = dt.datetime.now(HOBART_TZ)
-                    midnight = (now + dt.timedelta(days=1)).replace(
-                        hour=0, minute=5, second=0, microsecond=0
-                    )
-                    sleep_s = max(60.0, (midnight - now).total_seconds())
-                    log(f"poll: budget exhausted — sleeping {sleep_s / 3600:.1f}h until budget resets")
-                    _shutdown.wait(timeout=sleep_s)
+                    exc_str = str(exc)
+                    import re as _re
+                    m = _re.search(r"cooldown \((\d+)s / (\d+)s\)", exc_str)
+                    if m:
+                        # Per-type cooldown — sleep only until it expires
+                        remaining_s = max(60.0, int(m.group(2)) - int(m.group(1)) + 30)
+                        log(f"poll: type cooldown — sleeping {int(remaining_s)}s")
+                        _shutdown.wait(timeout=remaining_s)
+                    else:
+                        # Daily cap exhausted — sleep until 5 min past midnight
+                        now = dt.datetime.now(HOBART_TZ)
+                        midnight = (now + dt.timedelta(days=1)).replace(
+                            hour=0, minute=5, second=0, microsecond=0
+                        )
+                        sleep_s = max(60.0, (midnight - now).total_seconds())
+                        log(f"poll: budget exhausted — sleeping {sleep_s / 3600:.1f}h until budget resets")
+                        _shutdown.wait(timeout=sleep_s)
                 else:
                     log(f"poll: CRASHED: {exc}")
                     _shutdown.wait(timeout=args.poll_interval)
