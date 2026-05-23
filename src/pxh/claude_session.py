@@ -81,7 +81,7 @@ _TYPE_QUOTAS: dict[str, int] = {
     "research": 3,
     "compose": 2,
     "conversation": 4,
-    "blog": 3,
+    "blog": 5,
 }
 
 # Higher number = higher priority.  Used for budget-tight gating.

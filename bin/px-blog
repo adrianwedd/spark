@@ -760,6 +760,12 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
         post = generate_post(post_type, target_date, blog_data, dry=dry)
         if post is None:
             had_skips = True
+            # QA-rejected daily: mark skipped so catch-up advances to the next
+            # date rather than retrying (and burning quota) on the same post.
+            if post_type == "daily":
+                log(f"skipping {pid}: QA rejection — marking skipped to advance catch-up")
+                blog_data.setdefault("skipped", []).append(pid)
+                save_blog(blog_data)
             continue
 
         blog_data.setdefault("posts", []).append(post)
