@@ -272,7 +272,7 @@ def run_claude_session(
 
     # Build command
     cmd = [
-        "claude", "-p", prompt,
+        os.environ.get("PX_CLAUDE_BIN", "claude"), "-p", prompt,
         "--model", model,
         "--no-session-persistence",
         "--output-format", "text",

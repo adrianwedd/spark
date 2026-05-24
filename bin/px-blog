@@ -734,7 +734,7 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
     generated = 0
     had_skips = False
 
-    for post_type in ("daily", "weekly", "monthly", "yearly"):
+    for post_type in ("weekly", "monthly", "yearly", "daily"):
         due, target_date = is_due(post_type, blog_data)
         if not due or target_date is None:
             continue
