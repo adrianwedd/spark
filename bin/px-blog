@@ -211,8 +211,9 @@ def save_blog(data: dict) -> None:
 def append_blog_log(record: dict) -> None:
     """Append a record to the blog log."""
     BLOG_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(BLOG_LOG, "a") as f:
-        f.write(json.dumps(record) + "\n")
+    with _blog_lock(BLOG_LOG):
+        with open(BLOG_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 def post_exists(blog_data: dict | list, post_id: str) -> bool:

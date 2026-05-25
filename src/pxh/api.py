@@ -1173,16 +1173,17 @@ async def public_chat(req: PublicChatRequest, request: Request):
         )
 
     def _sanitize_chat_text(text: str) -> str:
-        """Strip newlines and role-tag brackets to prevent prompt injection."""
-        return text.replace("\n", " ").replace("\r", " ").replace("[", "(").replace("]", ")")
+        """Collapse whitespace and strip NUL bytes from user-supplied text."""
+        return text.replace("\n", " ").replace("\r", " ").replace("\x00", "")
 
-    # Build structured prompt to prevent injection via history content
+    # Use XML-style role tags with a namespace prefix that user content cannot
+    # replicate — bracket-only tags like [USER]: are trivially injected.
     history_block = "\n".join(
-        f"[{'USER' if item.role == 'user' else 'SPARK'}]: {_sanitize_chat_text(item.text)}"
+        f"<spark:{'user' if item.role == 'user' else 'assistant'}>{_sanitize_chat_text(item.text)}</spark:{'user' if item.role == 'user' else 'assistant'}>"
         for item in req.history
     )
     prompt = (history_block + "\n" if history_block else "") + \
-             f"[USER]: {_sanitize_chat_text(req.message)}\n[SPARK]:"
+             f"<spark:user>{_sanitize_chat_text(req.message)}</spark:user>\n<spark:assistant>"
     ctx = _build_public_context()
     if ctx:
         prompt = ctx + "\n\n" + prompt
@@ -1402,8 +1403,8 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
                         "last_action": tool,
                         "last_action_ts": utc_timestamp(),
                     })
-                except Exception:
-                    pass  # non-critical
+                except Exception as _exc:
+                    logging.getLogger("pxh.api").warning("update_session post-tool failed: %s", _exc)
 
         asyncio.create_task(_run_async())
         return JSONResponse(
