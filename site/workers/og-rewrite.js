@@ -36,19 +36,19 @@ function escapeHtmlAttr(s) {
  */
 function rewriteOgImage(html, imageUrl) {
   html = html.replace(
-    /<meta property="og:image" content="[^"]*">/,
+    /<meta\s[^>]*property="og:image"[^>]*>/,
     `<meta property="og:image" content="${imageUrl}">`
   );
   html = html.replace(
-    /<meta property="og:image:width" content="[^"]*">/,
+    /<meta\s[^>]*property="og:image:width"[^>]*>/,
     '<meta property="og:image:width" content="1080">'
   );
   html = html.replace(
-    /<meta property="og:image:height" content="[^"]*">/,
+    /<meta\s[^>]*property="og:image:height"[^>]*>/,
     '<meta property="og:image:height" content="1080">'
   );
   html = html.replace(
-    /<meta name="twitter:image" content="[^"]*">/,
+    /<meta\s[^>]*name="twitter:image"[^>]*>/,
     `<meta name="twitter:image" content="${imageUrl}">`
   );
   return html;
@@ -61,22 +61,22 @@ function rewriteOgText(html, title, description) {
   if (title) {
     const safeTitle = escapeHtmlAttr(title);
     html = html.replace(
-      /<meta property="og:title" content="[^"]*">/,
+      /<meta\s[^>]*property="og:title"[^>]*>/,
       `<meta property="og:title" content="${safeTitle}">`
     );
     html = html.replace(
-      /<meta name="twitter:title" content="[^"]*">/,
+      /<meta\s[^>]*name="twitter:title"[^>]*>/,
       `<meta name="twitter:title" content="${safeTitle}">`
     );
   }
   if (description) {
     const safeDesc = escapeHtmlAttr(description);
     html = html.replace(
-      /<meta property="og:description" content="[^"]*">/,
+      /<meta\s[^>]*property="og:description"[^>]*>/,
       `<meta property="og:description" content="${safeDesc}">`
     );
     html = html.replace(
-      /<meta name="twitter:description" content="[^"]*">/,
+      /<meta\s[^>]*name="twitter:description"[^>]*>/,
       `<meta name="twitter:description" content="${safeDesc}">`
     );
   }
