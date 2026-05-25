@@ -11,76 +11,49 @@
  * Both routes are wired in wrangler.toml and deployed to the spark-og-rewrite
  * Worker. Cloudflare prevents recursive invocation on the same zone, so
  * fetch(request) hits the origin server, not this Worker again.
+ *
+ * Uses HTMLRewriter (Cloudflare Workers streaming HTML parser) rather than
+ * regex to avoid breakage on `>` inside quoted attribute values.
  */
 
 const API_BASE = 'https://spark-api.wedd.au/api/v1/public';
 
-// Validate ts looks like an ISO timestamp (prevent XSS injection into HTML attributes)
+// Validate ts looks like an ISO timestamp (prevent open-redirect via query param)
 const TS_PATTERN = /^[\d\-T:+.Z]+$/;
 
 // Validate blog id: e.g. blog-20260325-daily, blog-2026w13-weekly, blog-202603-monthly
 const BLOG_ID_PATTERN = /^blog-[\dw\-]+-[a-z_]+(-\d+)?$/;
 
-function escapeHtmlAttr(s) {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/"/g, '&quot;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/'/g, '&#39;')
-    .replace(/[\r\n]+/g, ' ');
-}
-
 /**
- * Rewrite og:image, og:image:width, og:image:height, and twitter:image tags.
+ * HTMLRewriter element handler that rewrites OG/Twitter meta tag attributes.
+ * setAttribute() in HTMLRewriter HTML-encodes values automatically.
  */
-function rewriteOgImage(html, imageUrl) {
-  html = html.replace(
-    /<meta\s[^>]*property="og:image"[^>]*>/,
-    `<meta property="og:image" content="${imageUrl}">`
-  );
-  html = html.replace(
-    /<meta\s[^>]*property="og:image:width"[^>]*>/,
-    '<meta property="og:image:width" content="1080">'
-  );
-  html = html.replace(
-    /<meta\s[^>]*property="og:image:height"[^>]*>/,
-    '<meta property="og:image:height" content="1080">'
-  );
-  html = html.replace(
-    /<meta\s[^>]*name="twitter:image"[^>]*>/,
-    `<meta name="twitter:image" content="${imageUrl}">`
-  );
-  return html;
-}
+class MetaRewriter {
+  constructor({ imageUrl = null, title = null, description = null }) {
+    this.imageUrl = imageUrl;
+    this.title = title;
+    this.description = description;
+  }
 
-/**
- * Rewrite og:title and og:description tags.
- */
-function rewriteOgText(html, title, description) {
-  if (title) {
-    const safeTitle = escapeHtmlAttr(title);
-    html = html.replace(
-      /<meta\s[^>]*property="og:title"[^>]*>/,
-      `<meta property="og:title" content="${safeTitle}">`
-    );
-    html = html.replace(
-      /<meta\s[^>]*name="twitter:title"[^>]*>/,
-      `<meta name="twitter:title" content="${safeTitle}">`
-    );
+  element(el) {
+    const prop = el.getAttribute('property');
+    const name = el.getAttribute('name');
+
+    if (this.imageUrl) {
+      if (prop === 'og:image') el.setAttribute('content', this.imageUrl);
+      if (prop === 'og:image:width') el.setAttribute('content', '1080');
+      if (prop === 'og:image:height') el.setAttribute('content', '1080');
+      if (name === 'twitter:image') el.setAttribute('content', this.imageUrl);
+    }
+    if (this.title) {
+      if (prop === 'og:title') el.setAttribute('content', this.title);
+      if (name === 'twitter:title') el.setAttribute('content', this.title);
+    }
+    if (this.description) {
+      if (prop === 'og:description') el.setAttribute('content', this.description);
+      if (name === 'twitter:description') el.setAttribute('content', this.description);
+    }
   }
-  if (description) {
-    const safeDesc = escapeHtmlAttr(description);
-    html = html.replace(
-      /<meta\s[^>]*property="og:description"[^>]*>/,
-      `<meta property="og:description" content="${safeDesc}">`
-    );
-    html = html.replace(
-      /<meta\s[^>]*name="twitter:description"[^>]*>/,
-      `<meta name="twitter:description" content="${safeDesc}">`
-    );
-  }
-  return html;
 }
 
 export default {
@@ -109,7 +82,7 @@ export default {
       const contentType = response.headers.get('content-type') || '';
       if (!contentType.includes('text/html')) return response;
 
-      const imageUrl = escapeHtmlAttr(`${API_BASE}/thought-image?ts=${encodeURIComponent(ts)}`);
+      const imageUrl = `${API_BASE}/thought-image?ts=${encodeURIComponent(ts)}`;
 
       // Probe the image URL — if API is down, serve original HTML with default og:image
       try {
@@ -119,16 +92,9 @@ export default {
         return response;
       }
 
-      let html = await response.text();
-      html = rewriteOgImage(html, imageUrl);
-
-      return new Response(html, {
-        status: response.status,
-        headers: {
-          ...Object.fromEntries(response.headers),
-          'content-type': 'text/html; charset=utf-8',
-        },
-      });
+      return new HTMLRewriter()
+        .on('meta', new MetaRewriter({ imageUrl }))
+        .transform(response);
     }
 
     // ── /blog/?id=<id> ────────────────────────────────────────────────────
@@ -165,16 +131,9 @@ export default {
       // If we couldn't find post data, serve original HTML unchanged
       if (!postTitle && !postDesc) return response;
 
-      let html = await response.text();
-      html = rewriteOgText(html, postTitle, postDesc);
-
-      return new Response(html, {
-        status: response.status,
-        headers: {
-          ...Object.fromEntries(response.headers),
-          'content-type': 'text/html; charset=utf-8',
-        },
-      });
+      return new HTMLRewriter()
+        .on('meta', new MetaRewriter({ title: postTitle, description: postDesc }))
+        .transform(response);
     }
 
     return fetch(request);
