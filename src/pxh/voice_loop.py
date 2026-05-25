@@ -797,6 +797,13 @@ def supervisor_loop(args: argparse.Namespace) -> None:
     ensure_session()
     system_prompt = read_prompt(Path(args.prompt))
 
+    # Install SIGTERM handler so the watchdog's os.kill(SIGTERM) triggers
+    # SystemExit rather than the default C-level termination, allowing Python
+    # atexit handlers and finally blocks (including FileLock release) to run.
+    def _sigterm(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
+
     heartbeat_lock = threading.Lock()
     heartbeat_val: list = [time.monotonic()]
     if args.input_mode != "text":

@@ -1211,7 +1211,11 @@ async def public_chat(req: PublicChatRequest, request: Request):
             content={"error": "Something went quiet on my end. Try again?"},
         )
 
-    if not reply.strip():
+    # Claude sometimes echoes the opening/closing XML role tags into stdout when
+    # the prompt ends with <spark:assistant>. Strip them so they don't leak to clients.
+    reply = reply.removeprefix("<spark:assistant>").removesuffix("</spark:assistant>").strip()
+
+    if not reply:
         _public_chat_log.warning("public_chat: empty stdout from claude (exit 0), ip=%s", ip_hash)
         reply = "I'm here — I just went quiet for a moment. Try again?"
 
