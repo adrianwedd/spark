@@ -20,7 +20,14 @@ from pathlib import Path
 
 PROJECT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
 STATE   = Path(os.environ.get("PX_STATE_DIR", PROJECT / "state"))
-LOGS    = Path(os.environ.get("LOG_DIR", PROJECT / "logs"))
+_logs_raw = Path(os.environ.get("LOG_DIR", PROJECT / "logs"))
+# Clamp to project tree: when px-motd runs as root from PAM, a user-controlled
+# LOG_DIR could otherwise tail arbitrary files readable by root.
+try:
+    _logs_raw.resolve().relative_to(PROJECT.resolve())
+    LOGS = _logs_raw
+except ValueError:
+    LOGS = PROJECT / "logs"
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
 
