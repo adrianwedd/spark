@@ -342,10 +342,11 @@ _JOBS_MAX = 200  # evict oldest when exceeded
 def _set_job(job_id: str, data: Dict[str, Any]) -> None:
     with _jobs_lock:
         _jobs[job_id] = data
-        # Evict oldest entries when registry grows too large
+        # Evict oldest *completed* entries only — never evict still-running jobs
+        # or callers polling an active job would get spurious 404s.
         if len(_jobs) > _JOBS_MAX:
-            oldest = list(_jobs.keys())[: len(_jobs) - _JOBS_MAX]
-            for k in oldest:
+            done = [k for k, v in _jobs.items() if v.get("status") in ("complete", "error")]
+            for k in done[: len(_jobs) - _JOBS_MAX]:
                 del _jobs[k]
 
 
@@ -1518,44 +1519,52 @@ async def race_action(action: str, request: Request) -> JSONResponse:
             )
         _race_starting = True
 
-    # Parse request body. Validate via RaceRequest so bad JSON shapes return
-    # 422 instead of crashing with a 500 (issue #151). Distinguish empty body
-    # (use defaults) from malformed JSON (return 400).
-    body_bytes = await request.body()
-    raw_body: dict = {}
-    if body_bytes:
-        try:
-            raw_body = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="malformed JSON body") from None
+    # Everything from here until _executor.submit must clear _race_starting on
+    # any exception — otherwise a malformed request permanently deadlocks race
+    # control (409 "already_running" forever).
     try:
-        parsed = RaceRequest(**raw_body) if raw_body else RaceRequest()
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from None
-    dry = _resolve_dry(parsed.dry)
+        # Parse request body. Validate via RaceRequest so bad JSON shapes return
+        # 422 instead of crashing with a 500 (issue #151). Distinguish empty body
+        # (use defaults) from malformed JSON (return 400).
+        body_bytes = await request.body()
+        raw_body: dict = {}
+        if body_bytes:
+            try:
+                raw_body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="malformed JSON body") from None
+        try:
+            parsed = RaceRequest(**raw_body) if raw_body else RaceRequest()
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from None
+        dry = _resolve_dry(parsed.dry)
 
-    # Launch via bin/px-race so yield_alive runs *before* Picarx() is constructed
-    # (issue #145). The bash launcher sources px-env, sends SIGUSR1 to px-alive,
-    # waits for it to exit + 2s lgpiod settle, then delegates to `python -m pxh.race`.
-    px_race = str(PROJECT_ROOT / "bin" / "px-race")
-    cmd: list[str] = [px_race]
+        # Launch via bin/px-race so yield_alive runs *before* Picarx() is constructed
+        # (issue #145). The bash launcher sources px-env, sends SIGUSR1 to px-alive,
+        # waits for it to exit + 2s lgpiod settle, then delegates to `python -m pxh.race`.
+        px_race = str(PROJECT_ROOT / "bin" / "px-race")
+        cmd: list[str] = [px_race]
 
-    if action == "calibrate_gate":
-        cmd.extend(["--calibrate", "--dry-run"] if dry else ["--calibrate"])
-    elif action == "map":
-        cmd.append("--map")
-        if dry:
-            cmd.append("--dry-run")
-    elif action == "race":
-        laps = max(1, min(100, parsed.laps))
-        max_speed = max(10, min(60, parsed.max_speed))
-        cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
-        if dry:
-            cmd.append("--dry-run")
+        if action == "calibrate_gate":
+            cmd.extend(["--calibrate", "--dry-run"] if dry else ["--calibrate"])
+        elif action == "map":
+            cmd.append("--map")
+            if dry:
+                cmd.append("--dry-run")
+        elif action == "race":
+            laps = max(1, min(100, parsed.laps))
+            max_speed = max(10, min(60, parsed.max_speed))
+            cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
+            if dry:
+                cmd.append("--dry-run")
 
-    # Launch as async job
-    job_id = str(uuid.uuid4())
-    _set_job(job_id, {"status": "running", "action": f"race_{action}"})
+        # Launch as async job
+        job_id = str(uuid.uuid4())
+        _set_job(job_id, {"status": "running", "action": f"race_{action}"})
+    except BaseException:
+        with _race_proc_lock:
+            _race_starting = False
+        raise
 
     def _run_race():
         # Hold a local reference to the popen — never re-read the global after
@@ -1585,6 +1594,10 @@ async def race_action(action: str, request: Request) -> JSONResponse:
             if proc:
                 proc.kill()
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "timeout"})
+        except (ValueError, OSError):
+            # communicate() raises ValueError if the stop endpoint already called
+            # terminate() + wait() and closed the pipe; treat as terminated.
+            _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "terminated"})
         except Exception as exc:
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": str(exc)})
         finally:
@@ -2559,7 +2572,11 @@ async def serve_photo(filename: str):
     if not re.fullmatch(r"[\w\-]+\.jpe?g", filename, re.IGNORECASE):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="not found")
+    photos_root = (PROJECT_ROOT / "photos").resolve()
     photo_path = PROJECT_ROOT / "photos" / filename
+    if photo_path.resolve().parent != photos_root:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="not found")
     if not photo_path.exists():
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="photo not found")
