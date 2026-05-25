@@ -389,7 +389,7 @@ class TestBlogSessionType:
 
     def test_blog_quota(self):
         from pxh.claude_session import _TYPE_QUOTAS
-        assert _TYPE_QUOTAS["blog"] == 3
+        assert _TYPE_QUOTAS["blog"] == 5
 
     def test_blog_priority(self):
         from pxh.claude_session import _PRIORITY

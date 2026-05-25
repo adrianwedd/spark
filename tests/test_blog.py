@@ -221,7 +221,7 @@ class TestBlogSchedule:
         assert match
         order = match.group(1)
         types = [t.strip().strip('"').strip("'") for t in order.split(",")]
-        assert types == ["daily", "weekly", "monthly", "yearly"]
+        assert types == ["weekly", "monthly", "yearly", "daily"]
 
     def test_min_thoughts_threshold(self, blog_mod):
         """Only 2 thoughts exist, verify daily skipped."""

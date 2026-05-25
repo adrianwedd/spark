@@ -17,6 +17,11 @@ from pathlib import Path
 
 from pxh.logging import log_event
 from pxh.state import update_session
+
+try:
+    from filelock import FileLock as _FL
+except ImportError:
+    _FL = None
 from pxh.time import utc_timestamp
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
@@ -91,8 +96,14 @@ def main() -> int:
             "started_at": utc_timestamp(),
             "pid": pid,
         }
-        with TIMERS_JSONL.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        _lock = _FL(str(TIMERS_JSONL) + ".lock", timeout=5) if _FL else None
+        if _lock:
+            with _lock:
+                with TIMERS_JSONL.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(record) + "\n")
+        else:
+            with TIMERS_JSONL.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
     except OSError:
         pass  # Non-fatal — timer is already running
 

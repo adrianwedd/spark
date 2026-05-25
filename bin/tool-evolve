@@ -17,6 +17,11 @@ from pathlib import Path
 
 from pxh.state import atomic_write
 
+try:
+    from filelock import FileLock as _FL
+except ImportError:
+    _FL = None
+
 # ── Paths ──────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
@@ -102,13 +107,15 @@ def main() -> int:
     if dry:
         queue_entry["dry"] = True
 
-    existing = ""
-    if EVOLVE_QUEUE.exists():
-        existing = EVOLVE_QUEUE.read_text(encoding="utf-8")
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-
-    atomic_write(EVOLVE_QUEUE, existing + json.dumps(queue_entry) + "\n")
+    _lock = _FL(str(EVOLVE_QUEUE) + ".lock", timeout=5) if _FL else None
+    ctx = _lock if _lock else __import__("contextlib").nullcontext()
+    with ctx:
+        existing = ""
+        if EVOLVE_QUEUE.exists():
+            existing = EVOLVE_QUEUE.read_text(encoding="utf-8")
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+        atomic_write(EVOLVE_QUEUE, existing + json.dumps(queue_entry) + "\n")
 
     print(json.dumps({"status": "queued", "id": evolve_id}))
     return 0

@@ -273,7 +273,7 @@ app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://spark.wedd.au", "http://spark.wedd.au", "https://spark-api.wedd.au", "http://localhost:8420"],
+    allow_origins=["https://spark.wedd.au", "https://spark-api.wedd.au", "http://localhost:8420"],
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
@@ -908,10 +908,8 @@ async def public_race():
             "laps_completed": len(prof.get("lap_history", [])),
         }
         if prof.get("lap_history"):
-            result["profile"]["best_lap_s"] = min(
-                lh["duration_s"] for lh in prof["lap_history"]
-                if "duration_s" in lh
-            ) if prof["lap_history"] else None
+            durations = [lh["duration_s"] for lh in prof["lap_history"] if "duration_s" in lh]
+            result["profile"]["best_lap_s"] = min(durations) if durations else None
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     # Live telemetry
@@ -1123,8 +1121,18 @@ def _log_chat_public(*, ip_hash: str, turns: int, status: str, latency_ms: int) 
         "latency_ms": latency_ms,
     }
     try:
-        with open(log_path, "a") as f:
-            f.write(_j.dumps(entry) + "\n")
+        from filelock import FileLock as _FL
+        _lock = _FL(str(log_path) + ".lock", timeout=5)
+    except ImportError:
+        _lock = None
+    try:
+        if _lock:
+            with _lock:
+                with open(log_path, "a") as f:
+                    f.write(_j.dumps(entry) + "\n")
+        else:
+            with open(log_path, "a") as f:
+                f.write(_j.dumps(entry) + "\n")
     except Exception as exc:
         _public_chat_log.warning("_log_chat_public failed: %s", exc)
 
@@ -2067,8 +2075,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       <div class="sec-hdr" style="color:var(--spark)">&#x1F9D8; I need help</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
         <button class="btn btn-spark" onclick="doTool('tool_breathe',{rounds:2})">&#x1F4A8; Breathe with me</button>
-        <button class="btn btn-spark" onclick="doTool('tool_quiet',{mode:'on'})">&#x1F92B; Go quiet</button>
-        <button class="btn btn-muted"  onclick="doTool('tool_quiet',{mode:'off'})">&#x2705; End quiet</button>
+        <button class="btn btn-spark" onclick="doTool('tool_quiet',{action:'start'})">&#x1F92B; Go quiet</button>
+        <button class="btn btn-muted"  onclick="doTool('tool_quiet',{action:'end'})">&#x2705; End quiet</button>
         <button class="btn btn-spark" onclick="doTool('tool_sensory_check',{})">&#x1F9E0; Body check</button>
         <button class="btn btn-spark" onclick="doTool('tool_dopamine_menu',{energy:'medium'})">&#x1F3B2; What can I do?</button>
         <button class="btn btn-spark" onclick="doTool('tool_repair',{})">&#x1F91D; Make things better</button>
@@ -2092,12 +2100,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       </div>
       <div class="sec-hdr" style="color:var(--orange)">&#x1F4CB; Our routines</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-        <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'start',routine:'morning'})">&#x1F305; Morning</button>
-        <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'start',routine:'homework'})">&#x1F4DA; Homework</button>
-        <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'start',routine:'bedtime'})">&#x1F319; Bedtime</button>
+        <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'load',name:'morning'})">&#x1F305; Morning</button>
+        <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'load',name:'homework'})">&#x1F4DA; Homework</button>
+        <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'load',name:'bedtime'})">&#x1F319; Bedtime</button>
         <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'next'})">&#x27A1;&#xFE0F; Next step</button>
         <button class="btn btn-orange" onclick="doTool('tool_routine',{action:'status'})">&#x2753; What&apos;s the plan?</button>
-        <button class="btn btn-muted"  onclick="doTool('tool_routine',{action:'stop'})">&#x23F9;&#xFE0F; Stop routine</button>
+        <button class="btn btn-muted"  onclick="doTool('tool_routine',{action:'complete'})">&#x23F9;&#xFE0F; Stop routine</button>
       </div>
       <div class="sec-hdr" style="color:var(--orange)">&#x23F0; Transitions</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">

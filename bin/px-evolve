@@ -50,6 +50,13 @@ POLL_INTERVAL = 60
 QUEUE_FILE = STATE_DIR / "evolve_queue.jsonl"
 EVOLVE_LOG = STATE_DIR / "evolve_log.jsonl"
 
+try:
+    from filelock import FileLock as _FileLock
+    _QUEUE_LOCK = _FileLock(str(QUEUE_FILE) + ".lock", timeout=5)
+except ImportError:
+    _FileLock = None  # type: ignore[assignment,misc]
+    _QUEUE_LOCK = None
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -90,24 +97,30 @@ def atomic_write(path: Path, content: str) -> None:
 
 def load_queue() -> list[dict]:
     """Load all entries from the queue file."""
-    if not QUEUE_FILE.exists():
-        return []
-    entries = []
-    for line in QUEUE_FILE.read_text().strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entries.append(json.loads(line))
-        except json.JSONDecodeError:
-            log(f"skipping malformed queue line: {line[:80]}")
-    return entries
+    import contextlib
+    ctx = _QUEUE_LOCK if _QUEUE_LOCK is not None else contextlib.nullcontext()
+    with ctx:
+        if not QUEUE_FILE.exists():
+            return []
+        entries = []
+        for line in QUEUE_FILE.read_text().strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                log(f"skipping malformed queue line: {line[:80]}")
+        return entries
 
 
 def save_queue(entries: list[dict]) -> None:
     """Atomically write all queue entries back."""
+    import contextlib
     content = "\n".join(json.dumps(e) for e in entries) + "\n" if entries else ""
-    atomic_write(QUEUE_FILE, content)
+    ctx = _QUEUE_LOCK if _QUEUE_LOCK is not None else contextlib.nullcontext()
+    with ctx:
+        atomic_write(QUEUE_FILE, content)
 
 
 def append_evolve_log(record: dict) -> None:

@@ -14,6 +14,11 @@ from pathlib import Path
 from pxh.utils import clamp
 from pxh.time import utc_timestamp
 
+try:
+    from filelock import FileLock as _FileLock
+except ImportError:
+    _FileLock = None
+
 
 class PDController:
     """Proportional-Derivative controller with output clamping."""
@@ -416,10 +421,17 @@ class RaceController:
         path = self.state_dir / "race_log.jsonl"
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
+            lock = _FileLock(str(path) + ".lock", timeout=5) if _FileLock else None
+            if lock:
+                with lock:
+                    with path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(entry) + "\n")
+            else:
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry) + "\n")
+        except Exception as exc:
+            import logging
+            logging.getLogger("pxh.race").warning("_append_race_log failed: %s", exc)
 
     # ─── Mapping phase ────────────────────────────────────────────────────────
 

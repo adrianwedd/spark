@@ -1,7 +1,7 @@
 [Unit]
 Description=Cloudflare Tunnel — api.spark.wedd.au → localhost:8420
-After=network-online.target
-Wants=network-online.target
+After=network-online.target px-api-server.service
+Wants=network-online.target px-api-server.service
 
 [Service]
 EnvironmentFile=/home/pi/picar-x-hacking/.env

@@ -228,7 +228,7 @@ Central dispatcher for all SPARK-initiated Claude Code interactions. Manages mod
 | `conversation`  | Sonnet | 15min    | 4/day       |
 | `blog`          | Haiku  | 30min    | 5/day       |
 
-Global: 30-min cooldown between sessions (except `self_debug`), 8/day cap. Priority gating when ≤2 remaining: only `self_debug` and `evolve` allowed. Models configurable via `PX_CLAUDE_MODEL_*` env vars.
+Global: 30-min cooldown between sessions (except `self_debug` and `blog`), 8/day cap. Priority gating when ≤2 remaining: only `self_debug` and `evolve` allowed. Models configurable via `PX_CLAUDE_MODEL_*` env vars.
 
 **Rate limiting**: `check_budget()` returns None (allowed) or reason string. `SessionBudgetExhausted` exception for callers. Budget bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Day boundary: midnight Hobart time.
 

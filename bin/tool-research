@@ -13,6 +13,11 @@ import sys
 from pathlib import Path
 
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", os.environ.get("PROJECT_ROOT", ".") + "/state"))
+
+try:
+    from filelock import FileLock as _FL
+except ImportError:
+    _FL = None
 DRY = os.environ.get("PX_DRY", "0") != "0"
 
 
@@ -70,8 +75,14 @@ def main():
     notes_file = STATE_DIR / "notes-spark.jsonl"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        with open(notes_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        _lock = _FL(str(notes_file) + ".lock", timeout=5) if _FL else None
+        if _lock:
+            with _lock:
+                with open(notes_file, "a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        else:
+            with open(notes_file, "a") as f:
+                f.write(json.dumps(entry) + "\n")
     except OSError:
         pass
 
