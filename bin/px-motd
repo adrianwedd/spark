@@ -18,9 +18,24 @@ from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-PROJECT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
-STATE   = Path(os.environ.get("PX_STATE_DIR", PROJECT / "state"))
-LOGS    = Path(os.environ.get("LOG_DIR", PROJECT / "logs"))
+# Derive project root from script location — do NOT trust PROJECT_ROOT env var here.
+# px-motd runs as root from PAM; an attacker-controlled PROJECT_ROOT would defeat
+# the PX_STATE_DIR / LOG_DIR clamping below.
+PROJECT = Path(__file__).resolve().parent.parent
+# Clamp PX_STATE_DIR and LOG_DIR to the project tree: px-motd runs as root
+# from PAM, so user-controlled paths could otherwise read arbitrary files.
+_state_raw = Path(os.environ.get("PX_STATE_DIR", PROJECT / "state"))
+try:
+    _state_raw.resolve().relative_to(PROJECT.resolve())
+    STATE = _state_raw
+except ValueError:
+    STATE = PROJECT / "state"
+_logs_raw = Path(os.environ.get("LOG_DIR", PROJECT / "logs"))
+try:
+    _logs_raw.resolve().relative_to(PROJECT.resolve())
+    LOGS = _logs_raw
+except ValueError:
+    LOGS = PROJECT / "logs"
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
 

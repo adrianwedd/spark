@@ -303,6 +303,16 @@ def _run_in_worktree(
         if not file_in_whitelist(f):
             log(f"[{entry_id}] whitelist violation: {f}")
             return "failed:whitelist_violation"
+        # bin/tool-* is whitelisted for NEW tools only; reject if file already exists on master.
+        # Reject on non-zero returncode too (fail-safe: git error → block rather than allow).
+        if f.startswith("bin/tool-"):
+            ls = subprocess.run(
+                ["git", "ls-tree", "master", "--", f],
+                cwd=workdir, capture_output=True, text=True,
+            )
+            if ls.returncode != 0 or ls.stdout.strip():
+                log(f"[{entry_id}] whitelist violation: existing tool modified (or ls-tree error): {f}")
+                return "failed:whitelist_violation"
 
     # 6. Enforce max files
     if len(changed_files) > EVOLVE_MAX_FILES:
@@ -411,6 +421,39 @@ def _cleanup_worktree(workdir: str, entry_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Queue targeted update (preserves entries appended after our last load_queue)
+# ---------------------------------------------------------------------------
+
+def _update_entry_in_queue(entry_id: str, **fields) -> None:
+    """Reload queue from disk under lock, update matching entry by id, write back.
+
+    Using load_queue/save_queue here would lose entries appended by tool-evolve
+    between our original load and this save, because save_queue overwrites the
+    whole file. Instead we reload fresh, update in-place, and write directly.
+    """
+    import contextlib
+    ctx = _QUEUE_LOCK if _QUEUE_LOCK is not None else contextlib.nullcontext()
+    with ctx:
+        if not QUEUE_FILE.exists():
+            return
+        entries = []
+        for line in QUEUE_FILE.read_text().strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        for e in entries:
+            if e["id"] == entry_id:
+                e.update(fields)
+                break
+        content = "\n".join(json.dumps(e) for e in entries) + "\n" if entries else ""
+        atomic_write(QUEUE_FILE, content)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -425,8 +468,7 @@ def run_once(*, dry: bool) -> int:
         if entry.get("status") != "pending":
             continue
         if entry.get("dry"):
-            entry["status"] = "skipped:dry"
-            save_queue(entries)
+            _update_entry_in_queue(entry["id"], status="skipped:dry")
             continue
 
         raw_status = process_entry(entry, dry=dry)
@@ -443,12 +485,12 @@ def run_once(*, dry: bool) -> int:
         else:
             status = raw_status
 
-        entry["status"] = status
-        entry["ts_completed"] = ts_now
         processed += 1
 
-        # Update queue atomically
-        save_queue(entries)
+        # Targeted update: reload queue from disk, update this entry by id.
+        # save_queue(entries) would overwrite entries appended by tool-evolve
+        # during the ~30min Claude subprocess (issue #M2).
+        _update_entry_in_queue(entry["id"], status=status, ts_completed=ts_now)
 
         # Append to evolve log with numeric ts for rate limiting
         log_entry = {

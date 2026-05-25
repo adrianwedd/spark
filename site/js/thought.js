@@ -63,7 +63,7 @@
     var card = document.getElementById('thought-card');
     card.hidden = false;
 
-    document.getElementById('thought-text').textContent = post.thought;
+    document.getElementById('thought-text').textContent = post.thought != null ? String(post.thought) : '';
 
     var badge = document.getElementById('thought-mood');
     badge.className = 'mood-badge ' + moodClass(post.mood);

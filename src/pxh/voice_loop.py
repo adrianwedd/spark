@@ -758,6 +758,7 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
         elapsed = time.monotonic() - _last_tool_execution
         if elapsed < 0.5:
             time.sleep(0.5 - elapsed)
+        _last_tool_execution = time.monotonic()
 
     command_path = TOOL_COMMANDS[tool]
     if not command_path.exists():
@@ -789,14 +790,19 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
         )
     except subprocess.TimeoutExpired:
         return 1, json.dumps({"status": "error", "error": f"tool {tool} timed out after {timeout}s"}), ""
-    finally:
-        _last_tool_execution = time.monotonic()
     return result.returncode, result.stdout, result.stderr
 
 
 def supervisor_loop(args: argparse.Namespace) -> None:
     ensure_session()
     system_prompt = read_prompt(Path(args.prompt))
+
+    # Install SIGTERM handler so the watchdog's os.kill(SIGTERM) triggers
+    # SystemExit rather than the default C-level termination, allowing Python
+    # atexit handlers and finally blocks (including FileLock release) to run.
+    def _sigterm(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _sigterm)
 
     heartbeat_lock = threading.Lock()
     heartbeat_val: list = [time.monotonic()]

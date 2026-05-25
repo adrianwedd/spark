@@ -198,7 +198,7 @@ class TestReflectionIntrospectionTs:
             awareness = {"time_of_day": "afternoon", "obi_mode": "calm"}
             result = mind.reflection(awareness, dry=True)
             # Should not crash — that's the main assertion
-            assert result is not None or result is None  # no crash
+            assert result is None or isinstance(result, dict)  # returns dict|None per type hint
 
     def test_iso_string_ts(self, tmp_path):
         """reflection() should handle ISO string ts (backward compat)."""

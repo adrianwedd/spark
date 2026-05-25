@@ -24,8 +24,9 @@ LOCK_TIMEOUT_S = 10  # seconds — fail fast rather than hang forever
 def atomic_write(path: Path, content: str) -> None:
     """Write content to path atomically via temp file + os.replace.
 
-    Preserves original file's ownership and sets mode 0o644 so that
-    cross-user writers (root px-alive, pi px-mind) don't lock each other out.
+    Attempts to preserve original file's ownership (skipped silently if caller
+    lacks privileges) and sets mode 0o644 so that cross-user writers
+    (root px-alive, pi px-mind) don't lock each other out.
     """
     # Capture original ownership before replacing
     try:

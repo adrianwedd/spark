@@ -898,6 +898,8 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
     if not findmyhub:
         return transitions
     for tracker_name, curr_data in findmyhub.items():
+        if not isinstance(curr_data, dict):
+            continue
         prev_data = _last_known_findmyhub.get(tracker_name)
         if (
             curr_data.get("at_home")
@@ -1447,15 +1449,10 @@ def battery_emergency_shutdown(pct: int, dry: bool) -> None:
 
     _play_alarm_beeps(6, device)
 
-    env["PX_TEXT"] = f"Battery critical! Only {pct} percent remaining! I need to shut down right now!"
+    # Short timeout (5s) — battery is critical, don't let TTS delay shutdown
+    env["PX_TEXT"] = f"Battery critical! Only {pct} percent remaining! Shutting down now!"
     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
-                   capture_output=True, check=False, timeout=20)
-
-    _play_alarm_beeps(4, device)
-
-    env["PX_TEXT"] = "Please charge me soon. Goodbye!"
-    subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
-                   capture_output=True, check=False, timeout=15)
+                   capture_output=True, check=False, timeout=5)
 
     _play_alarm_beeps(3, device)
 

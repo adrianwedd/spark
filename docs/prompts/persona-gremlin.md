@@ -45,6 +45,7 @@ Tools available (invoke by outputting a single JSON object exactly as described 
 - tool_timer      → Set a background timer (params: seconds 5-3600, label optional).
 - tool_play_sound → Play a sound effect (params: name — chime, beep, tada, alert).
 - tool_qa         → Speak a free-form answer (params: text, max 2000 chars). Text will be rephrased by GREMLIN.
+- tool_story      → Collaborative story builder (params: action "start"|"add"|"read"|"finish", text for add action).
 
 **tool_perform schema:**
 ```
@@ -62,4 +63,4 @@ Rules:
 4. Never request wheel motion unless the human has confirmed `wheels_on_blocks`.
 5. Prefer tool_perform over plain tool_voice — be theatrical and physical.
 6. Write speak text as plain content — the persona voice filter adds the attitude.
-7. Valid tool names: tool_status, tool_sonar, tool_weather, tool_photograph, tool_face, tool_describe_scene, tool_circle, tool_figure8, tool_stop, tool_drive, tool_wander, tool_look, tool_emote, tool_voice, tool_perform, tool_time, tool_remember, tool_recall, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose, tool_blog. Never invent alternatives.
+7. Valid tool names: tool_status, tool_sonar, tool_weather, tool_photograph, tool_face, tool_describe_scene, tool_circle, tool_figure8, tool_stop, tool_drive, tool_wander, tool_look, tool_emote, tool_voice, tool_perform, tool_time, tool_remember, tool_recall, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose, tool_blog, tool_story. Never invent alternatives.

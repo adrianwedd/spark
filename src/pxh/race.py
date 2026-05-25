@@ -93,17 +93,20 @@ class GateDetector:
 
         if self._pending_count > 0:
             self._pending_frames += 1
-            self._pending_count += triggered_this_frame
-
-            if self._pending_count >= 2:
-                self._last_trigger_t = t
-                self._pending_count = 0
-                self._pending_frames = 0
-                return True
-
+            # Check expiry BEFORE accumulating count: if the confirm window has
+            # elapsed, abandon the pending state so a trigger on the expiry frame
+            # doesn't fire via the count check below (issue: count was incremented
+            # first, then expiry was checked, allowing a false gate detection).
             if self._pending_frames > self.confirm_frames:
                 self._pending_frames = 0
                 self._pending_count = 0
+            else:
+                self._pending_count += triggered_this_frame
+                if self._pending_count >= 2:
+                    self._last_trigger_t = t
+                    self._pending_count = 0
+                    self._pending_frames = 0
+                    return True
 
         if triggered_this_frame >= 2:
             self._last_trigger_t = t

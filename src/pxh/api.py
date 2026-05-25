@@ -124,6 +124,16 @@ def _check_public_rate_limit(ip: str) -> bool:
                      if not v or now - v[-1] > _PUBLIC_RATE_WINDOW_S]
             for k in stale[:len(_public_rate_store) - 10000]:
                 del _public_rate_store[k]
+            # Under a flood of fresh IPs stale eviction may yield nothing; fall
+            # back to evicting the oldest-accessed IPs to keep the store capped.
+            if len(_public_rate_store) > 10000:
+                overflow = len(_public_rate_store) - 10000
+                oldest = sorted(
+                    _public_rate_store.keys(),
+                    key=lambda k: _public_rate_store[k][-1] if _public_rate_store[k] else 0,
+                )[:overflow]
+                for k in oldest:
+                    del _public_rate_store[k]
         return True
 
 
@@ -332,16 +342,18 @@ _JOBS_MAX = 200  # evict oldest when exceeded
 def _set_job(job_id: str, data: Dict[str, Any]) -> None:
     with _jobs_lock:
         _jobs[job_id] = data
-        # Evict oldest entries when registry grows too large
+        # Evict oldest *completed* entries only — never evict still-running jobs
+        # or callers polling an active job would get spurious 404s.
         if len(_jobs) > _JOBS_MAX:
-            oldest = list(_jobs.keys())[: len(_jobs) - _JOBS_MAX]
-            for k in oldest:
+            done = [k for k, v in _jobs.items() if v.get("status") in ("complete", "error")]
+            for k in done[: len(_jobs) - _JOBS_MAX]:
                 del _jobs[k]
 
 
 def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with _jobs_lock:
-        return _jobs.get(job_id)
+        data = _jobs.get(job_id)
+        return data.copy() if data is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1161,16 +1173,17 @@ async def public_chat(req: PublicChatRequest, request: Request):
         )
 
     def _sanitize_chat_text(text: str) -> str:
-        """Strip newlines and role-tag brackets to prevent prompt injection."""
-        return text.replace("\n", " ").replace("\r", " ").replace("[", "(").replace("]", ")")
+        """Collapse whitespace and strip NUL bytes from user-supplied text."""
+        return text.replace("\n", " ").replace("\r", " ").replace("\x00", "")
 
-    # Build structured prompt to prevent injection via history content
+    # Use XML-style role tags with a namespace prefix that user content cannot
+    # replicate — bracket-only tags like [USER]: are trivially injected.
     history_block = "\n".join(
-        f"[{'USER' if item.role == 'user' else 'SPARK'}]: {_sanitize_chat_text(item.text)}"
+        f"<spark:{'user' if item.role == 'user' else 'assistant'}>{_sanitize_chat_text(item.text)}</spark:{'user' if item.role == 'user' else 'assistant'}>"
         for item in req.history
     )
     prompt = (history_block + "\n" if history_block else "") + \
-             f"[USER]: {_sanitize_chat_text(req.message)}\n[SPARK]:"
+             f"<spark:user>{_sanitize_chat_text(req.message)}</spark:user>\n<spark:assistant>"
     ctx = _build_public_context()
     if ctx:
         prompt = ctx + "\n\n" + prompt
@@ -1198,7 +1211,11 @@ async def public_chat(req: PublicChatRequest, request: Request):
             content={"error": "Something went quiet on my end. Try again?"},
         )
 
-    if not reply.strip():
+    # Claude sometimes echoes the opening/closing XML role tags into stdout when
+    # the prompt ends with <spark:assistant>. Strip them so they don't leak to clients.
+    reply = reply.removeprefix("<spark:assistant>").removesuffix("</spark:assistant>").strip()
+
+    if not reply:
         _public_chat_log.warning("public_chat: empty stdout from claude (exit 0), ip=%s", ip_hash)
         reply = "I'm here — I just went quiet for a moment. Try again?"
 
@@ -1390,8 +1407,8 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
                         "last_action": tool,
                         "last_action_ts": utc_timestamp(),
                     })
-                except Exception:
-                    pass  # non-critical
+                except Exception as _exc:
+                    logging.getLogger("pxh.api").warning("update_session post-tool failed: %s", _exc)
 
         asyncio.create_task(_run_async())
         return JSONResponse(
@@ -1455,6 +1472,7 @@ async def get_job(job_id: str) -> Dict[str, Any]:
 
 # Track active race process so we can stop it
 _race_proc: Optional[subprocess.Popen] = None
+_race_starting: bool = False  # sentinel: True between check and Popen assignment
 _race_proc_lock = threading.Lock()
 
 
@@ -1467,7 +1485,7 @@ class RaceRequest(BaseModel):
 @app.post("/api/v1/race/{action}", dependencies=[Depends(_verify_token)])
 async def race_action(action: str, request: Request) -> JSONResponse:
     """Start/stop race commands. Actions: map, race, stop, status, calibrate_gate."""
-    global _race_proc
+    global _race_proc, _race_starting
 
     if action == "stop":
         with _race_proc_lock:
@@ -1496,56 +1514,68 @@ async def race_action(action: str, request: Request) -> JSONResponse:
     if action not in ("map", "race", "calibrate_gate"):
         raise HTTPException(status_code=400, detail=f"unknown action: {action}")
 
-    # Don't start if already running
+    # Don't start if already running. Set _race_starting sentinel atomically so a
+    # second concurrent request can't slip through before the worker assigns _race_proc.
     with _race_proc_lock:
-        if _race_proc and _race_proc.poll() is None:
+        if (_race_proc and _race_proc.poll() is None) or _race_starting:
             return JSONResponse(
                 status_code=409,
                 content={"status": "already_running", "detail": "stop current race first"},
             )
+        _race_starting = True
 
-    # Parse request body (all actions may carry a dry field). Validate via
-    # RaceRequest so bad JSON shapes return 422 instead of crashing the route
-    # with a 500 from int() on a non-numeric value (issue #151).
-    raw_body: dict = {}
+    # Everything from here until _executor.submit must clear _race_starting on
+    # any exception — otherwise a malformed request permanently deadlocks race
+    # control (409 "already_running" forever).
     try:
-        raw_body = await request.json()
-    except Exception:
-        pass
-    try:
-        parsed = RaceRequest(**raw_body) if raw_body else RaceRequest()
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from None
-    dry = _resolve_dry(parsed.dry)
+        # Parse request body. Validate via RaceRequest so bad JSON shapes return
+        # 422 instead of crashing with a 500 (issue #151). Distinguish empty body
+        # (use defaults) from malformed JSON (return 400).
+        body_bytes = await request.body()
+        raw_body: dict = {}
+        if body_bytes:
+            try:
+                raw_body = await request.json()
+            except Exception:
+                raise HTTPException(status_code=400, detail="malformed JSON body") from None
+        try:
+            parsed = RaceRequest(**raw_body) if raw_body else RaceRequest()
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.errors()) from None
+        dry = _resolve_dry(parsed.dry)
 
-    # Launch via bin/px-race so yield_alive runs *before* Picarx() is constructed
-    # (issue #145). The bash launcher sources px-env, sends SIGUSR1 to px-alive,
-    # waits for it to exit + 2s lgpiod settle, then delegates to `python -m pxh.race`.
-    px_race = str(PROJECT_ROOT / "bin" / "px-race")
-    cmd: list[str] = [px_race]
+        # Launch via bin/px-race so yield_alive runs *before* Picarx() is constructed
+        # (issue #145). The bash launcher sources px-env, sends SIGUSR1 to px-alive,
+        # waits for it to exit + 2s lgpiod settle, then delegates to `python -m pxh.race`.
+        px_race = str(PROJECT_ROOT / "bin" / "px-race")
+        cmd: list[str] = [px_race]
 
-    if action == "calibrate_gate":
-        cmd.extend(["--calibrate", "--dry-run"] if dry else ["--calibrate"])
-    elif action == "map":
-        cmd.append("--map")
-        if dry:
-            cmd.append("--dry-run")
-    elif action == "race":
-        laps = max(1, min(100, parsed.laps))
-        max_speed = max(10, min(60, parsed.max_speed))
-        cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
-        if dry:
-            cmd.append("--dry-run")
+        if action == "calibrate_gate":
+            cmd.extend(["--calibrate", "--dry-run"] if dry else ["--calibrate"])
+        elif action == "map":
+            cmd.append("--map")
+            if dry:
+                cmd.append("--dry-run")
+        elif action == "race":
+            laps = max(1, min(100, parsed.laps))
+            max_speed = max(10, min(60, parsed.max_speed))
+            cmd.extend(["--race", "--laps", str(laps), "--max-speed", str(max_speed)])
+            if dry:
+                cmd.append("--dry-run")
 
-    # Launch as async job
-    job_id = str(uuid.uuid4())
-    _set_job(job_id, {"status": "running", "action": f"race_{action}"})
+        # Launch as async job
+        job_id = str(uuid.uuid4())
+        _set_job(job_id, {"status": "running", "action": f"race_{action}"})
+    except BaseException:
+        with _race_proc_lock:
+            _race_starting = False
+        raise
 
     def _run_race():
         # Hold a local reference to the popen — never re-read the global after
         # spawn (issue #146). Stop endpoint nulls the global; reading
         # _race_proc.returncode after that would raise AttributeError.
-        global _race_proc
+        global _race_proc, _race_starting
         proc: subprocess.Popen | None = None
         try:
             env = os.environ.copy()
@@ -1556,6 +1586,7 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                     env=env, cwd=str(PROJECT_ROOT),
                 )
                 _race_proc = proc
+                _race_starting = False  # sentinel cleared once proc is assigned
             stdout, stderr = proc.communicate(timeout=600)
             _set_job(job_id, {
                 "status": "complete" if proc.returncode == 0 else "error",
@@ -1568,6 +1599,10 @@ async def race_action(action: str, request: Request) -> JSONResponse:
             if proc:
                 proc.kill()
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "timeout"})
+        except (ValueError, OSError):
+            # communicate() raises ValueError if the stop endpoint already called
+            # terminate() + wait() and closed the pipe; treat as terminated.
+            _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "terminated"})
         except Exception as exc:
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": str(exc)})
         finally:
@@ -1576,6 +1611,7 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                 # racing with a subsequent race start that wrote a new value.
                 if _race_proc is proc:
                     _race_proc = None
+                _race_starting = False  # always clear on any exit path
 
     _executor.submit(_run_race)
     return JSONResponse(
@@ -2541,7 +2577,11 @@ async def serve_photo(filename: str):
     if not re.fullmatch(r"[\w\-]+\.jpe?g", filename, re.IGNORECASE):
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="not found")
+    photos_root = (PROJECT_ROOT / "photos").resolve()
     photo_path = PROJECT_ROOT / "photos" / filename
+    if photo_path.resolve().parent != photos_root:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="not found")
     if not photo_path.exists():
         from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="photo not found")
