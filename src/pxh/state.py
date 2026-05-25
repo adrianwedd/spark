@@ -132,7 +132,7 @@ def rotate_log(path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | No
         _log.warning("rotate_log: %s: %s", path, exc)
 
 
-STATE_DIR = PROJECT_ROOT / "state"
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
 DEFAULT_SESSION_PATH = STATE_DIR / "session.json"
 TEMPLATE_PATH = STATE_DIR / "session.template.json"
 

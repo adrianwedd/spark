@@ -40,7 +40,7 @@ Test environment variables (set automatically via `conftest.py` `isolated_projec
 
 - **`state.py`** — Thread-safe session management via `FileLock` (10 s timeout — raises `filelock.Timeout` on deadlock). Key functions: `load_session()`, `save_session()`, `update_session()`, `ensure_session()`, `atomic_write()`, `rotate_log()`. **Important**: `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant. `atomic_write()` uses `mkstemp` + `fsync` + `os.replace` for SD card durability. `rotate_log()` keeps last half of lines when file exceeds 5 MB, using `atomic_write()` for durability.
 - **`mind.py`** — Cognitive loop daemon (`bin/px-mind` is a thin launcher). Three-layer architecture: awareness (sensors + state), reflection (LLM thought generation), expression (speech/action dispatch). 3,300+ lines extracted from the original bin/px-mind heredoc. See [Cognitive Loop](#cognitive-loop-px-mind) below.
-- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist; 44 tools) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. `execute_tool()` accepts an optional `timeout` parameter — `subprocess.run` kills the child on `TimeoutExpired`. Watchdog thread (default 30 s) sends SIGTERM on stall to trigger Python's normal shutdown path (FileLock release, atexit handlers), then falls back to `os._exit(1)` after a 5 s grace if SIGTERM didn't terminate. Only active in voice input mode.
+- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist; 41 tools) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. `execute_tool()` accepts an optional `timeout` parameter — `subprocess.run` kills the child on `TimeoutExpired`. Watchdog thread (default 30 s) sends SIGTERM on stall to trigger Python's normal shutdown path (FileLock release, atexit handlers), then falls back to `os._exit(1)` after a 5 s grace if SIGTERM didn't terminate. Only active in voice input mode.
 - **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe. PIN rate limiting is per-IP (v2 schema in `state/pin_lockout.json`) with file-based persistence across API restarts, 1000-IP hard cap with two-phase eviction. `X-Forwarded-For` only trusted from localhost (Cloudflare tunnel). Rate limit store capped at 10k IPs with oldest-first eviction. PIN verify returns short-lived session tokens (4h TTL) instead of the raw Bearer token. Device reboot/shutdown requires two-step nonce confirmation.
 - **`logging.py`** — Structured JSON log emission to `logs/tool-<event>.log`. Uses late import of `rotate_log` from state.py to avoid circular dependency.
 - **`time.py`** — UTC timestamp helper (`datetime.now(timezone.utc)`, not deprecated `utcnow`).
@@ -217,7 +217,7 @@ Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one 
 
 Central dispatcher for all SPARK-initiated Claude Code interactions. Manages model routing, rate limiting, execution, logging, and file whitelist enforcement.
 
-**Model routing** (5 session types):
+**Model routing** (6 session types):
 
 | Session Type    | Model  | Cooldown | Daily Quota |
 |-----------------|--------|----------|-------------|
@@ -226,6 +226,7 @@ Central dispatcher for all SPARK-initiated Claude Code interactions. Manages mod
 | `research`      | Haiku  | 2h       | 3/day       |
 | `compose`       | Haiku  | 4h       | 2/day       |
 | `conversation`  | Sonnet | 15min    | 4/day       |
+| `blog`          | Haiku  | 30min    | 5/day       |
 
 Global: 30-min cooldown between sessions (except `self_debug`), 8/day cap. Priority gating when ≤2 remaining: only `self_debug` and `evolve` allowed. Models configurable via `PX_CLAUDE_MODEL_*` env vars.
 

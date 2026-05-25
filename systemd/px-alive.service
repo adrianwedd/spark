@@ -11,6 +11,8 @@ Environment=HOME=/home/pi
 ExecStart=/home/pi/picar-x-hacking/bin/px-alive --no-face
 Restart=always
 RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=10
 StandardOutput=journal
 StandardError=journal
 

@@ -14,7 +14,8 @@ Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/pi/picar-x-hacking/bin/px-mind
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=0
+StartLimitBurst=5
+StartLimitIntervalSec=300
 KillMode=control-group
 KillSignal=SIGTERM
 TimeoutStopSec=5

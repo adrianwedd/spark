@@ -138,7 +138,7 @@ def test_rotate_log_uses_filelock(tmp_path):
     # After rotation, the file is smaller than before
     assert log.stat().st_size < 200_000
     # No stray rotlock file left behind in the success path
-    assert not (tmp_path / "concurrent.log.rotlock.lock").exists() or True
+    assert not (tmp_path / "concurrent.log.rotlock.lock").exists()
 
 
 def test_rotate_log_skips_when_locked(tmp_path):

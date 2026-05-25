@@ -3160,8 +3160,9 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 }
                 debug_file = STATE_DIR / "debug_reports.jsonl"
                 try:
-                    with open(debug_file, "a") as f:
-                        f.write(json.dumps(report) + "\n")
+                    with FileLock(str(debug_file) + ".lock", timeout=10):
+                        with open(debug_file, "a") as f:
+                            f.write(json.dumps(report) + "\n")
                 except OSError:
                     pass
                 log(f"expression: self_debug completed — {len(result.stdout)}B output")
