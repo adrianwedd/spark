@@ -442,7 +442,7 @@ class TestLogs:
         (log_dir / "px-mind.log").write_text(
             "\n".join(f"line-{i}" for i in range(200)) + "\n"
         )
-        r = api_client.get("/api/v1/logs/px-mind?lines=200", headers=auth_headers)
+        r = api_client.get("/api/v1/logs/px-mind?lines=100", headers=auth_headers)
         assert r.status_code == 200
         assert len(r.json()["lines"]) == 100
 

@@ -561,7 +561,7 @@ PERSONA_REFLECTION_SYSTEMS = {
 
 
 def log(msg: str) -> None:
-    ts = dt.datetime.now().isoformat(timespec="seconds")
+    ts = dt.datetime.now(HOBART_TZ).isoformat(timespec="seconds")
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Emoji routing for visual scanning
     icon = "  "
@@ -1732,7 +1732,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     frigate = _fetch_frigate_presence(dry)
     session = load_session()
     history = session.get("history") or []
-    now_hour = dt.datetime.now().hour
+    now_hour = dt.datetime.now(HOBART_TZ).hour
     now_mono = time.monotonic()
     time_period = classify_time_period(now_hour)
 

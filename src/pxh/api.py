@@ -1983,7 +1983,7 @@ def _sanitize_log_line(line: str) -> str:
 
 
 @app.get("/api/v1/logs/{service}", dependencies=[Depends(_verify_token)])
-async def tail_log(service: str, lines: int = Query(default=100, ge=1, le=2000)) -> JSONResponse:
+async def tail_log(service: str, lines: int = Query(default=100, ge=1, le=100)) -> JSONResponse:
     """Return last N lines from a named log file."""
     if service not in _LOG_ALLOWLIST:
         raise HTTPException(status_code=400, detail=f"unknown log: {service}")
