@@ -582,14 +582,24 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 
 ## Multi-Model QA
 
-Adrian uses Codex (OpenAI) and Gemini (Google) CLIs for independent QA reviews. Both are installed locally. When asked to "have codex and gemini QA", run both in parallel via Bash `run_in_background`:
+Adrian uses four agent CLIs for independent QA reviews. All are installed locally. Run in parallel via Bash `run_in_background` and synthesise the combined results.
 
 ```bash
+# Hermes — oneshot mode; auto-approves tools; loads AGENTS.md + rules from CWD
+hermes -z "QA prompt here" 2>&1
+
+# Agy (Antigravity) — non-interactive; requires --add-dir to set workspace
+agy --print --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark "QA prompt here" 2>&1
+
 # Gemini — prompt via -p flag
 gemini -p "QA prompt here" 2>&1
 
-# Codex — prompt via stdin (the -p flag is NOT supported by codex exec)
+# Codex — prompt via stdin (-p flag NOT supported by codex exec)
 echo "QA prompt here" | codex exec --full-auto - 2>&1
 ```
 
-Give both the same comprehensive remit. Synthesise and present the combined results.
+**Key flags:**
+- `hermes -z` — oneshot (`--oneshot`): no banner, no spinner, tools + memory loaded, approvals bypassed
+- `agy --print` / `agy -p` — non-interactive single prompt; `--dangerously-skip-permissions` bypasses tool approval prompts; `--add-dir` is required to give agy access to the repo (it has no default workspace)
+- `codex exec --full-auto` — fully autonomous; reads prompt from stdin when `-` is passed
+- `gemini -p` — single prompt, exits after response
