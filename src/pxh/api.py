@@ -193,40 +193,40 @@ _API_TOKEN: Optional[str] = None
 # ---------------------------------------------------------------------------
 
 _session_tokens: dict[str, float] = {}  # token → expiry_ts (monotonic)
+_session_token_lock = threading.Lock()
 _SESSION_TOKEN_TTL = 4 * 3600  # 4 hours
 _SESSION_TOKEN_MAX = 20  # max concurrent sessions
 
 
 def _create_session_token() -> str:
-    # Prune expired tokens first
-    now = _time.monotonic()
-    expired = [k for k, v in _session_tokens.items() if v < now]
-    for k in expired:
-        del _session_tokens[k]
-    # Reject if at capacity (force old sessions to expire naturally)
-    if len(_session_tokens) >= _SESSION_TOKEN_MAX:
-        raise HTTPException(
-            status_code=429,
-            detail="too many active sessions — try again later",
-        )
-    token = secrets.token_hex(32)
-    _session_tokens[token] = now + _SESSION_TOKEN_TTL
-    return token
+    with _session_token_lock:
+        now = _time.monotonic()
+        expired = [k for k, v in _session_tokens.items() if v < now]
+        for k in expired:
+            del _session_tokens[k]
+        if len(_session_tokens) >= _SESSION_TOKEN_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="too many active sessions — try again later",
+            )
+        token = secrets.token_hex(32)
+        _session_tokens[token] = now + _SESSION_TOKEN_TTL
+        return token
 
 
 def _is_valid_session_token(token: str) -> bool:
-    # Sweep expired on each check
-    now = _time.monotonic()
-    expired = [k for k, v in _session_tokens.items() if v < now]
-    for k in expired:
-        del _session_tokens[k]
-    expiry = _session_tokens.get(token)
-    if expiry is None:
-        return False
-    if now > expiry:
-        del _session_tokens[token]
-        return False
-    return True
+    with _session_token_lock:
+        now = _time.monotonic()
+        expired = [k for k, v in _session_tokens.items() if v < now]
+        for k in expired:
+            del _session_tokens[k]
+        expiry = _session_tokens.get(token)
+        if expiry is None:
+            return False
+        if now > expiry:
+            del _session_tokens[token]
+            return False
+        return True
 
 
 def _load_token() -> str:
@@ -844,7 +844,7 @@ async def public_thoughts(limit: int = Query(default=12, ge=1, le=50)) -> list:
     thoughts_path = state_dir / "thoughts-spark.jsonl"
     results = []
     try:
-        lines = tail_lines(thoughts_path, n=50)
+        lines = tail_lines(thoughts_path, n=limit + 1)
         for line in reversed(lines):
             try:
                 t = json.loads(line)
@@ -1264,7 +1264,7 @@ async def verify_pin(body: PinRequest, request: Request) -> JSONResponse:
         with _pin_lock:
             _pin_attempts[client_ip] = _pin_attempts.get(client_ip, 0) + 1
             ip_attempts = _pin_attempts[client_ip]
-            if ip_attempts >= _PIN_ESCALATION_THRESHOLD and ip_attempts % _PIN_MAX_ATTEMPTS == 0:
+            if ip_attempts >= _PIN_ESCALATION_THRESHOLD:
                 _pin_lockout_until[client_ip] = _time.monotonic() + _PIN_ESCALATED_SECONDS
             elif ip_attempts % _PIN_MAX_ATTEMPTS == 0:
                 _pin_lockout_until[client_ip] = _time.monotonic() + _PIN_LOCKOUT_SECONDS
@@ -1628,7 +1628,8 @@ def _do_chat_turn(text: str, dry: bool) -> Dict[str, Any]:
     except VoiceLoopError as exc:
         return {"status": "error", "error": str(exc), "action": action}
 
-    t_rc, t_stdout, t_stderr = execute_tool(tool, env_overrides, dry, SYNC_TIMEOUT_DEFAULT)
+    timeout = SYNC_TIMEOUT_SLOW if tool in SLOW_TOOLS else SYNC_TIMEOUT_DEFAULT
+    t_rc, t_stdout, t_stderr = execute_tool(tool, env_overrides, dry, timeout)
     return {
         "status": "ok" if t_rc == 0 else "error",
         "tool": tool,
@@ -2092,7 +2093,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
       </div>
       <div class="sec-hdr" style="color:var(--blue)">&#x1F50A; Sounds &amp; memory</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-        <button class="btn btn-blue" onclick="doTool('tool_play_sound',{sound:'happy'})">&#x1F3B5; Play a sound</button>
+        <button class="btn btn-blue" onclick="doTool('tool_play_sound',{name:'chime'})">&#x1F3B5; Play a sound</button>
         <button class="btn btn-blue" onclick="promptTimer()">&#x23F1;&#xFE0F; Set a timer</button>
         <button class="btn btn-blue" onclick="promptRemember()">&#x1F4AD; Remember this</button>
         <button class="btn btn-blue" onclick="doTool('tool_recall',{})">&#x1F50D; What do you remember?</button>
@@ -2136,11 +2137,11 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <button class="btn btn-purple" onclick="doTool('tool_circle',{speed:30,duration:4})">&#x2B55; Spin in a circle</button>
         <button class="btn btn-purple" onclick="doTool('tool_figure8',{speed:25,duration:6})">&#x221E; Figure-8</button>
         <button class="btn btn-purple" onclick="doTool('tool_wander',{})">&#x1F3B2; Explore the room</button>
-        <button class="btn btn-purple" onclick="doTool('tool_perform',{performance:'dance'})">&#x1F57A; Do a trick</button>
-        <button class="btn btn-purple" onclick="doTool('tool_look',{direction:'left'})">&#x1F448; Look left</button>
-        <button class="btn btn-purple" onclick="doTool('tool_look',{direction:'right'})">&#x1F449; Look right</button>
-        <button class="btn btn-purple" onclick="doTool('tool_look',{direction:'up'})">&#x261D;&#xFE0F; Look up</button>
-        <button class="btn btn-purple" onclick="doTool('tool_emote',{emotion:'happy'})">&#x1F604; Happy face</button>
+        <button class="btn btn-purple" onclick="doTool('tool_celebrate',{})">&#x1F57A; Do a trick</button>
+        <button class="btn btn-purple" onclick="doTool('tool_look',{pan:-40})">&#x1F448; Look left</button>
+        <button class="btn btn-purple" onclick="doTool('tool_look',{pan:40})">&#x1F449; Look right</button>
+        <button class="btn btn-purple" onclick="doTool('tool_look',{tilt:-30})">&#x261D;&#xFE0F; Look up</button>
+        <button class="btn btn-purple" onclick="doTool('tool_emote',{name:'happy'})">&#x1F604; Happy face</button>
         <button class="btn btn-purple" onclick="doTool('tool_describe_scene',{})">&#x1F4F8; What do you see?</button>
         <button class="btn btn-purple" onclick="doTool('tool_sonar',{})">&#x1F4E1; How far away?</button>
       </div>
@@ -2317,7 +2318,7 @@ async function loadParental(){
 async function toggleMotion(){try{const s=await api('/api/v1/session');const on=!s.confirm_motion_allowed;const body={confirm_motion_allowed:on};if(on)body.confirm=true;await api('/api/v1/session',{method:'PATCH',body:JSON.stringify(body)});}catch(e){}loadParental();}
 async function toggleQuiet(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_quiet_mode:!s.spark_quiet_mode})});}catch(e){}loadParental();}
 async function setPersona(p){try{await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({persona:p})});}catch(e){}}
-async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});chat('History cleared ('+r.cleared+' entries removed).');}
+async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});addMsg('spark','History cleared ('+r.cleared+' entries removed).');}
 async function logEvt(){
   const mood=document.getElementById('sh-mood').value;
   const detail=document.getElementById('sh-detail').value;
@@ -2433,7 +2434,7 @@ async function doPhoto(){
 function promptTimer(){
   const label=prompt('Timer name?');if(!label)return;
   const mins=prompt('How many minutes?');if(!mins||isNaN(mins))return;
-  doTool('tool_timer',{duration_s:parseFloat(mins)*60,label});
+  doTool('tool_timer',{seconds:parseFloat(mins)*60,label});
 }
 function promptRemember(){const t=prompt('What should SPARK remember?');if(t)doTool('tool_remember',{text:t});}
 let _rcT=null,_rcBusy=false;

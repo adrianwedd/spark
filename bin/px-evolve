@@ -125,9 +125,13 @@ def save_queue(entries: list[dict]) -> None:
 
 def append_evolve_log(record: dict) -> None:
     """Append a completion record to the evolve log."""
+    import contextlib
     EVOLVE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(EVOLVE_LOG, "a") as f:
-        f.write(json.dumps(record) + "\n")
+    _lock = _FileLock(str(EVOLVE_LOG) + ".lock", timeout=5) if _FileLock is not None else None
+    ctx = _lock if _lock is not None else contextlib.nullcontext()
+    with ctx:
+        with open(EVOLVE_LOG, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------------------------------------------------------
