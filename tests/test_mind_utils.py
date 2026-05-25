@@ -231,13 +231,12 @@ def test_frigate_presence_below_min_score():
 
 
 def test_frigate_presence_low_score():
-    """A low-score event (< 0.5) → not a confident detection."""
+    """A low-score event (0.3 < FRIGATE_MIN_SCORE=0.6) → person_present is False."""
     events = [_make_frigate_event(score=0.3)]
     with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn(events)):
         result = _fetch_frigate_presence(dry=False)
     assert result is not None
-    # Low-score may or may not be counted as person detected depending on threshold
-    # but the function should not crash
+    assert result.get("person_present") is False
 
 
 def test_frigate_presence_multi_camera():

@@ -22,6 +22,7 @@
 
   let state = {};
   let lastSuccessMs = null;
+  let _pollSeq = 0;   // monotonic counter to discard out-of-order responses
 
   // ── localStorage helpers ─────────────────────────────────────────────────
 
@@ -61,6 +62,8 @@
   // ── Poll cycle ────────────────────────────────────────────────────────────
 
   async function poll() {
+    // Discard results from an older in-flight poll that resolved after a newer one
+    const mySeq = ++_pollSeq;
     const [statusR, vitalsR, sonarR, awarenessR, servicesR, budgetR] = await Promise.allSettled([
       fetchWithTimeout(API + '/status'),
       fetchWithTimeout(API + '/vitals'),
@@ -69,6 +72,8 @@
       fetchWithTimeout(API + '/services'),
       fetchWithTimeout(API + '/budget'),
     ]);
+
+    if (mySeq !== _pollSeq) return;  // a newer poll already completed; discard
 
     let anySuccess = false;
 
@@ -381,6 +386,13 @@
       _resetCarousel(count);
     });
 
+    // WCAG 2.2.2 pause on hover/focus — re-attached to the fresh node so these
+    // handlers survive the cloneNode() replacement above (issue: old node detached).
+    fresh.addEventListener('mouseenter', function () { _carouselPaused = true; });
+    fresh.addEventListener('mouseleave', function () { _carouselPaused = false; });
+    fresh.addEventListener('focusin',    function () { _carouselPaused = true; });
+    fresh.addEventListener('focusout',   function () { _carouselPaused = false; });
+
     // Touch swipe: left = next, right = prev
     fresh.addEventListener('touchstart', (e) => {
       _swipeStartX = e.changedTouches[0].clientX;
@@ -434,15 +446,9 @@
   poll();
   fetchThoughts();
 
-  // Carousel pause on hover/focus (WCAG 2.2.2)
-  var _carouselEl = document.getElementById('thought-carousel');
+  // Hover/focus pause handlers are now attached inside _attachCarouselInteraction
+  // (called on every carousel rebuild) so they survive cloneNode() replacement.
   var _pauseBtn = document.getElementById('carousel-pause');
-  if (_carouselEl) {
-    _carouselEl.addEventListener('mouseenter', function () { _carouselPaused = true; });
-    _carouselEl.addEventListener('mouseleave', function () { _carouselPaused = false; });
-    _carouselEl.addEventListener('focusin', function () { _carouselPaused = true; });
-    _carouselEl.addEventListener('focusout', function () { _carouselPaused = false; });
-  }
   if (_pauseBtn) {
     _pauseBtn.addEventListener('click', function () {
       _carouselPaused = !_carouselPaused;
