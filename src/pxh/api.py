@@ -124,6 +124,16 @@ def _check_public_rate_limit(ip: str) -> bool:
                      if not v or now - v[-1] > _PUBLIC_RATE_WINDOW_S]
             for k in stale[:len(_public_rate_store) - 10000]:
                 del _public_rate_store[k]
+            # Under a flood of fresh IPs stale eviction may yield nothing; fall
+            # back to evicting the oldest-accessed IPs to keep the store capped.
+            if len(_public_rate_store) > 10000:
+                overflow = len(_public_rate_store) - 10000
+                oldest = sorted(
+                    _public_rate_store.keys(),
+                    key=lambda k: _public_rate_store[k][-1] if _public_rate_store[k] else 0,
+                )[:overflow]
+                for k in oldest:
+                    del _public_rate_store[k]
         return True
 
 
@@ -341,7 +351,8 @@ def _set_job(job_id: str, data: Dict[str, Any]) -> None:
 
 def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with _jobs_lock:
-        return _jobs.get(job_id)
+        data = _jobs.get(job_id)
+        return data.copy() if data is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -1455,6 +1466,7 @@ async def get_job(job_id: str) -> Dict[str, Any]:
 
 # Track active race process so we can stop it
 _race_proc: Optional[subprocess.Popen] = None
+_race_starting: bool = False  # sentinel: True between check and Popen assignment
 _race_proc_lock = threading.Lock()
 
 
@@ -1467,7 +1479,7 @@ class RaceRequest(BaseModel):
 @app.post("/api/v1/race/{action}", dependencies=[Depends(_verify_token)])
 async def race_action(action: str, request: Request) -> JSONResponse:
     """Start/stop race commands. Actions: map, race, stop, status, calibrate_gate."""
-    global _race_proc
+    global _race_proc, _race_starting
 
     if action == "stop":
         with _race_proc_lock:
@@ -1496,22 +1508,26 @@ async def race_action(action: str, request: Request) -> JSONResponse:
     if action not in ("map", "race", "calibrate_gate"):
         raise HTTPException(status_code=400, detail=f"unknown action: {action}")
 
-    # Don't start if already running
+    # Don't start if already running. Set _race_starting sentinel atomically so a
+    # second concurrent request can't slip through before the worker assigns _race_proc.
     with _race_proc_lock:
-        if _race_proc and _race_proc.poll() is None:
+        if (_race_proc and _race_proc.poll() is None) or _race_starting:
             return JSONResponse(
                 status_code=409,
                 content={"status": "already_running", "detail": "stop current race first"},
             )
+        _race_starting = True
 
-    # Parse request body (all actions may carry a dry field). Validate via
-    # RaceRequest so bad JSON shapes return 422 instead of crashing the route
-    # with a 500 from int() on a non-numeric value (issue #151).
+    # Parse request body. Validate via RaceRequest so bad JSON shapes return
+    # 422 instead of crashing with a 500 (issue #151). Distinguish empty body
+    # (use defaults) from malformed JSON (return 400).
+    body_bytes = await request.body()
     raw_body: dict = {}
-    try:
-        raw_body = await request.json()
-    except Exception:
-        pass
+    if body_bytes:
+        try:
+            raw_body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="malformed JSON body") from None
     try:
         parsed = RaceRequest(**raw_body) if raw_body else RaceRequest()
     except ValidationError as exc:
@@ -1545,7 +1561,7 @@ async def race_action(action: str, request: Request) -> JSONResponse:
         # Hold a local reference to the popen — never re-read the global after
         # spawn (issue #146). Stop endpoint nulls the global; reading
         # _race_proc.returncode after that would raise AttributeError.
-        global _race_proc
+        global _race_proc, _race_starting
         proc: subprocess.Popen | None = None
         try:
             env = os.environ.copy()
@@ -1556,6 +1572,7 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                     env=env, cwd=str(PROJECT_ROOT),
                 )
                 _race_proc = proc
+                _race_starting = False  # sentinel cleared once proc is assigned
             stdout, stderr = proc.communicate(timeout=600)
             _set_job(job_id, {
                 "status": "complete" if proc.returncode == 0 else "error",
@@ -1576,6 +1593,7 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                 # racing with a subsequent race start that wrote a new value.
                 if _race_proc is proc:
                     _race_proc = None
+                _race_starting = False  # always clear on any exit path
 
     _executor.submit(_run_race)
     return JSONResponse(

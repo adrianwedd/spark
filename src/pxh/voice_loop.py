@@ -758,6 +758,7 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
         elapsed = time.monotonic() - _last_tool_execution
         if elapsed < 0.5:
             time.sleep(0.5 - elapsed)
+        _last_tool_execution = time.monotonic()
 
     command_path = TOOL_COMMANDS[tool]
     if not command_path.exists():
@@ -789,8 +790,6 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
         )
     except subprocess.TimeoutExpired:
         return 1, json.dumps({"status": "error", "error": f"tool {tool} timed out after {timeout}s"}), ""
-    finally:
-        _last_tool_execution = time.monotonic()
     return result.returncode, result.stdout, result.stderr
 
 

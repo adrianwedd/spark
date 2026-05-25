@@ -38,6 +38,14 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+try:
+    from filelock import FileLock as _FileLock
+    def _blog_lock(path: Path):
+        return _FileLock(str(path) + ".lock")
+except ImportError:
+    import contextlib
+    def _blog_lock(path: Path):
+        return contextlib.nullcontext()
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
@@ -752,8 +760,12 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
             thoughts = gather_thoughts(target_date)
             if len(thoughts) < MIN_THOUGHTS_FOR_DAILY:
                 log(f"skipping {pid}: only {len(thoughts)} thoughts (offline or quiet day) — marking skipped")
-                blog_data.setdefault("skipped", []).append(pid)
-                save_blog(blog_data)
+                with _blog_lock(BLOG_FILE):
+                    fresh = load_blog()
+                    if pid not in fresh.get("skipped", []):
+                        fresh.setdefault("skipped", []).append(pid)
+                        save_blog(fresh)
+                blog_data = load_blog()
                 had_skips = True
                 continue
 
@@ -764,12 +776,20 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
             # date rather than retrying (and burning quota) on the same post.
             if post_type == "daily":
                 log(f"skipping {pid}: QA rejection — marking skipped to advance catch-up")
-                blog_data.setdefault("skipped", []).append(pid)
-                save_blog(blog_data)
+                with _blog_lock(BLOG_FILE):
+                    fresh = load_blog()
+                    if pid not in fresh.get("skipped", []):
+                        fresh.setdefault("skipped", []).append(pid)
+                        save_blog(fresh)
+                blog_data = load_blog()
             continue
 
-        blog_data.setdefault("posts", []).append(post)
-        save_blog(blog_data)
+        with _blog_lock(BLOG_FILE):
+            fresh = load_blog()
+            if not post_exists(fresh, pid):
+                fresh.setdefault("posts", []).append(post)
+                save_blog(fresh)
+        blog_data = load_blog()
 
         append_blog_log({
             "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -815,8 +835,12 @@ def run_backfill(*, dry: bool = False) -> int:
         post = generate_post("daily", target, blog_data, dry=dry)
         if post:
             post["source"] = "backfill"
-            blog_data.setdefault("posts", []).append(post)
-            save_blog(blog_data)
+            with _blog_lock(BLOG_FILE):
+                fresh = load_blog()
+                if not post_exists(fresh, pid):
+                    fresh.setdefault("posts", []).append(post)
+                    save_blog(fresh)
+            blog_data = load_blog()
             append_blog_log({
                 "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "id": post["id"], "type": "daily", "title": post["title"],
@@ -854,8 +878,12 @@ def run_backfill(*, dry: bool = False) -> int:
             post = generate_post("weekly", target, blog_data, dry=dry)
             if post:
                 post["source"] = "backfill"
-                blog_data.setdefault("posts", []).append(post)
-                save_blog(blog_data)
+                with _blog_lock(BLOG_FILE):
+                    fresh = load_blog()
+                    if not post_exists(fresh, pid):
+                        fresh.setdefault("posts", []).append(post)
+                        save_blog(fresh)
+                blog_data = load_blog()
                 append_blog_log({
                     "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "id": post["id"], "type": "weekly", "title": post["title"],

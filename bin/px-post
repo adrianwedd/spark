@@ -470,6 +470,13 @@ def poll_new_thoughts(thoughts_file: Path) -> list[dict]:
 FEED_FILE = STATE_DIR / "feed.json"
 FEED_LIMIT = 100
 
+try:
+    from filelock import FileLock as _FileLock
+    _FEED_LOCK = _FileLock(str(FEED_FILE) + ".lock", timeout=10)
+except ImportError:
+    import contextlib
+    _FEED_LOCK = contextlib.nullcontext()
+
 
 def truncate_at_word(text: str, max_len: int) -> str:
     """Truncate text at the last word boundary before max_len, append ellipsis."""
@@ -484,37 +491,38 @@ def truncate_at_word(text: str, max_len: int) -> str:
 
 def write_feed(thought: dict) -> bool:
     """Append thought to feed.json. Returns True on success."""
-    try:
-        existing = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {"posts": []}
-    except (json.JSONDecodeError, OSError):
-        existing = {"posts": []}
-
-    post = {
-        "ts": thought.get("ts", ""),
-        "thought": thought["thought"],
-        "mood": thought.get("mood", ""),
-        "salience": thought.get("salience", 0),
-        "posted_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
-    }
-    existing["posts"].append(post)
-    existing["posts"] = existing["posts"][-FEED_LIMIT:]
-    existing["updated"] = dt.datetime.now(dt.timezone.utc).isoformat()
-
-    try:
-        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, str(FEED_FILE))
-        return True
-    except Exception as exc:
-        log(f"feed.json write failed: {exc}")
+    with _FEED_LOCK:
         try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-        return False
+            existing = json.loads(FEED_FILE.read_text()) if FEED_FILE.exists() else {"posts": []}
+        except (json.JSONDecodeError, OSError):
+            existing = {"posts": []}
+
+        post = {
+            "ts": thought.get("ts", ""),
+            "thought": thought["thought"],
+            "mood": thought.get("mood", ""),
+            "salience": thought.get("salience", 0),
+            "posted_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        existing["posts"].append(post)
+        existing["posts"] = existing["posts"][-FEED_LIMIT:]
+        existing["updated"] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, str(FEED_FILE))
+            return True
+        except Exception as exc:
+            log(f"feed.json write failed: {exc}")
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            return False
 
 
 class BlueskyClient:
@@ -744,7 +752,29 @@ def _load_queue() -> list[dict]:
 
 
 def _save_queue(entries: list[dict]) -> None:
-    """Rewrite queue atomically. Trim to QUEUE_LIMIT."""
+    """Rewrite queue atomically, merging any entries appended since last _load_queue.
+
+    queue_thought() appends via open("a") without holding a lock. Without this
+    merge, a concurrent append between _load_queue and _save_queue would be lost
+    when the atomic replace overwrites the file.
+    """
+    seen_ids = {e["id"] for e in entries}
+    if QUEUE_FILE.exists():
+        try:
+            for line in QUEUE_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    eid = e.get("id")
+                    if eid and eid not in seen_ids:
+                        entries.append(e)
+                        seen_ids.add(eid)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        except OSError:
+            pass
     entries = entries[-QUEUE_LIMIT:]
     fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
     try:

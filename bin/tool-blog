@@ -86,54 +86,61 @@ def main():
     ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     date_str = now.strftime("%Y%m%d")
 
-    # Read existing blog.json or create fresh
     blog_file = STATE_DIR / "blog.json"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        if blog_file.exists():
-            blog = json.loads(blog_file.read_text(encoding="utf-8"))
-        else:
-            blog = {"updated": None, "posts": []}
-    except (json.JSONDecodeError, OSError):
-        blog = {"updated": None, "posts": []}
-
-    posts = blog.get("posts", [])
-    post_id = _next_post_id(posts, date_str)
-
-    post = {
-        "id": post_id,
-        "type": "essay",
-        "source": "voice",
-        "title": title,
-        "body": body,
-        "ts": ts,
-        "model": result.model_used,
-        "word_count": len(body.split()) if body else 0,
-        "thought_count": None,
-        "mood_summary": None,
-        "period_start": None,
-        "period_end": None,
-        "salience": 0.7,
-    }
-
-    posts.append(post)
-
-    # Trim to 500 posts
-    if len(posts) > 500:
-        posts = posts[-500:]
-
-    blog["posts"] = posts
-    blog["updated"] = ts
 
     try:
-        from pxh.state import atomic_write
-        atomic_write(blog_file, json.dumps(blog, indent=2) + "\n")
+        from filelock import FileLock
+        _blog_lock = FileLock(str(blog_file) + ".lock", timeout=30)
     except ImportError:
-        # Fallback without atomic_write
-        import tempfile
-        tmp = blog_file.parent / (blog_file.name + ".tmp")
-        tmp.write_text(json.dumps(blog, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(blog_file)
+        import contextlib
+        _blog_lock = contextlib.nullcontext()
+
+    with _blog_lock:
+        try:
+            if blog_file.exists():
+                blog = json.loads(blog_file.read_text(encoding="utf-8"))
+            else:
+                blog = {"updated": None, "posts": []}
+        except (json.JSONDecodeError, OSError):
+            blog = {"updated": None, "posts": []}
+
+        posts = blog.get("posts", [])
+        post_id = _next_post_id(posts, date_str)
+
+        post = {
+            "id": post_id,
+            "type": "essay",
+            "source": "voice",
+            "title": title,
+            "body": body,
+            "ts": ts,
+            "model": result.model_used,
+            "word_count": len(body.split()) if body else 0,
+            "thought_count": None,
+            "mood_summary": None,
+            "period_start": None,
+            "period_end": None,
+            "salience": 0.7,
+        }
+
+        posts.append(post)
+
+        # Trim to 500 posts
+        if len(posts) > 500:
+            posts = posts[-500:]
+
+        blog["posts"] = posts
+        blog["updated"] = ts
+
+        try:
+            from pxh.state import atomic_write
+            atomic_write(blog_file, json.dumps(blog, indent=2) + "\n")
+        except ImportError:
+            import tempfile
+            tmp = blog_file.parent / (blog_file.name + ".tmp")
+            tmp.write_text(json.dumps(blog, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(blog_file)
 
     print(json.dumps({
         "status": "ok",
