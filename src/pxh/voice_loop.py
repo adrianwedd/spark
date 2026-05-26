@@ -484,6 +484,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         raise VoiceLoopError(f"unsupported tool requested: {tool}")
 
     params = action.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
     sanitized: Dict[str, Any] = {}
 
     if tool in ("tool_status", "tool_stop", "tool_weather"):
@@ -851,7 +853,9 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         prompt_excerpt = prompt[:800]
 
         with heartbeat_lock:
-            heartbeat_val[0] = time.monotonic()
+            # Extend heartbeat well past expected LLM call duration so the
+            # watchdog doesn't fire during a legitimately long subprocess.
+            heartbeat_val[0] = time.monotonic() + 300.0
         rc, stdout, stderr = run_codex(args.codex_cmd, prompt)
         with heartbeat_lock:
             heartbeat_val[0] = time.monotonic()

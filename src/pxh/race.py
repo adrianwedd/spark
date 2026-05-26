@@ -278,7 +278,7 @@ class StuckDetector:
     def __init__(self, timeout_s: float = 2.0, tolerance_cm: float = 3.0):
         self.timeout_s = timeout_s
         self.tolerance_cm = tolerance_cm
-        self._last_change_t: float = 0.0
+        self._last_change_t: float | None = None
         self._last_cm: float | None = None
 
     def update(self, sonar_cm: float | None, t: float) -> None:
@@ -289,11 +289,13 @@ class StuckDetector:
             self._last_change_t = t
 
     def is_stuck(self, t: float) -> bool:
+        if self._last_change_t is None:
+            return False  # no baseline yet — not stuck
         return (t - self._last_change_t) > self.timeout_s
 
     def reset(self) -> None:
         self._last_cm = None
-        self._last_change_t = time.time()
+        self._last_change_t = None  # reset to waiting-for-baseline state
 
 
 def _avg(values: list[float]) -> float:
@@ -622,6 +624,8 @@ class RaceController:
         sonar_correction: float = 0.0
         prev_loop_t = time.time()
         iteration = 0
+        estop_consecutive = 0
+        _ESTOP_MAX = 10
 
         # Per-lap tracking
         lap_seg_actuals: list[dict] = []
@@ -762,6 +766,13 @@ class RaceController:
 
             # E-stop
             if check_estop(last_sonar_cm, target_speed):
+                estop_consecutive += 1
+                if estop_consecutive >= _ESTOP_MAX:
+                    self._append_race_log({"event": "estop_limit",
+                                           "consecutive": estop_consecutive, "iter": iteration})
+                    if not self.dry and self.px is not None:
+                        self.px.stop()
+                    break  # abandon lap — sonar stuck or obstacle won't clear
                 if not self.dry and self.px is not None:
                     self.px.stop()
                 current_seg_actual["obstacle"] = True
@@ -776,6 +787,8 @@ class RaceController:
                 target_speed = OBSTACLE_SPEED
                 if not self.dry and self.px is not None:
                     self.px.forward(int(target_speed))
+            else:
+                estop_consecutive = 0
 
             # Stuck detection
             if stuck_detector.is_stuck(now) and not self.dry:

@@ -2092,6 +2092,13 @@ def auto_remember(thought: dict, persona: str = "") -> None:
     log(f"auto-remembered [{persona or 'shared'}]: {thought['thought']}")
 
 
+def _safe_float(value: object, default: float) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return default
+
+
 def extract_json(text: str) -> dict | None:
     """Extract last JSON object from text (handles markdown fences, prose, unescaped newlines)."""
     # Small models often put literal newlines inside JSON strings — fix them
@@ -2686,8 +2693,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         "ts": utc_timestamp(),
         "thought": str(parsed.get("thought", "")),
         "mood": parsed.get("mood") if parsed.get("mood") in VALID_MOODS else _SYS_RNG.choice(sorted(VALID_MOODS)),
-        "action": parsed.get("action", "wait") if parsed.get("action") in VALID_ACTIONS else "comment",
-        "salience": max(0.0, min(1.0, float(parsed.get("salience", 0.5)))),
+        "action": parsed.get("action", "wait") if parsed.get("action") in VALID_ACTIONS else "wait",
+        "salience": max(0.0, min(1.0, _safe_float(parsed.get("salience", 0.5), 0.5))),
     }
 
     # Apply mood momentum: blend LLM's raw mood with running average
@@ -3427,15 +3434,22 @@ def main(argv) -> int:
             return 0
         else:
             log(f"pid {_existing_pid} alive but not px-mind (recycled PID) — taking over")
-    PID_FILE.write_text(str(os.getpid()))
-    log(f"starting pid={os.getpid()} dry={args.dry_run} model={MODEL}")
+    _my_pid = os.getpid()
+    _pid_tmp = PID_FILE.with_suffix(".pid.tmp")
+    _pid_tmp.write_text(str(_my_pid))
+    os.replace(str(_pid_tmp), str(PID_FILE))
+    log(f"starting pid={_my_pid} dry={args.dry_run} model={MODEL}")
+
+    def _safe_unlink_pid() -> None:
+        try:
+            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == _my_pid:
+                PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _shutdown(sig, _frame):
         log(f"received signal {sig} — shutting down")
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _safe_unlink_pid()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -3452,7 +3466,7 @@ def main(argv) -> int:
                 expression(thought, dry=True, awareness=awareness)
             time.sleep(0.3)
         log("dry-run complete")
-        PID_FILE.unlink(missing_ok=True)
+        _safe_unlink_pid()
         return 0
 
     try:
@@ -3463,7 +3477,7 @@ def main(argv) -> int:
         log(f"fatal: {exc}")
         return 1
     finally:
-        PID_FILE.unlink(missing_ok=True)
+        _safe_unlink_pid()
         log("stopped")
     return 0
 

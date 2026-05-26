@@ -562,6 +562,8 @@ SLOW_TOOLS = {
     "tool_quiet", "tool_breathe", "tool_sensory_check", "tool_repair",
     # GWS tools: network I/O to Google APIs
     "tool_gws_calendar", "tool_gws_sheets_log",
+    # AI/blocking tools: Claude subprocess or long-running timer
+    "tool_timer", "tool_research", "tool_compose", "tool_blog", "tool_story",
 }
 SYNC_TIMEOUT_SLOW = float(os.environ.get("PX_API_TIMEOUT_SLOW", "120"))
 

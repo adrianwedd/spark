@@ -636,14 +636,19 @@ class BlueskyClient:
                     })
                     search_start = start + len(url_bytes)
             elif token.startswith("#") and len(token) > 1:
-                tag_bytes = token.encode("utf-8")
-                start = text_bytes.find(tag_bytes, search_start)
+                # Strip trailing punctuation — AT Protocol tags must be alphanumeric
+                import string as _string
+                clean_tag = token[1:].rstrip(_string.punctuation)
+                if not clean_tag:
+                    continue
+                match_bytes = ("#" + clean_tag).encode("utf-8")
+                start = text_bytes.find(match_bytes, search_start)
                 if start >= 0:
                     facets.append({
-                        "index": {"byteStart": start, "byteEnd": start + len(tag_bytes)},
-                        "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": token[1:]}],
+                        "index": {"byteStart": start, "byteEnd": start + len(match_bytes)},
+                        "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": clean_tag}],
                     })
-                    search_start = start + len(tag_bytes)
+                    search_start = start + len(match_bytes)
         if facets:
             rec["facets"] = facets
         record = {

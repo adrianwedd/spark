@@ -54,6 +54,11 @@ try:
     from filelock import FileLock as _FileLock
     _QUEUE_LOCK = _FileLock(str(QUEUE_FILE) + ".lock", timeout=5)
 except ImportError:
+    import sys as _sys
+    print(
+        "CRITICAL: filelock not installed — evolve queue has NO concurrency protection",
+        file=_sys.stderr,
+    )
     _FileLock = None  # type: ignore[assignment,misc]
     _QUEUE_LOCK = None
 
@@ -382,30 +387,11 @@ def _run_in_worktree(
 
 
 def _run_claude_direct(entry_id: str, intent: str, prompt: str, workdir: str) -> str:
-    """Fallback: run Claude directly without session manager."""
-    cmd = [
-        "claude", "-p", prompt,
-        "--model", os.environ.get("PX_EVOLVE_MODEL", "claude-opus-4-6"),
-        "--no-session-persistence",
-        "--output-format", "text",
-        "--allowedTools", "Read,Write,Edit,Glob,Grep",
-        "--dangerously-skip-permissions",
-    ]
-
-    run_env = {k: v for k, v in os.environ.items()
-               if not k.startswith("CLAUDE_CODE")
-               and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")}
-
-    try:
-        result = subprocess.run(
-            cmd, cwd=workdir, capture_output=True, text=True,
-            timeout=EVOLVE_TIMEOUT, env=run_env,
-        )
-        log(f"[{entry_id}] direct claude exit={result.returncode}")
-        return "direct_fallback"  # caller handles change detection
-    except subprocess.TimeoutExpired:
-        log(f"[{entry_id}] direct claude timed out")
-        return "failed:timeout"
+    """Disabled: running without the session manager skips whitelist, diff, tests, and PR gate."""
+    log(f"[{entry_id}] REFUSING direct Claude execution — pxh.claude_session unavailable; "
+        "whitelist enforcement, test gate, and PR creation would all be bypassed. "
+        "Fix the pxh package installation to restore evolution.")
+    return "failed:no_session_manager"
 
 
 def _cleanup_worktree(workdir: str, entry_id: str) -> None:
