@@ -22,6 +22,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 LOCK_TIMEOUT_S = 10  # seconds — fail fast rather than hang forever
 
 
+def _trim_corrupt_backups(path: Path, keep: int = 3) -> None:
+    """Delete all but the newest `keep` .corrupt.* backups next to `path`."""
+    pattern = path.name + ".corrupt."
+    backups = sorted(path.parent.glob(pattern + "*"), key=lambda p: p.stat().st_mtime)
+    for old in backups[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def atomic_write(path: Path, content: str) -> None:
     """Write content to path atomically via temp file + os.replace.
 
@@ -213,6 +224,7 @@ def load_session() -> Dict[str, Any]:
                 _log.warning("corrupt session backed up to %s", corrupt_backup)
             except OSError:
                 pass
+            _trim_corrupt_backups(path, keep=3)
             data = default_state()
             atomic_write(path, json.dumps(data, indent=2) + "\n")
             return data
