@@ -120,6 +120,11 @@ FINDMYHUB_STALE_S      = 900   # treat as stale after 15 min (cron runs every 5 
 # Approximate home coordinates for distance calculation
 HOME_LAT               = float(os.environ.get("PX_HOME_LAT", "-43.13567"))
 HOME_LON               = float(os.environ.get("PX_HOME_LON", "147.11840"))
+# Semantic address → named place. Substring-matched (lowercased). at_home=True for at-dads.
+_SEMANTIC_PLACES: dict[str, str] = {
+    "thorp street": "at-mums",
+    "the shack":    "at-dads",
+}
 
 HA_HOST                = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")
 HA_TOKEN               = os.environ.get("PX_HA_TOKEN", "")
@@ -837,21 +842,35 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _enrich_tracker(raw: dict, name: str) -> dict | None:
-    """Add distance_km, at_home, age_s to a raw tracker entry. Returns None on error."""
+    """Add at_home, age_s (and place/distance_km) to a raw tracker entry. Returns None on error."""
     try:
         if "error" in raw:
             return None
+        age_s = time.time() - raw["ts"]
+        if raw.get("semantic"):
+            addr = raw.get("address", "")
+            place = next(
+                (p for key, p in _SEMANTIC_PLACES.items() if key in addr.lower()),
+                "unknown",
+            )
+            return {
+                "semantic": True,
+                "address":  addr,
+                "place":    place,
+                "ts":       raw["ts"],
+                "age_s":    round(age_s),
+                "at_home":  place == "at-dads",
+            }
         lat, lon = raw["lat"], raw["lon"]
         distance_km = _haversine_km(HOME_LAT, HOME_LON, lat, lon)
-        age_s = time.time() - raw["ts"]
         return {
-            "lat":        round(lat, 5),
-            "lon":        round(lon, 5),
-            "accuracy_m": round(raw.get("accuracy_m", 0)),
-            "ts":         raw["ts"],
-            "age_s":      round(age_s),
+            "lat":         round(lat, 5),
+            "lon":         round(lon, 5),
+            "accuracy_m":  round(raw.get("accuracy_m", 0)),
+            "ts":          raw["ts"],
+            "age_s":       round(age_s),
             "distance_km": round(distance_km, 2),
-            "at_home":    distance_km < 0.15,
+            "at_home":     distance_km < 0.15,
         }
     except Exception as exc:
         log(f"findmyhub: {name} enrich error: {exc}")
