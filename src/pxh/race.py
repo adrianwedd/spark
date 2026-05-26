@@ -468,72 +468,74 @@ class RaceController:
         prev_gs = track_ref[:]
         iteration = 0
 
-        while not self._stop_flag:
-            iteration += 1
-            if max_iterations and iteration > max_iterations:
-                break
-
-            now = time.time()
-
-            # Sonar 3-point sweep
-            if self.dry:
-                left_cm = right_cm = center_cm = 90.0
-                # Still call set_cam_pan_angle in dry mode via mock
-                for angle in (-25, 0, 25):
-                    self.px.set_cam_pan_angle(angle)
-                self.px.set_cam_pan_angle(0)
-            else:
-                left_cm, right_cm = quick3_scan(self.px)
-                center_cm = safe_ping(self.px)
-                if center_cm is None:
-                    center_cm = 90.0
-                if left_cm is None:
-                    left_cm = 90.0
-                if right_cm is None:
-                    right_cm = 90.0
-
-            # Grayscale
-            if self.dry:
-                gs_raw = self.px.get_grayscale_data()
-            else:
-                gs_raw = safe_grayscale(self.px) or track_ref[:]
-
-            seg_type = classify_segment(left_cm, right_cm, center_cm, track_width_cm)
-
-            samples.append({
-                "t": now - lap_start,
-                "type": seg_type,
-                "left_cm": left_cm,
-                "right_cm": right_cm,
-                "center_cm": center_cm,
-                "gs_raw": gs_raw,
-            })
-
-            # Gate detection
-            if gate_detector.update(prev_gs, gs_raw, now) and iteration > 3:
-                # Lap complete — stop if max_iterations not driving us
-                if not max_iterations:
+        try:
+            while not self._stop_flag:
+                iteration += 1
+                if max_iterations and iteration > max_iterations:
                     break
-            prev_gs = gs_raw[:]
 
-            # Drive at MAP_SPEED (skip in dry mode)
+                now = time.time()
+
+                # Sonar 3-point sweep
+                if self.dry:
+                    left_cm = right_cm = center_cm = 90.0
+                    # Still call set_cam_pan_angle in dry mode via mock
+                    for angle in (-25, 0, 25):
+                        self.px.set_cam_pan_angle(angle)
+                    self.px.set_cam_pan_angle(0)
+                else:
+                    left_cm, right_cm = quick3_scan(self.px)
+                    center_cm = safe_ping(self.px)
+                    if center_cm is None:
+                        center_cm = 90.0
+                    if left_cm is None:
+                        left_cm = 90.0
+                    if right_cm is None:
+                        right_cm = 90.0
+
+                # Grayscale
+                if self.dry:
+                    gs_raw = self.px.get_grayscale_data()
+                else:
+                    gs_raw = safe_grayscale(self.px) or track_ref[:]
+
+                seg_type = classify_segment(left_cm, right_cm, center_cm, track_width_cm)
+
+                samples.append({
+                    "t": now - lap_start,
+                    "type": seg_type,
+                    "left_cm": left_cm,
+                    "right_cm": right_cm,
+                    "center_cm": center_cm,
+                    "gs_raw": gs_raw,
+                })
+
+                # Gate detection
+                if gate_detector.update(prev_gs, gs_raw, now) and iteration > 3:
+                    # Lap complete — stop if max_iterations not driving us
+                    if not max_iterations:
+                        break
+                prev_gs = gs_raw[:]
+
+                # Drive at MAP_SPEED (skip in dry mode)
+                if not self.dry and self.px is not None:
+                    self.px.set_dir_servo_angle(0)
+                    self.px.forward(MAP_SPEED)
+                    time.sleep(0.1)
+
+            lap_duration = time.time() - lap_start
+            self.profile = self._compress_samples(samples, track_width_cm)
+            self.profile.lap_duration_s = round(lap_duration, 2)
+            self.profile.map_speed = MAP_SPEED
+            self.profile.track_width_cm = track_width_cm
+
+            profile_path = self.state_dir / "race_track.json"
+            self.profile.save(profile_path)
+        finally:
             if not self.dry and self.px is not None:
+                self.px.stop()
                 self.px.set_dir_servo_angle(0)
-                self.px.forward(MAP_SPEED)
-                time.sleep(0.1)
-
-        if not self.dry and self.px is not None:
-            self.px.stop()
-            self.px.set_dir_servo_angle(0)
-
-        lap_duration = time.time() - lap_start
-        self.profile = self._compress_samples(samples, track_width_cm)
-        self.profile.lap_duration_s = round(lap_duration, 2)
-        self.profile.map_speed = MAP_SPEED
-        self.profile.track_width_cm = track_width_cm
-
-        profile_path = self.state_dir / "race_track.json"
-        self.profile.save(profile_path)
+            self._set_exploring(False)
 
     def _compress_samples(self, samples: list[dict], track_width_cm: float) -> TrackProfile:
         """Convert raw map samples into a TrackProfile with merged segments."""

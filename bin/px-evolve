@@ -30,6 +30,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -197,8 +198,9 @@ def process_entry(entry: dict, *, dry: bool = False) -> str:
     intent = entry.get("intent", "")
     introspection = entry.get("introspection", {})
 
-    branch = f"spark/evolve-{entry_id}"
-    workdir = f"/tmp/spark-evolve-{entry_id}"
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "-", entry_id)[:64]
+    branch = f"spark/evolve-{safe_id}"
+    workdir = f"/tmp/spark-evolve-{safe_id}"
 
     log(f"[{entry_id}] starting: {intent[:80]}")
 
@@ -289,6 +291,9 @@ def _run_in_worktree(
         ["git", "commit", "-m", commit_msg],
         cwd=workdir, capture_output=True, text=True, timeout=10,
     )
+    if commit_result.returncode != 0:
+        log(f"[{entry_id}] git commit failed: {commit_result.stderr[:300]}")
+        return "failed:git_commit"
 
     # 4. Check for changes against master (not HEAD — we just committed)
     diff_result = subprocess.run(

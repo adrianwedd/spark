@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -206,6 +207,12 @@ def load_session() -> Dict[str, Any]:
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             _log.warning("session.json corrupt — resetting to defaults: %s", path)
+            corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
+            try:
+                path.rename(corrupt_backup)
+                _log.warning("corrupt session backed up to %s", corrupt_backup)
+            except OSError:
+                pass
             data = default_state()
             atomic_write(path, json.dumps(data, indent=2) + "\n")
             return data
@@ -246,6 +253,11 @@ def update_session(
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             data = default_state()
+            corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
+            try:
+                path.rename(corrupt_backup)
+            except OSError:
+                pass
             log_event("state-corruption", {"path": str(path), "message": "session.json was corrupt; reset to default state"})
 
         if fields:

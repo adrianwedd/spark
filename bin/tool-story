@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.environ.get("PROJECT_ROOT", "."), "src"))
 from pxh.state import load_session, update_session
 
 action = os.environ.get("TOOL_ACTION", "read")
-text = os.environ.get("TOOL_TEXT", "")
+text = os.environ.get("TOOL_TEXT", "")[:500]
 dry = os.environ.get("PX_DRY", "") == "1"
 
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", ".")
@@ -98,6 +98,8 @@ try:
         if not lines:
             print(json.dumps({"status": "error", "error": "no story to finish"}))
             sys.exit(0)
+        # Clear session first (idempotent) so story state is gone even if notes write fails
+        update_session({"obi_story_lines": []})
         state_dir = os.environ.get("PX_STATE_DIR", os.path.join(PROJECT_ROOT, "state"))
         notes_file = os.path.join(state_dir, "notes-spark.jsonl")
         story_text = " ".join(l["text"] for l in lines)
@@ -113,7 +115,6 @@ try:
         with FileLock(notes_file + ".lock", timeout=10):
             with open(notes_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
-        update_session({"obi_story_lines": []})
         if not dry:
             import subprocess
             subprocess.run(

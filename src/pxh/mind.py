@@ -1477,7 +1477,7 @@ def battery_warn_comment(pct: int, dry: bool) -> None:
         _play_alarm_beeps(2, env.get("PX_VOICE_DEVICE", ""))
     else:
         msg = f"Heads up — my battery is at {pct} percent. I might need charging soon."
-    env["PX_TEXT"] = msg
+    env["PX_TEXT"] = msg[:2000]
     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                    capture_output=True, check=False, timeout=20)
     log(f"battery warning spoken: {pct}%")
@@ -2933,8 +2933,9 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
 
             # yield_alive
             try:
+                import shlex as _shlex
                 subprocess.run(
-                    ["bash", "-c", f"source {BIN_DIR / 'px-env'} && yield_alive"],
+                    ["bash", "-c", f"source {_shlex.quote(str(BIN_DIR / 'px-env'))} && yield_alive"],
                     capture_output=True, text=True, check=False, timeout=15,
                 )
             except Exception as exc:

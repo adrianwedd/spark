@@ -283,7 +283,7 @@ app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://spark.wedd.au", "https://spark-api.wedd.au", "http://localhost:8420"],
+    allow_origins=["https://spark.wedd.au", "https://spark-api.wedd.au"],
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
@@ -1175,8 +1175,9 @@ async def public_chat(req: PublicChatRequest, request: Request):
         )
 
     def _sanitize_chat_text(text: str) -> str:
-        """Collapse whitespace and strip NUL bytes from user-supplied text."""
-        return text.replace("\n", " ").replace("\r", " ").replace("\x00", "")
+        """Collapse whitespace, strip NUL and XML angle brackets from user-supplied text."""
+        return (text.replace("\n", " ").replace("\r", " ").replace("\x00", "")
+                    .replace("<", "").replace(">", ""))
 
     # Use XML-style role tags with a namespace prefix that user content cannot
     # replicate — bracket-only tags like [USER]: are trivially injected.
@@ -1600,6 +1601,10 @@ async def race_action(action: str, request: Request) -> JSONResponse:
         except subprocess.TimeoutExpired:
             if proc:
                 proc.kill()
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
             _set_job(job_id, {"status": "error", "action": f"race_{action}", "error": "timeout"})
         except (ValueError, OSError):
             # communicate() raises ValueError if the stop endpoint already called
@@ -1615,7 +1620,12 @@ async def race_action(action: str, request: Request) -> JSONResponse:
                     _race_proc = None
                 _race_starting = False  # always clear on any exit path
 
-    _executor.submit(_run_race)
+    try:
+        _executor.submit(_run_race)
+    except Exception:
+        with _race_proc_lock:
+            _race_starting = False
+        raise
     return JSONResponse(
         status_code=202,
         content={"status": "accepted", "job_id": job_id, "poll": f"/api/v1/jobs/{job_id}"},
@@ -1653,7 +1663,7 @@ def _do_chat_turn(text: str, dry: bool) -> Dict[str, Any]:
     prompt = build_model_prompt(system_prompt, session, text)
 
     codex_cmd = os.environ.get("CODEX_CHAT_CMD", _CODEX_CMD)
-    rc, stdout, stderr = run_codex(codex_cmd, prompt)
+    rc, stdout, stderr = run_codex(codex_cmd, prompt, timeout=SYNC_TIMEOUT_SLOW)
     if rc != 0:
         return {"status": "error", "error": f"LLM error (rc={rc}): {stderr.strip()[-500:]}"}
 

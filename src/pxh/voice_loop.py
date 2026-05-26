@@ -422,16 +422,20 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
     )
 
 
-def run_codex(command_spec: str, prompt: str) -> Tuple[int, str, str]:
+def run_codex(command_spec: str, prompt: str, timeout: Optional[float] = None) -> Tuple[int, str, str]:
     command = shlex.split(command_spec)
-    result = subprocess.run(
-        command,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode, result.stdout, result.stderr
+    try:
+        result = subprocess.run(
+            command,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return 1, "", f"run_codex timed out after {timeout}s"
 
 
 def extract_action(text: str) -> Optional[Dict[str, Any]]:

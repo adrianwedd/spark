@@ -57,6 +57,9 @@ HOBART_TZ = ZoneInfo("Australia/Hobart")
 BLOG_LIMIT = 500
 MIN_THOUGHTS_FOR_DAILY = 3
 POLL_INTERVAL = 60
+QA_CIRCUIT_BREAKER_LIMIT = 3  # block publishing after this many consecutive QA errors
+
+_qa_consecutive_errors = 0
 # How many days back to scan for unwritten daily posts (handles power outages)
 DAILY_CATCHUP_DAYS = 30
 
@@ -679,13 +682,20 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
     # QA gate
     qa_result = "pass"
     if os.environ.get("PX_BLOG_QA", "1") != "0":
+        global _qa_consecutive_errors
+        if _qa_consecutive_errors >= QA_CIRCUIT_BREAKER_LIMIT:
+            log(f"QA circuit breaker open ({_qa_consecutive_errors} consecutive errors) — skipping {post_type}")
+            return None
         qa_result = _qa_gate(body)
         if qa_result == "rejected":
             log(f"QA rejected {post_type}: {title[:60]}")
+            _qa_consecutive_errors = 0
             return None
         if qa_result is None:
-            log(f"QA gate error for {post_type} — publishing anyway (safety net)")
-            qa_result = "error_pass"
+            _qa_consecutive_errors += 1
+            log(f"QA gate error for {post_type} (consecutive={_qa_consecutive_errors}) — skipping to avoid unreviewed publish")
+            return None
+        _qa_consecutive_errors = 0
 
     duration_s = round(time.monotonic() - _gen_start, 1)
 
@@ -934,7 +944,16 @@ def main(argv: list[str]) -> int:
     except (ValueError, OSError) as exc:
         log(f"pid file check failed, removing: {exc}")
         pid_file.unlink(missing_ok=True)
-    pid_file.write_text(str(my_pid))
+    try:
+        fd, tmp = tempfile.mkstemp(dir=pid_file.parent, prefix=".px-blog-pid.")
+        try:
+            os.write(fd, str(my_pid).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, str(pid_file))
+    except OSError:
+        pid_file.write_text(str(my_pid))
 
     def _safe_unlink_pid():
         try:

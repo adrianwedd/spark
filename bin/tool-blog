@@ -19,8 +19,15 @@ DRY = os.environ.get("PX_DRY", "0") != "0"
 def _next_post_id(posts: list, date_str: str) -> str:
     """Generate next sequential blog post ID for today."""
     prefix = f"blog-{date_str}-essay-"
-    existing = [p.get("id", "") for p in posts if p.get("id", "").startswith(prefix)]
-    n = len(existing) + 1
+    existing_ns = []
+    for p in posts:
+        pid = p.get("id", "")
+        if pid.startswith(prefix):
+            try:
+                existing_ns.append(int(pid[len(prefix):]))
+            except ValueError:
+                pass
+    n = max(existing_ns, default=0) + 1
     return f"{prefix}{n:03d}"
 
 
@@ -69,6 +76,9 @@ def main():
     import datetime as dt
 
     raw = result.stdout.strip()
+    if not raw:
+        print(json.dumps({"status": "error", "error": "claude returned empty output"}))
+        return
     lines = raw.splitlines()
 
     # Extract title (first non-empty line) and body (remainder after blank line)

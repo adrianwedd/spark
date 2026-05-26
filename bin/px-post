@@ -877,7 +877,8 @@ def flush_queue(bluesky: 'BlueskyClient', dry: bool) -> dict:
         feed_texts = set()
 
     for entry in entries:
-        posted = entry.get("posted", {})
+        entry.setdefault("posted", {"feed": None, "bluesky": None})
+        posted = entry["posted"]
         # Need Bluesky posting?
         bsky_pending = posted.get("bluesky") is None or (isinstance(posted.get("bluesky"), str) and posted["bluesky"].startswith("error:"))
         if not bsky_pending:
@@ -904,7 +905,7 @@ def flush_queue(bluesky: 'BlueskyClient', dry: bool) -> dict:
             social_suffix += "\n\n" + permalink
         if hashtags:
             social_suffix += "\n\n" + hashtags
-        bsky_thought = truncate_at_word(text, 300 - len(social_suffix.encode("utf-8")))
+        bsky_thought = truncate_at_word(text, 300 - len(social_suffix))
 
         # Generate thought card image
         image_path = generate_thought_card(text, entry.get("mood", ""), entry.get("ts", ""))
