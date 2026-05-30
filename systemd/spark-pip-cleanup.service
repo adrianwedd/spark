@@ -1,0 +1,6 @@
+[Unit]
+Description=Sweep leftover pip scratch dirs in /tmp (failed install cleanup)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/spark-pip-cleanup.sh

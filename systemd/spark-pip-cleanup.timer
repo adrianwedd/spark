@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily sweep of leftover pip scratch dirs in /tmp
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target
