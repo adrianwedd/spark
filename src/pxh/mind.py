@@ -2805,6 +2805,13 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     if action == "wait":
         return
 
+    # Hard night silence: 19:00–07:00 Hobart time — unconditional, no sensor dependencies
+    _night_hour = dt.datetime.now(HOBART_TZ).hour
+    if _night_hour >= 19 or _night_hour < 7:
+        if action not in ("wait", "remember"):
+            log(f"expression: suppressed {action} — night silence (19:00–07:00)")
+            return
+
     # Gate speech on obi_mode: at night when Obi is absent, suppress non-essential actions
     _aw = awareness or {}
     if not _aw:

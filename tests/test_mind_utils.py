@@ -736,8 +736,12 @@ def _thought(action, mood="curious", text="test thought", salience=0.5):
 
 @pytest.fixture(autouse=False)
 def _mock_awareness_and_battery(tmp_path):
-    """Stub AWARENESS_FILE, BATTERY_FILE, and LOG_FILE so expression() gates don't
-    block and log output stays isolated from the production px-mind.log."""
+    """Stub AWARENESS_FILE, BATTERY_FILE, LOG_FILE, and datetime so expression() gates
+    don't block and log output stays isolated from the production px-mind.log.
+    Time is fixed to 12:00 Hobart to stay clear of the 19:00–07:00 night gate."""
+    import datetime as _dt
+    from unittest.mock import patch as _patch
+
     old_aw = getattr(pxh.mind, "AWARENESS_FILE", None)
     old_bat = getattr(pxh.mind, "BATTERY_FILE", None)
     old_log = getattr(pxh.mind, "LOG_FILE", None)
@@ -748,7 +752,16 @@ def _mock_awareness_and_battery(tmp_path):
     pxh.mind.AWARENESS_FILE = aw_file
     pxh.mind.BATTERY_FILE = bat_file
     pxh.mind.LOG_FILE = tmp_path / "px-mind.log"
-    yield
+
+    # Fix the clock to midday Hobart so the night gate (19:00–07:00) never fires.
+    _noon = _dt.datetime(2025, 1, 1, 12, 0, 0, tzinfo=pxh.mind.HOBART_TZ)
+    with _patch("pxh.mind.dt") as mock_dt:
+        mock_dt.datetime.now.return_value = _noon
+        mock_dt.datetime.fromisoformat = _dt.datetime.fromisoformat
+        mock_dt.timezone = _dt.timezone
+        mock_dt.timedelta = _dt.timedelta
+        yield
+
     if old_aw is not None:
         pxh.mind.AWARENESS_FILE = old_aw
     if old_bat is not None:
@@ -829,6 +842,43 @@ def test_expression_calendar_check_calls_tool(_mock_awareness_and_battery):
     assert len(calls) == 1
     env = calls[0].kwargs.get("env") or calls[0][1].get("env", {})
     assert env.get("PX_CALENDAR_ACTION") == "next"
+
+
+def test_expression_suppressed_during_night_window(tmp_path):
+    """expression() suppresses all non-silent actions between 19:00 and 07:00 Hobart."""
+    import datetime as _dt
+    from unittest.mock import patch as _patch
+
+    aw_file = tmp_path / "awareness.json"
+    bat_file = tmp_path / "battery.json"
+    log_file = tmp_path / "px-mind.log"
+    aw_file.write_text(_json.dumps({"obi_mode": "calm"}))
+    bat_file.write_text(_json.dumps({"pct": 80, "charging": False}))
+
+    old_aw = pxh.mind.AWARENESS_FILE
+    old_bat = pxh.mind.BATTERY_FILE
+    old_log = pxh.mind.LOG_FILE
+    pxh.mind.AWARENESS_FILE = aw_file
+    pxh.mind.BATTERY_FILE = bat_file
+    pxh.mind.LOG_FILE = log_file
+
+    try:
+        _midnight = _dt.datetime(2025, 6, 15, 23, 0, 0, tzinfo=pxh.mind.HOBART_TZ)
+        with _patch("pxh.mind.dt") as mock_dt:
+            mock_dt.datetime.now.return_value = _midnight
+            mock_dt.datetime.fromisoformat = _dt.datetime.fromisoformat
+            mock_dt.timezone = _dt.timezone
+            mock_dt.timedelta = _dt.timedelta
+            with patch("subprocess.run") as mock_run:
+                for action in ("comment", "greet", "play_sound", "emote", "greet_arrival"):
+                    expression(_thought(action), dry=True)
+        assert mock_run.call_count == 0, "No tools should be called during night window"
+        log_text = log_file.read_text()
+        assert "night silence" in log_text
+    finally:
+        pxh.mind.AWARENESS_FILE = old_aw
+        pxh.mind.BATTERY_FILE = old_bat
+        pxh.mind.LOG_FILE = old_log
 
 
 def test_unknown_action_logged(_mock_awareness_and_battery, tmp_path):
