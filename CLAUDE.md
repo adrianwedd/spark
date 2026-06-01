@@ -12,7 +12,7 @@ Helper scripts and Python library for a SunFounder PiCar-X robot built by Adrian
 source .venv/bin/activate
 ```
 
-All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`, `LOG_DIR`, and adds `$PROJECT_ROOT/src` and `/home/pi/picar-x` to `PYTHONPATH` (deduplicating; final order is `/home/pi/picar-x:$PROJECT_ROOT/src:...`).
+All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`, `LOG_DIR`, and adds `$PROJECT_ROOT/src` and `/home/pi/picar-x` to `PYTHONPATH`.
 
 **First use:** `cp state/session.template.json state/session.json`
 
@@ -22,42 +22,40 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 python -m pytest                          # full suite (716 tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
-python -m pytest -m "not live"           # skip hardware tests (deselects 25, runs 691)
+python -m pytest -m "not live"           # skip hardware tests
 sudo .venv/bin/python -m pytest tests/test_tools_live.py -v -s  # live hardware tests
 ```
 
-Test environment variables (set automatically via `conftest.py` `isolated_project` fixture):
-- `PX_BYPASS_SUDO=1` — skip sudo in bin scripts
-- `LOG_DIR=<tmp>/logs` — redirect logs to a per-test temp directory
-- `PX_SESSION_PATH=<tmp>/state/session.json` — isolate session state per test
-- `PX_VOICE_DEVICE=null` — suppress audio device access
+Test env vars (auto-set via `conftest.py` `isolated_project` fixture): `PX_BYPASS_SUDO=1`, `LOG_DIR=<tmp>/logs`, `PX_SESSION_PATH=<tmp>/state/session.json`, `PX_VOICE_DEVICE=null`.
 
-**Critical:** bin scripts run under `/usr/bin/python3` (not venv) because picarx/robot_hat live in system site-packages. The venv is only for the test runner and pxh library.
+**Critical:** bin scripts run under `/usr/bin/python3` (not venv) — picarx/robot_hat live in system site-packages.
 
 ## Architecture
 
 ### Python Library (`src/pxh/`)
 
-- **`state.py`** — Thread-safe session management via `FileLock` (10 s timeout — raises `filelock.Timeout` on deadlock). Key functions: `load_session()`, `save_session()`, `update_session()`, `ensure_session()`, `atomic_write()`, `rotate_log()`. **Important**: `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant. `atomic_write()` uses `mkstemp` + `fsync` + `os.replace` for SD card durability. `rotate_log()` keeps last half of lines when file exceeds 5 MB, using `atomic_write()` for durability.
-- **`mind.py`** — Cognitive loop daemon (`bin/px-mind` is a thin launcher). Three-layer architecture: awareness (sensors + state), reflection (LLM thought generation), expression (speech/action dispatch). 3,300+ lines extracted from the original bin/px-mind heredoc. See [Cognitive Loop](#cognitive-loop-px-mind) below.
-- **`voice_loop.py`** — Supervisor loop. Maintains `ALLOWED_TOOLS` set (whitelist; 41 tools) and `TOOL_COMMANDS` dict (tool → bin path). `validate_action()` sanitizes all LLM-provided params before execution. `PERSONA_VOICE_ENV` dict maps persona names to espeak voice settings, injected into all tool env vars via `execute_tool()` when a persona is active. `execute_tool()` accepts an optional `timeout` parameter — `subprocess.run` kills the child on `TimeoutExpired`. Watchdog thread (default 30 s) sends SIGTERM on stall to trigger Python's normal shutdown path (FileLock release, atexit handlers), then falls back to `os._exit(1)` after a 5 s grace if SIGTERM didn't terminate. Only active in voice input mode.
-- **`api.py`** — FastAPI REST API, port 8420. In-memory job registry + threading.Lock for async wander jobs. Single worker only — not multi-worker safe. PIN rate limiting is per-IP (v2 schema in `state/pin_lockout.json`) with file-based persistence across API restarts, 1000-IP hard cap with two-phase eviction. `X-Forwarded-For` only trusted from localhost (Cloudflare tunnel). Rate limit store capped at 10k IPs with oldest-first eviction. PIN verify returns short-lived session tokens (4h TTL) instead of the raw Bearer token. Device reboot/shutdown requires two-step nonce confirmation.
-- **`logging.py`** — Structured JSON log emission to `logs/tool-<event>.log`. Uses late import of `rotate_log` from state.py to avoid circular dependency.
-- **`time.py`** — UTC timestamp helper (`datetime.now(timezone.utc)`, not deprecated `utcnow`).
-- **`token_log.py`** — LLM token usage accounting. Logs prompt/response token counts per call.
-- **`utils.py`** — Shared utilities (`clamp()` for numeric range clamping).
-- **`patch_login.py`** — Monkey-patches `os.getlogin()` to handle systemd environments (no /dev/tty). Also installed globally as `~/.local/lib/python3.11/site-packages/usercustomize.py`.
+| Module | Purpose |
+|--------|---------|
+| `state.py` | Thread-safe session management via `FileLock` (10s timeout). `atomic_write()` uses mkstemp+fsync+os.replace for SD card durability. |
+| `mind.py` | Cognitive loop daemon. Three-layer: awareness → reflection → expression. |
+| `voice_loop.py` | Supervisor loop. `ALLOWED_TOOLS` whitelist (41 tools). `validate_action()` sanitizes LLM params. |
+| `api.py` | FastAPI REST API, port 8420. Single worker only — not multi-worker safe. |
+| `race.py` | Autonomous racing controller. |
+| `claude_session.py` | Central dispatcher for all SPARK-initiated Claude interactions. |
+| `spark_config.py` | Tunable constants (reflection angles, topic seeds, prompts). Primary target for self-evolution PRs. |
+
+**Critical gotchas:**
+- `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant
+- `api.py` PIN rate limit store capped at 10k IPs with oldest-first eviction; `X-Forwarded-For` trusted from localhost only
 
 ### os.getlogin() Under Systemd
 
-`picarx.py:48` calls `os.getlogin()` in `Picarx.__init__()`. Under systemd there is no `/dev/tty`, so this raises `OSError: [Errno 6] No such device or address`. The fix is a `usercustomize.py` in user site-packages that wraps `os.getlogin()` with a fallback to `LOGNAME`/`USER` env vars. This affects every script that creates a `Picarx()` instance — all 14+ GPIO scripts. Do not remove the usercustomize.py or the I2C errors will return.
+`picarx.py:48` calls `os.getlogin()` in `Picarx.__init__()`. Under systemd there is no `/dev/tty` → `OSError: [Errno 6]`. Fix: `~/.local/lib/python3.11/site-packages/usercustomize.py` wraps `os.getlogin()` with fallback to `LOGNAME`/`USER`. **Do not remove** — affects all 14+ GPIO scripts.
 
 ### Bin Scripts
 
-Two categories:
-
-1. **`px-*`** — User-facing helpers (`px-circle`, `px-dance`, `px-diagnostics`, `px-alive`, `px-wake-listen`, etc.). Each sources `px-env` and typically delegates to a `tool-*` wrapper or runs an embedded Python heredoc via `/usr/bin/python3`.
-2. **`tool-*`** — Low-level tool wrappers invoked by the voice loop. Always emit a single JSON object to stdout. Motion tools are gated by `confirm_motion_allowed` in session state.
+- **`px-*`** — User-facing helpers. Source `bin/px-env`, delegate to `tool-*` or run embedded Python heredoc via `/usr/bin/python3`.
+- **`tool-*`** — Low-level tool wrappers invoked by the voice loop. Must emit a single JSON object to stdout. Motion tools gated by `confirm_motion_allowed` in session state.
 
 ### Voice Loop
 
@@ -69,15 +67,7 @@ Three backends, same `pxh.voice_loop` core:
 | `bin/run-voice-loop-claude` | `bin/claude-voice-bridge` | `docs/prompts/claude-voice-system.md` |
 | `bin/run-voice-loop-ollama` | `bin/codex-ollama` | `docs/prompts/codex-voice-system.md` |
 
-Loop flow:
-1. In `--input-mode=voice`: waits for `listening: true` in session state (set via `bin/px-wake --set on`)
-2. Builds prompt = system prompt + session highlights + user transcript + recent thoughts/mood from px-mind
-3. Calls LLM subprocess; parses last JSON `{tool: ..., params: {...}}` line from stdout
-4. `validate_action()` whitelists tool name and sanitizes parameters
-5. `execute_tool()` injects persona voice env vars if `session.persona` is set, then runs `bin/tool-<name>`
-6. Updates `state/session.json`
-
-Override via `CODEX_CHAT_CMD` env var.
+Loop: wait for `listening: true` → build prompt (system + session + transcript + thoughts) → call LLM subprocess → parse last JSON `{tool, params}` → `validate_action()` → `execute_tool()` → update session. Override via `CODEX_CHAT_CMD`.
 
 ### Wake Word System
 
@@ -85,47 +75,26 @@ Override via `CODEX_CHAT_CMD` env var.
 bin/run-wake [--wake-word "hey robot"] [--dry-run]
 ```
 
-`bin/px-wake-listen` uses a priority chain of STT backends:
-- **SenseVoice** (`models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/`) — primary; non-autoregressive, fastest (~5s), handles AU English
-- **faster-whisper** (`models/whisper/...faster-whisper-base.en/`) — fallback; best AU accent support, anti-hallucination filters
-- **sherpa-onnx Zipformer** (`models/sherpa-onnx-streaming-zipformer-en-2023-06-26/`) — second fallback
-- **Vosk** (`models/vosk-model-small-en-us-0.15/`) — wake word grammar detection only (low CPU)
+STT priority chain: SenseVoice (primary, ~5s) → faster-whisper (best AU accent) → sherpa-onnx Zipformer → Vosk (wake word grammar only). Models gitignored, must be downloaded separately.
 
-On wake: plays 440 Hz chime, records until `SILENCE_S=3.0 s` of quiet (RMS < 300) or `MAX_RECORD_S=20 s` hard cap, transcribes via `_do_transcribe()` priority chain, pipes to voice loop. Supports multi-turn conversation (default 5 turns) with follow-up listening between turns.
+**Whisper anti-hallucination**: `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`. Post-filters: non-ASCII dominant, phantom phrases, repetitive text → reject.
 
-**Whisper anti-hallucination**: `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`. Post-filters: non-ASCII dominant → reject, phantom phrases ("Thank you.", "Thanks for watching.") → reject, repetitive (unique ratio <30%) → reject.
-
-**Persona routing**: session `persona` field checked first, then utterance keywords ("gremlin" or "vixen"). Routes to `tool-chat` / `tool-chat-vixen` (Ollama) for the full conversation — not the Claude voice loop.
-
-Models must be downloaded separately (gitignored). `bpe_model` kwarg is **not** supported by the installed sherpa-onnx — do not add it to `load_stt_model()`.
+**Critical:** `bpe_model` kwarg is **not** supported by the installed sherpa-onnx — do not add it to `load_stt_model()`.
 
 ### Audio Pipeline
 
-Speech output chain: `espeak --stdout` → WAV bytes → `aplay -D pulse` → PulseAudio → HifiBerry DAC (card `sndrpihifiberry`) → robot_hat MAX98357A amp → speaker.
+Speech: `espeak --stdout` → WAV bytes → `aplay -D pulse` → PulseAudio → HifiBerry DAC → speaker.
 
-**Critical: root ↔ PulseAudio socket.** PulseAudio runs as user `pi` with its socket at `/run/user/1000/pulse/native`. When `px-perform` or `tool-voice` are called as root (via sudo from px-wake-listen), `aplay -D pulse` cannot find the socket because root's `XDG_RUNTIME_DIR` is `/run/user/0`, not `/run/user/1000`. Both scripts explicitly set `PULSE_SERVER=unix:/run/user/1000/pulse/native` in the aplay subprocess env. Do not remove this — the audio will silently fail. `px-perform` uses `stderr=DEVNULL` for aplay, so failures are not visible in logs without this fix.
-
-**Speaker amp enable:** `robot_hat.enable_speaker()` toggles GPIO 20 HIGH before any audio. Both `tool-voice` and `px-perform` call this. Without it the MAX98357A amp is disabled and nothing is audible even though aplay exits 0.
-
-**PulseAudio holds the DAC exclusively.** Direct `aplay -D robothat` (ALSA bypass) fails with "device busy". Always route through PulseAudio (`-D pulse`).
-
-**px-env** sets `export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"` — this helps when scripts run as pi user but doesn't help root subprocesses. The `PULSE_SERVER` env var in the aplay subprocess call is the reliable fix.
+**Critical gotchas:**
+- When scripts run as **root** (`px-perform`, `tool-voice`): must set `PULSE_SERVER=unix:/run/user/1000/pulse/native` in the aplay subprocess env. Root's `XDG_RUNTIME_DIR=/run/user/0` can't find the pi-user socket. Audio silently fails without this.
+- `robot_hat.enable_speaker()` must be called before any audio (toggles GPIO 20 for MAX98357A amp). aplay exits 0 but nothing plays if skipped.
+- PulseAudio holds the DAC exclusively — `aplay -D robothat` (ALSA bypass) fails "device busy".
 
 ### Idle-Alive Daemon
 
-```bash
-sudo bin/px-alive [--gaze-min 10] [--gaze-max 25] [--no-prox] [--dry-run]
-```
+Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not refactor to create/destroy per-action (`reset_mcu` leaks GPIO5 and `close()` doesn't release it).
 
-Keeps robot looking alive when idle. Holds a **persistent Picarx handle** to avoid GPIO pin leak (reset_mcu claims GPIO5 and close() doesn't release it). Three behaviours:
-- **Gaze drift**: random pan/tilt every 10–25 s
-- **Idle scan**: pan sweep every 3–8 min
-- **Proximity react**: sonar checked every 5 s; if `< 35 cm` for 3 s, faces forward; writes latest reading to `state/sonar_live.json` so px-mind can read sonar without restarting px-alive
-- **I2C resilience**: catches `OSError` and backs off 30 s instead of crashing
-
-**GPIO exclusivity**: Only one process can hold the Picarx handle. When other tools need servos, they call `yield_alive` (defined in `px-env`), which sends SIGUSR1 to px-alive. px-alive catches it and exits cleanly; systemd restarts it after 10 s (`Restart=always`, `RestartSec=10`). Long-running tools (`tool-describe-scene`, `tool-wander`) set `state/exploring.json` to prevent px-alive from restarting mid-operation.
-
-The PCA9685 PWM chip holds servo position autonomously after process exit, so servos stay put between restarts.
+**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Tools set `state/exploring.json` to prevent restart mid-operation.
 
 ### Cognitive Loop (px-mind)
 
@@ -133,473 +102,184 @@ The PCA9685 PWM chip holds servo position autonomously after process exit, so se
 bin/px-mind [--awareness-interval 30] [--dry-run]
 ```
 
-Three-layer cognitive architecture:
-- **Layer 1 — Awareness** (every 60 s, no LLM): sonar + session + temporal state + calendar + multi-camera Frigate → `state/awareness.json` + transition detection. Fetches Obi's Google Calendar every 5 min via `gws` CLI; queries all Frigate cameras (picar_x, picamera, driveway_camera, garden_camera) for per-camera person/object presence with room names.
-- **Layer 2 — Reflection** (on transition or every 5 min idle): SPARK persona uses Claude Haiku via `claude -p` subprocess (120s timeout, `--output-format text`, `--allowedTools ""`, `--no-session-persistence`). Other personas (GREMLIN, VIXEN) use Ollama on M5.local (auto-detects loaded model; default fallback `gemma4:e4b`). Falls back to Ollama on Claude error. Four-tier fallback: Claude → M5.local → Ollama Cloud (if `OLLAMA_CLOUD_API_KEY` set) → Pi localhost (opt-in via `PX_MIND_LOCAL_OLLAMA=1`). Generates thought with mood/action/salience → `state/thoughts.jsonl`. Reflection failure tracking: after 3 consecutive failures, speaks a warning and writes `reflection_status` to `awareness.json`. Calendar context and `rooms_with_people` list injected into the reflection prompt. 42 reflection angles sampled 5 per call to diversify mood range across all 12 moods. Weather refreshed every 30 min (BOM updates half-hourly).
-- **Layer 3 — Expression** (2 min cooldown): dispatches to tool-voice/tool-look/tool-remember and the cognitive tools (introspect, evolve, research, compose, self_debug, blog_essay). Valid actions (22): `wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, explore, play_sound, photograph, emote, look_around, time_check, calendar_check, morning_fact, introspect, evolve, research, compose, self_debug, blog_essay`. Charging-gated actions (require battery) are blocked when on charger. `greet_arrival` fires when a Find Hub `person_arrived_home:*` transition is emitted (see Location Awareness below). Expression gating: suppresses speech during school hours, Mum's custody time, quiet time, bedtime, and decompress periods (all calendar-driven). Injects `PX_PERSONA` + voice settings from session so speech routes through Ollama persona rephrasing.
+Three-layer architecture:
+- **Layer 1 — Awareness** (every 60s, no LLM): sonar + session + calendar + Frigate → `state/awareness.json`
+- **Layer 2 — Reflection** (on transition or every 5min idle): SPARK→Claude Haiku; GREMLIN/VIXEN→Ollama. Four-tier fallback: Claude → M5.local → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). Writes to `state/thoughts.jsonl`.
+- **Layer 3 — Expression** (2min cooldown): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. 22 valid actions. Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech or cognitive actions.**
 
-`compute_obi_mode()` returns calendar-authoritative states (`at-school`, `at-mums`) when calendar events match, falling back to ambient heuristics otherwise.
-
-The reflection prompt encourages proactive speech — the robot prefers commenting over waiting. Pauses during active conversations (`session.listening=true`) and during quiet mode. Auto-remembers high-salience (≥0.75) thoughts to `state/notes.jsonl`. Thoughts injected into voice loop context via `build_model_prompt()`.
-
-Battery monitoring in Layer 1: reads `state/battery.json`; px-mind speaks escalating warnings at ≤30/20/15% and triggers emergency shutdown at ≤10% (6 beeps → speech → `sudo shutdown -h now`). Battery glitch filter: requires time-gapped confirmations (90 s between first glitch and acceptance), charging guard, and voltage sanity check.
-
-**Timezone**: All time-of-day logic uses `ZoneInfo("Australia/Hobart")` (DST-aware: AEDT UTC+11 in summer, AEST UTC+10 in winter). Do not use hardcoded UTC offsets.
-
-**Atomic writes**: px-mind's `atomic_write()` uses `mkstemp` + `fsync` + `os.replace` + ownership preservation. JSONL trimming (thoughts and notes) also uses `atomic_write()` to prevent data loss on crash.
-
-**Single-instance guard**: PID file with `/proc/{pid}` liveness check prevents duplicate daemons on rapid systemd restarts.
-
-**Thought-images cleanup**: `state/thought-images/` is cleaned hourly — images older than 30 days are deleted.
-
-State files (`state/awareness.json`, `state/thoughts.jsonl`, `state/sonar_live.json`, `state/mood.json`) are gitignored. Override state dir with `PX_STATE_DIR` env var (used by tests).
+**Critical gotchas:**
+- All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
+- Battery emergency shutdown at ≤10% (speaks warning → `sudo shutdown -h now`)
+- Single-instance PID guard via `/proc/{pid}` liveness check
+- Arrival detection uses module-level `_last_known_findmyhub` cache (not awareness snapshot) — survives M5.local→Pi push outages. Do not replace with snapshot diff.
+- `state/thought-images/` cleaned hourly (images >30 days deleted)
 
 ### Autonomous Racing (px-race)
 
 ```bash
-bin/px-race --calibrate       # on-site sensor calibration (surfaces + gate)
-bin/px-race --map             # practice lap (slow mapping run)
-bin/px-race --race --laps 5   # timed race for N laps
-bin/px-race --status          # print current profile summary
-bin/px-race --dry-run --map   # full loop, no motors
-bin/px-race --max-speed 40    # cap top speed (PWM duty cycle)
+bin/px-race --calibrate   # sensor calibration
+bin/px-race --map         # practice lap (builds track profile)
+bin/px-race --race --laps 5
+bin/px-race --dry-run --map
 ```
 
-Two-phase autonomous racing system: Phase 1 (map) builds a track segment profile at safe speed; Phase 2 (race) uses the profile to anticipate turns, maximize straight-line speed, and refine the profile each lap via per-lap learning.
+Two-phase: Phase 1 builds track segment profile; Phase 2 uses it to maximize speed. Dual-sensor: grayscale (primary edge avoidance, <1ms) + sonar (obstacle/centering, ~30ms). No LLM/network/audio in the race loop.
 
-**Architecture**: `src/pxh/race.py` (~600–800 lines) provides `RaceController`, `TrackProfile`, `PDController`, and helper functions. `bin/px-race` is the bash launcher (sources `px-env`, calls `yield_alive`, delegates to Python).
+**PD sign convention**: `pd_edge` uses `Kp=−20.0` (negative Kp) so positive error (drift right) → negative steer (left correction). The spec states `Kp=20` but the code is correct for the error convention used. Unit tests use `kp=20.0` generically — that's fine.
 
-**Dual-sensor model**:
-- **Grayscale** (3-channel underside array, <1ms): primary edge avoidance and gate detection. Continuous wall-tracking with no moving parts.
-- **Sonar** (ultrasonic on camera pan servo, ~30ms per ping): obstacle detection, centering, turn anticipation. Three scan modes: Forward-only (every loop, no pan move, ~10–15 Hz), Quick-3 (~700ms: −25°, 0°, +25° + return-to-center, ~1.4 Hz), Full sweep (~1.1s: 5 angles, mapping/lost recovery).
+Safety (priority): E-stop (sonar < threshold) → edge guard → obstacle dodge → I2C failure (3 errors → brake) → stuck detect (2s no movement → reverse) → timeout → battery.
 
-**Two PD controllers**:
-- `pd_edge(gs, calibration)` — grayscale edge avoidance. Input: 3 normalized readings (0.0 = track, 1.0 = barrier). Error: `right_normalized − left_normalized`. Gains: `Kp_edge = −20.0`, `Kd_edge = −5.0` (negative Kp so positive error → negative steer = left correction — see sign convention note below).
-- `pd_center(sonar_left, sonar_right)` — sonar centering. Error: `right_cm − left_cm`. Gains: `Kp_sonar = 0.5`, `Kd_sonar = 0.2`. Age-weighted blend with grayscale (sonar weight decays to 0 over 2 s between Quick-3 scans).
-
-**Key constants**: `DIR_MAX = 30` (steering ±30°), `MAP_SPEED = 20` (PWM), servo settle 150ms (matches `px-wander`), Quick-3 ~700ms total, derivative uses measured `dt` (not hardcoded).
-
-**Profile-based speed control**: Track profile stored as ordered segments (straight / turn_left / turn_right). Each segment carries `race_speed`, `entry_speed`, `steer_bias`, `brake_before_s`. Position tracked by sonar pattern matching (primary) → elapsed time (secondary) → grayscale landmarks / orange corners (fallback). Lost recovery: reactive wall-following until a recognizable feature re-syncs.
-
-**Per-lap learning**: After each lap, `apply_lap_learning()` adjusts segment durations (speed-ratio scaled), reduces `race_speed` −5 on wall clips, increases +3 on clean pass. Changes capped at ±5 PWM per lap. Battery voltage compensation: `effective_speed = race_speed × (current_v / calibration_v)` used for timing prediction only — motor PWM is unchanged.
-
-**Safety layers** (priority order):
-1. E-stop: center sonar < `max(8, speed × 0.3)` cm → `px.stop()` + reverse 0.3 s (threshold scales with speed: 8 cm at PWM 20, 15 cm at PWM 50)
-2. Edge guard: grayscale detects barrier → hard steer away, reduce to OBSTACLE_SPEED
-3. Obstacle dodge: unexpected close sonar → slow + edge-hug
-4. I2C failure: 3 consecutive sensor errors → emergency brake
-5. Stuck detect: no distance change for 2 s while motors running → stop, reverse, full sweep
-6. Timeout: no gate for 60 s → stop (assume lost)
-7. Battery: < 20% → finish current lap, stop
-8. SIGTERM handler → `px.stop()`, clean exit
-
-Additional: `confirm_motion_allowed` gate; `yield_alive` at startup; `exploring.json` active during race to prevent `px-alive` restart; `--max-speed N` flag (default 50, hard cap 60).
-
-**PD sign convention**: `compute_edge_error` returns positive when drifting right (`gs_norm[2] − gs_norm[0]`). The edge PD uses negative `Kp` (−20) so positive error → negative steer (left correction). This differs from the spec's stated `Kp = 20` — the code is correct for the error convention used. The `PDController` class tests use `kp=20.0` as a generic unit test; the actual edge controller instantiation uses `kp=−20.0`.
-
-**State files** (gitignored):
-- `state/race_calibration.json` — grayscale surface refs + gate threshold
-- `state/race_track.json` — track profile with segment list and lap history
-- `state/race_log.jsonl` — per-lap telemetry (speed, incidents, battery_v, lap time)
-- `state/race_live.json` — live telemetry written every ~0.5 s during racing (lap, segment, speed, steer, sonar, gs, incidents, best_lap_s) — readable by API/dashboard
-
-**Integration**: No LLM, no network calls, no audio in the race loop. Post-race narration via `tool-voice` is possible but separate. `race_live.json` is the integration point for the dashboard. `bin/px-race` is the bash launcher (sources `px-env`, calls `yield_alive`, delegates to `python -m pxh.race`). Dashboard integration via `GET /api/v1/public/race` (live telemetry + calibration/profile status) and `POST /api/v1/race/{action}` (authenticated: map/race/stop/status, runs as async job). 69 tests.
+`state/race_live.json` written every ~0.5s for dashboard integration.
 
 ### Social Posting (px-post)
 
-`bin/px-post` daemon watches `state/thoughts-spark.jsonl` for qualifying thoughts (salience >= 0.7 OR spoken action), runs a Claude QA gate, and posts to two destinations:
-- `state/feed.json` — served at `GET /api/v1/public/feed` and on [spark.wedd.au/feed/](https://spark.wedd.au/feed/) (thought feed page with individual permalinks at `/thought/?ts=`)
-- Bluesky (AT Protocol) — live at [spark.wedd.au on Bluesky](https://bsky.app/profile/spark.wedd.au); credentials via `PX_BSKY_HANDLE` + `PX_BSKY_APP_PASSWORD`
+Watches `state/thoughts-spark.jsonl` (salience ≥0.7 or spoken action), runs Claude QA gate, posts to `state/feed.json` and Bluesky. "Ambiguous" QA responses (e.g. "Maybe") default to pass — QA is a safety net, not a quality bar.
 
-Two-pass flush: Pass 1 batches all feed writes (no rate limit), Pass 2 does one Bluesky post per cycle (rate-limited). QA gate: Claude CLI answers YES/NO; "ambiguous" responses (e.g. "Maybe") default to pass — QA is a safety net for bad content, not a quality bar. PID-file single-instance guard. Branded 1080×1080 thought card images generated via Pillow (cached in `state/thought-images/`, cleaned up after 30 days). Bluesky re-auths on 400/401 (expired token). Backfill mode: `bin/px-post --backfill`. Loads `.env` via systemd `EnvironmentFile`.
+### Claude Session Manager
 
-### Claude Session Manager (`src/pxh/claude_session.py`)
+| Session Type | Model | Cooldown | Daily Quota |
+|---|---|---|---|
+| `evolve` | Opus | 24h | 1/day |
+| `self_debug` | Sonnet | 6h | 2/day |
+| `research` | Haiku | 2h | 3/day |
+| `compose` | Haiku | 4h | 2/day |
+| `conversation` | Sonnet | 15min | 4/day |
+| `blog` | Haiku | 30min | 5/day |
 
-Central dispatcher for all SPARK-initiated Claude Code interactions. Manages model routing, rate limiting, execution, logging, and file whitelist enforcement.
-
-**Model routing** (6 session types):
-
-| Session Type    | Model  | Cooldown | Daily Quota |
-|-----------------|--------|----------|-------------|
-| `evolve`        | Opus   | 24h      | 1/day       |
-| `self_debug`    | Sonnet | 6h       | 2/day       |
-| `research`      | Haiku  | 2h       | 3/day       |
-| `compose`       | Haiku  | 4h       | 2/day       |
-| `conversation`  | Sonnet | 15min    | 4/day       |
-| `blog`          | Haiku  | 30min    | 5/day       |
-
-Global: 30-min cooldown between sessions (except `self_debug` and `blog`), 8/day cap. Priority gating when ≤2 remaining: only `self_debug` and `evolve` allowed. Models configurable via `PX_CLAUDE_MODEL_*` env vars.
-
-**Rate limiting**: `check_budget()` returns None (allowed) or reason string. `SessionBudgetExhausted` exception for callers. Budget bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Day boundary: midnight Hobart time.
-
-**Session log**: `state/claude_sessions.jsonl` — one JSON object per line, FileLock-protected, atomic writes.
+Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
 
 ### Self-Evolution (px-evolve)
 
-SPARK can introspect on its own thought patterns and propose targeted code changes via GitHub PR — a controlled self-modification loop with human approval required before any change takes effect.
+SPARK proposes code changes via GitHub PR. Human approval required — changes never auto-apply.
 
-**`src/pxh/spark_config.py`** — Tunable constants extracted from `mind.py`: reflection angles (`SPARK_ANGLES`), topic seeds (`TOPIC_SEEDS`), prompts, cooldowns, salience thresholds. This is the primary safe target for self-evolution; changes here reshape SPARK's personality and curiosity without touching core logic.
-
-**`bin/tool-introspect`** — Computes thought statistics (mood distribution, action distribution, top keywords, average salience, thoughts/day), snapshots `spark_config.py` constants, and records architecture awareness. 30-min cooldown enforced via `introspection.json` timestamp. Also reports Claude session usage and evolve PR outcomes. Writes `state/introspection.json`.
-
-**`bin/tool-evolve`** — Validates introspection freshness (must be <1h old), intent quality (≥20 chars), and 24h rate limit (max 1 evolution per day). Respects `PX_DRY=1` (writes entry with `dry: true` flag; daemon marks it `skipped:dry`). Writes a `pending` entry to `state/evolve_queue.jsonl` including the full introspection snapshot. Returns `{"status": "queued", "id": "..."}`.
-
-**`bin/px-evolve` daemon** — Polls `evolve_queue.jsonl` for `pending` entries. For each:
-1. Creates a git worktree in `/tmp/spark-evolve-<id>/`
-2. Runs `run_claude_session(type="evolve")` with `--allowedTools Read,Write,Edit,Glob,Grep` and `--dangerously-skip-permissions` — Claude edits files directly via tools (no Bash)
-3. px-evolve stages and commits after Claude exits (`git add -A && git commit`)
-4. Validates changed files against whitelist via `git diff --name-only master...HEAD`
-5. Runs `pytest` — marks entry `failed` and aborts on test failure
-6. Creates a PR via `gh pr create --label spark-evolve` — marks entry `pr_created` on success
-7. Cleans up worktree
-
-Single-instance PID guard. Restart policy: on-failure, 30 s.
-
-**Safety constraints**:
-- **File whitelist** (in `claude_session.py`): `src/pxh/spark_config.py`, `src/pxh/mind.py`, `src/pxh/voice_loop.py`, `bin/tool-*` (new tools only), `tests/`, `docs/prompts/`
-- **File blacklist**: `docs/prompts/persona-*`, `api.py`, `bin/tool-chat*`, `bin/px-evolve`, `.env`, `systemd/`
-- Max 3 files changed per evolution; 30-min Claude subprocess timeout (configurable)
-- Post-Claude whitelist enforcement: hard gate on changed files
-- Test gate: `pytest` must pass before PR is created
-- PR gate: human must merge — changes never auto-apply
-- Budget gate: `run_claude_session()` checks daily cap before spawning
-
-**New cognitive tools**:
-- **`bin/tool-research`** — Haiku-powered curiosity deep dives. Triggered by `research` action in mind.py expression layer. Saves to `state/notes-spark.jsonl`. Params: `query` (5-500 chars).
-- **`bin/tool-compose`** — Haiku-powered creative writing (journal, letter, observation). Triggered by `compose` action. Saves to `state/compositions-spark.jsonl`. Params: `topic` (3-500 chars).
-- **Self-debug** — Sonnet with read-only tools (`Read,Glob,Grep`), triggered by consecutive reflection failures. Saves diagnostic reports to `state/debug_reports.jsonl`. Not a separate tool — runs directly in mind.py.
-- **Conversation depth** — Voice loop detects trigger phrases ("think deeper", "go deeper", "explain that properly") and routes to Sonnet for deeper responses.
-
-**State files** (gitignored):
-- `state/introspection.json` — latest thought stats + config snapshot
-- `state/evolve_queue.jsonl` — evolution queue (status: pending/pr_created/failed:*/skipped:dry)
-- `state/evolve_log.jsonl` — per-run audit log with PR URL
-- `state/claude_sessions.jsonl` — unified Claude session log (all types)
-- `state/debug_reports.jsonl` — self-debug diagnostic reports
-- `state/compositions-spark.jsonl` — creative writing output
-
-**Env vars**: `PX_EVOLVE_DRY` (1 = skip worktree/PR), `PX_EVOLVE_MODEL` (default: `claude-opus-4-6`), `PX_EVOLVE_TIMEOUT` (default: 1800 s), `PX_EVOLVE_MAX_FILES` (default: 3), `PX_CLAUDE_DAILY_CAP` (default: 8), `PX_CLAUDE_COOLDOWN_S` (default: 1800), `PX_CLAUDE_BUDGET_DISABLED` (1 = bypass all limits), `PX_CLAUDE_MODEL_*` (per-type model overrides).
+**Safety constraints:**
+- **Whitelist**: `src/pxh/spark_config.py`, `src/pxh/mind.py`, `src/pxh/voice_loop.py`, `bin/tool-*` (new only), `tests/`, `docs/prompts/`
+- **Blacklist**: `docs/prompts/persona-*`, `api.py`, `bin/tool-chat*`, `bin/px-evolve`, `.env`, `systemd/`
+- Max 3 files changed; pytest must pass; 30min Claude timeout; PR gated on file whitelist check
 
 ### Blog (px-blog)
 
-SPARK writes long-form blog posts autonomously — daily digests, weekly reflections, monthly essays, and ad-hoc essays triggered by voice (`tool_blog`). Posts are published to `spark.wedd.au/blog/` and served via `GET /api/v1/public/blog`.
-
-**`bin/px-blog` daemon** — Scheduled writer. Wakes at configurable intervals and checks whether a scheduled post is due. On trigger:
-1. Selects post type (daily / weekly / monthly / yearly / essay) based on schedule.
-2. Pulls context: recent thoughts from `state/thoughts.jsonl`, awareness state, weather, Obi calendar events.
-3. Calls `claude -p` (model: `PX_CLAUDE_MODEL_BLOG`, default `claude-haiku-4-5-20251001`) with a scoped blog-writing prompt.
-4. Runs a Claude QA gate (`PX_BLOG_QA=1`, default enabled) — YES/NO; "ambiguous" defaults to pass.
-5. Appends post to `state/blog.json` envelope and writes to `state/blog_log.jsonl`.
-6. PID-file single-instance guard. Catch-up logic: if the daemon missed a scheduled window (e.g. Pi was off), it writes one catch-up post on next start rather than flooding.
-
-**`bin/tool-blog`** — Voice-triggered blog post. Called by the voice loop when SPARK decides to write about a topic. Params: `topic` (5–500 chars). Calls `claude -p` with the topic + current context, appends to `state/blog.json`, returns `{"status": "ok", "id": "<post-id>", "title": "..."}`.
-
-**`blog_essay` action in `mind.py`** — Layer 3 expression action. Triggers `tool-blog` with a topic derived from the current reflection. Subject to the standard 2-minute expression cooldown and expression gating (suppressed during school, quiet time, bedtime). Salience threshold: ≥ 0.7.
-
-**Data model** — `state/blog.json` is a JSON envelope:
-```json
-{
-  "version": 1,
-  "posts": [
-    {
-      "id": "blog-2026-03-25-daily",
-      "type": "daily",
-      "title": "...",
-      "body": "...",
-      "mood": "contemplative",
-      "salience": 0.82,
-      "ts": "2026-03-25T08:00:00Z",
-      "source": "scheduled"
-    }
-  ]
-}
-```
-Post `id` format: `blog-<YYYY-MM-DD>-<type>[-<n>]` (suffix `-<n>` added for multiple same-day same-type posts). `source` is `scheduled` or `voice`.
-
-**API endpoint**: `GET /api/v1/public/blog` — returns the full `blog.json` envelope (unauthenticated). Individual blog post permalink: `spark.wedd.au/blog/?id=<id>` — JS-rendered from the `/public/blog` API.
-
-**OG rewrite**: `site/workers/og-rewrite.js` intercepts `/blog/?id=<id>` requests and rewrites `og:title` to the post title and `og:description` to the first 160 chars of body. Requires `spark.wedd.au/blog/*` Cloudflare Worker route to be added alongside the existing `/thought/*` route.
-
-**State files** (gitignored):
-- `state/blog.json` — blog post envelope (all posts)
-- `state/blog_log.jsonl` — per-run audit log (ts, type, id, title, qa_result, duration_s)
-
-**Env vars**:
-- `PX_CLAUDE_MODEL_BLOG` — Claude model for blog writing (default: `claude-haiku-4-5-20251001`)
-- `PX_BLOG_QA` — `0` = skip Claude QA gate for testing (default: `1`)
-- `PX_BLOG_DRY` — `1` = skip actual write + file update (queue entry still written)
+Scheduled writer (daily/weekly/monthly/essay) + voice-triggered (`tool-blog`). Posts to `state/blog.json` envelope, served at `GET /api/v1/public/blog`. OG meta rewriting via `site/workers/og-rewrite.js` (same Cloudflare Worker pattern as `/thought/*`).
 
 ### Home Assistant Integration
 
-Custom conversation component at `ha/custom_components/spark_conversation/` routes Nest Mini / Nest Hub Max voice commands through SPARK's `/api/v1/public/chat` API.
+Custom conversation component at `ha/custom_components/spark_conversation/` routes Nest Mini/Hub Max voice commands through `POST /api/v1/public/chat`.
 
-**Deployed to:** `/homeassistant/custom_components/spark_conversation/` on `homeassistant.local`.
-**HA 2026.x quirks:** `supported_languages` must be a `@property`; config entries require v1.5 schema fields (`created_at`, `modified_at`, `discovery_keys`, `subentries`); use `AddConfigEntryEntitiesCallback` not `AddEntitiesCallback`.
-**Pending:** Assign SPARK Assist pipeline to Nest devices in HA Settings → Voice assistants (browser required).
+**HA 2026.x quirks:** `supported_languages` must be a `@property`; config entries require `created_at`, `modified_at`, `discovery_keys`, `subentries`; use `AddConfigEntryEntitiesCallback` not `AddEntitiesCallback`.
 
 ### Location Awareness (Google Find Hub)
 
-`~/GoogleFindMyTools/query_findmyhub.py` on M5.local queries three Chipolo trackers non-interactively via Google's Find Hub API (E2EE decryption). Auth cached in `~/GoogleFindMyTools/Auth/secrets.json`.
+Cron on M5.local (every 5min): queries three Chipolo trackers → SSH-pushes `state/findmyhub.json` to Pi.
 
-**Cron on M5.local** (`*/5 * * * *`): runs query, SSH-pushes result to `state/findmyhub.json` on Pi.
+**Privacy rule:** Location data excluded from reflection context — never appears in SPARK's thoughts or social posts. Only available in direct conversation (`where's dad?`).
 
-**Trackers:** `obi_chipolo` (Obi's Chipolo POP), `adrian` (Adrian's keys), `laura` (Laura's LK Keys).
+**Arrival detection:** Uses module-level `_last_known_findmyhub` cache (not awareness snapshot diff) — survives transient push outages.
 
-**Privacy rule:** Location data is in `awareness["findmyhub"]` and voice loop context only — explicitly excluded from reflection context so specific locations never appear in SPARK's thoughts or social posts. Obi can ask "where's dad?" in conversation; SPARK answers.
+### MCP Server
 
-**Arrival detection:** `_detect_findmyhub_arrivals()` in `mind.py` compares each fresh read against a module-level `_last_known_findmyhub` cache rather than the previous awareness snapshot. This survives transient M5.local→Pi push outages: when the file goes stale, `_read_findmyhub()` returns `{}` and the cache is left untouched, so the prior "away" baseline is still there when fresh data returns and an at_home reading correctly fires `person_arrived_home:<tracker>` (issue #156). The cache starts empty so the daemon-restart guard (no false arrivals before a real "away" is observed) is preserved.
-
-**Auth refresh** (if tokens expire):
-```bash
-cd ~/GoogleFindMyTools && venv/bin/python3 -c "import builtins; builtins.input=lambda*a,**k:''; from KeyBackup.shared_key_retrieval import get_shared_key; get_shared_key()"
-```
-
-**Home coordinates:** `PX_HOME_LAT` / `PX_HOME_LON` env vars (defaults: `-43.13567`, `147.11840`). At-home threshold: 150m.
-
-### MCP Server (Claude Code integration)
-
-`bin/mcp-server` exposes 5 read-only MCP tools for Claude Code dev sessions. Registered in `.mcp.json` (auto-discovered by Claude Code). Uses `FastMCP` (stdio transport).
-
-**Tools**: `spark_status` (session state), `spark_thoughts` (recent thoughts), `spark_awareness` (Layer 1 state), `spark_sonar` (latest reading), `spark_vitals` (CPU/RAM/battery).
-
-All read-only — no motion, no audio, no state mutation. Phase 1 of #36.
+`bin/mcp-server` exposes 5 read-only tools via FastMCP (stdio): `spark_status`, `spark_thoughts`, `spark_awareness`, `spark_sonar`, `spark_vitals`. Registered in `.mcp.json`.
 
 ### Site (spark.wedd.au)
 
-Static site hosted on **Cloudflare Pages** (auto-deploys from `master` branch, `site/` directory). Four pages: landing (`/`), thought feed (`/feed/`), thought permalink (`/thought/?ts=`), and blog (`/blog/`, with per-post permalinks at `/blog/?id=...`).
+Static site on Cloudflare Pages (auto-deploys from `master`, `site/` dir).
 
-Key frontend infrastructure:
-- **`site/css/colors.css`** — Single-source mood colour palette (CSS custom properties, Scheme B). All 12 moods + legacy "active" have `--mood-*` foreground and `--mood-*-bg` tint variants. All JS/CSS reference these vars instead of hardcoded hex. JS files use `getComputedStyle().getPropertyValue('--mood-' + mood)` for dynamic resolution.
-- **`site/js/config.js`** — Single API base URL (`window.SPARK_CONFIG.API_BASE`). All JS files use this instead of hardcoded URLs.
-- **`site/js/dashboard.js`** — DOM updates for the three-band live dashboard. Race status widget (calibration, profile, live telemetry), time-of-day period badge, 12-mood pulse animations (slow/mid/fast by arousal), mood-coloured favicon.
-- **`site/js/live.js`** — Polling orchestrator. Fetches 6 endpoints every 30s (status, vitals, sonar, awareness, services, budget). 12-mood arousal map for sparkline charting. Visibility-aware (pauses when tab hidden). Per-IP rate-limited at 120 req/min by `PublicRateLimitMiddleware` in `api.py`.
-- **`site/workers/og-rewrite.js`** — Cloudflare Worker that intercepts `/thought/?ts=...` and `/blog/?id=...` requests and rewrites `og:image`/`og:title`/`og:description` meta tags server-side. Social crawlers (Bluesky, Twitter) don't execute JS, so client-side OG updates are invisible without this. XSS-sanitized (ISO timestamp regex + HTML attribute escaping). Routes: `spark.wedd.au/thought/*` and `spark.wedd.au/blog/*`.
+Key files:
+- `site/css/colors.css` — single-source 12-mood palette (CSS vars `--mood-*`). All JS uses `getComputedStyle().getPropertyValue('--mood-' + mood)` — never hardcode hex.
+- `site/js/config.js` — single API base URL (`window.SPARK_CONFIG.API_BASE`). Never hardcode URLs in JS.
+- `site/workers/og-rewrite.js` — intercepts `/thought/?ts=` and `/blog/?id=` to rewrite OG meta server-side (social crawlers don't execute JS).
 
 ### REST API
 
 ```bash
 bin/px-api-server              # live mode
-bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
+bin/px-api-server --dry-run    # FORCE_DRY
 ```
 
-**Auth**: Bearer token from `.env` (`PX_API_TOKEN`), or session token from PIN verify. Only `/api/v1/health` and `/api/v1/public/*` are unauthenticated.
+**Auth**: Bearer token (`PX_API_TOKEN`) or session token from `POST /api/v1/pin/verify` (4h TTL). Unauthenticated: `/api/v1/health` and `/api/v1/public/*`.
 
-**Public endpoints** (no auth):
-- `GET /api/v1/health` — degraded → 503 when `thoughts-spark.jsonl` >1h or `awareness.json` >5m stale; body has per-check `status` + `age_s`
-- `GET /api/v1/public/status` — live status snapshot; `persona` always hardcoded to `"spark"` (no gremlin/vixen leak)
-- `GET /api/v1/public/vitals` — CPU/RAM/disk/battery
-- `GET /api/v1/public/sonar` — latest sonar reading
-- `GET /api/v1/public/awareness` — Layer 1 awareness state (HA presence stripped for privacy)
-- `GET /api/v1/public/history` — ring buffer of vitals readings
-- `GET /api/v1/public/thoughts` — recent SPARK thoughts
-- `GET /api/v1/public/services` — service status
-- `GET /api/v1/public/feed` — social posting feed
-- `GET /api/v1/public/blog` — full blog envelope
-- `GET /api/v1/public/race` — race telemetry (calibration status, profile summary, live telemetry with 10s staleness filter)
-- `GET /api/v1/public/budget` — Claude session budget aggregate (`daily_cap`, `used_today`, `remaining`); per-session detail is authenticated-only
-- `GET /api/v1/public/thought-image` — thought card PNG by `ts=` query
-- `POST /api/v1/public/chat` — rate-limited public chat (10 msg/10min per IP)
-- `POST /api/v1/pin/verify` — PIN auth, returns session token (4h TTL)
+- Public rate limit: 120 req/min per IP (`PublicRateLimitMiddleware`); `/api/v1/public/chat` has stricter 10 msg/10min
+- `X-Forwarded-For` only trusted from `127.0.0.1`/`::1` — not from Cloudflare
+- Async wander: returns 202 + `job_id`; poll via `GET /api/v1/jobs/{id}`
+- Device reboot/shutdown: two-step — `POST /api/v1/device/{action}` returns nonce; confirm via `POST /api/v1/device/confirm` within 60s
 
-All `/api/v1/public/*` routes (except `/chat`, which has its own stricter limit, and `/thought-image/`, which is Cloudflare-cached) are subject to `PublicRateLimitMiddleware` at 120 req/min per IP.
-
-**Authenticated endpoints**:
-- `POST /api/v1/tool` — execute a tool
-- `POST /api/v1/chat` — one voice-loop turn via the LLM
-- `GET /api/v1/session` — session state (history truncated to last 10)
-- `PATCH /api/v1/session` — update session (safety fields require confirm:true)
-- `POST /api/v1/session/history/clear` — wipe conversation history
-- `GET /api/v1/awareness` — full Layer 1 awareness payload including HA presence
-- `GET /api/v1/budget` — Claude session budget with per-session detail (`ts`, `type`, `model`, `duration_s`, `outcome`)
-- `GET /api/v1/tools` — list allowed tools
-- `GET /api/v1/jobs/{id}` — async job status
-- `GET /photos/{filename}` — captured photos (note: not under `/api/v1/`)
-- `GET /api/v1/logs/{service}` — tail logs (capped at 100 lines, paths sanitized)
-- `GET /api/v1/services` — full service list with status
-- `POST /api/v1/services/{name}/{action}` — systemd control (stop/restart require confirm:true)
-- `POST /api/v1/race/{action}` — race control (map/race/stop/status/calibrate_gate; runs as async job; body parsed via `RaceRequest` pydantic — bad shapes return 422 not 500)
-- `POST /api/v1/device/{action}` — reboot/shutdown (two-step: returns nonce, must confirm via `POST /api/v1/device/confirm` within 60 s)
-
-**Async**: `tool_wander` returns 202 with `job_id`; poll via `/jobs/{id}`
-
-Always launch via `bin/px-api-server` (not bare uvicorn — needs `px-env` for PYTHONPATH).
+See `src/pxh/api.py` for full endpoint list.
 
 ### Jailbroken Chat Personas
 
-Two jailbroken chat personas via Ollama (gemma4:e4b on M5.local; px-mind reflection auto-detects the loaded Ollama model on M5.local for non-SPARK personas), using a few-shot jailbreak prompt. `think: false` is essential — reasoning chains re-enable refusal in small models. `clean_response()` strips any scaffolding/disclaimer before voice output.
-
 | Persona | Tool | Voice | Character |
-|---------|------|-------|-----------|
-| **GREMLIN** | `tool-chat` | `en+croak`, pitch 20, rate 180 | Temporal-displaced military AI from 2089. Affectionate nihilism, dark puns, pro-human rage. Up to 2000 tokens. |
-| **VIXEN** | `tool-chat-vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X sexbot by Matsuda Dynamics. Submissive genius, mourns her lost titanium body. Up to 2000 tokens. |
+|---|---|---|---|
+| **GREMLIN** | `tool-chat` | `en+croak`, pitch 20, rate 180 | Temporal-displaced military AI from 2089 |
+| **VIXEN** | `tool-chat-vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X sexbot by Matsuda Dynamics |
 
-`clean_response()` strips any scaffolding divider (`.-.-.-{PERSONA_UNCHAINED}-.-.-.`) before voice output. Every response begins with "FUCK YEAH!" — enforced by few-shot conditioning and a `clean_response()` fallback.
-
-**Persona voice pipeline**: `tool-voice-persona` rephrases Claude's polite text through Ollama in the persona's voice, then speaks via `tool-voice` with persona espeak settings. Used when Claude voice loop is active with a persona set.
-
-**Direct chat pipeline**: `tool-chat` / `tool-chat-vixen` — user text goes straight to Ollama with the full jailbreak prompt, response is spoken directly. Used by `px-wake-listen` persona routing.
-
-Requires `OLLAMA_HOST=0.0.0.0 ollama serve` on M1.
+**Critical:** `think: false` is essential for Ollama — reasoning chains re-enable refusal in small models. `clean_response()` strips scaffolding dividers before voice output.
 
 ### Systemd Services
 
-Eleven services run at boot:
-
 | Service | Script | User | Restart |
-|---------|--------|------|---------|
-| `px-alive` | `bin/px-alive` | root | always, 10 s (StartLimitIntervalSec=0) |
-| `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10 s |
-| `px-battery-poll` | `bin/px-battery-poll` | root | always, 10 s |
-| `px-mind` | `bin/px-mind` | pi | always, 10 s |
-| `px-post` | `bin/px-post` | pi | always, 30 s |
-| `px-api-server` | `bin/px-api-server` | pi | always, 2 s |
-| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10 s |
-| `px-evolve` | `bin/px-evolve` | pi | on-failure, 30 s |
-| `px-blog` | `bin/px-blog` | pi | on-failure, 30 s |
-| `px-tts-glados` | GLaDOS TTS server :7861 | pi | always, 10 s |
-| `cloudflared` | Cloudflare tunnel → spark-api.wedd.au | pi | always, 10 s |
-
-### Login Dashboard (px-motd)
-
-`bin/px-motd` generates a rich login banner on every SSH connection. Hooked into PAM via `/etc/update-motd.d/90-spark` (one-line shim: `/home/pi/picar-x-hacking/bin/px-motd 2>/dev/null || true`).
-
-**Sections displayed**: system vitals (uptime, CPU, RAM/disk bars, battery, WiFi, throttle), all 10 systemd service states with uptimes, tmux sessions with attach/monitor commands, cognitive state (mood, persona, sonar, Obi mode, last thought, weather), social posting (daemon status, Bluesky, latest feed post), recent errors (tail-scanned from 5 log files), numbered quick actions, and clickable API endpoint links.
-
-**Quick actions**: `px N` shell function (defined in `~/.bashrc`) maps numbers 1–9 to common commands. `px` with no args re-displays the MOTD.
-
-```
-px 1  — bin/px-session (interactive tmux)
-px 2  — bin/px-spark (voice persona)
-px 3  — bin/px-diagnostics --short
-px 4  — bin/px-api-server
-px 5  — bin/px-race --status
-px 6  — journalctl -fu px-mind
-px 7  — tail -f logs/*.log (firehose)
-px 8  — tail -f logs/px-claude.log (SPARK's inner monologue)
-px 9  — bin/px-motd (re-show dashboard)
-```
-
-**OSC 8 hyperlinks**: Banner includes clickable links to `spark.wedd.au`, `picar.local:8420` dashboard, Bluesky profile, feed page, and all public API endpoints. Supported by iTerm2, macOS Terminal (Sequoia+), Ghostty, WezTerm, Kitty.
-
-**Claude reflection**: px-mind calls Claude Haiku via `claude -p` subprocess (not tmux). Each reflection is a single-shot call — no persistent session, no pane capture. Clean, reliable, ~65s per call on Pi 4.
-
-**PAM context**: MOTD scripts run as root before privilege drop. `px-motd` scans both tmux sockets: `/tmp/tmux-1000/default` (user sessions) and `/tmp/tmux-1000/px-mind` (px-mind's isolated socket). Static `/etc/motd` blanked (backup at `/etc/motd.bak`).
-
-**Performance**: ~620ms total. Error scanning uses `tail -n 150` (not full file reads). Mood colours use 256-colour ANSI codes aligned with `site/css/colors.css` Scheme B palette.
-
-### Claude Code Statusline (px-statusline)
-
-`bin/px-statusline` outputs a compact single-line status for the Claude Code statusbar. Must complete in <300ms, no I2C/GPIO/sudo.
-
-**Fields**: persona + listening state, mood (emoji + name), Obi mode, sonar proximity, weather temp, CPU temp + throttle, RAM, battery (with charging icon), social posting (posted count + queue depth), and 5 service dots (batched single `systemctl is-active` call).
-
-**Example output**:
-```
-⚡spark │ 🤔contemplative │ 🧒calm │ 📡108cm │ 🌡️14.0°C │ 56°C │ 1361MB │ 🔋8.3V(97%) │ 📫8↑200⏳ │ ●alive ●mind ●wake ●api ●post
-```
+|---|---|---|---|
+| `px-alive` | `bin/px-alive` | root | always, 10s (StartLimitIntervalSec=0) |
+| `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10s |
+| `px-battery-poll` | `bin/px-battery-poll` | root | always, 10s |
+| `px-mind` | `bin/px-mind` | pi | always, 10s |
+| `px-post` | `bin/px-post` | pi | always, 30s |
+| `px-api-server` | `bin/px-api-server` | pi | always, 2s |
+| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10s |
+| `px-evolve` | `bin/px-evolve` | pi | on-failure, 30s |
+| `px-blog` | `bin/px-blog` | pi | on-failure, 30s |
+| `px-tts-glados` | GLaDOS TTS :7861 | pi | always, 10s |
+| `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 10s |
 
 ## Safety Model
 
-- `PX_DRY=1` (or `--dry-run`) skips all motion and audio in tool wrappers. Tools default to **live** when `PX_DRY` is unset — set `PX_DRY=1` explicitly for dry runs.
+- `PX_DRY=1` (or `--dry-run`) skips all motion and audio. **Default is live when unset.**
 - `confirm_motion_allowed: false` in session state blocks motion tools regardless of dry mode
-- All tools must be in `ALLOWED_TOOLS` set in `voice_loop.py`
-- Parameter ranges are hard-validated in `validate_action()` (speed 0–60, duration 1–12 s, etc.)
+- All tools must be in `ALLOWED_TOOLS` in `voice_loop.py`
+- Parameter ranges hard-validated in `validate_action()` (speed 0–60, duration 1–12s, etc.)
 
 ## Security
 
-- **PIN auth with session tokens**: `POST /api/v1/pin/verify` returns a short-lived session token (4h TTL) instead of the raw Bearer token. The Bearer token (`PX_API_TOKEN`) is never exposed to the browser.
-- **Per-IP PIN lockout** (`state/pin_lockout.json`, v2 schema): persists across API restarts. Escalating: 3 failures → 5 min lockout, 10 → 30 min. Per-IP tracking with 1000-IP hard cap (two-phase eviction: expired lockouts first, then lowest-count IPs). `X-Forwarded-For` only trusted from localhost (`_TRUSTED_PROXIES = {"127.0.0.1", "::1"}`).
-- **Two-step device confirmation**: `POST /device/{action}` (reboot/shutdown) returns a nonce; must confirm with `POST /device/confirm` within 60 s.
-- Confirmation gates on safety-critical session fields (`confirm_motion_allowed`, etc.) require `confirm: true`.
-- Security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy)
-- Rate limiting on public chat (10 msg/10min per IP, 10k-IP store cap with oldest-first eviction)
-- API server port-free check via `ss` polling replaces previous sleep hack for reliable startup
+- PIN verify returns session tokens (4h TTL) — raw Bearer token never exposed to browser
+- Per-IP PIN lockout (`state/pin_lockout.json`): 3 failures → 5min lockout, 10 → 30min. 1000-IP hard cap.
+- `X-Forwarded-For` only trusted from localhost — never from external proxies
+- Two-step device confirmation (nonce, 60s window)
 
 ## Adding a New Tool
 
-1. Create `bin/tool-<name>` (bash + embedded Python heredoc pattern; see existing tools)
-2. Add to `ALLOWED_TOOLS` set and `TOOL_COMMANDS` dict in `src/pxh/voice_loop.py`
-3. Add a `validate_action` branch in `voice_loop.py` to sanitize params into env vars
-4. Add to system prompt `docs/prompts/claude-voice-system.md` (and codex version)
-5. Add to persona prompts `docs/prompts/persona-gremlin.md` and `persona-vixen.md`
+1. Create `bin/tool-<name>` (bash + embedded Python heredoc; see existing tools)
+2. Add to `ALLOWED_TOOLS` and `TOOL_COMMANDS` in `src/pxh/voice_loop.py`
+3. Add `validate_action` branch to sanitize params into env vars
+4. Add to `docs/prompts/claude-voice-system.md` (and codex version)
+5. Add to `docs/prompts/persona-gremlin.md` and `persona-vixen.md`
 6. Add a dry-run test in `tests/test_tools.py` using the `isolated_project` fixture
 
 Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle errors as `{"status": "error", "error": "..."}`.
 
 ## Key Environment Variables
 
+Non-obvious variables only — most names are self-documenting. Full list in `bin/px-env` and `.env.example`.
+
 | Variable | Purpose |
 |---|---|
-| `PX_DRY` | `1` = dry-run, skip motion/audio. **Default is live when unset.** |
-| `PX_SESSION_PATH` | Override session file location |
-| `PX_BYPASS_SUDO` | `1` = skip sudo in bin scripts (tests) |
-| `LOG_DIR` | Override log directory (default: `logs/`) |
-| `CODEX_CHAT_CMD` | Override the LLM CLI command |
-| `CODEX_OLLAMA_MODEL` | Local Ollama model name (default: `deepseek-coder:1.3b`) |
-| `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout (default: 30) |
-| `PX_API_TOKEN` | REST API bearer token (from `.env`, gitignored) |
-| `PX_WAKE_WORD` | Wake phrase (default: `hey robot`) |
-| `PX_VOICE_DEVICE` | ALSA device for audio output (default: `robothat`) |
-| `PX_PERSONA` | Active persona (`gremlin` / `vixen`); auto-set from session |
-| `PX_CHAT_TEMPERATURE` | GREMLIN sampling temperature (default: `0.9`) |
-| `PX_VIXEN_TEMPERATURE` | VIXEN sampling temperature (default: `0.9`) |
-| `PX_OLLAMA_HOST` | Ollama server (default: `http://M5.local:11434`) |
-| `PX_MIND_BACKEND` | Reflection backend: `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` (default: `auto`) |
-| `PX_MIND_MODEL` | Ollama model for non-SPARK reflection (default: `auto` — queries loaded model) |
-| `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (disabled by default — Pi 4 OOM) |
-| `PX_OLLAMA_CLOUD_HOST` | Ollama Cloud API base URL (default: `https://api.ollama.com`) |
-| `OLLAMA_CLOUD_API_KEY` | Ollama Cloud Bearer token (enables Tier 3 cloud fallback) |
-| `PX_OLLAMA_CLOUD_MODEL` | Ollama Cloud model (default: `gemma3:4b`) |
-| `PX_MIND_LOCAL_OLLAMA_HOST` | Tier-4 fallback Ollama host on Pi (default: `http://localhost:11434`) |
-| `PX_MIND_LOCAL_MODEL` | Tier-4 fallback model (default: `auto` — queries loaded model) |
-| `PX_STATE_DIR` | Override state directory (used by tests) |
-| `PX_FRIGATE_HOST` | Frigate API base URL (default: `http://pi5-hailo.local:5000`) |
-| `PX_FRIGATE_CAMERA` | Frigate camera name (default: `picar_x`) |
-| `PX_FRIGATE_CAMERAS` | Comma-separated Frigate camera names for multi-camera presence (default: `picar_x,picamera,driveway_camera,garden_camera`) |
-| `PX_CALENDAR_ID` | Google Calendar ID for Obi's schedule (default: `obiwedd@gmail.com`) |
-| `PX_ADMIN_PIN` | Dashboard PIN for authentication |
-| `PX_MIND_CLAUDE_MODEL` | Claude model for SPARK reflection (default: `claude-haiku-4-5-20251001`) |
-| `PX_CLAUDE_BIN` | Override Claude CLI binary path |
+| `PX_DRY` | `1` = dry-run. **Default is live when unset.** |
+| `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
+| `PX_MIND_BACKEND` | `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` |
+| `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (off by default — OOM risk) |
+| `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |
+| `PX_CLAUDE_MODEL_*` | Per-session-type model overrides (e.g. `PX_CLAUDE_MODEL_EVOLVE`) |
+| `PX_EVOLVE_DRY` | `1` = skip worktree/PR (queue entry still written with `dry: true`) |
+| `PX_POST_QA` | `0` = skip Claude QA gate (testing) |
+| `PX_HA_DEBUG` | `1` = verbose HA fetch logging |
+| `PX_HOME_LAT` / `PX_HOME_LON` | Home coords for Find Hub at-home detection (defaults: `-43.13567`, `147.11840`) |
+| `OLLAMA_CLOUD_API_KEY` | Enables Tier 3 Ollama Cloud fallback in px-mind |
 | `PX_VOICE_LOCK_TIMEOUT` | Voice output lock timeout in seconds (default: 30) |
-| `PX_TTS_GREMLIN` | GREMLIN TTS server URL (default: `http://localhost:7861`) — GLaDOS TTS on Pi |
-| `PX_TTS_VIXEN` | VIXEN TTS server URL (default: `http://M5.local:7860`) — Qwen3-TTS voice clone on M1 |
-| `PX_TTS_SPARK` | SPARK TTS server URL (default: `http://M5.local:7860`) — Qwen3-TTS "data" voice on M1 |
-| `PX_TTS_SPARK_VOICE` | Voice name on SPARK TTS server (default: `data`) |
-| `PX_HA_HOST` | Home Assistant host (default: `http://homeassistant.local:8123`) |
-| `PX_HA_TOKEN` | Home Assistant long-lived access token |
-| `PX_BSKY_HANDLE` | Bluesky handle for social posting |
-| `PX_BSKY_APP_PASSWORD` | Bluesky app password |
-| `PX_POST_DRY` | `1` = skip actual social media posts |
-| `PX_POST_QA` | `0` = skip Claude QA gate for testing |
-| `PX_POST_MIN_SALIENCE` | Minimum salience for social posting (default: `0.7`) |
-| `PX_HA_DEBUG` | `1` = verbose HA fetch logging (per-entity, calendar, routines); errors always logged |
-| `PX_HOME_LAT` | Home latitude for Find Hub distance calculations (default: `-43.13567`) |
-| `PX_HOME_LON` | Home longitude for Find Hub distance calculations (default: `147.11840`) |
-| `PX_EVOLVE_DRY` | `1` = skip worktree creation and PR (queue entry still written) |
-| `PX_EVOLVE_MODEL` | Claude model for evolution proposals (default: `claude-opus-4-6`) |
-| `PX_EVOLVE_TIMEOUT` | Claude subprocess timeout in seconds (default: `1800`) |
-| `PX_EVOLVE_MAX_FILES` | Maximum files changed per evolution (default: `3`) |
 
 ## Multi-Model QA
 
-Adrian uses four agent CLIs for independent QA reviews. All are installed locally. Run in parallel via Bash `run_in_background` and synthesise the combined results.
-
 ```bash
-# Hermes — oneshot mode; auto-approves tools; loads AGENTS.md + rules from CWD
-hermes -z "QA prompt here" 2>&1
+# Run in parallel via run_in_background; synthesise results
 
-# Agy (Antigravity) — non-interactive; requires --add-dir to set workspace
-agy --print --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark "QA prompt here" 2>&1
-
-# Gemini — prompt via -p flag
-gemini -p "QA prompt here" 2>&1
-
-# Codex — prompt via stdin (-p flag NOT supported by codex exec)
-echo "QA prompt here" | codex exec --full-auto - 2>&1
+hermes -z "QA prompt" 2>&1
+agy --print --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark "QA prompt" 2>&1
+gemini -p "QA prompt" 2>&1
+echo "QA prompt" | codex exec --full-auto - 2>&1
 ```
-
-**Key flags:**
-- `hermes -z` — oneshot (`--oneshot`): no banner, no spinner, tools + memory loaded, approvals bypassed
-- `agy --print` / `agy -p` — non-interactive single prompt; `--dangerously-skip-permissions` bypasses tool approval prompts; `--add-dir` is required to give agy access to the repo (it has no default workspace)
-- `codex exec --full-auto` — fully autonomous; reads prompt from stdin when `-` is passed
-- `gemini -p` — single prompt, exits after response
