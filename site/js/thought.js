@@ -73,18 +73,22 @@
     time.dateTime = post.ts;
     time.textContent = formatTime(post.ts);
 
-    // Mood-colored rule
+    // Mood atmosphere — drives card border, gradient wash, quote mark, glow, and
+    // nav/share pill hover. Set on container so siblings (nav, share) inherit.
     var moodColor = _moodCSSColor(post.mood);
-    var rule = document.querySelector('.thought-mood-rule');
-    if (rule && moodColor) rule.style.borderTopColor = moodColor;
+    if (moodColor) {
+      card.style.setProperty('--spark-accent', moodColor);
+      var container = card.closest('.container-narrow');
+      if (container) container.style.setProperty('--spark-accent', moodColor);
+    }
 
-    // Mood wash background
+    // Mood wash on the page behind the card
     var page = document.querySelector('.thought-page');
     if (page && moodColor && /^#[0-9a-fA-F]{6}$/.test(moodColor)) {
       var r = parseInt(moodColor.slice(1,3),16);
       var g = parseInt(moodColor.slice(3,5),16);
       var b = parseInt(moodColor.slice(5,7),16);
-      page.style.background = 'radial-gradient(ellipse at 50% 0%, rgba(' + r + ',' + g + ',' + b + ',0.25) 0%, transparent 50%)';
+      page.style.background = 'radial-gradient(ellipse at 50% 0%, rgba(' + r + ',' + g + ',' + b + ',0.20) 0%, transparent 55%)';
     }
 
     // Prev/next navigation

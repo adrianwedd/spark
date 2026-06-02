@@ -58,9 +58,9 @@
     a.className = salience >= 0.85 ? 'feed-card feed-card--featured' : 'feed-card';
     a.href = thoughtURL(post);
 
-    // Mood-colored top border
+    // Mood atmosphere — drives border, gradient wash, quote mark, and hover glow
     var moodColor = _moodCSSColor(post.mood);
-    if (moodColor) a.style.borderTopColor = moodColor;
+    if (moodColor) a.style.setProperty('--spark-accent', moodColor);
 
     var quote = document.createElement('p');
     quote.className = 'feed-card-quote';

@@ -50,7 +50,12 @@ body {
 .feed-card,
 .thought-bubble {
   position: relative;
-  background: var(--dark-surface);
+  background: var(--dark-surface); /* fallback: browsers without color-mix() */
+  background:
+    linear-gradient(145deg,
+      color-mix(in srgb, var(--spark-accent, var(--dark-accent)) 14%, transparent) 0%,
+      transparent 55%),
+    var(--dark-surface);
   border: 1px solid var(--dark-border);
   border-top: 2px solid var(--spark-accent, var(--dark-accent));
   border-radius: var(--radius);
@@ -58,19 +63,46 @@ body {
   text-decoration: none;
   color: inherit;
   display: block;
-  transition: transform 0.25s cubic-bezier(0.25, 0.1, 0.25, 1), box-shadow 0.25s cubic-bezier(0.25, 0.1, 0.25, 1);
+  transition: transform 0.25s cubic-bezier(0.25, 0.1, 0.25, 1),
+              box-shadow 0.25s cubic-bezier(0.25, 0.1, 0.25, 1);
   margin-bottom: 0;
+  overflow: hidden;
+}
+
+/* Decorative open-quote mark */
+.feed-card::before,
+.thought-bubble::before {
+  content: '\201C';
+  position: absolute;
+  top: 0.5rem;
+  right: 1.25rem;
+  font-family: 'Courier Prime', monospace;
+  font-size: 5.5rem;
+  line-height: 1;
+  color: var(--spark-accent, var(--dark-accent));
+  opacity: 0.12;
+  pointer-events: none;
+  user-select: none;
+  z-index: 0;
 }
 
 .feed-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 4px 20px var(--dark-glow);
+  box-shadow:
+    0 4px 20px var(--dark-glow),
+    0 0 28px color-mix(in srgb, var(--spark-accent, var(--dark-accent)) 18%, transparent);
 }
 
 /* Featured card — high salience */
 .feed-card--featured {
   border-top-width: 3px;
   padding: 2rem 2.25rem;
+  box-shadow: 0 0 36px color-mix(in srgb, var(--spark-accent, var(--dark-accent)) 22%, transparent);
+}
+.feed-card--featured:hover {
+  box-shadow:
+    0 4px 24px var(--dark-glow),
+    0 0 52px color-mix(in srgb, var(--spark-accent, var(--dark-accent)) 30%, transparent);
 }
 .feed-card--featured .feed-card-quote {
   font-size: var(--text-subtitle);
@@ -85,6 +117,8 @@ body {
   color: var(--dark-text);
   text-indent: -0.4em;
   padding-left: 0.4em;
+  position: relative;
+  z-index: 1;
 }
 
 .feed-card-meta {
@@ -96,6 +130,8 @@ body {
   font-size: var(--text-small);
   font-weight: 500;
   color: var(--dark-muted);
+  position: relative;
+  z-index: 1;
 }
 
 /* ── Mood badge ─────────────────────────────────── */
@@ -137,10 +173,38 @@ body {
 /* ── Thought centrepiece (permalink page) ──────────────── */
 
 .thought-centrepiece {
+  position: relative;
   text-align: center;
-  padding: 4rem 0;
-  max-width: 600px;
+  padding: 3.5rem 2.5rem;
+  max-width: 640px;
   margin: 0 auto;
+  background: var(--dark-surface); /* fallback: browsers without color-mix() */
+  background:
+    linear-gradient(160deg,
+      color-mix(in srgb, var(--spark-accent, var(--dark-accent)) 10%, transparent) 0%,
+      transparent 60%),
+    var(--dark-surface);
+  border: 1px solid var(--dark-border);
+  border-top: 3px solid var(--spark-accent, var(--dark-accent));
+  border-radius: var(--radius);
+  box-shadow: 0 0 48px color-mix(in srgb, var(--spark-accent, var(--dark-accent)) 18%, transparent);
+  overflow: hidden;
+}
+
+.thought-centrepiece::before {
+  content: '\201C';
+  position: absolute;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: 'Courier Prime', monospace;
+  font-size: 8rem;
+  line-height: 1;
+  color: var(--spark-accent, var(--dark-accent));
+  opacity: 0.08;
+  pointer-events: none;
+  user-select: none;
+  z-index: 0;
 }
 
 .thought-centrepiece-quote {
@@ -150,13 +214,13 @@ body {
   line-height: 1.7;
   color: var(--dark-text);
   margin: 0 0 2rem;
-  text-indent: -0.4em;
-  padding-left: 0.4em;
+  position: relative;
+  z-index: 1;
 }
 
 .thought-mood-rule {
   border: none;
-  border-top: 2px solid var(--dark-accent);
+  border-top: 2px solid var(--spark-accent, var(--dark-accent));
   max-width: 120px;
   margin: 0 auto 1.5rem;
 }
@@ -174,38 +238,57 @@ body {
 
 .thought-prev-next {
   display: flex;
-  justify-content: space-between;
-  padding: 1rem 0;
-  border-top: 1px solid var(--dark-border-subtle, rgba(255,255,255,0.04));
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2rem 0 1rem;
+  margin-top: 1.5rem;
 }
 
 .thought-nav-link {
-  color: var(--dark-accent);
+  display: inline-flex;
+  align-items: center;
+  padding: 0.5rem 1.25rem;
+  border: 1px solid var(--dark-border);
+  border-radius: 999px;
+  color: var(--dark-muted);
   text-decoration: none;
   font-family: 'Inter', system-ui, sans-serif;
   font-size: var(--text-small);
   font-weight: 500;
+  transition: border-color 0.2s, color 0.2s;
 }
-.thought-nav-link:hover { color: var(--dark-accent-hover); text-decoration: underline; }
+.thought-nav-link:hover {
+  border-color: var(--spark-accent, var(--dark-accent));
+  color: var(--spark-accent, var(--dark-accent));
+  text-decoration: none;
+}
 
 .thought-share {
   display: flex;
   justify-content: center;
-  gap: 1.5rem;
-  padding: 1rem 0;
-  font-size: var(--text-xs);
+  gap: 0.75rem;
+  padding: 0 0 2rem;
 }
 
 .thought-share-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.45rem 1.1rem;
+  border: 1px solid var(--dark-border);
+  border-radius: 999px;
   color: var(--dark-muted);
   text-decoration: none;
   background: none;
-  border: none;
   cursor: pointer;
   font-family: 'Inter', system-ui, sans-serif;
-  font-size: inherit;
+  font-size: var(--text-small);
+  font-weight: 500;
+  transition: border-color 0.2s, color 0.2s;
 }
-.thought-share-link:hover { color: var(--dark-accent); }
+.thought-share-link:hover {
+  border-color: var(--spark-accent, var(--dark-accent));
+  color: var(--spark-accent, var(--dark-accent));
+}
 
 /* ── Breadcrumb (thought page) ──────────────────── */
 

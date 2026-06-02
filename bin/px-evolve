@@ -434,8 +434,8 @@ def _run_in_worktree(
             skip_budget_check=True,
         )
         qa = _extract_json(qa_result.stdout) or {}
-        if qa.get("status") == "rejected":
-            log(f"[{entry_id}] QA rejected: {qa.get('reason', '?')}")
+        if qa.get("status") != "approved":
+            log(f"[{entry_id}] QA not approved (status={qa.get('status')!r}): {qa.get('reason', '?')}")
             return "failed:qa_rejected"
         log(f"[{entry_id}] QA approved: {qa.get('reason', 'ok')}")
     except subprocess.TimeoutExpired:
