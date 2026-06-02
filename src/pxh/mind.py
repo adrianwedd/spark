@@ -371,29 +371,28 @@ _HOST_FAILURE_BACKOFF_S = 60  # retry offline hosts after 60 s
 
 
 def _resolve_ollama_model(host: str, preferred: str) -> str:
-    """Resolve 'auto' to the first loaded model on the Ollama host.
+    """Resolve 'auto' to the currently-loaded model on the Ollama host.
 
-    Caches the result per-host for 30 min, then re-queries. This avoids
-    blocking at import time and adapts to model swaps on the Ollama host.
+    Prefers /api/ps (in-memory) over /api/tags (all downloaded). Caches
+    per-host for 30 min, then re-queries to track model swaps.
     """
     if preferred != "auto":
         return preferred
     cached = _resolved_models.get(host)
     if cached and (time.monotonic() - cached[1]) < _MODEL_CACHE_TTL:
         return cached[0]
-    try:
-        r = urllib.request.urlopen(f"{host}/api/tags", timeout=3)
-        tags = json.loads(r.read())
-        models = [m["name"] for m in tags.get("models", [])]
-        if models:
-            _resolved_models[host] = (models[0], time.monotonic())
-            return models[0]
-    except Exception:
-        pass
-    # Return cached model if available, else fallback
+    for endpoint in ("/api/ps", "/api/tags"):
+        try:
+            r = urllib.request.urlopen(f"{host}{endpoint}", timeout=3)
+            models = [m["name"] for m in json.loads(r.read()).get("models", [])]
+            if models:
+                _resolved_models[host] = (models[0], time.monotonic())
+                return models[0]
+        except Exception:
+            pass
     if cached:
         return cached[0]
-    return "gemma4:e4b"  # ultimate fallback
+    return "gemma4:e4b"  # ultimate fallback if host is unreachable
 
 
 # Eagerly resolve at module load for startup logging, but non-blocking:
