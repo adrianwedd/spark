@@ -124,6 +124,7 @@ If Layer 2 decided on an action, Layer 3 makes it happen:
 | `remember` | Writes a note to remember later |
 | `weather_comment` | Talks about the weather |
 | `scan` | Looks around the room |
+| `message_obi` | Sends Obi a private message through the dashboard |
 | `wait` | Does nothing (sometimes quiet is best) |
 
 **Memories:** If a thought is really important (salience > 0.7), Spark writes it down in a "diary" file. Next time Spark thinks, it can read its old diary entries — so it actually remembers things across days!

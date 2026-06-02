@@ -105,7 +105,8 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 Three-layer architecture:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session + calendar + Frigate → `state/awareness.json`
 - **Layer 2 — Reflection** (on transition or every 5min idle): SPARK→Claude Haiku; GREMLIN/VIXEN→Ollama. Four-tier fallback: Claude → M5.local → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). Writes to `state/thoughts.jsonl`.
-- **Layer 3 — Expression** (2min cooldown): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. 22 valid actions. Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech or cognitive actions.**
+- **Layer 3 — Expression** (2min cooldown): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. 21 valid actions (wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech or cognitive actions.**
+- **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. Thoughts with `action=message_obi` are **redacted** in `thoughts-spark.jsonl` (written as `[private message to Obi]`) so the private DM content never reaches the public `/api/v1/public/thoughts` endpoint.
 
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
@@ -134,6 +135,8 @@ Safety (priority): E-stop (sonar < threshold) → edge guard → obstacle dodge 
 ### Social Posting (px-post)
 
 Watches `state/thoughts-spark.jsonl` (salience ≥0.7 or spoken action), runs Claude QA gate, posts to `state/feed.json` and Bluesky. "Ambiguous" QA responses (e.g. "Maybe") default to pass — QA is a safety net, not a quality bar.
+
+**Privacy:** `message_obi` thoughts are redacted before being written to `thoughts-spark.jsonl` (the thought text is replaced with `[private message to Obi]`), so private DMs never reach social posting or the public thoughts endpoint.
 
 ### Claude Session Manager
 
@@ -201,6 +204,7 @@ bin/px-api-server --dry-run    # FORCE_DRY
 - `X-Forwarded-For` only trusted from `127.0.0.1`/`::1` — not from Cloudflare
 - Async wander: returns 202 + `job_id`; poll via `GET /api/v1/jobs/{id}`
 - Device reboot/shutdown: two-step — `POST /api/v1/device/{action}` returns nonce; confirm via `POST /api/v1/device/confirm` within 60s
+- **Obi chat**: `POST /api/v1/obi-chat` (auth required) — Obi sends a message, SPARK responds using `_OBI_CHAT_SYSTEM_PROMPT`, both sides logged to `state/obi_chat.jsonl`; 10s rate gate. `GET /api/v1/obi-chat?since=<iso>` returns messages after the given timestamp. User-supplied text is sanitised via `_sanitize_chat_text()` (strips `<>`, newlines, NUL) before being stored or interpolated into prompts.
 
 See `src/pxh/api.py` for full endpoint list.
 
@@ -242,6 +246,7 @@ See `src/pxh/api.py` for full endpoint list.
 - Per-IP PIN lockout (`state/pin_lockout.json`): 3 failures → 5min lockout, 10 → 30min. 1000-IP hard cap.
 - `X-Forwarded-For` only trusted from localhost — never from external proxies
 - Two-step device confirmation (nonce, 60s window)
+- `_sanitize_chat_text()` (module-level in `api.py`) strips `<>`, `\n`, `\r`, NUL from all user-supplied chat text before storage or prompt interpolation — applied to both public chat history and obi-chat messages
 
 ## Adding a New Tool
 

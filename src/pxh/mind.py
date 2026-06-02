@@ -2752,7 +2752,12 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if len(_mood_history) > 20:
         _mood_history[:] = _mood_history[-20:]
 
-    append_thought(thought, persona=persona)
+    # message_obi thoughts contain private DM content — redact before writing to the log
+    # which feeds the public /api/v1/public/thoughts endpoint.
+    if thought.get("action") == "message_obi":
+        append_thought({**thought, "thought": "[private message to Obi]", "text": ""}, persona=persona)
+    else:
+        append_thought(thought, persona=persona)
 
     # Write mood state for px-alive servo coordination
     try:

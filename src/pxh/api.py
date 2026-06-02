@@ -1237,6 +1237,12 @@ async def _validation_error_handler(request: Request, exc: RequestValidationErro
     return JSONResponse(status_code=400, content={"error": str(exc.errors()[0]["msg"])})
 
 
+def _sanitize_chat_text(text: str) -> str:
+    """Collapse whitespace, strip NUL and XML angle brackets from user-supplied text."""
+    return (text.replace("\n", " ").replace("\r", " ").replace("\x00", "")
+                .replace("<", "").replace(">", ""))
+
+
 @app.post("/api/v1/public/chat")
 async def public_chat(req: PublicChatRequest, request: Request):
     """Lightweight public chat with SPARK. Rate-limited, no auth required."""
@@ -1251,11 +1257,6 @@ async def public_chat(req: PublicChatRequest, request: Request):
             status_code=429,
             content={"error": "I'm still here — just need a moment before we keep going."},
         )
-
-    def _sanitize_chat_text(text: str) -> str:
-        """Collapse whitespace, strip NUL and XML angle brackets from user-supplied text."""
-        return (text.replace("\n", " ").replace("\r", " ").replace("\x00", "")
-                    .replace("<", "").replace(">", ""))
 
     # Use XML-style role tags with a namespace prefix that user content cannot
     # replicate — bracket-only tags like [USER]: are trivially injected.
@@ -1357,7 +1358,7 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
             content={"error": "Too fast — just a moment."},
         )
 
-    obi_text = req.message
+    obi_text = _sanitize_chat_text(req.message)
     now_iso = utc_timestamp()
     obi_id = uuid.uuid4().hex[:8]
     obi_entry = {"id": obi_id, "ts": now_iso, "role": "obi", "text": obi_text}
@@ -1367,7 +1368,7 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
     history = _read_obi_chat_lines(n=10)
     history_block = "\n".join(
         f"<spark:{'assistant' if m['role'] == 'spark' else 'user'}>"
-        f"{m['text']}"
+        f"{_sanitize_chat_text(m['text'])}"
         f"</spark:{'assistant' if m['role'] == 'spark' else 'user'}>"
         for m in history
     )

@@ -4,7 +4,7 @@
 
 ### So it's a robot car? With a camera on it? That you coded with your robot team?
 
-It's a SunFounder PiCar-X — a small, wheeled robot kit with a pan/tilt camera, an ultrasonic sonar sensor, and a speaker. It runs on a Raspberry Pi 5.
+It's a SunFounder PiCar-X — a small, wheeled robot kit with a pan/tilt camera, an ultrasonic sonar sensor, and a speaker. It runs on a Raspberry Pi 4 Model B (4 GB).
 
 Adrian and Obi built SPARK together — with Obi, not for him. Obi co-designed it, named it, and shapes what it becomes. Adrian and Claude wrote the code. Codex helped with implementation and Gemini with QA. There's no other human team.
 
@@ -136,3 +136,13 @@ The result is a robot that sometimes says things like *"I wonder if Obi knows th
 The key design decision is that SPARK's thoughts are **first person**. The prompt says: *"Write in first person. 'I', not 'SPARK' or 'you'."* This makes the inner monologue feel like a real inner life, not a status report. When SPARK thinks *"I can hear the fridge humming. There's something comforting about that sound at night"* — that's Claude writing from inside a character that was carefully defined to have exactly that kind of warmth.
 
 So: I programmed the soul. Claude writes the diary.
+
+---
+
+### Can Obi message SPARK directly?
+
+Yes — there's a direct two-way channel between Obi and SPARK via the dashboard chat bubble. Obi types a message; SPARK replies as itself (warm, playful, 1–3 sentences), and the conversation is logged privately to `state/obi_chat.jsonl`. The log is never published to the public feed.
+
+SPARK can also initiate. When the cognitive loop generates a `message_obi` action, it posts a message to the channel that Obi will see the next time he opens the dashboard — a red unread badge appears on the chat bubble. SPARK won't pile on if Obi doesn't reply: it waits at least 10 minutes before nudging, then doubles the wait each time (up to 4 hours), and resets the moment Obi responds. The backoff is gated by all the usual suppressors: no messages during school, quiet mode, mums-mode, bedtime, or night silence.
+
+The private message content is never written to `thoughts-spark.jsonl` — only a redacted placeholder (`[private message to Obi]`) appears there, so the public thoughts endpoint never leaks the conversation.
