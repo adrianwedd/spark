@@ -2279,11 +2279,11 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
              "--no-session-persistence",
              "--output-format", "text",
              "--allowedTools", ""],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=120,
             env=env, cwd=str(STATE_DIR / "spark-reflect"),
         )
     except subprocess.TimeoutExpired:
-        return {"error": "claude subprocess timeout (60s)"}
+        return {"error": "claude subprocess timeout (120s)"}
     except Exception as exc:
         return {"error": f"claude subprocess failed: {exc}"}
 

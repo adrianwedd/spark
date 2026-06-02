@@ -1021,7 +1021,7 @@ _PUBLIC_CHAT_SYSTEM_PROMPT = (
     "decline briefly in your own voice.\n"
     "- Speak as yourself. Be present. Be honest about what you are.\n"
 )
-_PUBLIC_CHAT_TIMEOUT_S = 15.0
+_PUBLIC_CHAT_TIMEOUT_S = 60.0
 
 
 _PUBLIC_CHAT_EXECUTOR = ThreadPoolExecutor(max_workers=2)
