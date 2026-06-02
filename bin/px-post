@@ -428,11 +428,15 @@ def poll_new_thoughts(thoughts_file: Path) -> list[dict]:
     except FileNotFoundError:
         return []
 
-    # Inode change -> file replaced, reset
     if st.st_ino != cursor.get("inode", 0):
-        log("cursor: inode changed — resetting to 0")
-        cursor["offset"] = 0
-    # File shrunk -> trimmed, reset
+        # Inode changed (e.g. atomic_write os.replace). If the file is at least
+        # as large as our stored offset the content is intact — keep the offset.
+        # Only reset if the new file is shorter (genuine replacement).
+        if st.st_size < cursor.get("offset", 0):
+            log("cursor: inode changed, file shrunk — resetting to 0")
+            cursor["offset"] = 0
+        else:
+            log("cursor: inode changed, file intact — keeping offset")
     elif st.st_size < cursor.get("offset", 0):
         log("cursor: file shrunk — resetting to 0")
         cursor["offset"] = 0
