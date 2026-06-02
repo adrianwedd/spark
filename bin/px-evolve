@@ -164,15 +164,26 @@ def _whitelist_lines() -> tuple[str, str]:
 
 
 def _extract_json(text: str) -> dict | None:
-    """Extract the last {...} JSON object from Claude output text."""
-    import re as _re
-    matches = list(_re.finditer(r'\{[^{}]*\}', text, _re.DOTALL))
-    for m in reversed(matches):
+    """Extract the last valid JSON object from Claude output text.
+
+    Uses json.JSONDecoder.raw_decode so nested braces, braces inside
+    string values, and multiple objects are all handled correctly.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    results: list[dict] = []
+    while idx < len(text):
+        idx = text.find("{", idx)
+        if idx == -1:
+            break
         try:
-            return json.loads(m.group())
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                results.append(obj)
+            idx = end
         except json.JSONDecodeError:
-            continue
-    return None
+            idx += 1
+    return results[-1] if results else None
 
 
 def build_plan_prompt(intent: str, introspection: dict) -> str:
@@ -321,7 +332,6 @@ def _run_in_worktree(
         from pxh.claude_session import run_claude_session, SessionBudgetExhausted, file_in_whitelist
     except ImportError:
         log(f"[{entry_id}] claude_session not importable, using direct subprocess")
-        from pxh.claude_session import file_in_whitelist  # type: ignore[assignment]
         return _run_claude_direct(entry_id, intent, build_implement_prompt(intent, {}), workdir)
 
     # ── Phase 1: Plan (Opus, budget-checked, read-only) ──────────────────────
@@ -343,6 +353,10 @@ def _run_in_worktree(
         log(f"[{entry_id}] phase 1 timed out")
         return "failed:timeout"
 
+    if plan_result.returncode != 0:
+        log(f"[{entry_id}] phase 1 exit={plan_result.returncode}, stderr: {plan_result.stderr[:300]}")
+        return "failed:plan_error"
+
     plan = _extract_json(plan_result.stdout) or {}
     log(f"[{entry_id}] plan: {json.dumps(plan)[:300]}")
 
@@ -350,7 +364,7 @@ def _run_in_worktree(
     log(f"[{entry_id}] phase 2/4: implementing with {IMPLEMENT_MODEL}")
     impl_timeout = max(300, EVOLVE_TIMEOUT - 300)
     try:
-        run_claude_session(
+        impl_result = run_claude_session(
             session_type="evolve",
             prompt=build_implement_prompt(intent, plan),
             timeout=impl_timeout,
@@ -363,6 +377,10 @@ def _run_in_worktree(
     except subprocess.TimeoutExpired:
         log(f"[{entry_id}] phase 2 timed out after {impl_timeout}s")
         return "failed:timeout"
+
+    if impl_result.returncode != 0:
+        log(f"[{entry_id}] phase 2 exit={impl_result.returncode}, stderr: {impl_result.stderr[:300]}")
+        return "failed:impl_error"
 
     # ── Check phase 2 produced changes ───────────────────────────────────────
     status_result = subprocess.run(
