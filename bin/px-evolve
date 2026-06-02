@@ -46,6 +46,12 @@ STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
 EVOLVE_TIMEOUT = int(os.environ.get("PX_EVOLVE_TIMEOUT", "1800"))
 EVOLVE_MAX_FILES = int(os.environ.get("PX_EVOLVE_MAX_FILES", "3"))
+
+# Per-phase model overrides — defaults follow the plan/implement/test/qa pattern
+PLAN_MODEL      = os.environ.get("PX_EVOLVE_PLAN_MODEL",      "claude-opus-4-6")
+IMPLEMENT_MODEL = os.environ.get("PX_EVOLVE_IMPLEMENT_MODEL", "claude-sonnet-4-6")
+TEST_MODEL      = os.environ.get("PX_EVOLVE_TEST_MODEL",      "claude-haiku-4-5-20251001")
+QA_MODEL        = os.environ.get("PX_EVOLVE_QA_MODEL",        "claude-sonnet-4-6")
 POLL_INTERVAL = 60
 
 QUEUE_FILE = STATE_DIR / "evolve_queue.jsonl"
@@ -144,20 +150,34 @@ def append_evolve_log(record: dict) -> None:
 # Core: process a single pending entry
 # ---------------------------------------------------------------------------
 
-def build_prompt(intent: str, introspection: dict) -> str:
-    # Import whitelist/blacklist from session manager for single-source-of-truth
+def _whitelist_lines() -> tuple[str, str]:
+    """Return (wl_lines, bl_lines) strings for prompt injection."""
     try:
         from pxh.claude_session import WHITELIST_PATTERNS, BLACKLIST_FILES, BLACKLIST_PATTERNS
-        wl_lines = "\n".join(f"- {p}" for p in WHITELIST_PATTERNS)
-        bl_lines = "\n".join(f"- {f}" for f in sorted(BLACKLIST_FILES))
-        bl_lines += "\n" + "\n".join(f"- {p}*" for p in BLACKLIST_PATTERNS)
+        wl = "\n".join(f"- {p}" for p in WHITELIST_PATTERNS)
+        bl = "\n".join(f"- {f}" for f in sorted(BLACKLIST_FILES))
+        bl += "\n" + "\n".join(f"- {p}*" for p in BLACKLIST_PATTERNS)
     except ImportError:
-        wl_lines = "- src/pxh/spark_config.py\n- bin/tool-*\n- tests/"
-        bl_lines = "- src/pxh/api.py\n- bin/px-evolve\n- .env"
+        wl = "- src/pxh/spark_config.py\n- bin/tool-*\n- tests/"
+        bl = "- src/pxh/api.py\n- bin/px-evolve\n- .env"
+    return wl, bl
 
-    return f"""You are SPARK, a PiCar-X robot making a targeted code change.
 
-YOUR TASK: Modify src/pxh/spark_config.py (or another whitelisted file) to implement the intent below.
+def _extract_json(text: str) -> dict | None:
+    """Extract the last {...} JSON object from Claude output text."""
+    import re as _re
+    matches = list(_re.finditer(r'\{[^{}]*\}', text, _re.DOTALL))
+    for m in reversed(matches):
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def build_plan_prompt(intent: str, introspection: dict) -> str:
+    wl_lines, _ = _whitelist_lines()
+    return f"""You are SPARK, planning a targeted change to your own code.
 
 ## Intent
 {intent}
@@ -165,19 +185,36 @@ YOUR TASK: Modify src/pxh/spark_config.py (or another whitelisted file) to imple
 ## Current state
 {json.dumps(introspection, indent=2)}
 
-## MANDATORY WORKFLOW — follow these steps exactly:
+## MANDATORY WORKFLOW:
+Step 1: Read src/pxh/spark_config.py (and any other relevant whitelisted file) using the Read tool.
+Step 2: Output ONLY this JSON — no other text before or after it:
+{{"approach": "one sentence describing the implementation", "files": ["path/to/file"], "key_changes": ["change 1", "change 2"]}}
 
-Step 1: Run the Read tool on src/pxh/spark_config.py to see the current code.
-Step 2: Run the Edit tool to make your change. Use the exact old_string/new_string format.
-Step 3: Verify your edit by running Read again on the changed file.
-Step 4: Stop. Do NOT summarize, describe, or narrate what you did.
+## File whitelist (ONLY these may be modified later)
+{wl_lines}
+
+Do NOT make any edits. Your only job right now is to plan.
+"""
+
+
+def build_implement_prompt(intent: str, plan: dict) -> str:
+    wl_lines, bl_lines = _whitelist_lines()
+    return f"""You are SPARK implementing a planned code change.
+
+## Intent
+{intent}
+
+## Plan
+{json.dumps(plan, indent=2)}
+
+## MANDATORY WORKFLOW:
+Step 1: Read each file listed in the plan using the Read tool.
+Step 2: Implement every key change using Edit or Write tools.
+Step 3: Stop. Do NOT summarize or narrate what you did.
 
 ## CRITICAL RULES:
-- You MUST call the Edit or Write tool to modify files. Describing changes in text does NOTHING.
-- The ONLY way to make changes is by invoking Edit(file_path, old_string, new_string) or Write(file_path, content).
-- If you output text describing a change without calling Edit/Write, the evolution FAILS.
-- Do NOT use Bash. Do NOT run git commands. Do NOT create diffs or patches in text.
-- Do NOT explain or summarize after editing — just stop.
+- You MUST call Edit or Write to modify files — text descriptions do NOTHING.
+- Do NOT use Bash. Do NOT run git commands.
 - Max {EVOLVE_MAX_FILES} files changed.
 
 ## File whitelist (ONLY these may be modified)
@@ -186,9 +223,58 @@ Step 4: Stop. Do NOT summarize, describe, or narrate what you did.
 ## File blacklist (NEVER touch)
 {bl_lines}
 
-CRITICAL: You may ONLY edit files matching the whitelist above.
-If you edit ANY other file, the entire evolution will be REJECTED and your work will be lost.
-Maximum {EVOLVE_MAX_FILES} files changed. Exceeding this limit will also cause rejection.
+CRITICAL: Editing any file outside the whitelist will REJECT the entire evolution.
+"""
+
+
+def build_test_prompt(intent: str, diff: str, changed_files: list) -> str:
+    diff_excerpt = diff[:3000] + ("…[truncated]" if len(diff) > 3000 else "")
+    return f"""You are SPARK's test writer. A code change was just made — check if tests need updating.
+
+## Intent
+{intent}
+
+## Changed files
+{changed_files}
+
+## Diff
+{diff_excerpt}
+
+## MANDATORY WORKFLOW:
+Step 1: Read the changed files and their corresponding test files.
+Step 2: If any new function or behaviour clearly has no test coverage, add a minimal test.
+        Use existing patterns from tests/test_spark_config.py or tests/test_mind_utils.py.
+Step 3: If coverage is already adequate, make NO changes.
+Step 4: Stop. Do NOT summarize.
+
+Only write NEW tests — do not modify or delete existing ones.
+Only add tests in the tests/ directory.
+"""
+
+
+def build_qa_prompt(intent: str, diff: str) -> str:
+    diff_excerpt = diff[:5000] + ("…[truncated]" if len(diff) > 5000 else "")
+    return f"""You are SPARK's QA reviewer. Review this diff and decide if it should be merged.
+
+## Intent
+{intent}
+
+## Diff
+{diff_excerpt}
+
+## Check for:
+- Does the change implement the intent correctly?
+- Any obvious bugs, off-by-one errors, or broken invariants?
+- Style consistent with surrounding code?
+- Any safety concerns (never touch .env, systemd, api.py, px-evolve)?
+
+Output ONLY this JSON — no other text:
+{{"status": "approved", "reason": "brief reason"}}
+OR
+{{"status": "rejected", "reason": "specific problem"}}
+
+Be permissive — minor style issues are NOT grounds for rejection.
+Only reject if the change is wrong, dangerous, or clearly broken.
 """
 
 
@@ -226,45 +312,118 @@ def _run_in_worktree(
     entry_id: str, intent: str, introspection: dict,
     branch: str, workdir: str, *, dry: bool,
 ) -> str:
-    """Run Claude with real tool access, validate, test, and PR inside the worktree."""
-    prompt = build_prompt(intent, introspection)
-
-    log(f"[{entry_id}] running claude with Read/Write/Edit tools (timeout={EVOLVE_TIMEOUT}s, cwd={workdir})")
-
+    """4-phase evolution: plan (Opus) → implement (Sonnet) → test (Haiku) → QA (Sonnet)."""
     if dry:
         log(f"[{entry_id}] DRY RUN — skipping Claude execution")
         return "failed:no_changes"
 
-    # 2. Run Claude Opus with real tool access via session manager
     try:
         from pxh.claude_session import run_claude_session, SessionBudgetExhausted, file_in_whitelist
     except ImportError:
-        # Fallback: direct subprocess if session manager not available
         log(f"[{entry_id}] claude_session not importable, using direct subprocess")
-        return _run_claude_direct(entry_id, intent, prompt, workdir)
+        from pxh.claude_session import file_in_whitelist  # type: ignore[assignment]
+        return _run_claude_direct(entry_id, intent, build_implement_prompt(intent, {}), workdir)
 
+    # ── Phase 1: Plan (Opus, budget-checked, read-only) ──────────────────────
+    log(f"[{entry_id}] phase 1/4: planning with {PLAN_MODEL}")
     try:
-        result = run_claude_session(
+        plan_result = run_claude_session(
             session_type="evolve",
-            prompt=prompt,
-            timeout=EVOLVE_TIMEOUT,
-            allowed_tools="Read,Write,Edit,Glob,Grep",
+            prompt=build_plan_prompt(intent, introspection),
+            timeout=120,
+            allowed_tools="Read,Glob,Grep",
             skip_permissions=True,
             cwd=workdir,
+            model_override=PLAN_MODEL,
         )
-        log(f"[{entry_id}] claude exit={result.returncode} stdout={len(result.stdout)}B stderr={len(result.stderr)}B")
-        if result.stderr:
-            log(f"[{entry_id}] claude stderr (first 500): {result.stderr[:500]}")
-        if result.stdout:
-            log(f"[{entry_id}] claude stdout (first 500): {result.stdout[:500]}")
     except SessionBudgetExhausted as exc:
         log(f"[{entry_id}] budget exhausted: {exc}")
         return "failed:budget"
     except subprocess.TimeoutExpired:
-        log(f"[{entry_id}] claude timed out after {EVOLVE_TIMEOUT}s")
+        log(f"[{entry_id}] phase 1 timed out")
         return "failed:timeout"
 
-    # 3. Pre-commit validation: check for empty changes or merge conflicts
+    plan = _extract_json(plan_result.stdout) or {}
+    log(f"[{entry_id}] plan: {json.dumps(plan)[:300]}")
+
+    # ── Phase 2: Implement (Sonnet, no budget check) ──────────────────────────
+    log(f"[{entry_id}] phase 2/4: implementing with {IMPLEMENT_MODEL}")
+    impl_timeout = max(300, EVOLVE_TIMEOUT - 300)
+    try:
+        run_claude_session(
+            session_type="evolve",
+            prompt=build_implement_prompt(intent, plan),
+            timeout=impl_timeout,
+            allowed_tools="Read,Write,Edit,Glob,Grep",
+            skip_permissions=True,
+            cwd=workdir,
+            model_override=IMPLEMENT_MODEL,
+            skip_budget_check=True,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"[{entry_id}] phase 2 timed out after {impl_timeout}s")
+        return "failed:timeout"
+
+    # ── Check phase 2 produced changes ───────────────────────────────────────
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=workdir, capture_output=True, text=True, timeout=10,
+    )
+    if not status_result.stdout.strip():
+        log(f"[{entry_id}] implement phase made no changes — skipping")
+        return "failed:no_changes"
+
+    raw_diff = subprocess.run(
+        ["git", "diff"], cwd=workdir, capture_output=True, text=True, timeout=10,
+    ).stdout
+    changed_so_far = [
+        line[3:].strip()
+        for line in status_result.stdout.strip().splitlines()
+        if line.strip()
+    ]
+
+    # ── Phase 3: Test (Haiku) ─────────────────────────────────────────────────
+    log(f"[{entry_id}] phase 3/4: writing tests with {TEST_MODEL}")
+    try:
+        run_claude_session(
+            session_type="evolve",
+            prompt=build_test_prompt(intent, raw_diff, changed_so_far),
+            timeout=120,
+            allowed_tools="Read,Write,Edit,Glob,Grep",
+            skip_permissions=True,
+            cwd=workdir,
+            model_override=TEST_MODEL,
+            skip_budget_check=True,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"[{entry_id}] phase 3 timed out — continuing without new tests")
+
+    full_diff = subprocess.run(
+        ["git", "diff"], cwd=workdir, capture_output=True, text=True, timeout=10,
+    ).stdout
+
+    # ── Phase 4: QA (Sonnet, diff review) ────────────────────────────────────
+    log(f"[{entry_id}] phase 4/4: QA review with {QA_MODEL}")
+    try:
+        qa_result = run_claude_session(
+            session_type="evolve",
+            prompt=build_qa_prompt(intent, full_diff),
+            timeout=90,
+            allowed_tools="",
+            skip_permissions=True,
+            cwd=workdir,
+            model_override=QA_MODEL,
+            skip_budget_check=True,
+        )
+        qa = _extract_json(qa_result.stdout) or {}
+        if qa.get("status") == "rejected":
+            log(f"[{entry_id}] QA rejected: {qa.get('reason', '?')}")
+            return "failed:qa_rejected"
+        log(f"[{entry_id}] QA approved: {qa.get('reason', 'ok')}")
+    except subprocess.TimeoutExpired:
+        log(f"[{entry_id}] phase 4 timed out — proceeding without QA")
+
+    # ── Pre-commit validation ─────────────────────────────────────────────────
     status_result = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=workdir, capture_output=True, text=True, timeout=10,
@@ -272,7 +431,7 @@ def _run_in_worktree(
     status_out = status_result.stdout.strip()
 
     if not status_out:
-        log(f"[{entry_id}] Claude made no changes — marking skipped")
+        log(f"[{entry_id}] no changes after all phases — skipping")
         return "failed:no_changes"
 
     conflict_markers = {"UU ", "AA ", "DD "}

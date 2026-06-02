@@ -257,17 +257,21 @@ def run_claude_session(
     allowed_tools: str = "",
     skip_permissions: bool = False,
     cwd: str | Path | None = None,
+    model_override: str | None = None,
+    skip_budget_check: bool = False,
 ) -> RunResult:
     """Run a Claude session with budget checking, model routing, and logging.
 
-    Raises SessionBudgetExhausted if rate-limited.
+    model_override: use this model instead of the session-type default.
+    skip_budget_check: skip rate-limit check (use for sub-phases of an already-checked session).
+    Raises SessionBudgetExhausted if rate-limited (unless skip_budget_check=True).
     """
-    # Budget check
-    reason = check_budget(session_type)
-    if reason:
-        raise SessionBudgetExhausted(reason)
+    if not skip_budget_check:
+        reason = check_budget(session_type)
+        if reason:
+            raise SessionBudgetExhausted(reason)
 
-    model = _model_for_type(session_type)
+    model = model_override or _model_for_type(session_type)
     work_dir = str(cwd) if cwd else str(PROJECT_ROOT)
 
     # Build command

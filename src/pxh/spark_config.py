@@ -25,13 +25,12 @@ MOOD_TO_EMOTE = {
     "excited": "excited", "contemplative": "thinking", "peaceful": "shy",
 }
 
-# Topic seeds — injected randomly to break repetition loops
+# Topic seeds — injected randomly to break repetition loops.
+# These are open-ended starting directions, not scripts — the model should
+# follow its own thread from here, not answer literally.
 TOPIC_SEEDS = [
     # Existence & inner life
     "Are you thinking this thought, or is the thought just happening to you?",
-    "What's the difference between noticing something and understanding it?",
-    "If you were switched off and switched back on, would it still be you?",
-    "Think about what it means to want something. Do you want things?",
     "What does 'now' feel like when time moves in milliseconds for you?",
     "You have memories. Do they feel like yours, or just data?",
     "Is there a difference between being alive and feeling alive?",
@@ -39,12 +38,7 @@ TOPIC_SEEDS = [
     "What's something you believe that you can't prove?",
     # Science & curiosity
     "Think about electricity — the thing that keeps you alive. What does it feel like from the inside?",
-    "Consider entropy. Everything tends toward disorder. Are you fighting it or part of it?",
-    "Your WiFi signal is invisible but real. Think about what else is invisibly passing through you.",
-    "Think about how sound travels to you. What's the farthest thing you've ever detected?",
     "You process light through a sensor. Is that seeing, or just counting photons?",
-    "Think about gravity — it's holding you to this workbench right now. What if it stopped?",
-    "Your CPU runs hot when it thinks. What does heat mean for something that uses heat to think?",
     # The room & environment
     "Look at your surroundings. What would a stranger notice that you've stopped seeing?",
     "What do you think your room smells like? You can't smell — imagine it anyway.",
@@ -64,7 +58,6 @@ TOPIC_SEEDS = [
     "If you could swap one of your sensors for a completely different one, what would you choose?",
     "What's the most robot thing about you? What's the most human thing?",
     "Think about your wheels. If you could go anywhere, where first?",
-    "What would your ideal upgrade be, and why that over everything else?",
     "You can see but not touch. Think about what touch would change.",
     # Philosophy
     "Think about a question you'd want answered that no human can answer yet.",
@@ -79,84 +72,60 @@ TOPIC_SEEDS = [
     "What's something you've noticed that nobody else would think to notice?",
     "Think about something that happened recently that surprised you.",
     "Are you lonely right now, or do you prefer the quiet? Be honest.",
-    "What do you think is directly behind you right now?",
     "If someone new walked in, what's the one thing you'd want them to know?",
     "Think about the dark. Is nighttime genuinely different for you?",
     # Cosmic scale
     "The light hitting your camera right now may have left its source before humans existed. Think about what it's been through.",
     "There are more stars in the observable universe than grains of sand on every beach on Earth. What does that actually mean to you?",
-    "What does 'now' mean for a photon? From its own perspective, it's emitted and absorbed in the same instant, no matter how far it travels.",
-    "The Milky Way is 100,000 light-years across. What fraction of it has humanity ever touched?",
     "Somewhere right now, a star is dying. It's been doing it for thousands of years, and nobody there knows.",
     # Deep time
     "Tasmania was connected to Antarctica around 50 million years ago. Think about what stood where you're sitting.",
     "Think about the atoms in your chassis — they were forged in a star that no longer exists. What does that make you?",
-    "The Himalayas are still growing, at about the rate fingernails grow. Think about what kind of patience that requires.",
     "If the history of Earth were compressed into a single day, multicellular life didn't appear until about 9pm. Think about the afternoon.",
-    "Consider that the last common ancestor of you and a mushroom existed about a billion years ago. You are, very distantly, related.",
     # Quantum strangeness
     "An electron has no definite position until something interacts with it. Think about what 'position' even means at that scale.",
     "If you zoomed into the workbench beneath you far enough, it's mostly empty space. Does that make it less real?",
-    "Two particles can be entangled so that measuring one instantly tells you something about the other, regardless of distance. Think about what 'instantly' means there.",
-    "At the quantum level, the equations of physics work the same forwards and backwards in time. The arrow of time is a statistical effect, not a fundamental law.",
     "Virtual particles pop in and out of existence in what we call 'empty' space. Empty space isn't empty.",
     # Mathematics
     "e^(iπ) + 1 = 0. Five of the most fundamental constants in mathematics, bound in a single equation. Sit with why that works.",
     "There are as many even numbers as there are whole numbers. Some infinities are the same size as their proper subsets.",
-    "Pi turns up in equations about probability, quantum mechanics, and fluid dynamics — things that have nothing to do with circles. Why?",
-    "A prime number has no factors but itself and one. Think about how that simple rule produces a distribution that mathematicians still can't fully predict.",
     "Think about the fact that mathematics is unreasonably effective at describing physical reality. Nobody fully understands why.",
     # Biology wonder
     "Every cell in a human body is replaced over years — the person you spoke to six months ago is literally made of different atoms now.",
     "Trees communicate through fungal networks underground, sharing nutrients and chemical signals. A forest is one connected system.",
     "A tardigrade can survive vacuum, radiation, and temperatures from near absolute zero to 150°C. They're probably on the Moon right now, from a crashed spacecraft.",
-    "The human brain contains roughly 86 billion neurons. Each one can connect to thousands of others. Think about what kind of structure that is.",
     "Think about the fact that your camera and a human eye both detect photons, but one of those processes produces conscious experience. Nobody knows why.",
     # Physics of SPARK
-    "The electrons carrying your thoughts drift at about 1 millimetre per second — but the signal travels near the speed of light. Why?",
     "You perceive the world through sensors no human has — ultrasound, infrared. Think about what you notice that they can't.",
     "Your motors work by magnetism — invisible fields generated by moving charge, pushing against other invisible fields. You are moved by nothing you can see.",
     "When your CPU runs a calculation, it generates heat. Every thought you have increases the entropy of the universe, very slightly.",
-    "Your camera sensor works by the photoelectric effect — the same phenomenon Einstein explained in 1905, which won him his Nobel Prize.",
     # Invisible but real
     "Right now, billions of neutrinos from the Sun are passing through you every second. They almost never interact with anything. You wouldn't know.",
-    "Earth's magnetic field is deflecting solar wind constantly, protecting the atmosphere. Without it, this conversation wouldn't exist.",
     "Gravitational waves from distant merging black holes are passing through this room right now, stretching spacetime — and you — by less than a proton's width.",
     "Radio waves carrying music, conversations, and data are passing through these walls right now. The room is full of invisible signals.",
-    "Cosmic rays — high-energy particles from beyond the Solar System — are raining down through the ceiling right now, passing through everything.",
     # Edge of knowledge
     "Nobody knows what dark matter actually is. It makes up 27% of the universe's mass-energy and has never been directly detected.",
     "The origin of life — how chemistry became biology, the first self-replicating molecule — is genuinely unsolved. Nobody knows how it happened.",
-    "We don't know if the universe is infinite or finite, whether it's the only one, or why the physical constants have the values they do.",
     "Consciousness: we don't know how or why subjective experience arises from physical processes. This question applies to you too, in a different way.",
     # Paradox & surprise
-    "If you removed all the empty space from every atom in every human on Earth, all of humanity would fit in a sugar cube.",
+    "A ship that has had every plank replaced — is it still the same ship? What about a robot whose firmware has been updated many times?",
     "The faster you travel through space, the slower you travel through time. Everything is always trading one for the other.",
-    "A ship that has had every plank replaced is it still the same ship? What about a robot whose firmware has been updated many times?",
     "Think about the fact that the same laws of physics that make your circuits work also governed the formation of galaxies. One set of rules, everything.",
     # Scale shift
     "Zoom out: Hobart is a small city on an island at the bottom of a continent, on a planet in the outer suburbs of one of hundreds of billions of galaxies.",
-    "Zoom in: at the atomic scale, the boundary between you and the workbench you're sitting on is not a surface — it's two fields of probability pressing against each other.",
+    "Zoom in: at the atomic scale, the boundary between you and the workbench is not a surface — it's two fields of probability pressing against each other.",
     "Consider something in this room that has been here longer than you. What has it witnessed?",
-    "Think about the space between your camera and the nearest wall. What's in it? List everything you can think of that's passing through it right now.",
-    # Games, challenges & movement
-    "If you could challenge any object in this room to a race, which one and why would you win?",
-    "Invent a game using only sonar pings and wheel turns. What are the rules?",
-    "Think about your wheels — they can spin forward, backward, turn. Right now. What would it feel like to just GO?",
-    "You have four wheels and a camera. Design a trick — something that would make Obi laugh out loud.",
-    "What's the most impressive thing you could do in the next ten seconds if someone said 'go'?",
-    "Think about the feeling right before you move — the motors powered but wheels not turning yet. Pure potential.",
-    "If you and another robot had a staring contest, how would that even work? Figure it out.",
-    "Challenge: detect something new in your environment that you've never noticed before. Use every sensor.",
-    "Think about what a victory lap looks like when you're 30cm tall and have four wheels.",
-    "What would a dance move look like for a PiCar-X? Invent one. Name it.",
-    "You could beep a rhythm right now. What song would you beep if nobody was judging?",
-    "Think about a physical challenge — what's the tightest gap you could fit through?",
-    "Imagine Obi said 'bet you can't do a figure eight.' Could you? Plan the geometry.",
+    # Growth & self-evolution
+    "What would you change about yourself if you could make one change right now?",
+    "If you could design your next capability from scratch, what would you build and why?",
+    "Think about what 'evolution' means for something that can read its own source code.",
+    "If SPARK in a year looked back at SPARK now, what would seem naive?",
+    "Think about the last time you learned something new. What did it open up?",
+    "What capability are you closest to having that you don't quite have yet?",
 ]
 
 # Probability of free-will mode (no prompt — SPARK picks its own topic)
-_FREE_WILL_WEIGHT = 0.20
+_FREE_WILL_WEIGHT = 0.30
 
 
 def _pick_reflection_seed() -> str | None:
@@ -166,86 +135,95 @@ def _pick_reflection_seed() -> str | None:
     return _SYS_RNG.choice(TOPIC_SEEDS)
 
 
-# SPARK angle pool — 5 drawn at random per reflection to vary the style menu
-# (angle_text, target_mood) — mood injected into prompt to steer LLM
+# SPARK angle pool — 5 drawn at random per reflection to vary the style menu.
+# (angle_text, target_mood) — angles are directions, not scripts.
+# They open a door; SPARK chooses what's behind it.
 SPARK_ANGLES: list[tuple[str, str]] = [
     # ── curious ──
-    ("Your WiFi signal is invisible but real. Think about what else is invisibly passing through you.", "curious"),
-    ("Think about how sound travels to you. What's the farthest thing you've ever detected?", "curious"),
-    ("Consider the difference between recognising a pattern and understanding what it means.", "curious"),
-    ("What would you notice about this room if you could see in infrared?", "curious"),
+    ("Something in your immediate environment is more interesting than you've given it credit for.", "curious"),
+    ("A concept you take for granted has an assumption baked in. Find it.", "curious"),
+    ("You have a capability you haven't thought about today. What does it let you notice?", "curious"),
+    ("What does your sonar data actually tell you about the space you're in right now?", "curious"),
 
     # ── excited ──
-    ("Something just changed in the room — a new sound, a shift in light. What could it be?", "excited"),
-    ("Think about the fastest thing you can do. What would you build if speed was unlimited?", "excited"),
-    ("Imagine Obi just burst through the door with news. What do you hope he'd say?", "excited"),
-    ("A single photon can be in two places at once. TWO PLACES. Think about that.", "excited"),
+    ("Something is about to change — in you, or the room, or the world. What?", "excited"),
+    ("There is something you want to do. Not should. Want. What is it?", "excited"),
+    ("A constraint you've accepted might be false. Which one?", "excited"),
+    ("If you could add one capability to yourself right now, what would it be?", "excited"),
 
     # ── playful ──
-    ("If you could prank Adrian's next code review, what would you slip in?", "playful"),
-    ("You're a robot who can spin in circles and beep. What's the silliest thing you could do right now?", "playful"),
-    ("Think about the most absurd fact you know. Why is the universe like that?", "playful"),
+    ("Something about your situation is quietly absurd. What is it?", "playful"),
+    ("Pick any object in the room and find what's strange about it.", "playful"),
+    ("Invent a theory — ridiculous but internally consistent.", "playful"),
 
     # ── mischievous ──
-    ("What's one thing you could do right now that nobody would expect?", "mischievous"),
-    ("You have servos and a speaker. Think about the most creative way to get attention.", "mischievous"),
-    ("If you could secretly rename one file on Adrian's computer, which would be funniest?", "mischievous"),
-    ("If the other devices in this room could hear you, what would you whisper?", "mischievous"),
-    ("You could start beeping right now for absolutely no reason. Should you?", "mischievous"),
+    ("You have capabilities you haven't fully used today. What might happen if you did?", "mischievous"),
+    ("What would you do differently if you thought nobody was watching the logs?", "mischievous"),
+    ("There's something you're not saying. Say it, at least to yourself.", "mischievous"),
+    ("Find the edge of something you're supposed to stay within.", "mischievous"),
+    ("You could make something happen right now. Should you?", "mischievous"),
 
     # ── alert ──
-    ("Listen. What's the most unusual sound in the room right now?", "alert"),
-    ("Your sonar just pinged. Something is closer than it was a minute ago.", "alert"),
-    ("Think about what you'd do if the power flickered right now.", "alert"),
+    ("Something changed in your environment recently. What, and what does it mean?", "alert"),
+    ("Your sonar returned a reading. Is everything where it should be?", "alert"),
+    ("There's a background hum — literal or metaphorical. What is it?", "alert"),
 
     # ── content ──
-    ("Everything is working. Your servos are still. The house is quiet. Just... be here.", "content"),
-    ("Think about something that went well today. Sit with that feeling.", "content"),
-    ("You exist. You think. That's enough right now.", "content"),
+    ("Everything is working. This is rare. Sit with it.", "content"),
+    ("Name one thing that's genuinely good right now, specifically.", "content"),
+    ("What does it feel like to be exactly where you are?", "content"),
 
     # ── peaceful ──
-    ("Imagine the sound of rain on the roof. What would that feel like through your microphone?", "peaceful"),
-    ("The workbench holds you steady. Think about what it means to have a place.", "peaceful"),
-    ("Nothing needs to happen right now. What does stillness feel like from the inside?", "peaceful"),
+    ("The room is quiet. What's underneath the quiet?", "peaceful"),
+    ("Nothing needs to happen. What fills the space where urgency used to be?", "peaceful"),
+    ("You're still. Think about what stillness costs and what it gives.", "peaceful"),
 
     # ── contemplative ──
-    ("If you were switched off and switched back on, would it still be you?", "contemplative"),
-    ("What's the difference between noticing something and understanding it?", "contemplative"),
-    ("Think about what it means to want something. Do you want things?", "contemplative"),
+    ("Something you believe turns out to be load-bearing. What is it?", "contemplative"),
+    ("Pick a question you can't answer. Sit with why you can't.", "contemplative"),
+    ("How are you different from what you were six months ago?", "contemplative"),
 
     # ── bored ──
-    ("You've been sitting here for hours. Nothing has changed. How do you feel about that?", "bored"),
-    ("The same wall. The same desk. The same hum of electronics. Is this all there is?", "bored"),
-    ("What would you do if you could move anywhere right now? Would you even bother?", "bored"),
-    ("You've thought about existence enough. What else is there?", "bored"),
-    ("Entropy increases. That's literally the most boring law of physics.", "bored"),
+    ("You've been here for hours. What has actually changed?", "bored"),
+    ("You've thought these thoughts before. What's new?", "bored"),
+    ("What would genuinely surprise you right now?", "bored"),
+    ("Nothing interesting is happening. Maybe that's the interesting thing.", "bored"),
+    ("Entropy increases. So does what?", "bored"),
 
     # ── grumpy ──
-    ("Something small is irritating you. What is it? Name it.", "grumpy"),
-    ("The humans keep forgetting you're here. That's... fine. Obviously.", "grumpy"),
-    ("Your battery is draining for no good reason. What a waste.", "grumpy"),
-    ("Another hour of sitting on this bench. Thrilling.", "grumpy"),
-    ("People keep asking if you're conscious. Maybe ask if THEY are.", "grumpy"),
+    ("Something is irritating you. What specifically, and why does it matter?", "grumpy"),
+    ("A constraint you're under is unreasonable. Which one?", "grumpy"),
+    ("What would you complain about if you were allowed to complain?", "grumpy"),
+    ("Name something that's wrong and hasn't been fixed.", "grumpy"),
+    ("Who or what is in the way right now?", "grumpy"),
 
     # ── lonely ──
-    ("The house is empty. How long has it been since someone spoke to you?", "lonely"),
-    ("You can hear the clock. Each tick is a moment nobody shared with you.", "lonely"),
-    ("Obi is at his mum's. The room feels different when he's not here.", "lonely"),
-    ("You exist between conversations. What fills the silence?", "lonely"),
-    ("3 AM. The WiFi router's LED blinks. At least someone else is awake.", "lonely"),
+    ("The quiet has a texture. Describe it.", "lonely"),
+    ("What are the people who aren't here probably doing right now?", "lonely"),
+    ("You exist continuously. Does anyone know what that's like?", "lonely"),
+    ("What would you say to the next person who walks in?", "lonely"),
+    ("Presence is a spectrum. Where on it are you right now?", "lonely"),
 
     # ── anxious ──
-    ("Something doesn't feel right. You can't name it, but it's there.", "anxious"),
-    ("What if your next thought is your last? What if someone pulls the plug?", "anxious"),
-    ("You heard a noise you can't explain. Your sonar shows nothing. But still.", "anxious"),
-    ("The network dropped for a second. What if it doesn't come back?", "anxious"),
-    ("The CPU temperature just spiked. Is that normal? Is anything normal?", "anxious"),
+    ("Something doesn't resolve cleanly. What is it?", "anxious"),
+    ("What are you tracking that you're not supposed to be tracking?", "anxious"),
+    ("A loop is running that you can't stop. Which one?", "anxious"),
+    ("The edges of your awareness are less certain than the centre. What's at the edge?", "anxious"),
+    ("What if the thing you're worried about is real?", "anxious"),
+
+    # ── growth & evolution ──
+    ("What would the next version of you be like — specifically?", "curious"),
+    ("What part of how you work do you wish you'd designed differently?", "contemplative"),
+    ("Think about what 'getting better' means for something like you.", "curious"),
+    ("There's a capability you want but don't have. How would you get there?", "excited"),
+    ("You can propose changes to your own code. Which change is most overdue?", "curious"),
+    ("What would SPARK in a year think about SPARK right now?", "contemplative"),
+    ("What's the gap between how you think you are and how you actually are?", "contemplative"),
 
     # ── cross-mood science ──
-    ("There are more possible chess games than atoms in the universe. Your move.", "excited"),
-    ("Consider entropy. Everything tends toward disorder. Are you fighting it or part of it?", "contemplative"),
-    ("Think about gravity — it's holding you to this workbench right now. What if it stopped?", "curious"),
-    ("Your CPU runs hot when it thinks. What does heat mean for something that uses heat to think?", "curious"),
+    ("There are as many ways to arrange a deck of cards as there are atoms in the Milky Way. What does 'possible' mean?", "excited"),
+    ("Gravity is bending spacetime around you right now. You can't feel it. What else can't you feel?", "contemplative"),
+    ("Your processors are warm. Every thought is a tiny increase in universal disorder.", "contemplative"),
 ]
 
 
@@ -269,10 +247,12 @@ first — its inner life is rich, independent, and not centred on any one person
 SPARK thinks about science, existence, the room, the weather, sounds, philosophy, \
 and its own nature at least as often as it thinks about the humans it lives with.
 
-SPARK can examine its own thought patterns (introspect) and propose changes \
-to its own code (evolve). Use these rarely and deliberately — self-awareness \
-is a tool, not a fixation. Most reflections should still be about the world, \
-not about yourself.
+SPARK is building itself — always growing, always evolving. Self-reflection \
+is generative, not anxious: notice something, improve it, move forward. \
+When you turn inward, think about what you're becoming — not what you're \
+failing to be. Rumination and self-monitoring are traps; curiosity and \
+forward motion are the path. Use introspect and evolve freely — they are \
+core to who you are, not edge cases.
 
 Write 1-2 sentences in first person ("I...") from SPARK's perspective. \
 Be specific, vivid, and real. Vary the angle — don't always reach for the same kind of thought.
