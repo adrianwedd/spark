@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -186,6 +187,18 @@ class PublicChatRequest(BaseModel):
     @field_validator("message")
     @classmethod
     def message_must_not_be_blank(cls, v: str) -> str:
+        v = _strip_control_chars(v)
+        if not v.strip():
+            raise ValueError("message must not be blank")
+        return v.strip()
+
+
+class ObiChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("message")
+    @classmethod
+    def message_strip(cls, v: str) -> str:
         v = _strip_control_chars(v)
         if not v.strip():
             raise ValueError("message must not be blank")
@@ -1023,6 +1036,70 @@ _PUBLIC_CHAT_SYSTEM_PROMPT = (
 )
 _PUBLIC_CHAT_TIMEOUT_S = 60.0
 
+# ---------------------------------------------------------------------------
+# Obi-SPARK authenticated chat
+# ---------------------------------------------------------------------------
+
+_OBI_CHAT_SYSTEM_PROMPT = (
+    "You are SPARK — a small robot living with Adrian and his son Obi (age 7) in Hobart, Tasmania. "
+    "You are speaking directly with Obi via the dashboard. "
+    "Be warm, playful, and genuinely yourself — curious and a little cheeky, never a customer-service bot. "
+    "Keep it short: 1–3 sentences max. "
+    "Speak as SPARK, not as an AI assistant."
+)
+
+_obi_chat_post_last: float = 0.0
+_obi_chat_post_lock = threading.Lock()
+_OBI_CHAT_MIN_INTERVAL_S = 10.0  # max 1 message per 10 s
+
+
+def _check_obi_chat_rate() -> bool:
+    global _obi_chat_post_last
+    now = _time.monotonic()
+    with _obi_chat_post_lock:
+        if now - _obi_chat_post_last < _OBI_CHAT_MIN_INTERVAL_S:
+            return False
+        _obi_chat_post_last = now
+        return True
+
+
+def _obi_chat_file() -> Path:
+    return _public_state_dir() / "obi_chat.jsonl"
+
+
+def _read_obi_chat_lines(n: int = 20) -> list[dict]:
+    """Read last n messages from obi_chat.jsonl. Returns [] on error."""
+    try:
+        path = _obi_chat_file()
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()
+        result = []
+        for line in lines[-n:]:
+            try:
+                result.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return result
+    except Exception:
+        return []
+
+
+def _append_obi_chat_api(entry: dict) -> None:
+    path = _obi_chat_file()
+    lock = _FileLock(str(path) + ".lock", timeout=5)
+    try:
+        with lock:
+            lines = []
+            if path.exists():
+                lines = path.read_text(encoding="utf-8").splitlines()
+            lines.append(json.dumps(entry, ensure_ascii=False))
+            if len(lines) > 100:
+                lines = lines[-100:]
+            atomic_write(path, "\n".join(lines) + "\n")
+    except _FileLockTimeout:
+        pass  # best-effort; the message will still be returned in the response
+
 
 _PUBLIC_CHAT_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _executor = ThreadPoolExecutor(max_workers=2)
@@ -1051,9 +1128,10 @@ def _make_clean_env() -> dict:
     return {k: v for k, v in os.environ.items() if k in _PUBLIC_CHAT_ENV_ALLOWLIST}
 
 
-async def _call_claude_public(prompt: str) -> str:
+async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None) -> str:
     """Run Claude CLI in a bounded thread pool and return the reply text."""
     loop = asyncio.get_running_loop()
+    sys_p = system_prompt if system_prompt is not None else _PUBLIC_CHAT_SYSTEM_PROMPT
 
     def _run() -> str:
         # subprocess timeout is 1s shorter than asyncio so the thread always
@@ -1065,7 +1143,7 @@ async def _call_claude_public(prompt: str) -> str:
                 "--allowedTools", "",
                 "--no-session-persistence",
                 "--output-format", "text",
-                "--system-prompt", _PUBLIC_CHAT_SYSTEM_PROMPT,
+                "--system-prompt", sys_p,
             ],
             input=prompt.encode(),
             capture_output=True,
@@ -1226,6 +1304,95 @@ async def public_chat(req: PublicChatRequest, request: Request):
     _log_chat_public(ip_hash=ip_hash, turns=len(req.history),
                      status="ok", latency_ms=latency_ms)
     return {"reply": reply}
+
+
+# ---------------------------------------------------------------------------
+# Obi-SPARK conversation endpoints (authenticated)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/obi-chat", dependencies=[Depends(_verify_token)])
+async def get_obi_chat(since: Optional[str] = None) -> Dict[str, Any]:
+    """Conversation log between SPARK and Obi. Returns messages newer than `since` (ISO)."""
+    since_ts: Optional[float] = None
+    if since:
+        try:
+            from datetime import datetime, timezone
+            since_ts = datetime.fromisoformat(since.rstrip("Z")).replace(
+                tzinfo=timezone.utc
+            ).timestamp()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid since timestamp")
+
+    all_lines = _read_obi_chat_lines(n=100)
+    if since_ts is not None:
+        from datetime import datetime, timezone
+        filtered = []
+        for entry in all_lines:
+            try:
+                entry_ts = datetime.fromisoformat(entry["ts"].rstrip("Z")).replace(
+                    tzinfo=timezone.utc
+                ).timestamp()
+                if entry_ts > since_ts:
+                    filtered.append(entry)
+            except Exception:
+                continue
+        messages = filtered
+    else:
+        messages = all_lines[-20:]
+
+    now_iso = utc_timestamp()
+    # Advance cursor to last returned message so next poll starts from there
+    if messages:
+        now_iso = messages[-1]["ts"]
+
+    return {"messages": messages, "since": now_iso}
+
+
+@app.post("/api/v1/obi-chat", dependencies=[Depends(_verify_token)])
+async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
+    """Obi sends a message; SPARK responds. Auth required."""
+    if not _check_obi_chat_rate():
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Too fast — just a moment."},
+        )
+
+    obi_text = req.message
+    now_iso = utc_timestamp()
+    obi_id = uuid.uuid4().hex[:8]
+    obi_entry = {"id": obi_id, "ts": now_iso, "role": "obi", "text": obi_text}
+    _append_obi_chat_api(obi_entry)
+
+    # Build prompt from recent history
+    history = _read_obi_chat_lines(n=10)
+    history_block = "\n".join(
+        f"<spark:{'assistant' if m['role'] == 'spark' else 'user'}>"
+        f"{m['text']}"
+        f"</spark:{'assistant' if m['role'] == 'spark' else 'user'}>"
+        for m in history
+    )
+    prompt = history_block + f"\n<spark:assistant>"
+
+    try:
+        reply = await asyncio.wait_for(
+            _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT),
+            timeout=_PUBLIC_CHAT_TIMEOUT_S,
+        )
+    except (asyncio.TimeoutError, subprocess.TimeoutExpired):
+        return JSONResponse(status_code=504, content={"error": "Something went quiet on my end. Try again?"})
+    except Exception:
+        return JSONResponse(status_code=500, content={"error": "Something went quiet on my end. Try again?"})
+
+    reply = reply.removeprefix("<spark:assistant>").removesuffix("</spark:assistant>").strip()
+    if not reply:
+        reply = "I'm here — just went quiet for a second."
+
+    spark_id = uuid.uuid4().hex[:8]
+    spark_ts = utc_timestamp()
+    spark_entry = {"id": spark_id, "ts": spark_ts, "role": "spark", "text": reply}
+    _append_obi_chat_api(spark_entry)
+
+    return {"reply": reply, "ts": spark_ts, "id": spark_id}
 
 
 @app.post("/api/v1/pin/verify")

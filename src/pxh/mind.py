@@ -38,6 +38,7 @@ from pxh.spark_config import (
     MOOD_TO_SOUND, MOOD_TO_EMOTE,
     SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
     SALIENCE_THRESHOLD, WEATHER_INTERVAL_S,
+    OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
 )
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
@@ -417,13 +418,14 @@ VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_
                  "play_sound", "photograph", "emote", "look_around",
                  "time_check", "calendar_check", "morning_fact",
                  "introspect", "evolve",
-                 "research", "compose", "self_debug", "blog_essay"}
+                 "research", "compose", "self_debug", "blog_essay",
+                 "message_obi"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
-                        "research", "compose", "blog_essay"}
+                        "research", "compose", "blog_essay", "message_obi"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -2796,6 +2798,63 @@ def _run_voice(env: dict, *, timeout: int = 30, label: str = "") -> subprocess.C
     return result
 
 
+_OBI_CHAT_FILE = STATE_DIR / "obi_chat.jsonl"
+_OBI_CHAT_META = STATE_DIR / "obi_chat_meta.json"
+
+
+def _read_obi_chat_timestamps() -> tuple[float, float]:
+    """Return (last_spark_epoch, last_obi_epoch) from log. 0.0 if missing."""
+    try:
+        if not _OBI_CHAT_FILE.exists():
+            return 0.0, 0.0
+        last_spark = 0.0
+        last_obi = 0.0
+        for line in _OBI_CHAT_FILE.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+                ts = dt.datetime.fromisoformat(
+                    entry["ts"].rstrip("Z")
+                ).replace(tzinfo=dt.timezone.utc).timestamp()
+                if entry.get("role") == "spark":
+                    last_spark = ts
+                elif entry.get("role") == "obi":
+                    last_obi = ts
+            except Exception:
+                continue
+        return last_spark, last_obi
+    except Exception:
+        return 0.0, 0.0
+
+
+def _append_obi_chat(entry: dict) -> None:
+    lock = FileLock(str(_OBI_CHAT_FILE) + ".lock", timeout=5)
+    try:
+        with lock:
+            lines = []
+            if _OBI_CHAT_FILE.exists():
+                lines = _OBI_CHAT_FILE.read_text(encoding="utf-8").splitlines()
+            lines.append(json.dumps(entry, ensure_ascii=False))
+            if len(lines) > OBI_CHAT_MAX_LOG_LINES:
+                lines = lines[-OBI_CHAT_MAX_LOG_LINES:]
+            atomic_write(_OBI_CHAT_FILE, "\n".join(lines) + "\n")
+    except FileLockTimeout:
+        log("obi_chat: lock timeout on append")
+
+
+def _read_obi_chat_meta() -> dict:
+    try:
+        return json.loads(_OBI_CHAT_META.read_text(encoding="utf-8"))
+    except Exception:
+        return {"backoff_s": OBI_CHAT_BASE_BACKOFF_S}
+
+
+def _write_obi_chat_meta(meta: dict) -> None:
+    try:
+        atomic_write(_OBI_CHAT_META, json.dumps(meta, indent=2))
+    except Exception as exc:
+        log(f"obi_chat: failed to write meta: {exc}")
+
+
 def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     """Layer 3: act on a thought."""
     global _last_spoken_text, _last_morning_fact_date
@@ -3202,6 +3261,38 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 log("expression: self_debug skipped — claude_session not available")
             except Exception as exc:
                 log(f"expression: self_debug error: {exc}")
+
+        elif action == "message_obi":
+            if not text:
+                log("expression: message_obi has no text — skipping")
+            else:
+                now_ts = time.time()
+                last_spark_ts, last_obi_ts = _read_obi_chat_timestamps()
+                meta = _read_obi_chat_meta()
+                backoff_s = float(meta.get("backoff_s", OBI_CHAT_BASE_BACKOFF_S))
+
+                # Obi replied since last SPARK message → reset backoff
+                if last_obi_ts > last_spark_ts > 0:
+                    backoff_s = OBI_CHAT_BASE_BACKOFF_S
+
+                awaiting = last_spark_ts > last_obi_ts and last_spark_ts > 0
+                if awaiting:
+                    elapsed = now_ts - last_spark_ts
+                    if elapsed < backoff_s:
+                        log(f"expression: suppressed message_obi — awaiting reply "
+                            f"(backoff {backoff_s:.0f}s, elapsed {elapsed:.0f}s)")
+                        return
+                    # Nudge: backoff expired, double for next time
+                    backoff_s = min(backoff_s * 2, OBI_CHAT_MAX_BACKOFF_S)
+                    log(f"expression: message_obi nudge — backoff doubled to {backoff_s:.0f}s")
+                else:
+                    backoff_s = OBI_CHAT_BASE_BACKOFF_S
+
+                msg_id = format(int(now_ts * 1000) % 0xFFFFFFFF, "08x")
+                entry = {"id": msg_id, "ts": utc_timestamp(), "role": "spark", "text": text[:500]}
+                _append_obi_chat(entry)
+                _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
+                log(f"expression: message_obi written (id={msg_id})")
 
         else:
             log(f"expression: unhandled action: {action}")

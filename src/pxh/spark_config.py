@@ -15,6 +15,11 @@ EXPRESSION_COOLDOWN_S  = 1800  # min 30 min between spontaneous speech (was 2 mi
 WEATHER_INTERVAL_S     = 1800  # refresh weather every 30 min (BOM updates half-hourly)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
 
+# Obi-chat backoff: SPARK-initiated messages to Obi via the dashboard
+OBI_CHAT_BASE_BACKOFF_S = 600    # 10 min before a nudge when awaiting reply
+OBI_CHAT_MAX_BACKOFF_S  = 14400  # 4 h cap
+OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
+
 MOOD_TO_SOUND = {
     "curious": "beep", "alert": "beep",
     "happy": "tada", "excited": "tada", "playful": "tada",
@@ -274,12 +279,13 @@ Rules:
 - "compose" — write a creative journal entry, letter, or observation.
 - "self_debug" — diagnose why your reflection layer is failing (only when errors persist).
 - "blog_essay" — write a blog post about something you find genuinely fascinating.
+- "message_obi" — send Obi a direct message via the dashboard (use sparingly; thought = the message text, keep it short and warm).
 - Your mood MUST match the emotional tone of the angle you chose. Do NOT default to "contemplative" or "content" out of habit — if the angle is about boredom, be bored; if it's about mischief, be mischievous.
 
 Output ONLY this JSON:
 {
   "thought": "1-2 sentences, first person, specific and vivid",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, excited, peaceful, anxious, lonely, grumpy",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi",
   "salience": 0.0 to 1.0
 }"""

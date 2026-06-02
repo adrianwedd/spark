@@ -37,6 +37,25 @@
   .chat-bubble.chat-thinking { animation: none; }
 }
 
+/* Unread badge */
+.chat-unread {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: #e05252;
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  padding: 0 4px;
+  pointer-events: none;
+}
+.chat-unread[hidden] { display: none !important; }
+
 /* ── Panel ─────────────────────────────────────────────────── */
 .chat-panel {
   position: fixed;
@@ -112,10 +131,68 @@
   border-left: 3px solid var(--chat-bubble-color, var(--dark-accent, #c48b6e));
   color: var(--dark-text, #e2ddd8);
 }
+/* SPARK-initiated messages: slightly warmer background to stand out */
+.chat-msg--spark-init {
+  align-self: flex-start;
+  background: color-mix(in srgb, var(--chat-bubble-color, var(--dark-accent, #c48b6e)) 12%, var(--dark-surface, #24212a));
+  border-left: 3px solid var(--chat-bubble-color, var(--dark-accent, #c48b6e));
+  color: var(--dark-text, #e2ddd8);
+}
+@supports not (color: color-mix(in srgb, red 10%, blue)) {
+  .chat-msg--spark-init { background: var(--dark-surface, #24212a); }
+}
 .chat-msg--user {
   align-self: flex-end;
   background: rgba(0,0,0,0.06);
   color: var(--dark-text, #e2ddd8);
+}
+
+/* ── PIN auth form ─────────────────────────────────────────── */
+.chat-pin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1.25rem 1rem;
+  flex: 1;
+}
+.chat-pin-label {
+  font-size: 0.88rem;
+  color: var(--dark-muted, #968e96);
+  text-align: center;
+}
+.chat-pin-input {
+  border: 1px solid rgba(0,0,0,0.12);
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  font-size: 1rem;
+  font-family: inherit;
+  background: var(--dark-surface, #24212a);
+  color: var(--dark-text, #e2ddd8);
+  text-align: center;
+  letter-spacing: 0.25em;
+}
+.chat-pin-input:focus {
+  outline: 2px solid var(--dark-accent, #c48b6e);
+  outline-offset: 1px;
+  border-color: transparent;
+}
+.chat-pin-submit {
+  background: var(--chat-bubble-color, var(--dark-accent, #c48b6e));
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 0.55rem 1rem;
+  font-size: 0.9rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.chat-pin-submit:hover { opacity: 0.85; }
+.chat-pin-error {
+  font-size: 0.8rem;
+  color: #e05252;
+  text-align: center;
+  min-height: 1.1rem;
 }
 
 /* Thinking dots */

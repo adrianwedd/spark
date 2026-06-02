@@ -616,7 +616,7 @@ def test_can_explore_corrupt_meta_fails_safe(explore_state):
 
 
 def test_valid_actions_includes_new_actions():
-    """All 22 actions must be present in VALID_ACTIONS."""
+    """All known actions must be present in VALID_ACTIONS."""
     expected = {
         "wait", "greet", "greet_arrival", "comment", "remember", "look_at",
         "weather_comment", "scan", "explore",
@@ -624,6 +624,7 @@ def test_valid_actions_includes_new_actions():
         "time_check", "calendar_check", "morning_fact",
         "introspect", "evolve",
         "research", "compose", "self_debug", "blog_essay",
+        "message_obi",
     }
     assert VALID_ACTIONS == expected
 
