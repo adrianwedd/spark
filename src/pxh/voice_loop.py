@@ -197,7 +197,7 @@ def watchdog_thread_func(heartbeat_lock: threading.Lock, heartbeat_val: list, ti
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Codex-driven PiCar-X voice assistant loop")
+    parser = argparse.ArgumentParser(description="PiCar-X voice assistant loop")
     parser.add_argument(
         "--prompt",
         default=str(PROJECT_ROOT / "docs/prompts/codex-voice-system.md"),

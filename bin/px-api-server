@@ -29,6 +29,17 @@ PORT="${PX_API_PORT:-8420}"
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --help | -h)
+            echo "Usage: px-api-server [--dry-run] [--port PORT] [--host HOST]"
+            echo ""
+            echo "Launch the PiCar-X REST API (uvicorn, port 8420 by default)."
+            echo ""
+            echo "Options:"
+            echo "  --dry-run       Force PX_DRY=1 (skips motion and audio)"
+            echo "  --port PORT     Override port (default: \$PX_API_PORT or 8420)"
+            echo "  --host HOST     Override bind host (default: \$PX_API_HOST or 0.0.0.0)"
+            exit 0
+            ;;
         --dry-run)  export PX_DRY=1;  shift ;;
         --port)     PORT="$2";        shift 2 ;;
         --host)     HOST="$2";        shift 2 ;;

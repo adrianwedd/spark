@@ -1001,10 +1001,10 @@ def run_backfill(dry: bool) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="SPARK social posting daemon")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--backfill", action="store_true")
-    parser.add_argument("--poll-interval", type=int, default=60)
-    parser.add_argument("--flush-interval", type=int, default=300)
+    parser.add_argument("--dry-run", action="store_true", help="Skip Bluesky posting and feed writes")
+    parser.add_argument("--backfill", action="store_true", help="Post all unposted thoughts from history and exit")
+    parser.add_argument("--poll-interval", type=int, default=60, help="Seconds between thoughts-file polls (default: 60)")
+    parser.add_argument("--flush-interval", type=int, default=300, help="Seconds between feed flushes to disk (default: 300)")
     args = parser.parse_args(argv)
 
     dry = args.dry_run or os.environ.get("PX_POST_DRY", "0") != "0"

@@ -901,10 +901,10 @@ def run_backfill(*, dry: bool = False) -> int:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="SPARK blog daemon")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Skip Claude calls and blog writes")
     parser.add_argument("--once", action="store_true", help="Run once and exit")
     parser.add_argument("--backfill", action="store_true", help="Generate all missing posts from history")
-    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL)
+    parser.add_argument("--poll-interval", type=int, default=POLL_INTERVAL, help=f"Seconds between schedule checks (default: {POLL_INTERVAL})")
     args = parser.parse_args(argv)
 
     dry = args.dry_run or os.environ.get("PX_BLOG_DRY", "0") != "0"

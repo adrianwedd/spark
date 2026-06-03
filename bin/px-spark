@@ -14,6 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+# Short-circuit --help/-h before persona activation or greeting
+for arg in "$@"; do
+    if [[ "$arg" == "--help" || "$arg" == "-h" ]]; then
+        exec "$SCRIPT_DIR/codex-voice-loop" --help
+    fi
+done
+
 # Activate SPARK persona in session state
 python3 - <<'PY'
 import os, sys
