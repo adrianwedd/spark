@@ -67,6 +67,19 @@ def test_default_state_contains_tracking_fields(tmp_path, monkeypatch):
     assert all(key in loaded for key in expected_keys)
 
 
+def test_default_state_includes_robot_name(tmp_path, monkeypatch):
+    """robot_name is consumed by mcp_server status; it must be initialised
+    in both default_state() and the on-disk template (ensure_session prefers
+    the template) so it is never the empty string in a real session."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    assert state.default_state()["robot_name"] == "Spark"
+    # ensure_session writes from the repo template — robot_name must round-trip
+    state.ensure_session()
+    loaded = json.loads(session_file.read_text())
+    assert loaded["robot_name"] == "Spark"
+
+
 # -- tail_lines (issue #140) --
 
 def test_tail_lines_returns_last_n(tmp_path):

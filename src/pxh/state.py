@@ -169,6 +169,8 @@ def default_state() -> Dict[str, Any]:
         "persona": None,
         "listening": False,
         "listening_since": None,
+        # Robot's name — Obi calls it Spark (consumed by mcp_server status)
+        "robot_name": "Spark",
         # SPARK child-companion fields
         "obi_routine": None,
         "obi_step": 0,
