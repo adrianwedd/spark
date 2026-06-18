@@ -402,11 +402,11 @@ def _load_cursor() -> dict:
         return json.loads(CURSOR_FILE.read_text())
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         log(f"cursor reset (fresh start): {exc}")
-        return {"offset": 0, "inode": 0}
+        return {}
 
 
-def _save_cursor(offset: int, inode: int) -> None:
-    data = {"file": "thoughts-spark.jsonl", "offset": offset, "inode": inode,
+def _save_cursor(last_ts: str) -> None:
+    data = {"file": "thoughts-spark.jsonl", "last_ts": last_ts, "initialized": True,
             "last_poll_ts": dt.datetime.now(dt.timezone.utc).isoformat()}
     try:
         # Atomic write
@@ -421,39 +421,34 @@ def _save_cursor(offset: int, inode: int) -> None:
 
 
 def poll_new_thoughts(thoughts_file: Path) -> list[dict]:
-    """Read new complete lines from thoughts file since last cursor position."""
+    """Return thought entries newer (by ``ts``) than the cursor.
+
+    The cursor tracks the timestamp of the last processed thought rather than a
+    byte offset, so it is immune to the atomic rewrites and rolling-window
+    truncation that px-mind performs on thoughts-spark.jsonl. A byte-offset
+    cursor reset to 0 on every inode change / shrink and re-processed the entire
+    10k-line window each time — the runaway-CPU bug this replaces.
+
+    On a fresh start (no initialized cursor) it records the latest ts and returns
+    nothing: the daemon does not replay history. Use ``--backfill`` to seed the
+    feed from past thoughts intentionally.
+    """
     cursor = _load_cursor()
     try:
-        st = thoughts_file.stat()
+        raw = thoughts_file.read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return []
 
-    if st.st_ino != cursor.get("inode", 0):
-        # Inode changed (e.g. atomic_write os.replace). If the file is at least
-        # as large as our stored offset the content is intact — keep the offset.
-        # Only reset if the new file is shorter (genuine replacement).
-        if st.st_size < cursor.get("offset", 0):
-            log("cursor: inode changed, file shrunk — resetting to 0")
-            cursor["offset"] = 0
-        else:
-            log("cursor: inode changed, file intact — keeping offset")
-    elif st.st_size < cursor.get("offset", 0):
-        log("cursor: file shrunk — resetting to 0")
-        cursor["offset"] = 0
-
-    with thoughts_file.open("rb") as f:
-        f.seek(cursor["offset"])
-        raw = f.read()
-
-    # Only process complete lines (ending in \n)
-    last_nl = raw.rfind(b"\n")
+    # Only consider complete lines (the final line must end with a newline).
+    last_nl = raw.rfind("\n")
     if last_nl == -1:
-        return []  # no complete lines
-    processable = raw[:last_nl + 1]
-    new_offset = cursor["offset"] + len(processable)
+        return []
+    raw = raw[:last_nl + 1]
 
-    entries = []
-    for line in processable.decode("utf-8", errors="replace").splitlines():
+    last_ts = cursor.get("last_ts", "")
+    max_ts = last_ts
+    parsed: list[tuple[str, dict]] = []
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -465,10 +460,20 @@ def poll_new_thoughts(thoughts_file: Path) -> list[dict]:
         if not REQUIRED_FIELDS.issubset(entry.keys()):
             log(f"malformed entry skipped: {list(entry.keys())}")
             continue
-        entries.append(entry)
+        ts = entry.get("ts", "")
+        parsed.append((ts, entry))
+        if ts > max_ts:
+            max_ts = ts
 
-    _save_cursor(new_offset, st.st_ino)
-    return entries
+    # Fresh / legacy / corrupt cursor: record position, do not replay the backlog.
+    if not cursor.get("initialized"):
+        _save_cursor(max_ts)
+        return []
+
+    new_entries = [entry for ts, entry in parsed if ts > last_ts]
+    if max_ts > last_ts:
+        _save_cursor(max_ts)
+    return new_entries
 
 
 FEED_FILE = STATE_DIR / "feed.json"
@@ -717,15 +722,9 @@ def _generate_post_id() -> str:
     return f"post-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{_SYS_RNG.randint(0, 999):03d}"
 
 
-def queue_thought(entry: dict) -> None:
-    """Append a qualifying thought to the post queue. Skips if already queued (dedup)."""
-    # Check for duplicates in existing queue
-    existing = _load_queue()
-    new_thought = entry["thought"][:100]
-    for existing_entry in existing:
-        if existing_entry.get("thought", "")[:100] == new_thought:
-            return  # already queued
-    queue_entry = {
+def _build_queue_entry(entry: dict) -> dict:
+    """Build a queue record from a thought entry."""
+    return {
         "id": _generate_post_id(),
         "ts": entry.get("ts", ""),
         "thought": entry["thought"],
@@ -736,12 +735,65 @@ def queue_thought(entry: dict) -> None:
         "qa_result": None,
         "posted": {"feed": None, "bluesky": None},
     }
+
+
+def _entry_posted_to_feed(entry: dict) -> bool:
+    """True if a queue entry has been successfully written to the feed."""
+    fv = (entry.get("posted") or {}).get("feed")
+    return fv is not None and not (isinstance(fv, str) and fv.startswith("error:"))
+
+
+def _trim_queue(entries: list[dict]) -> list[dict]:
+    """Cap the queue at QUEUE_LIMIT, preferring to keep entries not yet posted.
+
+    Dropping the oldest entries blindly could discard un-posted thoughts in favour
+    of already-posted ones, so un-posted entries are retained first; remaining
+    capacity is filled with the most-recent posted entries. Original order kept.
+    """
+    if len(entries) <= QUEUE_LIMIT:
+        return entries
+    keep = set()
+    unposted = [e for e in entries if not _entry_posted_to_feed(e)]
+    if len(unposted) >= QUEUE_LIMIT:
+        for e in unposted[-QUEUE_LIMIT:]:
+            keep.add(id(e))
+    else:
+        for e in unposted:
+            keep.add(id(e))
+        room = QUEUE_LIMIT - len(unposted)
+        posted = [e for e in entries if _entry_posted_to_feed(e)]
+        for e in posted[-room:] if room else []:
+            keep.add(id(e))
+    return [e for e in entries if id(e) in keep]
+
+
+def _append_queue(new_entries: list[dict]) -> None:
+    """Add already-built queue records, deduped against the queue, capped at QUEUE_LIMIT.
+
+    Loads the queue once and rewrites atomically — avoids the per-entry reload
+    and the unbounded open("a") append that let the queue grow to thousands of
+    entries.
+    """
+    if not new_entries:
+        return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        with QUEUE_FILE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(queue_entry) + "\n")
-    except OSError as exc:
-        log(f"queue_thought failed: {exc}")
+    existing = _load_queue()
+    seen = {e.get("thought", "")[:100] for e in existing}
+    to_add = []
+    for e in new_entries:
+        key = e.get("thought", "")[:100]
+        if key in seen:
+            continue
+        seen.add(key)
+        to_add.append(e)
+    if not to_add:
+        return
+    _save_queue(_trim_queue(existing + to_add))
+
+
+def queue_thought(entry: dict) -> None:
+    """Append a qualifying thought to the post queue. Skips if already queued (dedup)."""
+    _append_queue([_build_queue_entry(entry)])
 
 
 def _load_queue() -> list[dict]:
@@ -784,7 +836,7 @@ def _save_queue(entries: list[dict]) -> None:
                     pass
         except OSError:
             pass
-    entries = entries[-QUEUE_LIMIT:]
+    entries = _trim_queue(entries)
     fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1091,11 +1143,28 @@ def main(argv: list[str]) -> int:
                 pass
 
             try:
-                queued_count = 0
-                for entry in new_thoughts:
-                    if qualifies(entry) and not is_duplicate(entry["thought"], feed_posts):
-                        queue_thought(entry)
-                        queued_count += 1
+                # Load the queue once per cycle (not once per entry) and collect
+                # qualifying thoughts for a single batched, capped append. The old
+                # per-entry queue_thought() re-parsed the whole queue file every
+                # iteration — O(N^2) that pegged a core on large batches.
+                existing_queue = _load_queue()
+                queued_keys = {e.get("thought", "")[:100] for e in existing_queue}
+                to_queue = []
+                for i, entry in enumerate(new_thoughts):
+                    if _shutdown.is_set():
+                        break  # stay responsive to SIGTERM mid-batch
+                    if i and i % 100 == 0:
+                        last_cycle = time.monotonic()  # keep the watchdog fed
+                    if not (qualifies(entry) and not is_duplicate(entry["thought"], feed_posts)):
+                        continue
+                    key = entry["thought"][:100]
+                    if key in queued_keys:
+                        continue
+                    queued_keys.add(key)
+                    to_queue.append(_build_queue_entry(entry))
+                if to_queue:
+                    _append_queue(to_queue)
+                queued_count = len(to_queue)
                 if new_thoughts or queued_count:
                     log(f"poll: {len(new_thoughts)} new thoughts, {queued_count} queued")
             except Exception as exc:
