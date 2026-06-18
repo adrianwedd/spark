@@ -630,6 +630,27 @@ def test_append_queue_enforces_limit(_cursor_env):
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
+def test_flush_stops_early_on_shutdown(_cursor_env):
+    """flush_queue honours a should_stop signal so SIGTERM stays responsive mid-flush."""
+    tmp = _cursor_env
+    queue_file = tmp / "post_queue.jsonl"
+    lines = [json.dumps(_make_queue_entry(thought=f"t{i}", entry_id=f"stop-{i:03d}"))
+             for i in range(5)]
+    queue_file.write_text("\n".join(lines) + "\n")
+
+    bsky = MagicMock()
+    bsky.post.return_value = "ok"
+
+    # Shutdown already requested: flush should do no feed writes and bail.
+    result = flush_queue(bsky, dry=True, should_stop=lambda: True)
+    assert result["processed"] == 0
+    bsky.post.assert_not_called()
+    # Nothing was marked posted
+    for line in queue_file.read_text().splitlines():
+        assert json.loads(line)["posted"]["feed"] is None
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "0"})
 def test_flush_empty_queue_returns_dict(_cursor_env):
     """flush_queue() on an empty queue returns a dict with processed: 0."""
     tmp = _cursor_env

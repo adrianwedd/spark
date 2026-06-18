@@ -862,8 +862,14 @@ def _is_in_feed(thought_text: str, feed_posts: list[dict]) -> bool:
     return False
 
 
-def flush_queue(bluesky: 'BlueskyClient', dry: bool) -> dict:
-    """Two-pass flush: batch all feed writes, then one social post. Never blocks feed on social rate limits."""
+def flush_queue(bluesky: 'BlueskyClient', dry: bool, should_stop=None) -> dict:
+    """Two-pass flush: batch all feed writes, then one social post. Never blocks feed on social rate limits.
+
+    ``should_stop`` is an optional predicate; when it returns True the flush bails
+    out between entries so SIGTERM stays responsive even with a full queue (each
+    entry can spend seconds in the QA gate).
+    """
+    _stop = should_stop or (lambda: False)
     entries = _load_queue()
     if not entries:
         return {"processed": 0, "posted": False, "rejected": False}
@@ -882,6 +888,9 @@ def flush_queue(bluesky: 'BlueskyClient', dry: bool) -> dict:
 
     # ── Pass 1: Batch all feed writes (local, no rate limit) ──
     for entry in entries:
+        if _stop():
+            log("flush: shutdown requested — stopping early (pass 1)")
+            break
         posted = entry.get("posted", {})
         if posted.get("feed") is not None and not (isinstance(posted.get("feed"), str) and posted["feed"].startswith("error:")):
             continue  # feed already done
@@ -933,6 +942,9 @@ def flush_queue(bluesky: 'BlueskyClient', dry: bool) -> dict:
         feed_texts = set()
 
     for entry in entries:
+        if _stop():
+            log("flush: shutdown requested — stopping early (pass 2)")
+            break
         entry.setdefault("posted", {"feed": None, "bluesky": None})
         posted = entry["posted"]
         # Need Bluesky posting?
@@ -1178,7 +1190,7 @@ def main(argv: list[str]) -> int:
             if now - last_flush >= args.flush_interval:
                 log(f"flush: starting (interval={args.flush_interval}s, bsky_ok={bluesky.available()}, queue={len(_load_queue())})")
                 try:
-                    result = flush_queue(bluesky, dry)
+                    result = flush_queue(bluesky, dry, should_stop=_shutdown.is_set)
                 except Exception as exc:
                     log(f"flush: CRASHED: {exc}")
                     result = {"posted": False, "rejected": False, "processed": 0}
