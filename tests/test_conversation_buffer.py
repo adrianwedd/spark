@@ -76,3 +76,23 @@ def test_spark_utterance_falls_back_to_tool_name_when_no_text():
 
 def test_spark_utterance_handles_missing_params():
     assert voice_loop.conversation_spark_text({"tool": "tool_stop"}, "tool_stop") == "(tool_stop)"
+
+
+def test_conversation_path_is_filename_safe(conv_state_dir):
+    """A persona value must never escape the flat state-dir namespace."""
+    path = voice_loop.conversation_path("../../etc/passwd")
+    assert path.parent == conv_state_dir
+    assert "/" not in path.name and ".." not in path.name
+
+
+def test_record_with_unsafe_persona_stays_in_state_dir(conv_state_dir):
+    voice_loop.record_conversation_turn("../../evil", "u", "s")
+    # nothing written outside the isolated state dir
+    assert not (conv_state_dir.parent.parent / "evil").exists()
+    # and it round-trips under the sanitized slug
+    assert voice_loop.recent_conversation("../../evil") == [{"user": "u", "spark": "s"}]
+
+
+def test_max_turns_zero_disables_buffer(conv_state_dir):
+    voice_loop.record_conversation_turn("spark", "u", "s", max_turns=0)
+    assert voice_loop.recent_conversation("spark") == []

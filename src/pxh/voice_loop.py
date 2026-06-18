@@ -174,8 +174,11 @@ def _state_dir() -> Path:
 
 
 def conversation_path(persona: str) -> Path:
-    """Per-persona buffer file. Keeps GREMLIN/VIXEN/Spark histories isolated."""
-    slug = (persona or "default").lower().strip() or "default"
+    """Per-persona buffer file. Keeps GREMLIN/VIXEN/Spark histories isolated.
+    The slug is sanitized to a safe filename charset so a hostile persona value
+    can never escape the flat state-dir namespace (path traversal)."""
+    import re
+    slug = re.sub(r"[^a-z0-9_-]", "", (persona or "").lower().strip()) or "default"
     return _state_dir() / f"conversation-{slug}.jsonl"
 
 
@@ -207,7 +210,11 @@ def record_conversation_turn(
     spark_text: str,
     max_turns: int = CONVERSATION_MAX_TURNS,
 ) -> None:
-    """Append a turn and trim the buffer to the last max_turns, atomically."""
+    """Append a turn and trim the buffer to the last max_turns, atomically.
+    max_turns <= 0 disables the buffer (writes an empty file)."""
+    if max_turns <= 0:
+        atomic_write(conversation_path(persona), "")
+        return
     turns = recent_conversation(persona, n=max_turns + 1)
     turns.append({"user": user_text, "spark": spark_text})
     turns = turns[-max_turns:]
@@ -380,15 +387,15 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
         context_sections.append("Recent events:")
         context_sections.append(json.dumps(recent_events, indent=2))
 
+    _active_persona = (state.get("persona") or "").lower().strip()
+
     # Rolling conversation memory (issue #161) — what was just said, per persona.
-    _conv_persona = (state.get("persona") or "").lower().strip()
-    recent_turns = recent_conversation(_conv_persona)
+    recent_turns = recent_conversation(_active_persona)
     if recent_turns:
         context_sections.append("Recent conversation (oldest first):")
         context_sections.append(json.dumps(recent_turns, indent=2))
 
     # Inject inner thoughts from px-mind — use persona-scoped file to prevent cross-persona leakage
-    _active_persona = (state.get("persona") or "").lower().strip()
     _thoughts_name = f"thoughts-{_active_persona}.jsonl" if _active_persona else "thoughts.jsonl"
     thoughts_file = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state"))) / _thoughts_name
     if thoughts_file.exists():
