@@ -78,6 +78,31 @@ def test_spark_utterance_handles_missing_params():
     assert voice_loop.conversation_spark_text({"tool": "tool_stop"}, "tool_stop") == "(tool_stop)"
 
 
+def test_spark_utterance_extracts_speak_from_perform_steps():
+    """tool_perform carries spoken words in steps[*].speak, not params.text."""
+    action = {
+        "tool": "tool_perform",
+        "params": {
+            "steps": [
+                {"speak": "Watch this"},
+                {"action": "spin"},
+                {"speak": "ta-da!"},
+            ]
+        },
+    }
+    assert (
+        voice_loop.conversation_spark_text(action, "tool_perform")
+        == "Watch this ta-da!"
+    )
+
+
+def test_spark_utterance_perform_without_speak_falls_back():
+    action = {"tool": "tool_perform", "params": {"steps": [{"action": "spin"}]}}
+    assert (
+        voice_loop.conversation_spark_text(action, "tool_perform") == "(tool_perform)"
+    )
+
+
 def test_conversation_path_is_filename_safe(conv_state_dir):
     """A persona value must never escape the flat state-dir namespace."""
     path = voice_loop.conversation_path("../../etc/passwd")
