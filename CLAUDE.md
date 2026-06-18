@@ -69,6 +69,8 @@ Three backends, same `pxh.voice_loop` core:
 
 Loop: wait for `listening: true` → build prompt (system + session + transcript + thoughts) → call LLM subprocess → parse last JSON `{tool, params}` → `validate_action()` → `execute_tool()` → update session. Override via `CODEX_CHAT_CMD`.
 
+**Conversation buffer**: each turn is appended to `state/conversation-{persona}.jsonl` (rolling window, `PX_CONVERSATION_TURNS`, default 10) and injected back into the next prompt as a "Recent conversation" section — gives SPARK short-term memory across turns without relying solely on file-injected session state. Per-persona file so GREMLIN/VIXEN/Spark histories never bleed. SPARK's utterance is the action's `params.text`, falling back to `(tool_name)` for non-speech actions.
+
 ### Wake Word System
 
 ```bash

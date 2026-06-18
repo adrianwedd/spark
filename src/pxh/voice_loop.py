@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 from pxh.utils import clamp
 
 from .logging import log_event
-from .state import load_session, update_session, ensure_session, tail_lines
+from .state import load_session, update_session, ensure_session, tail_lines, atomic_write
 from .time import utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -161,6 +161,65 @@ PERSONA_VOICE_ENV = {
         "PX_VOICE_RATE": "100",
     },
 }
+
+
+# Rolling per-persona conversation memory (issue #161). Lets SPARK remember
+# the last few turns without relying entirely on file-injected session state —
+# e.g. coaching a routine without losing the thread between turns.
+CONVERSATION_MAX_TURNS = int(os.environ.get("PX_CONVERSATION_TURNS", "10"))
+
+
+def _state_dir() -> Path:
+    return Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
+
+
+def conversation_path(persona: str) -> Path:
+    """Per-persona buffer file. Keeps GREMLIN/VIXEN/Spark histories isolated.
+    The slug is sanitized to a safe filename charset so a hostile persona value
+    can never escape the flat state-dir namespace (path traversal)."""
+    import re
+    slug = re.sub(r"[^a-z0-9_-]", "", (persona or "").lower().strip()) or "default"
+    return _state_dir() / f"conversation-{slug}.jsonl"
+
+
+def recent_conversation(persona: str, n: int = CONVERSATION_MAX_TURNS) -> list:
+    """Return up to the last n {user, spark} turns for this persona, oldest first."""
+    path = conversation_path(persona)
+    if not path.exists():
+        return []
+    turns = []
+    for line in tail_lines(path, n=n):
+        try:
+            turns.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return turns
+
+
+def conversation_spark_text(action: Dict[str, Any], tool: str) -> str:
+    """SPARK's utterance for the buffer: the spoken/typed text if the action
+    carries one, else a compact descriptor of what it did (e.g. '(tool_forward)')."""
+    params = action.get("params") or {}
+    text = (params.get("text") or "").strip()
+    return text if text else f"({tool})"
+
+
+def record_conversation_turn(
+    persona: str,
+    user_text: str,
+    spark_text: str,
+    max_turns: int = CONVERSATION_MAX_TURNS,
+) -> None:
+    """Append a turn and trim the buffer to the last max_turns, atomically.
+    max_turns <= 0 disables the buffer (writes an empty file)."""
+    if max_turns <= 0:
+        atomic_write(conversation_path(persona), "")
+        return
+    turns = recent_conversation(persona, n=max_turns + 1)
+    turns.append({"user": user_text, "spark": spark_text})
+    turns = turns[-max_turns:]
+    body = "".join(json.dumps(t, ensure_ascii=False) + "\n" for t in turns)
+    atomic_write(conversation_path(persona), body)
 
 
 class VoiceLoopError(Exception):
@@ -328,8 +387,15 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
         context_sections.append("Recent events:")
         context_sections.append(json.dumps(recent_events, indent=2))
 
-    # Inject inner thoughts from px-mind — use persona-scoped file to prevent cross-persona leakage
     _active_persona = (state.get("persona") or "").lower().strip()
+
+    # Rolling conversation memory (issue #161) — what was just said, per persona.
+    recent_turns = recent_conversation(_active_persona)
+    if recent_turns:
+        context_sections.append("Recent conversation (oldest first):")
+        context_sections.append(json.dumps(recent_turns, indent=2))
+
+    # Inject inner thoughts from px-mind — use persona-scoped file to prevent cross-persona leakage
     _thoughts_name = f"thoughts-{_active_persona}.jsonl" if _active_persona else "thoughts.jsonl"
     thoughts_file = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state"))) / _thoughts_name
     if thoughts_file.exists():
@@ -982,6 +1048,15 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             transcript_entry["voice_result"] = voice_result
 
         log_event("voice-transcript", transcript_entry)
+
+        # Record the turn into the rolling per-persona conversation buffer (#161)
+        # so the next prompt carries what was just said.
+        try:
+            record_conversation_turn(
+                active_persona, user_text, conversation_spark_text(action, tool)
+            )
+        except Exception:
+            print("[voice-loop] failed to record conversation turn", file=sys.stderr)
 
         if args.exit_on_stop and tool == "tool_stop" and rc_tool == 0:
             print("[voice-loop] Stop command acknowledged. Exiting loop.")
