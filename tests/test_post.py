@@ -72,9 +72,12 @@ run_backfill = _POST["run_backfill"]
 STATUS_FILE = _POST["STATUS_FILE"]
 
 
-def _make_line(thought="hello", salience=0.8, action="comment"):
+def _make_line(thought="hello", salience=0.8, action="comment", ts="2026-01-01T00:00:00Z"):
     """Build a valid JSONL line (with trailing newline)."""
-    return json.dumps({"thought": thought, "salience": salience, "action": action}) + "\n"
+    entry = {"thought": thought, "salience": salience, "action": action}
+    if ts is not None:
+        entry["ts"] = ts
+    return json.dumps(entry) + "\n"
 
 
 def _patch_state_dir(mod_globals, tmp_path):
@@ -166,102 +169,122 @@ def _cursor_env(tmp_path):
     _POST["FEED_FILE"] = orig_feed
 
 
-def test_file_offset_cursor(_cursor_env):
-    """Poll reads new entries and advances cursor; second poll returns only new."""
+def _ts(n):
+    """Monotonic ISO-ish timestamp for ordering thoughts in cursor tests."""
+    return f"2026-01-01T00:00:{n:02d}Z"
+
+
+def test_first_poll_initializes_without_replay(_cursor_env):
+    """Fresh cursor: first poll records position and returns nothing (no backlog replay)."""
     tmp = _cursor_env
     tf = tmp / "thoughts-spark.jsonl"
-    tf.write_text(_make_line("a") + _make_line("b") + _make_line("c"))
+    tf.write_text(_make_line("a", ts=_ts(1)) + _make_line("b", ts=_ts(2)) + _make_line("c", ts=_ts(3)))
 
     results = poll_new_thoughts(tf)
-    assert len(results) == 3
-    assert [r["thought"] for r in results] == ["a", "b", "c"]
+    assert results == []  # daemon does not replay history on first start
 
-    # Append 2 more lines
+    # Subsequent appends (newer ts) are returned
     with tf.open("a") as f:
-        f.write(_make_line("d") + _make_line("e"))
-
+        f.write(_make_line("d", ts=_ts(4)) + _make_line("e", ts=_ts(5)))
     results2 = poll_new_thoughts(tf)
-    assert len(results2) == 2
     assert [r["thought"] for r in results2] == ["d", "e"]
 
 
-def test_file_shrink_resets_cursor(_cursor_env):
-    """Truncated file resets cursor to 0 and re-reads from start."""
+def test_poll_returns_only_newer_by_ts(_cursor_env):
+    """After init, only entries with ts strictly greater than the cursor are returned."""
     tmp = _cursor_env
     tf = tmp / "thoughts-spark.jsonl"
-    tf.write_text(_make_line("a") + _make_line("b") + _make_line("c"))
+    tf.write_text(_make_line("a", ts=_ts(1)))
+    poll_new_thoughts(tf)  # initialize at ts 1
 
-    poll_new_thoughts(tf)  # advance cursor
-
-    # Truncate to shorter content
-    tf.write_text(_make_line("x"))
-    results = poll_new_thoughts(tf)
-    assert len(results) == 1
-    assert results[0]["thought"] == "x"
+    with tf.open("a") as f:
+        f.write(_make_line("b", ts=_ts(2)) + _make_line("c", ts=_ts(3)))
+    assert [r["thought"] for r in poll_new_thoughts(tf)] == ["b", "c"]
+    # Re-poll with no new content returns nothing
+    assert poll_new_thoughts(tf) == []
 
 
-def test_cursor_inode_change(_cursor_env):
-    """Deleting and recreating the file (new inode) resets cursor."""
+def test_cursor_survives_atomic_rewrite_no_replay(_cursor_env):
+    """REGRESSION: a rolling-window atomic rewrite (new inode, shrunk) must NOT replay the file.
+
+    This is the runaway-CPU bug: the old byte-offset cursor reset to 0 on inode
+    change / shrink and re-processed all 10k lines on every px-mind rewrite.
+    """
     tmp = _cursor_env
     tf = tmp / "thoughts-spark.jsonl"
-    tf.write_text(_make_line("a") + _make_line("b"))
+    # Start with a long window a..e and initialize the cursor at the newest (e/ts5).
+    tf.write_text("".join(_make_line(c, ts=_ts(i + 1)) for i, c in enumerate("abcde")))
+    poll_new_thoughts(tf)  # init at ts 5
 
-    poll_new_thoughts(tf)  # advance cursor
-
-    # Delete and recreate (different inode)
+    # px-mind rewrites atomically: new inode, SHORTER file (rolling window dropped
+    # a,b) and appends one genuinely new thought f/ts6.
     tf.unlink()
-    tf.write_text(_make_line("new"))
+    tf.write_text("".join(_make_line(c, ts=_ts(i)) for c, i in [("c", 3), ("d", 4), ("e", 5), ("f", 6)]))
 
     results = poll_new_thoughts(tf)
-    assert len(results) == 1
-    assert results[0]["thought"] == "new"
+    assert [r["thought"] for r in results] == ["f"]  # only the new one, NOT the whole file
 
 
-def test_cursor_corrupt_resets(_cursor_env):
-    """Corrupt cursor file causes reset to offset 0 without crashing."""
+def test_corrupt_cursor_reinitializes_without_replay(_cursor_env):
+    """Corrupt cursor file reinitializes cleanly (no crash, no backlog replay)."""
     tmp = _cursor_env
     tf = tmp / "thoughts-spark.jsonl"
-    tf.write_text(_make_line("a"))
-
-    # Write garbage to cursor file
-    cursor_f = tmp / "px-post-cursor.json"
-    cursor_f.write_text("{{{not json at all!!!")
+    tf.write_text(_make_line("a", ts=_ts(1)) + _make_line("b", ts=_ts(2)))
+    (tmp / "px-post-cursor.json").write_text("{{{not json at all!!!")
 
     results = poll_new_thoughts(tf)
-    assert len(results) == 1
-    assert results[0]["thought"] == "a"
+    assert results == []  # treated as fresh start, no replay
+    with tf.open("a") as f:
+        f.write(_make_line("c", ts=_ts(3)))
+    assert [r["thought"] for r in poll_new_thoughts(tf)] == ["c"]
+
+
+def test_legacy_offset_cursor_migrates_without_replay(_cursor_env):
+    """An old-format (offset/inode) cursor migrates to ts-based without replaying."""
+    tmp = _cursor_env
+    tf = tmp / "thoughts-spark.jsonl"
+    tf.write_text(_make_line("a", ts=_ts(1)) + _make_line("b", ts=_ts(2)))
+    # Simulate the pre-fix cursor on disk.
+    (tmp / "px-post-cursor.json").write_text(json.dumps({"file": "thoughts-spark.jsonl", "offset": 999, "inode": 123}))
+
+    results = poll_new_thoughts(tf)
+    assert results == []  # no legacy last_ts → fresh init, no replay
+    with tf.open("a") as f:
+        f.write(_make_line("c", ts=_ts(3)))
+    assert [r["thought"] for r in poll_new_thoughts(tf)] == ["c"]
 
 
 def test_partial_line_not_consumed(_cursor_env):
-    """Incomplete line (no trailing newline) is not returned."""
+    """Incomplete line (no trailing newline) is not returned until completed."""
     tmp = _cursor_env
     tf = tmp / "thoughts-spark.jsonl"
-    complete = _make_line("complete")
-    partial = json.dumps({"thought": "partial", "salience": 0.8, "action": "comment"})
-    # partial has no trailing \n
-    tf.write_text(complete + partial)
+    tf.write_text(_make_line("seed", ts=_ts(1)))
+    poll_new_thoughts(tf)  # init at ts 1
+
+    complete = _make_line("complete", ts=_ts(2))
+    partial = json.dumps({"thought": "partial", "salience": 0.8, "action": "comment", "ts": _ts(3)})
+    with tf.open("a") as f:
+        f.write(complete + partial)  # partial has no trailing newline
 
     results = poll_new_thoughts(tf)
-    assert len(results) == 1
-    assert results[0]["thought"] == "complete"
+    assert [r["thought"] for r in results] == ["complete"]
 
-    # Now finish the partial line
     with tf.open("a") as f:
-        f.write("\n")
-
+        f.write("\n")  # finish the partial line
     results2 = poll_new_thoughts(tf)
-    assert len(results2) == 1
-    assert results2[0]["thought"] == "partial"
+    assert [r["thought"] for r in results2] == ["partial"]
 
 
 def test_corrupt_jsonl_skipped(_cursor_env):
-    """Corrupt JSONL line is skipped; valid lines on both sides are returned."""
+    """Corrupt JSONL line is skipped; valid newer lines on both sides are returned."""
     tmp = _cursor_env
     tf = tmp / "thoughts-spark.jsonl"
-    tf.write_text(_make_line("good1") + "NOT VALID JSON\n" + _make_line("good2"))
+    tf.write_text(_make_line("seed", ts=_ts(1)))
+    poll_new_thoughts(tf)  # init at ts 1
 
+    with tf.open("a") as f:
+        f.write(_make_line("good1", ts=_ts(2)) + "NOT VALID JSON\n" + _make_line("good2", ts=_ts(3)))
     results = poll_new_thoughts(tf)
-    assert len(results) == 2
     assert [r["thought"] for r in results] == ["good1", "good2"]
 
 
@@ -555,6 +578,55 @@ def _make_queue_entry(thought="test thought", posted=None, qa_result="pass", ent
         "qa_result": qa_result,
         "posted": posted or {"feed": None, "bluesky": None},
     }
+
+
+def test_trim_queue_caps_at_limit(_cursor_env):
+    """_trim_queue caps the queue at QUEUE_LIMIT entries."""
+    _trim_queue = _POST["_trim_queue"]
+    limit = _POST["QUEUE_LIMIT"]
+    entries = [_make_queue_entry(f"t{i}", posted={"feed": "ok", "bluesky": "ok"}, entry_id=f"id-{i}")
+               for i in range(limit + 50)]
+    trimmed = _trim_queue(entries)
+    assert len(trimmed) == limit
+    # Keeps the most-recent entries
+    assert trimmed[-1]["id"] == f"id-{limit + 49}"
+
+
+def test_trim_queue_prefers_unposted(_cursor_env):
+    """When over the limit, _trim_queue keeps un-posted entries over older posted ones."""
+    _trim_queue = _POST["_trim_queue"]
+    limit = _POST["QUEUE_LIMIT"]
+    posted = [_make_queue_entry(f"p{i}", posted={"feed": "ok", "bluesky": "ok"}, entry_id=f"p-{i}")
+              for i in range(limit)]
+    unposted = [_make_queue_entry(f"u{i}", posted={"feed": None, "bluesky": None}, entry_id=f"u-{i}")
+                for i in range(5)]
+    trimmed = _trim_queue(posted + unposted)
+    assert len(trimmed) == limit
+    kept_ids = {e["id"] for e in trimmed}
+    # All un-posted entries survive even though they are newest and the queue is full
+    for u in unposted:
+        assert u["id"] in kept_ids
+
+
+def test_append_queue_enforces_limit(_cursor_env):
+    """_append_queue writes new entries and never lets the file exceed QUEUE_LIMIT."""
+    _append_queue = _POST["_append_queue"]
+    limit = _POST["QUEUE_LIMIT"]
+    # Seed the queue at the limit, all posted.
+    seed = [_make_queue_entry(f"s{i}", posted={"feed": "ok", "bluesky": "ok"}, entry_id=f"s-{i}")
+            for i in range(limit)]
+    (_cursor_env / "post_queue.jsonl").write_text("".join(json.dumps(e) + "\n" for e in seed))
+
+    new = [_make_queue_entry(f"n{i}", posted={"feed": None, "bluesky": None}, entry_id=f"n-{i}")
+           for i in range(10)]
+    _append_queue(new)
+
+    saved = _load_queue()
+    assert len(saved) <= limit
+    saved_ids = {e["id"] for e in saved}
+    # The freshly-appended (un-posted) entries are retained
+    for n in new:
+        assert n["id"] in saved_ids
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
