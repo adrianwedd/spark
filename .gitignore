@@ -16,6 +16,9 @@ state/timers.jsonl
 state/timers/
 test-frame.jpg
 track.png
+/*.png
+.playwright-mcp/
+cache/
 state/notes.jsonl
 state/notes-*.jsonl
 state/notes.jsonl.vixen-backup
