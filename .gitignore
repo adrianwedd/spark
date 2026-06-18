@@ -19,6 +19,7 @@ track.png
 state/notes.jsonl
 state/notes-*.jsonl
 state/notes.jsonl.vixen-backup
+state/conversation-*.jsonl
 state/awareness.json
 state/thoughts.jsonl
 state/thoughts-*.jsonl
