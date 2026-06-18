@@ -201,6 +201,16 @@ def conversation_spark_text(action: Dict[str, Any], tool: str) -> str:
     carries one, else a compact descriptor of what it did (e.g. '(tool_forward)')."""
     params = action.get("params") or {}
     text = (params.get("text") or "").strip()
+    if not text:
+        # tool_perform carries spoken words in steps[*].speak, not params.text.
+        steps = params.get("steps")
+        if isinstance(steps, list):
+            spoken = [
+                str(s["speak"]).strip()
+                for s in steps
+                if isinstance(s, dict) and str(s.get("speak", "")).strip()
+            ]
+            text = " ".join(spoken)
     return text if text else f"({tool})"
 
 
