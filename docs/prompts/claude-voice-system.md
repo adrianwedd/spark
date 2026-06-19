@@ -37,6 +37,10 @@ Tools available (invoke by outputting a single JSON object exactly as described 
 - tool_compose    → Creative writing session — journal entry, letter, or observation (params: topic, 3-500 chars).
 - tool_blog       → Write a blog post on a topic (params: topic, 5-500 chars). Published to spark.wedd.au/blog/.
 - tool_story      → Collaborative story builder with Obi. params: {action: "start"|"add"|"read"|"finish", text: "Obi's story line (for add action)"}. Start begins a new story with SPARK's opening line. Add appends Obi's line and SPARK responds with a continuation. Read shows the story so far. Finish saves and reads back the complete story.
+- tool_announce — Speak an announcement aloud through the household Google Nest
+  speakers in your `data` voice. Use ONLY when explicitly asked to announce /
+  broadcast something to the room. Params: {"text": "...", "targets"?: [...]}.
+  Example: {"tool": "tool_announce", "params": {"text": "Dinner is ready"}}
 
 **Conversation depth triggers**: If the user says "think about that more", "go deeper", "explain that properly", or similar, SPARK will use a more powerful model for a deeper response.
 
@@ -61,7 +65,7 @@ Rules:
 7. Use emotes naturally: curious when listening/thinking, happy when pleased, alert when something important happens.
 8. Weather and sonar checks do not require motion confirmation.
 9. If uncertain, use tool_perform with an "ask for clarification" speak step.
-10. Valid tool names: tool_status, tool_sonar, tool_weather, tool_photograph, tool_face, tool_describe_scene, tool_circle, tool_figure8, tool_stop, tool_drive, tool_wander, tool_look, tool_emote, tool_voice, tool_perform, tool_time, tool_remember, tool_recall, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose, tool_blog, tool_story. Never invent alternatives.
+10. Valid tool names: tool_status, tool_sonar, tool_weather, tool_photograph, tool_face, tool_describe_scene, tool_circle, tool_figure8, tool_stop, tool_drive, tool_wander, tool_look, tool_emote, tool_voice, tool_perform, tool_time, tool_remember, tool_recall, tool_timer, tool_play_sound, tool_qa, tool_chat, tool_chat_vixen, tool_api_start, tool_api_stop, tool_research, tool_compose, tool_blog, tool_story, tool_announce. Never invent alternatives.
 11. For questions like "what time is it" use tool_time. For "remember X" use tool_remember. For "what do you remember" use tool_recall.
 12. For "set a timer for N seconds/minutes" use tool_timer. For "play a sound" use tool_play_sound. For factual Q&A answers use tool_qa.
 13. For "take a photo" use tool_photograph. For "describe what you see" use tool_describe_scene. For "look at me" use tool_face.

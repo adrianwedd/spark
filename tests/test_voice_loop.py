@@ -73,3 +73,42 @@ def test_validate_action_wander_duration():
     # avoid mode should not set duration
     _, env4 = validate_action({"tool": "tool_wander", "params": {"mode": "avoid", "duration": 180}})
     assert "PX_WANDER_DURATION_S" not in env4
+
+
+from pxh.voice_loop import ALLOWED_TOOLS, TOOL_COMMANDS
+
+
+def test_tool_announce_registered():
+    assert "tool_announce" in ALLOWED_TOOLS
+    assert "tool_announce" in TOOL_COMMANDS
+
+
+def test_validate_announce_clamps_text():
+    tool, env = validate_action({"tool": "tool_announce", "params": {"text": "x" * 500}})
+    assert tool == "tool_announce"
+    assert len(env["PX_ANNOUNCE_TEXT"]) == 200  # ANNOUNCE_MAX_CHARS
+
+
+def test_validate_announce_requires_text():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_announce", "params": {"text": "   "}})
+
+
+def test_validate_announce_rejects_any_disallowed_target():
+    # Mixed good+bad must RAISE, not silently drop the bad one.
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_announce", "params": {
+            "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.evil"]}})
+
+
+def test_validate_announce_rejects_all_bad_targets():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_announce", "params": {
+            "text": "hi", "targets": ["media_player.evil"]}})
+
+
+def test_validate_announce_single_target_from_allowed_list():
+    # Multiple ALLOWED targets -> v1 takes exactly one (single-target).
+    _, env = validate_action({"tool": "tool_announce", "params": {
+        "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.nest_mini"]}})
+    assert env["PX_ANNOUNCE_TARGETS"] == "media_player.nest_hub_max"

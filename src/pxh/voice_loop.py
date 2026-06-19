@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from pxh.utils import clamp
+from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
 from .logging import log_event
 from .state import load_session, update_session, ensure_session, tail_lines, atomic_write
@@ -65,6 +66,7 @@ ALLOWED_TOOLS = {
     "tool_compose",
     "tool_blog",
     "tool_story",
+    "tool_announce",
 }
 
 TOOL_COMMANDS = {
@@ -111,6 +113,7 @@ TOOL_COMMANDS = {
     "tool_compose":          BIN_DIR / "tool-compose",
     "tool_blog":             BIN_DIR / "tool-blog",
     "tool_story":            BIN_DIR / "tool-story",
+    "tool_announce":         BIN_DIR / "tool-announce",
 }
 
 
@@ -817,6 +820,22 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         text = str(params.get("text", ""))[:500]
         if text:
             sanitized["TOOL_TEXT"] = text
+    elif tool == "tool_announce":
+        text = params.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise VoiceLoopError("tool_announce requires a non-empty text parameter")
+        sanitized["PX_ANNOUNCE_TEXT"] = text.strip()[:ANNOUNCE_MAX_CHARS]
+        raw_targets = params.get("targets") or []
+        if isinstance(raw_targets, str):
+            raw_targets = [raw_targets]
+        # Reject ANY target outside the allowlist — the LLM must not drive arbitrary
+        # HA entities (spec safety). Silent filtering would let a bad target slip past.
+        bad = [t for t in raw_targets if t not in ANNOUNCE_ALLOWED_TARGETS]
+        if bad:
+            raise VoiceLoopError(f"tool_announce: disallowed target(s): {bad}")
+        if raw_targets:
+            # v1 is single-target (multiple distinct casts echo) — take the first.
+            sanitized["PX_ANNOUNCE_TARGETS"] = raw_targets[0]
     else:
         if params:
             raise VoiceLoopError("unexpected parameters for tool")
