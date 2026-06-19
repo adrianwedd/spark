@@ -32,6 +32,7 @@ import wave as _wave
 from pathlib import Path
 
 from filelock import FileLock, Timeout as FileLockTimeout
+from pxh import spark_config            # module handle (flag read at call time, monkeypatchable)
 from pxh.spark_config import (
     _pick_spark_angles, _pick_reflection_seed,
     _SPARK_REFLECTION_PREFIX, _SPARK_REFLECTION_SUFFIX,
@@ -158,6 +159,24 @@ OBI_DAY_END    = 20  # 8pm Hobart — Obi's waking hours end
 def _is_night_silence(hour: int) -> bool:
     """True during the unconditional night-silence window (Hobart hour-of-day)."""
     return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
+
+
+def _dispatch_announce(text: str, private: bool = False) -> None:
+    """Fire bin/tool-announce off the critical path (non-blocking). No-op if disabled."""
+    if not spark_config.ANNOUNCE_ENABLED:
+        return
+    if not text or not text.strip():
+        return
+    env = os.environ.copy()
+    env["PX_ANNOUNCE_TEXT"] = text.strip()[:spark_config.ANNOUNCE_MAX_CHARS]
+    if private:
+        env["PX_ANNOUNCE_PRIVATE"] = "1"
+    try:
+        subprocess.Popen([str(BIN_DIR / "tool-announce")], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("expression: announce dispatched (non-blocking)")
+    except Exception as e:
+        log(f"expression: announce dispatch failed: {e}")
 
 
 def _daytime_action_hint(hour_override: int | None = None) -> str:
@@ -425,7 +444,7 @@ VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_
                  "time_check", "calendar_check", "morning_fact",
                  "introspect", "evolve",
                  "research", "compose", "self_debug", "blog_essay",
-                 "message_obi"}
+                 "message_obi", "announce"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
@@ -3305,6 +3324,12 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 _append_obi_chat(entry)
                 _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
                 log(f"expression: message_obi written (id={msg_id})")
+
+        elif action == "announce":
+            if not text:
+                log("expression: announce has no text — skipping")
+            else:
+                _dispatch_announce(text)
 
         else:
             log(f"expression: unhandled action: {action}")
