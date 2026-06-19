@@ -1,0 +1,10 @@
+# Local secrets and runtime artifacts — never commit (only .env.example is tracked)
+.env
+.env.*
+!.env.example
+.venv/
+data/
+*.log
+*.err
+__pycache__/
+.pytest_cache/
