@@ -72,3 +72,32 @@ def test_announce_rate_limited(client, monkeypatch):
     for _ in range(2):
         assert client.post("/announce", json={"text": "hello"}, headers=AUTH).status_code == 200
     assert client.post("/announce", json={"text": "again now"}, headers=AUTH).status_code == 429
+
+
+def test_audio_serves_cached_file(client):
+    body = client.post("/announce", json={"text": "play me"}, headers=AUTH).json()
+    name = body["audio_url"].rsplit("/", 1)[-1]
+    r = client.get(f"/audio/{name}")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/wav"
+    assert r.content[:4] == b"RIFF"
+
+
+def test_audio_rejects_path_traversal(client):
+    for bad in ["../config.py", "..%2f..%2fetc%2fpasswd", "foo/../bar.wav", "evil.txt"]:
+        r = client.get(f"/audio/{bad}")
+        assert r.status_code == 404
+
+
+def test_audio_404_for_unknown_id(client):
+    r = client.get("/audio/" + "a" * 16 + ".wav")
+    assert r.status_code == 404
+
+
+def test_startup_runs_janitor(monkeypatch):
+    from announce_relay import app as appmod
+    calls = []
+    monkeypatch.setattr(appmod.store, "run_janitor", lambda now=None: calls.append(1) or 0)
+    with TestClient(appmod.app):  # triggers startup event
+        pass
+    assert calls  # janitor ran at least once on startup

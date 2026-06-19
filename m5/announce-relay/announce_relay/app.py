@@ -1,5 +1,6 @@
 """Announce relay: synth text on M5, cache, serve unauthenticated for Chromecast."""
 import asyncio
+import contextlib
 import re
 import threading
 import time
@@ -100,3 +101,38 @@ def announce(body: AnnounceBody, authorization: str | None = Header(default=None
 def health():
     n = len(list(config.CACHE_DIR.glob("*.wav"))) if config.CACHE_DIR.exists() else 0
     return {"status": "ok", "afterwords": synth.ping(), "cache_files": n}
+
+
+@app.get("/audio/{name}")
+def audio(name: str):
+    if not _AUDIO_RE.match(name):
+        raise HTTPException(404, "not found")
+    for d in (config.CACHE_DIR, config.PRIV_DIR):
+        base = d.resolve()
+        candidate = (d / name).resolve()
+        if candidate.parent == base and candidate.is_file():
+            return FileResponse(str(candidate), media_type="audio/wav")
+    raise HTTPException(404, "not found")
+
+
+async def _janitor_loop():
+    while True:
+        await asyncio.sleep(config.JANITOR_INTERVAL_S)
+        store.run_janitor()
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app):
+    store.run_janitor()                              # sweep once on startup
+    task = asyncio.create_task(_janitor_loop())
+    _app.state.janitor_task = task
+    try:
+        yield
+    finally:                                         # cancel cleanly — no leaked task
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+# Attach the lifespan to the already-constructed app (supported Starlette hook).
+app.router.lifespan_context = _lifespan
