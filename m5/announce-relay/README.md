@@ -4,7 +4,11 @@ LAN-facing front door to the afterwords synthesis service. Exposes two endpoints
 
 ## Endpoints
 
-`POST /synthesize` accepts `text` and `voice` (fixed to `data`), returns `{url, content_type, cache_age_s}` or `{error}`. Rate limited to 30 req/min per client IP; max text 600 bytes; cache valid 7 days. `GET /health` returns operational status (memory, cache size, uptime).
+`POST /announce` (bearer-auth required) — body `{text, voice="data", cache=true}`. Returns `{audio_url, voice, cached, duration_s}`. Rate limited per token; max text configurable (default 600 bytes); synthesizes via afterwords and caches the WAV.
+
+`GET /audio/{name}.wav` — unauthenticated (Chromecast cannot send auth headers). Path-traversal-guarded (UUID/hex filename validation). Serves cached WAV files from both the public cache dir and the private (cache=false) dir.
+
+`GET /health` — unauthenticated. Returns `{status, afterwords, cache_files}` where `afterwords` is the result of a ping to the upstream synthesis service.
 
 ## Voice Contract
 

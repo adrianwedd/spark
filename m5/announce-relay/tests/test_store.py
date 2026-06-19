@@ -52,14 +52,17 @@ def test_janitor_deletes_expired_public_and_private(tmp_dirs):
     old_pub = config.CACHE_DIR / "old.wav"
     old_priv = config.PRIV_DIR / "old.wav"
     fresh_priv = config.PRIV_DIR / "fresh.wav"
-    for p in (old_pub, old_priv, fresh_priv):
+    fresh_pub = config.CACHE_DIR / "fresh.wav"
+    for p in (old_pub, old_priv, fresh_priv, fresh_pub):
         p.write_bytes(b"RIFFxxxxWAVE")
     now = time.time()
     import os
-    os.utime(old_pub, (now - 8 * 86400, now - 8 * 86400))   # 8 days > 7d TTL
-    os.utime(old_priv, (now - 600, now - 600))              # 10 min > 3 min TTL
-    os.utime(fresh_priv, (now - 30, now - 30))              # 30s < 3 min TTL
+    os.utime(old_pub, (now - 8 * 86400, now - 8 * 86400))   # 8 days > 7d TTL → deleted
+    os.utime(old_priv, (now - 600, now - 600))              # 10 min > 3 min TTL → deleted
+    os.utime(fresh_priv, (now - 30, now - 30))              # 30s < 3 min TTL → retained
+    os.utime(fresh_pub, (now - 30, now - 30))               # 30s < 7d TTL → retained
     removed = store.run_janitor(now=now)
     assert removed == 2
     assert not old_pub.exists() and not old_priv.exists()
     assert fresh_priv.exists()
+    assert fresh_pub.exists()

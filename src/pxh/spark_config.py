@@ -22,7 +22,7 @@ OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
 
 # --- Announce pipeline (data-voice over Google Nest) ----------------------
 ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
-ANNOUNCE_RELAY_URL       = "http://192.168.1.171:7862"   # IP, not M5.local (Nest mDNS)
+ANNOUNCE_RELAY_URL       = "http://192.168.1.171:7862"   # IP, not M5.local (Nest mDNS) — MUST be a DHCP reservation for M5; if M5's lease changes, the entire announce pipeline breaks silently
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
 ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
@@ -32,7 +32,7 @@ ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/w
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
 ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
-HA_BASE_URL              = "http://homeassistant.local:8123"
+HA_BASE_URL              = "http://homeassistant.local:8123"  # Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
 
 # Night silence bounds (Hobart time), applied via ZoneInfo("Australia/Hobart").
 # Sourced here so mind.py stops hardcoding 19/7.
