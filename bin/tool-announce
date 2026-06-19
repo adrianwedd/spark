@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Slow synth: release px-alive so it doesn't kill us mid-call (skip in dry).
+if [[ "${PX_DRY:-0}" == "0" ]]; then
+    yield_alive
+fi
+
+python - "$@" <<'PY'
+"""Tool wrapper: synth text on the M5 relay, then cast to a single Nest via HA."""
+from __future__ import annotations
+
+import datetime as dt
+import http.client
+import json
+import os
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from pxh.state import update_session
+from pxh import spark_config as cfg
+
+# Test/ops override hooks (production uses spark_config defaults). The tool runs
+# as a fresh subprocess, so config can't be monkeypatched in-process — these env
+# overrides are the test seam. Night-hour overrides make the clock-dependent gate
+# deterministic in tests (e.g. START=99,END=0 -> never night; START=0,END=24 -> always).
+if os.environ.get("PX_ANNOUNCE_RELAY_URL"):
+    cfg.ANNOUNCE_RELAY_URL = os.environ["PX_ANNOUNCE_RELAY_URL"]
+if os.environ.get("PX_HA_BASE_URL"):
+    cfg.HA_BASE_URL = os.environ["PX_HA_BASE_URL"]
+if os.environ.get("PX_NIGHT_SILENCE_START_H"):
+    cfg.NIGHT_SILENCE_START_H = int(os.environ["PX_NIGHT_SILENCE_START_H"])
+if os.environ.get("PX_NIGHT_SILENCE_END_H"):
+    cfg.NIGHT_SILENCE_END_H = int(os.environ["PX_NIGHT_SILENCE_END_H"])
+
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
+HOBART_TZ    = ZoneInfo("Australia/Hobart")
+
+
+def _set_exploring(active: bool) -> None:
+    """Write exploring.json so px-alive yields/doesn't restart us mid-call."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "exploring.json"
+    data = {"active": active}
+    if active:
+        data["pid"] = os.getpid()
+        data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _emit(payload: dict) -> int:
+    print(json.dumps(payload))
+    return 0
+
+
+def _is_night_silence() -> bool:
+    """True during the night-silence window — applies to ALL announce paths."""
+    hour = dt.datetime.now(HOBART_TZ).hour
+    return hour >= cfg.NIGHT_SILENCE_START_H or hour < cfg.NIGHT_SILENCE_END_H
+
+
+def _resolve_targets() -> list[str]:
+    """Resolve to a SINGLE allowed target (v1 is single-target — multiple echo)."""
+    raw = os.environ.get("PX_ANNOUNCE_TARGETS", "").strip()
+    targets = [t.strip() for t in raw.split(",") if t.strip()] if raw else list(cfg.ANNOUNCE_DEFAULT_TARGETS)
+    allowed = [t for t in targets if t in cfg.ANNOUNCE_ALLOWED_TARGETS]
+    return allowed[:1]   # at most one
+
+
+class _RelayHTTPError(Exception):
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"relay {status}: {detail}")
+
+
+def _post_json(url: str, body: dict, headers: dict, connect_to: int, read_to: int) -> dict:
+    """True split timeout: connect within connect_to, then read within read_to.
+
+    urllib's single `timeout=` can't separate connect from read, so we drive
+    http.client directly: open the connection with the short connect budget,
+    then widen the socket timeout to the long read budget before reading the
+    response (a cold synth can take ~33s).
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(host, port, timeout=connect_to)
+    try:
+        conn.connect()                       # bounded by connect_to (fast-fail if down)
+        conn.sock.settimeout(read_to)        # widen for the slow synth read
+        path = parsed.path + (("?" + parsed.query) if parsed.query else "")
+        conn.request("POST", path, body=json.dumps(body).encode("utf-8"),
+                     headers={"Content-Type": "application/json", **headers})
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        if resp.status >= 400:
+            raise _RelayHTTPError(resp.status, raw[:200])
+        return json.loads(raw)               # may raise ValueError on a non-JSON body
+    finally:
+        conn.close()
+
+
+def _ha_state(entity_id: str, ha_base: str, ha_token: str) -> str | None:
+    url = f"{ha_base}/api/states/{entity_id}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ha_token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("state")
+    except Exception:
+        return None
+
+
+def _ha_cast(entity_id: str, audio_url: str, ha_base: str, ha_token: str) -> bool:
+    url = f"{ha_base}/api/services/media_player/play_media"
+    body = {
+        "entity_id": entity_id,
+        "media_content_id": audio_url,
+        "media_content_type": cfg.ANNOUNCE_MEDIA_CONTENT_TYPE,
+    }
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Authorization": f"Bearer {ha_token}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return 200 <= resp.status < 300
+
+
+def main() -> int:
+    text = (os.environ.get("PX_ANNOUNCE_TEXT") or "").strip()
+    dry = os.environ.get("PX_DRY", "0") != "0"
+    private = os.environ.get("PX_ANNOUNCE_PRIVATE", "0") != "0"
+    targets = _resolve_targets()
+
+    if not text:
+        return _emit({"status": "error", "error": "PX_ANNOUNCE_TEXT is required"})
+    if not targets:
+        return _emit({"status": "error", "error": "no allowed targets resolved"})
+
+    if dry:
+        return _emit({"status": "dry", "voice": cfg.ANNOUNCE_VOICE,
+                      "targets": targets, "text": text[:cfg.ANNOUNCE_MAX_CHARS]})
+
+    # Night silence applies to EVERY announce path (incl. user-initiated voice loop).
+    # This is the single chokepoint all triggers pass through, so the gate lives here.
+    if _is_night_silence():
+        return _emit({"status": "suppressed", "reason": "night_silence",
+                      "voice": cfg.ANNOUNCE_VOICE, "targets": targets})
+
+    relay_token = os.environ.get("ANNOUNCE_RELAY_TOKEN", "")
+    ha_token = os.environ.get("PX_HA_TOKEN", "")
+
+    _set_exploring(True)
+    try:
+        # 1) synth on the relay
+        try:
+            result = _post_json(
+                f"{cfg.ANNOUNCE_RELAY_URL}/announce",
+                {"text": text[:cfg.ANNOUNCE_MAX_CHARS], "voice": cfg.ANNOUNCE_VOICE,
+                 "cache": not private},
+                {"Authorization": f"Bearer {relay_token}"},
+                cfg.ANNOUNCE_CONNECT_TIMEOUT, cfg.ANNOUNCE_READ_TIMEOUT,
+            )
+        except _RelayHTTPError as e:
+            return _emit({"status": "error", "error": f"relay {e.status}: {e.detail}"})
+        except (OSError, ValueError, http.client.HTTPException, urllib.error.URLError) as e:
+            # OSError covers connect timeout/refused; ValueError covers a non-JSON body.
+            return _emit({"status": "error", "error": f"relay unreachable: {e}"})
+
+        audio_url = result.get("audio_url")
+        if not audio_url:
+            return _emit({"status": "error", "error": f"relay returned no audio_url: {result}"})
+
+        # 2) cast to each resolved target (single in v1); skip unavailable
+        cast_ok = []
+        for entity in targets:
+            state = _ha_state(entity, cfg.HA_BASE_URL, ha_token)
+            if state == "unavailable":
+                continue  # skip + log via payload below
+            if state == "playing":
+                pass  # destructive to current playback (documented v1 behavior)
+            try:
+                if _ha_cast(entity, audio_url, cfg.HA_BASE_URL, ha_token):
+                    cast_ok.append(entity)
+            except Exception:
+                pass  # best-effort per target
+
+        payload = {
+            "status": "ok" if cast_ok else "error",
+            "audio_url": audio_url,
+            "targets": cast_ok,
+            "voice": result.get("voice", cfg.ANNOUNCE_VOICE),
+            "cached": result.get("cached"),
+            "duration_s": result.get("duration_s"),
+        }
+        if not cast_ok:
+            payload["error"] = "no target accepted the cast"
+        try:
+            update_session(
+                fields={"last_action": "tool_announce"},
+                history_entry={"event": "announce", "targets": cast_ok, "text": text[:80]},
+            )
+        except Exception:
+            pass   # session bookkeeping must never break the announce contract
+        return _emit(payload)
+    finally:
+        _set_exploring(False)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException as e:   # never raises — always emit a JSON error line
+        print(json.dumps({"status": "error", "error": f"tool-announce crashed: {e}"}))
+        raise SystemExit(0)
+PY

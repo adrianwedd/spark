@@ -1073,3 +1073,108 @@ def test_tool_blog_dry_run(isolated_project):
     data = parse_json(result.stdout)
     assert data["status"] == "ok"
     assert data["dry"] is True
+
+
+def test_tool_announce_dry_run(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_ANNOUNCE_TEXT"] = "Dinner is ready"
+    stdout = run_tool(["bin/tool-announce"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "dry"
+    assert payload["voice"] == "data"
+    assert payload["targets"]  # default target resolved
+
+
+import http.server
+import json as _json
+import threading
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    captured = []  # class-level capture: list of (method, path, body)
+
+    def log_message(self, *a):  # silence
+        pass
+
+    def _send(self, code, obj):
+        body = _json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        # HA state lookups: /api/states/<entity>
+        _StubHandler.captured.append(("GET", self.path, None))
+        self._send(200, {"state": "idle"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = _json.loads(self.rfile.read(length) or b"{}")
+        _StubHandler.captured.append(("POST", self.path, body))
+        if self.path.endswith("/announce"):
+            self._send(200, {"audio_url": "http://192.168.1.171:7862/audio/abc123.wav",
+                             "voice": "data", "cached": False, "duration_s": 1.2})
+        else:  # HA play_media
+            self._send(200, [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])
+
+
+def _start_stub():
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _StubHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatch):
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_ANNOUNCE_TEXT"] = "Dinner is ready"
+    env["PX_BYPASS_SUDO"] = "1"
+    # Point both relay and HA at the stub via spark_config override env (see Step 5 note).
+    env["PX_ANNOUNCE_RELAY_URL"] = base
+    env["PX_HA_BASE_URL"] = base
+    env["ANNOUNCE_RELAY_TOKEN"] = "t"
+    env["PX_HA_TOKEN"] = "t"
+    env["PX_NIGHT_SILENCE_START_H"] = "99"   # force "never night" — deterministic
+    env["PX_NIGHT_SILENCE_END_H"] = "0"
+    try:
+        stdout = run_tool(["bin/tool-announce"], env)
+    finally:
+        srv.shutdown()
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["audio_url"].endswith("/audio/abc123.wav")
+    assert payload["targets"] == ["media_player.nest_hub_max"]
+    paths = [p for (_, p, _) in _StubHandler.captured]
+    assert any(p.endswith("/announce") for p in paths)
+    assert any("/api/services/media_player/play_media" in p for p in paths)
+
+
+def test_tool_announce_suppressed_during_night_silence(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_ANNOUNCE_TEXT"] = "Should not play"
+    env["PX_NIGHT_SILENCE_START_H"] = "0"    # force "always night"
+    env["PX_NIGHT_SILENCE_END_H"] = "24"
+    # No relay/HA stub: if the gate is broken it'll error trying to reach the relay,
+    # which is itself a failure — a working gate returns before any network egress.
+    stdout = run_tool(["bin/tool-announce"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+
+
+def test_tool_announce_resolves_single_target_from_multiple(isolated_project):
+    # Even if multiple allowed targets are requested, v1 casts to exactly one (echo).
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_ANNOUNCE_TEXT"] = "hi"
+    env["PX_ANNOUNCE_TARGETS"] = "media_player.nest_hub_max,media_player.nest_mini"
+    payload = parse_json(run_tool(["bin/tool-announce"], env))
+    assert payload["status"] == "dry"
+    assert len(payload["targets"]) == 1
