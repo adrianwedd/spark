@@ -38,3 +38,33 @@ def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch):
     _, kwargs = calls[0]
     assert kwargs["env"]["PX_ANNOUNCE_TEXT"] == "hello"
     assert kwargs["env"]["PX_ANNOUNCE_PRIVATE"] == "1"
+
+
+def test_emit_message_obi_fires_private_announce(monkeypatch):
+    fired = []
+    monkeypatch.setattr(mind, "_dispatch_announce",
+                        lambda text, private=False: fired.append((text, private)))
+    # Stub the obi-chat IO so the helper reaches the "write entry" path (not suppressed).
+    monkeypatch.setattr(mind, "_read_obi_chat_timestamps", lambda: (0.0, 0.0))
+    monkeypatch.setattr(mind, "_read_obi_chat_meta", lambda: {})
+    monkeypatch.setattr(mind, "_append_obi_chat", lambda entry: None)
+    monkeypatch.setattr(mind, "_write_obi_chat_meta", lambda meta: None)
+
+    mind._emit_message_obi("Obi, are you there?")
+    assert fired == [("Obi, are you there?", True)]
+
+
+def test_emit_message_obi_suppressed_no_announce(monkeypatch):
+    fired = []
+    monkeypatch.setattr(mind, "_dispatch_announce",
+                        lambda text, private=False: fired.append((text, private)))
+    # last_spark_ts > last_obi_ts and recent -> awaiting reply within backoff -> suppressed.
+    import time as _t
+    now = _t.time()
+    monkeypatch.setattr(mind, "_read_obi_chat_timestamps", lambda: (now, 0.0))
+    monkeypatch.setattr(mind, "_read_obi_chat_meta", lambda: {"backoff_s": 9999})
+    monkeypatch.setattr(mind, "_append_obi_chat", lambda entry: None)
+    monkeypatch.setattr(mind, "_write_obi_chat_meta", lambda meta: None)
+
+    mind._emit_message_obi("still waiting")
+    assert fired == []   # no announce when the nudge is backoff-suppressed

@@ -2885,6 +2885,41 @@ def _write_obi_chat_meta(meta: dict) -> None:
         log(f"obi_chat: failed to write meta: {exc}")
 
 
+def _emit_message_obi(text: str) -> None:
+    """Write a message_obi nudge (with exponential backoff) and announce it to Obi."""
+    if not text:
+        log("expression: message_obi has no text — skipping")
+        return
+    now_ts = time.time()
+    last_spark_ts, last_obi_ts = _read_obi_chat_timestamps()
+    meta = _read_obi_chat_meta()
+    backoff_s = float(meta.get("backoff_s", OBI_CHAT_BASE_BACKOFF_S))
+
+    # Obi replied since last SPARK message → reset backoff
+    if last_obi_ts > last_spark_ts > 0:
+        backoff_s = OBI_CHAT_BASE_BACKOFF_S
+
+    awaiting = last_spark_ts > last_obi_ts and last_spark_ts > 0
+    if awaiting:
+        elapsed = now_ts - last_spark_ts
+        if elapsed < backoff_s:
+            log(f"expression: suppressed message_obi — awaiting reply "
+                f"(backoff {backoff_s:.0f}s, elapsed {elapsed:.0f}s)")
+            return                                       # suppressed -> NO announce
+        # Nudge: backoff expired, double for next time
+        backoff_s = min(backoff_s * 2, OBI_CHAT_MAX_BACKOFF_S)
+        log(f"expression: message_obi nudge — backoff doubled to {backoff_s:.0f}s")
+    else:
+        backoff_s = OBI_CHAT_BASE_BACKOFF_S
+
+    msg_id = format(int(now_ts * 1000) % 0xFFFFFFFF, "08x")
+    entry = {"id": msg_id, "ts": utc_timestamp(), "role": "spark", "text": text[:500]}
+    _append_obi_chat(entry)
+    _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
+    _dispatch_announce(text, private=True)               # Obi HEARS the DM in the data voice
+    log(f"expression: message_obi written (id={msg_id})")
+
+
 def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     """Layer 3: act on a thought."""
     global _last_spoken_text, _last_morning_fact_date
@@ -3294,36 +3329,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 log(f"expression: self_debug error: {exc}")
 
         elif action == "message_obi":
-            if not text:
-                log("expression: message_obi has no text — skipping")
-            else:
-                now_ts = time.time()
-                last_spark_ts, last_obi_ts = _read_obi_chat_timestamps()
-                meta = _read_obi_chat_meta()
-                backoff_s = float(meta.get("backoff_s", OBI_CHAT_BASE_BACKOFF_S))
-
-                # Obi replied since last SPARK message → reset backoff
-                if last_obi_ts > last_spark_ts > 0:
-                    backoff_s = OBI_CHAT_BASE_BACKOFF_S
-
-                awaiting = last_spark_ts > last_obi_ts and last_spark_ts > 0
-                if awaiting:
-                    elapsed = now_ts - last_spark_ts
-                    if elapsed < backoff_s:
-                        log(f"expression: suppressed message_obi — awaiting reply "
-                            f"(backoff {backoff_s:.0f}s, elapsed {elapsed:.0f}s)")
-                        return
-                    # Nudge: backoff expired, double for next time
-                    backoff_s = min(backoff_s * 2, OBI_CHAT_MAX_BACKOFF_S)
-                    log(f"expression: message_obi nudge — backoff doubled to {backoff_s:.0f}s")
-                else:
-                    backoff_s = OBI_CHAT_BASE_BACKOFF_S
-
-                msg_id = format(int(now_ts * 1000) % 0xFFFFFFFF, "08x")
-                entry = {"id": msg_id, "ts": utc_timestamp(), "role": "spark", "text": text[:500]}
-                _append_obi_chat(entry)
-                _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
-                log(f"expression: message_obi written (id={msg_id})")
+            _emit_message_obi(text)
 
         elif action == "announce":
             if not text:
