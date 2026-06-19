@@ -624,7 +624,7 @@ def test_valid_actions_includes_new_actions():
         "time_check", "calendar_check", "morning_fact",
         "introspect", "evolve",
         "research", "compose", "self_debug", "blog_essay",
-        "message_obi",
+        "message_obi", "announce",
     }
     assert VALID_ACTIONS == expected
 

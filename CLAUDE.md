@@ -184,6 +184,22 @@ Cron on M5.local (every 5min): queries three Chipolo trackers → SSH-pushes `st
 
 `bin/mcp-server` exposes 5 read-only tools via FastMCP (stdio): `spark_status`, `spark_thoughts`, `spark_awareness`, `spark_sonar`, `spark_vitals`. Registered in `.mcp.json`.
 
+### Announce Pipeline (tool-announce + M5 relay)
+
+SPARK speaks through the Nest Mini/Hub Max via a two-hop chain: `bin/tool-announce` (Pi) → M5 relay (LAN) → afterwords TTS (M5 localhost) → HA media-player cast.
+
+**Architecture:**
+- M5 relay (`m5/announce-relay/`) runs on port **7862**, fronting afterwords on `127.0.0.1:7860`. Afterwords never listens on LAN.
+- `POST /announce` pre-synthesizes text to a WAV file; `GET /audio/{key}` serves it unauthed so HA can fetch by URL.
+- Always address the relay by IP (`192.168.1.171`) — never `M5.local`. mDNS is unreliable from Pi and HA.
+- `data` voice only (afterwords `data` model); single target in v1 (no speaker groups → no echo).
+
+**Night silence:** Enforced inside `bin/tool-announce` using `ANNOUNCE_QUIET_START`/`ANNOUNCE_QUIET_END` from `spark_config` (default 19:00–07:00 Hobart time). All trigger paths (voice loop, px-mind `announce` action, `message_obi` private audio) pass through the tool, so the gate is a single chokepoint. Override via `PX_ANNOUNCE_FORCE=1` (tests only).
+
+**`ANNOUNCE_ENABLED` flag:** Defined in `src/pxh/spark_config.py`, ships `False`. Gates the G1 (transcode smoke) and G2 (HA entity pin) pre-flight checks inside the tool. Flip to `True` only after the relay is confirmed reachable by IP from the Pi (`curl http://192.168.1.171:7862/health`).
+
+**Private audio (`message_obi`):** Uses the relay's `priv/` namespace with a 3-minute TTL (vs. 7-day for public audio). The DM text itself is still redacted from `thoughts-spark.jsonl` as `[private message to Obi]`; only the audio is ephemeral on-relay.
+
 ### Site (spark.wedd.au)
 
 Static site on Cloudflare Pages (auto-deploys from `master`, `site/` dir).
