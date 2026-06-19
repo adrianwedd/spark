@@ -39,6 +39,7 @@ from pxh.spark_config import (
     SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
     SALIENCE_THRESHOLD, WEATHER_INTERVAL_S,
     OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
+    NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
@@ -152,6 +153,11 @@ from zoneinfo import ZoneInfo
 HOBART_TZ = ZoneInfo("Australia/Hobart")  # DST-aware: AEDT (UTC+11) / AEST (UTC+10)
 OBI_DAY_START  = 7   # 7am Hobart — Obi's waking hours begin
 OBI_DAY_END    = 20  # 8pm Hobart — Obi's waking hours end
+
+
+def _is_night_silence(hour: int) -> bool:
+    """True during the unconditional night-silence window (Hobart hour-of-day)."""
+    return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
 
 
 def _daytime_action_hint(hour_override: int | None = None) -> str:
@@ -2870,9 +2876,10 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
 
     # Hard night silence: 19:00–07:00 Hobart time — unconditional, no sensor dependencies
     _night_hour = dt.datetime.now(HOBART_TZ).hour
-    if _night_hour >= 19 or _night_hour < 7:
+    if _is_night_silence(_night_hour):
         if action not in ("wait", "remember"):
-            log(f"expression: suppressed {action} — night silence (19:00–07:00)")
+            log(f"expression: suppressed {action} — night silence "
+                f"({NIGHT_SILENCE_START_H:02d}:00–{NIGHT_SILENCE_END_H:02d}:00)")
             return
 
     # Gate speech on obi_mode: at night when Obi is absent, suppress non-essential actions
@@ -3334,7 +3341,7 @@ def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
     # Day/night split: dict with "day"/"night" keys (used by spark someone_left)
     if isinstance(phrases, dict):
         hour = dt.datetime.now(HOBART_TZ).hour
-        slot = "night" if (hour >= 19 or hour < 7) else "day"
+        slot = "night" if _is_night_silence(hour) else "day"
         phrases = phrases.get(slot, phrases.get("day", list(phrases.values())[0]))
 
     # Recency filter: avoid repeating any of the last 3 phrases for this slot
