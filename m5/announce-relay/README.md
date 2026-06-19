@@ -1,6 +1,6 @@
 # Announce Relay
 
-LAN-facing front door to the afterwords synthesis service. Exposes two endpoints (`/synthesize` and `/health`) that bind on `0.0.0.0:7862`. The relay forwards synthesis requests to afterwords (running locally on the M5), manages a cache of pre-synthesized audio (TTL configurable), and enforces rate limits and max-text-size bounds. Requires the `data` voice from afterwords.
+LAN-facing front door to the afterwords synthesis service. Binds `0.0.0.0:7862` and exposes three endpoints — `POST /announce`, `GET /audio/{name}.wav`, and `GET /health` (documented below). The relay forwards synthesis requests to afterwords (which it reaches at its localhost-only `/synthesize`, never exposed on the LAN), manages a cache of pre-synthesized audio (TTL configurable), and enforces rate limits and max-text-size bounds. Requires the `data` voice from afterwords.
 
 ## Endpoints
 
