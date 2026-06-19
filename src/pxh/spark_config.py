@@ -20,6 +20,25 @@ OBI_CHAT_BASE_BACKOFF_S = 600    # 10 min before a nudge when awaiting reply
 OBI_CHAT_MAX_BACKOFF_S  = 14400  # 4 h cap
 OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
 
+# --- Announce pipeline (data-voice over Google Nest) ----------------------
+ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
+ANNOUNCE_RELAY_URL       = "http://192.168.1.171:7862"   # IP, not M5.local (Nest mDNS)
+ANNOUNCE_VOICE           = "data"
+# v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
+ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
+ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.nest_mini",
+                            "media_player.googlehome1094"]
+ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/wav")
+ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
+ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
+ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
+HA_BASE_URL              = "http://homeassistant.local:8123"
+
+# Night silence bounds (Hobart time), applied via ZoneInfo("Australia/Hobart").
+# Sourced here so mind.py stops hardcoding 19/7.
+NIGHT_SILENCE_START_H    = 19
+NIGHT_SILENCE_END_H      = 7
+
 MOOD_TO_SOUND = {
     "curious": "beep", "alert": "beep",
     "happy": "tada", "excited": "tada", "playful": "tada",

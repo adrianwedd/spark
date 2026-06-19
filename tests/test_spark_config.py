@@ -61,3 +61,22 @@ def test_pick_reflection_seed_returns_string_or_none():
     assert len(nones) > 0
     assert all(isinstance(s, str) for s in strings)
     assert all(s in TOPIC_SEEDS for s in strings)
+
+
+def test_announce_constants_present_and_safe():
+    from pxh import spark_config as cfg
+
+    # Ships OFF until the relay is live on M5
+    assert cfg.ANNOUNCE_ENABLED is False
+    # IP-based, never M5.local (Nest can't resolve mDNS)
+    assert "192.168.1.171" in cfg.ANNOUNCE_RELAY_URL
+    assert "M5.local" not in cfg.ANNOUNCE_RELAY_URL
+    assert cfg.ANNOUNCE_VOICE == "data"
+    # v1 casts to exactly one default entity (no speaker group -> echo)
+    assert len(cfg.ANNOUNCE_DEFAULT_TARGETS) == 1
+    assert set(cfg.ANNOUNCE_DEFAULT_TARGETS).issubset(set(cfg.ANNOUNCE_ALLOWED_TARGETS))
+    assert cfg.ANNOUNCE_MAX_CHARS == 200
+    assert cfg.ANNOUNCE_CONNECT_TIMEOUT == 5
+    assert cfg.ANNOUNCE_READ_TIMEOUT == 70
+    assert cfg.NIGHT_SILENCE_START_H == 19
+    assert cfg.NIGHT_SILENCE_END_H == 7
