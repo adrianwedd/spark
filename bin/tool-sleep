@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+python - "$@" <<'PY'
+"""Tool: SPARK bedtime / sleep mode. start|check|end."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+from pxh.logging import log_event
+from pxh.state import load_session, update_session
+from pxh.time import utc_timestamp
+
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+TOOL_VOICE = PROJECT_ROOT / "bin" / "tool-voice"
+TOOL_EMOTE = PROJECT_ROOT / "bin" / "tool-emote"
+
+QUIET_FACTS = [
+    "Did you know octopuses have three hearts? Goodnight.",
+    "The moon is moving away from us, very slowly. Sleep well.",
+    "Honey never goes off. Rest now.",
+]
+
+
+def speak(text: str, dry: bool, amplitude: str = "100") -> None:
+    env = os.environ.copy()
+    env["PX_TEXT"] = text[:2000]
+    env["PX_VOICE_AMPLITUDE"] = amplitude
+    if dry:
+        env["PX_DRY"] = "1"
+    subprocess.run([str(TOOL_VOICE)], env=env, capture_output=True, check=False)
+
+
+def emote(name: str, dry: bool) -> None:
+    env = os.environ.copy(); env["PX_EMOTE"] = name
+    if dry:
+        env["PX_DRY"] = "1"
+    subprocess.run([str(TOOL_EMOTE)], env=env, capture_output=True, check=False)
+
+
+def main() -> int:
+    dry = os.environ.get("PX_DRY", "0") != "0"
+    action = os.environ.get("PX_SLEEP_ACTION", "start").lower()
+    session = load_session()
+
+    if action == "start":
+        emote("idle", dry)
+        import random
+        speak(random.choice(QUIET_FACTS), dry, amplitude="45")
+        update_session(
+            fields={"spark_sleep_mode": True, "last_action": "tool_sleep"},
+            history_entry={"event": "sleep_start", "ts": utc_timestamp()},
+        )
+        payload = {"status": "ok", "action": "start", "sleep_mode": True, "dry": dry}
+    elif action == "check":
+        payload = {"status": "ok", "action": "check",
+                   "sleep_mode": bool(session.get("spark_sleep_mode", False)), "dry": dry}
+    elif action == "end":
+        emote("curious", dry)
+        speak("Good morning. I'm awake.", dry)
+        update_session(
+            fields={"spark_sleep_mode": False, "last_action": "tool_sleep"},
+            history_entry={"event": "sleep_end", "ts": utc_timestamp()},
+        )
+        payload = {"status": "ok", "action": "end", "sleep_mode": False, "dry": dry}
+    else:
+        payload = {"status": "error", "error": f"unknown action '{action}'"}
+        log_event("sleep", payload); print(json.dumps(payload)); return 1
+
+    log_event("sleep", payload); print(json.dumps(payload)); return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY

@@ -1308,3 +1308,22 @@ def test_tool_announce_resolves_single_target_from_multiple(isolated_project):
     payload = parse_json(run_tool(["bin/tool-announce"], env))
     assert payload["status"] == "dry"
     assert len(payload["targets"]) == 1
+
+
+def test_tool_sleep_start_sets_flag(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SLEEP_ACTION"] = "start"
+    payload = parse_json(run_tool(["bin/tool-sleep"], env))
+    assert payload["status"] == "ok"
+    assert payload["sleep_mode"] is True
+    session = json.loads(isolated_project["session_path"].read_text())
+    assert session["spark_sleep_mode"] is True
+
+
+def test_tool_sleep_end_clears_flag(isolated_project):
+    env = isolated_project["env"].copy(); env["PX_DRY"] = "1"
+    run_tool(["bin/tool-sleep"], {**env, "PX_SLEEP_ACTION": "start"})
+    payload = parse_json(run_tool(["bin/tool-sleep"], {**env, "PX_SLEEP_ACTION": "end"}))
+    assert payload["sleep_mode"] is False
+    session = json.loads(isolated_project["session_path"].read_text())
+    assert session["spark_sleep_mode"] is False
