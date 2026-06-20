@@ -556,6 +556,16 @@ SAFETY_CRITICAL_FIELDS = {"confirm_motion_allowed", "roaming_allowed"}
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 
 
+class ConfigPatch(BaseModel):
+    mind_backend: Optional[str] = None
+    mind_claude_model: Optional[str] = None
+    awareness_interval: Optional[int] = None
+
+
+class ConfigImport(BaseModel):
+    session: Optional[Dict[str, Any]] = None
+    runtime_config: Optional[Dict[str, Any]] = None
+
 
 class PinRequest(BaseModel):
     pin: str = Field(min_length=1, max_length=16)
@@ -1594,6 +1604,51 @@ async def clear_session_history() -> Dict[str, Any]:
     count = len(session.get("history", []))
     update_session(fields={"history": []})
     return {"status": "ok", "cleared": count}
+
+
+@app.patch("/api/v1/config", dependencies=[Depends(_verify_token)])
+async def patch_config(body: ConfigPatch) -> Dict[str, Any]:
+    import pxh.runtime_config as rc
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not fields:
+        raise HTTPException(status_code=400, detail="no config fields provided")
+    if "mind_backend" in fields and fields["mind_backend"] not in ("claude", "ollama"):
+        raise HTTPException(status_code=400, detail="mind_backend must be claude|ollama")
+    try:
+        return rc.update(fields)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/v1/config/backup", dependencies=[Depends(_verify_token)])
+async def config_backup():
+    import pxh.runtime_config as rc
+    import tempfile
+    from fastapi.responses import FileResponse
+    export = {"exported_at": utc_timestamp(), "session": load_session(), "runtime_config": rc.load()}
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(export, f, indent=2)
+    f.close()
+    return FileResponse(f.name, media_type="application/json",
+                        filename="spark-config-backup.json",
+                        headers={"Content-Disposition": "attachment; filename=spark-config-backup.json"})
+
+
+@app.post("/api/v1/config/import", dependencies=[Depends(_verify_token)])
+async def config_import(body: ConfigImport) -> Dict[str, Any]:
+    import pxh.runtime_config as rc
+    applied: Dict[str, Any] = {}
+    if body.session:
+        fields = {k: v for k, v in body.session.items() if k in PATCHABLE_FIELDS}
+        if fields:
+            update_session(fields=fields)
+            applied["session"] = sorted(fields)
+    if body.runtime_config:
+        safe = {k: v for k, v in body.runtime_config.items() if k in rc.ALLOWED_KEYS}
+        if safe:
+            rc.update(safe)
+            applied["runtime_config"] = sorted(safe)
+    return {"status": "ok", "applied": applied}
 
 
 @app.post("/api/v1/tool", dependencies=[Depends(_verify_token)])

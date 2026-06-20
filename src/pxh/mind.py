@@ -2670,7 +2670,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         append_thought(thought, persona=persona)
         return thought
 
-    effective_backend = "claude" if (MIND_BACKEND == "claude" or (MIND_BACKEND == "auto" and persona == "spark")) else "ollama"
+    try:
+        import pxh.runtime_config as _rc
+        _rt_override = _rc.load().get("mind_backend")
+    except Exception:
+        _rt_override = None
+    _effective_mind_backend = _rt_override or MIND_BACKEND
+    effective_backend = "claude" if (_effective_mind_backend == "claude" or (_effective_mind_backend == "auto" and persona == "spark")) else "ollama"
     log(f"reflecting... (backend={effective_backend}, persona={persona or 'default'})")
     t0 = time.monotonic()
     if persona == "spark":

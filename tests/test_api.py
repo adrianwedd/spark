@@ -1345,3 +1345,58 @@ def test_voice_preview_requires_auth(isolated_project, monkeypatch):
     with TestClient(_api.app) as client:
         r = client.post("/api/v1/voice/preview", json={})
     assert r.status_code == 401
+
+
+# -- Config endpoints --
+
+def test_patch_config_sets_mind_backend(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.patch("/api/v1/config",
+                     json={"mind_backend": "ollama"},
+                     headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 200
+    assert r.json()["mind_backend"] == "ollama"
+
+
+def test_patch_config_rejects_invalid_backend(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.patch("/api/v1/config",
+                     json={"mind_backend": "gpt4"},
+                     headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 400
+
+
+def test_config_backup_returns_json_attachment(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.get("/api/v1/config/backup",
+                   headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 200
+    assert "attachment" in r.headers.get("content-disposition", "")
+    data = r.json()
+    assert "session" in data
+    assert "runtime_config" in data
+    assert "exported_at" in data
