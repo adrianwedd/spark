@@ -192,6 +192,21 @@ def test_voice_single_json_contract(isolated_project):
         assert "status" in payload
 
 
+def test_tool_voice_amplitude_in_dry_payload(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_TEXT"] = "hello"; env["PX_VOICE_AMPLITUDE"] = "50"
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["status"] == "ok"
+    assert payload["amplitude"] == 50
+
+
+def test_tool_voice_amplitude_clamped(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_TEXT"] = "hi"; env["PX_VOICE_AMPLITUDE"] = "999"
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["amplitude"] == 200
+
+
 def test_tool_weather_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
