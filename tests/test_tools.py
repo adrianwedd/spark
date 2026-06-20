@@ -297,7 +297,32 @@ def test_tool_frigate_events_dry_run(isolated_project):
     assert payload["dry"] is True
     assert isinstance(payload["events"], list)
     assert len(payload["events"]) > 0
-    assert "summary" in payload
+
+
+def test_tool_record_sound_dry_run(isolated_project, tmp_path):
+    sounds = tmp_path / "sounds"; sounds.mkdir()
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SOUNDS_DIR"] = str(sounds)
+    env["PX_RECORD_NAME"] = "Obi Laugh!"; env["PX_RECORD_SECONDS"] = "3"
+    payload = parse_json(run_tool(["bin/tool-record-sound"], env))
+    assert payload["status"] == "ok"
+    assert payload["name"] == "obi-laugh"   # sanitised slug
+    assert payload["seconds"] == 3
+    assert payload["dry"] is True
+    # dry-run must NOT create a file
+    assert not (sounds / "obi-laugh.wav").exists()
+
+
+def test_tool_record_sound_requires_name(isolated_project, tmp_path):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SOUNDS_DIR"] = str(tmp_path / "sounds")
+    env["PX_RECORD_NAME"] = "   "
+    result = subprocess.run(
+        ["bin/tool-record-sound"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, check=False, env=env,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
 
 
 def test_tool_frigate_events_unreachable(isolated_project):

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+python - "$@" <<'PY'
+"""Tool: record a short sound from the USB mic, save as a named effect."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+from pathlib import Path
+
+from pxh.logging import log_event
+from pxh.state import update_session
+
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+SOUNDS_DIR   = Path(os.environ.get("PX_SOUNDS_DIR", PROJECT_ROOT / "sounds"))
+
+
+def slugify(raw: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", raw.strip().lower()).strip("-")
+    return s[:40]
+
+
+def main() -> int:
+    dry = os.environ.get("PX_DRY", "0") != "0"
+    name = slugify(os.environ.get("PX_RECORD_NAME", ""))
+    try:
+        seconds = int(os.environ.get("PX_RECORD_SECONDS", "5"))
+    except ValueError:
+        seconds = 5
+    seconds = max(1, min(15, seconds))
+
+    if not name:
+        payload = {"status": "error", "error": "PX_RECORD_NAME is required"}
+        log_event("record_sound", payload); print(json.dumps(payload)); return 1
+    if name in {"chime", "beep", "tada", "alert"}:
+        payload = {"status": "error", "error": f"'{name}' is a built-in sound name"}
+        log_event("record_sound", payload); print(json.dumps(payload)); return 1
+
+    out_path = SOUNDS_DIR / f"{name}.wav"
+
+    if dry:
+        payload = {"status": "ok", "name": name, "seconds": seconds,
+                   "path": str(out_path), "dry": True}
+        log_event("record_sound", payload); print(json.dumps(payload)); return 0
+
+    SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
+    device = os.environ.get("PX_RECORD_DEVICE", "")
+    cmd = ["arecord", "-q", "-f", "cd", "-d", str(seconds)]
+    if device:
+        cmd.extend(["-D", device])
+    cmd.append(str(out_path))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except Exception as exc:
+        payload = {"status": "error", "error": f"arecord failed: {exc}"}
+        log_event("record_sound", payload); print(json.dumps(payload)); return 1
+    if result.returncode != 0:
+        payload = {"status": "error", "error": "arecord exited non-zero",
+                   "rc": result.returncode, "stderr": result.stderr[-512:]}
+        log_event("record_sound", payload); print(json.dumps(payload)); return 1
+
+    update_session(
+        fields={"last_action": "tool_record_sound"},
+        history_entry={"event": "record_sound", "name": name, "seconds": seconds},
+    )
+    payload = {"status": "ok", "name": name, "seconds": seconds,
+               "path": str(out_path), "dry": False}
+    log_event("record_sound", payload); print(json.dumps(payload)); return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
