@@ -1455,3 +1455,14 @@ def test_config_import_whitelist(isolated_project, monkeypatch):
     # bogus must not appear in runtime_config store
     cfg = rc.load()
     assert "bogus" not in cfg
+
+
+def test_dashboard_has_settings_tab(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        html = client.get("/").text
+    assert 'id="at-settings"' in html
+    assert "voice/preview" in html
+    assert "spark_sleep_mode" in html

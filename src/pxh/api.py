@@ -2531,6 +2531,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <button class="atab-btn"        id="at-tools"    onclick="swA('tools')">&#x1F6E0; Tools</button>
         <button class="atab-btn"        id="at-logs"     onclick="swA('logs')">&#x1F4CB; Logs</button>
         <button class="atab-btn"        id="at-parental" onclick="swA('parental')">&#x1F46A; Parental</button>
+        <button class="atab-btn"        id="at-settings" onclick="swA('settings')">&#x2699;&#xFE0F; Settings</button>
       </div>
       <div id="ap-svc" class="apanel active" style="padding:16px;overflow-y:auto">
         <div id="svc-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px"></div>
@@ -2577,6 +2578,25 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <input id="sh-detail" placeholder="What happened?" style="background:var(--surface2);border:none;border-radius:8px;padding:10px 14px;color:var(--text);font-family:inherit;font-size:14px">
         <button class="btn btn-blue" onclick="logEvt()">&#x1F4DD; Log to sheets</button>
       </div>
+      <div id="ap-settings" class="apanel" style="padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:12px">
+        <div class="sec-hdr">Voice</div>
+        <label>Pitch <input type="range" id="set-pitch" min="0" max="99"></label>
+        <label>Rate <input type="range" id="set-rate" min="80" max="200"></label>
+        <select id="set-variant" style="background:var(--surface2);border:none;border-radius:8px;padding:10px 14px;color:var(--text);font-family:inherit;font-size:14px">
+          <option value="en-gb">en-gb</option><option value="en+m1">en+m1</option>
+          <option value="en+f3">en+f3</option><option value="en+f4">en+f4</option>
+        </select>
+        <button class="btn btn-muted" onclick="voicePreview()">&#x25B6; Preview</button>
+        <button class="btn btn-spark" onclick="voiceSave()">Save voice</button>
+        <div class="sec-hdr">Sleep mode</div>
+        <button class="btn btn-muted" id="btn-sleep" onclick="toggleSleep()">Loading&#x2026;</button>
+        <div class="sec-hdr">Mind backend</div>
+        <select id="set-backend" onchange="setBackend(this.value)" style="background:var(--surface2);border:none;border-radius:8px;padding:10px 14px;color:var(--text);font-family:inherit;font-size:14px">
+          <option value="claude">claude</option><option value="ollama">ollama</option>
+        </select>
+        <div class="sec-hdr">Backup</div>
+        <a class="btn btn-muted" href="/api/v1/config/backup" download>&#x2B07; Export config</a>
+      </div>
     </div>
   </div>
 </div>
@@ -2597,7 +2617,7 @@ async function subPin(){
     if(r.verified){
       _apiToken=r.token||'';_pinOk=true;
       document.getElementById('auth-gate').style.display='none';
-      loadSvcs();loadParental();initTools();
+      loadSvcs();loadParental();loadSettings();initTools();
     } else {
       document.getElementById('pin-err').style.display='block';
       document.getElementById('pin-inp').value='';
@@ -2610,6 +2630,7 @@ function swA(name){
   document.getElementById('at-'+name).classList.add('active');
   document.getElementById('ap-'+name).classList.add('active');
   if(name==='logs')loadLog('px-mind');
+  if(name==='settings')loadSettings();
 }
 async function loadSvcs(){
   try{
@@ -2647,6 +2668,11 @@ async function loadParental(){
 async function toggleMotion(){try{const s=await api('/api/v1/session');const on=!s.confirm_motion_allowed;const body={confirm_motion_allowed:on};if(on)body.confirm=true;await api('/api/v1/session',{method:'PATCH',body:JSON.stringify(body)});}catch(e){}loadParental();}
 async function toggleQuiet(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_quiet_mode:!s.spark_quiet_mode})});}catch(e){}loadParental();}
 async function setPersona(p){try{await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({persona:p})});}catch(e){}}
+async function voicePreview(){await api('/api/v1/voice/preview',{method:'POST',body:JSON.stringify({pitch:+document.getElementById('set-pitch').value,rate:+document.getElementById('set-rate').value,variant:document.getElementById('set-variant').value})});}
+async function voiceSave(){await api('/api/v1/voice',{method:'PATCH',body:JSON.stringify({pitch:+document.getElementById('set-pitch').value,rate:+document.getElementById('set-rate').value,variant:document.getElementById('set-variant').value})});}
+async function toggleSleep(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_sleep_mode:!s.spark_sleep_mode})});}catch(e){}loadSettings();}
+async function setBackend(v){await api('/api/v1/config',{method:'PATCH',body:JSON.stringify({mind_backend:v})});}
+async function loadSettings(){try{const s=await api('/api/v1/session');const bs=document.getElementById('btn-sleep');bs.textContent=s.spark_sleep_mode?'\U0001F634 Sleep: ON':'☀️ Sleep: OFF';bs.className='btn '+(s.spark_sleep_mode?'btn-danger':'btn-muted');}catch(e){}}
 async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});addMsg('spark','History cleared ('+r.cleared+' entries removed).');}
 async function logEvt(){
   const mood=document.getElementById('sh-mood').value;
