@@ -1531,6 +1531,35 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
     return update_session(fields=fields)
 
 
+class VoicePatch(BaseModel):
+    variant: Optional[str] = None
+    pitch: Optional[int] = None
+    rate: Optional[int] = None
+
+
+VALID_VOICE_VARIANTS = {"en-gb", "en-us", "en+m1", "en+m3", "en+f3", "en+f4", "en+croak"}
+
+
+@app.patch("/api/v1/voice", dependencies=[Depends(_verify_token)])
+async def patch_voice(body: VoicePatch) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    if body.variant is not None:
+        if body.variant not in VALID_VOICE_VARIANTS:
+            raise HTTPException(status_code=400, detail=f"invalid variant: {body.variant!r}")
+        fields["voice_variant"] = body.variant
+    if body.pitch is not None:
+        if not (0 <= body.pitch <= 99):
+            raise HTTPException(status_code=400, detail="pitch must be 0-99")
+        fields["voice_pitch"] = body.pitch
+    if body.rate is not None:
+        if not (80 <= body.rate <= 200):
+            raise HTTPException(status_code=400, detail="rate must be 80-200")
+        fields["voice_rate"] = body.rate
+    if not fields:
+        raise HTTPException(status_code=400, detail="no voice fields provided")
+    return update_session(fields=fields)
+
+
 @app.post("/api/v1/session/history/clear", dependencies=[Depends(_verify_token)])
 async def clear_session_history() -> Dict[str, Any]:
     """Wipe session conversation history. Keeps all other session fields intact."""

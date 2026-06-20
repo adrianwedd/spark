@@ -1207,3 +1207,28 @@ def test_patch_session_sleep_mode(isolated_project, monkeypatch):
     assert r.json()["spark_sleep_mode"] is True
     from pxh.state import load_session
     assert load_session()["spark_sleep_mode"] is True
+
+
+def test_patch_voice_writes_session(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.patch("/api/v1/voice", json={"pitch": 60, "rate": 120, "variant": "en+m1"},
+                         headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    from pxh.state import load_session
+    s = load_session()
+    assert s["voice_pitch"] == 60 and s["voice_rate"] == 120 and s["voice_variant"] == "en+m1"
+
+
+def test_patch_voice_rejects_bad_range(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.patch("/api/v1/voice", json={"pitch": 999},
+                         headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
