@@ -1205,3 +1205,5 @@ def test_patch_session_sleep_mode(isolated_project, monkeypatch):
                          headers={"Authorization": "Bearer testtoken"})
     assert r.status_code == 200
     assert r.json()["spark_sleep_mode"] is True
+    from pxh.state import load_session
+    assert load_session()["spark_sleep_mode"] is True

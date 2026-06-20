@@ -173,3 +173,8 @@ def test_validate_sleep():
     tool, env = validate_action({"tool": "tool_sleep", "params": {"action": "start"}})
     assert tool == "tool_sleep"
     assert env["PX_SLEEP_ACTION"] == "start"
+
+
+def test_validate_sleep_rejects_bad_action():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_sleep", "params": {"action": "bad"}})
