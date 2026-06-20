@@ -1232,3 +1232,33 @@ def test_patch_voice_rejects_bad_range(isolated_project, monkeypatch):
         r = client.patch("/api/v1/voice", json={"pitch": 999},
                          headers={"Authorization": "Bearer testtoken"})
     assert r.status_code == 400
+
+
+def test_patch_voice_rejects_invalid(isolated_project, monkeypatch):
+    """Test PATCH /voice rejection paths: rate range, variant, empty body."""
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    headers = {"Authorization": "Bearer testtoken"}
+
+    with TestClient(_api.app) as client:
+        # rate below range (80-200): 50 is invalid
+        r = client.patch("/api/v1/voice", json={"rate": 50}, headers=headers)
+        assert r.status_code == 400
+        assert "rate must be 80-200" in r.json()["detail"]
+
+        # rate above range: 999 is invalid
+        r = client.patch("/api/v1/voice", json={"rate": 999}, headers=headers)
+        assert r.status_code == 400
+        assert "rate must be 80-200" in r.json()["detail"]
+
+        # invalid variant: "fr" is not in VALID_VOICE_VARIANTS
+        r = client.patch("/api/v1/voice", json={"variant": "fr"}, headers=headers)
+        assert r.status_code == 400
+        assert "invalid variant" in r.json()["detail"]
+
+        # empty body: no fields provided
+        r = client.patch("/api/v1/voice", json={}, headers=headers)
+        assert r.status_code == 400
+        assert "no voice fields provided" in r.json()["detail"]
