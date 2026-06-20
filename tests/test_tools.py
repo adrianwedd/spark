@@ -243,6 +243,31 @@ def test_tool_play_sound_invalid_name(isolated_project):
     assert payload["status"] == "error"
 
 
+def test_tool_play_sound_allows_recorded_file(isolated_project, tmp_path):
+    sounds = tmp_path / "sounds"
+    sounds.mkdir()
+    (sounds / "obi-laugh.wav").write_bytes(b"RIFF0000WAVEfmt ")
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_SOUNDS_DIR"] = str(sounds)
+    env["PX_SOUND"] = "obi-laugh"
+    payload = parse_json(run_tool(["bin/tool-play-sound"], env))
+    assert payload["status"] == "ok"
+    assert payload["sound"] == "obi-laugh"
+
+
+def test_tool_play_sound_rejects_unknown(isolated_project, tmp_path):
+    sounds = tmp_path / "sounds"; sounds.mkdir()
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SOUNDS_DIR"] = str(sounds); env["PX_SOUND"] = "nope"
+    result = subprocess.run(
+        ["bin/tool-play-sound"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, check=False, env=env,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
+
+
 def test_tool_face_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"

@@ -18,9 +18,17 @@ from pxh.logging import log_event
 from pxh.state import update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
-SOUNDS_DIR   = PROJECT_ROOT / "sounds"
+SOUNDS_DIR   = Path(os.environ.get("PX_SOUNDS_DIR", PROJECT_ROOT / "sounds"))
 
-ALLOWED_SOUNDS = {"chime", "beep", "tada", "alert"}
+# Built-in effects always allowed; recorded sounds are discovered from SOUNDS_DIR.
+BUILTIN_SOUNDS = {"chime", "beep", "tada", "alert"}
+
+
+def allowed_sounds() -> set[str]:
+    found = set()
+    if SOUNDS_DIR.exists():
+        found = {p.stem.lower() for p in SOUNDS_DIR.glob("*.wav")}
+    return BUILTIN_SOUNDS | found
 
 
 def main() -> int:
@@ -33,10 +41,10 @@ def main() -> int:
         print(json.dumps(payload))
         return 1
 
-    if name not in ALLOWED_SOUNDS:
+    if name not in allowed_sounds():
         payload = {
             "status": "error",
-            "error": f"unknown sound '{name}'; allowed: {sorted(ALLOWED_SOUNDS)}",
+            "error": f"unknown sound '{name}'; allowed: {sorted(allowed_sounds())}",
         }
         log_event("play_sound", payload)
         print(json.dumps(payload))
