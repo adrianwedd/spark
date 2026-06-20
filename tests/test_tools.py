@@ -801,6 +801,30 @@ def test_tool_dopamine_menu_invalid_energy(isolated_project):
     assert payload["energy"] == "medium"
 
 
+def test_dopamine_add_then_suggest_includes_item(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_DOPAMINE_ACTION"] = "add"
+    env["PX_DOPAMINE_ITEM"] = "Watching a volcano video"
+    env["PX_DOPAMINE_ENERGY"] = "low"
+    env["PX_DOPAMINE_CONTEXT"] = "free"
+    add = parse_json(run_tool(["bin/tool-dopamine-menu"], env))
+    assert add["status"] == "ok"
+    assert add["action"] == "add"
+
+    # the note file lives under the isolated state dir, shared persona scope
+    notes = (isolated_project["state_dir"] / "notes.jsonl").read_text()
+    assert "[dopamine-item:low:free] Watching a volcano video" in notes
+
+    env2 = isolated_project["env"].copy()
+    env2["PX_DRY"] = "1"
+    env2["PX_DOPAMINE_ENERGY"] = "low"; env2["PX_DOPAMINE_CONTEXT"] = "free"
+    # force the Obi item into the pick set by making it the only candidate path:
+    env2["PX_DOPAMINE_PICK_OBI_ONLY"] = "1"   # test seam
+    sug = parse_json(run_tool(["bin/tool-dopamine-menu"], env2))
+    assert "Watching a volcano video" in sug["picks"]
+
+
 def test_tool_sensory_check_ask_dry(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"

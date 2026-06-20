@@ -21,6 +21,8 @@ import random
 import subprocess
 from pathlib import Path
 
+from filelock import FileLock
+
 from pxh.logging import log_event
 from pxh.state import load_session, update_session
 from pxh.time import utc_timestamp
@@ -28,6 +30,38 @@ from pxh.time import utc_timestamp
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
 TOOL_EMOTE   = PROJECT_ROOT / "bin" / "tool-emote"
+
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+
+def notes_file_for_persona(persona: str) -> Path:
+    return STATE_DIR / (f"notes-{persona}.jsonl" if persona else "notes.jsonl")
+
+
+def add_item(item: str, energy: str, context: str, persona: str) -> None:
+    notes_file = notes_file_for_persona(persona)
+    notes_file.parent.mkdir(parents=True, exist_ok=True)
+    record = {"ts": utc_timestamp(),
+              "note": f"[dopamine-item:{energy}:{context}] {item[:200]}"}
+    with FileLock(str(notes_file) + ".lock", timeout=10):
+        with notes_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+
+def obi_items(energy: str, context: str, persona: str) -> list[str]:
+    notes_file = notes_file_for_persona(persona)
+    if not notes_file.exists():
+        return []
+    prefix = f"[dopamine-item:{energy}:{context}]"
+    out = []
+    for line in notes_file.read_text(encoding="utf-8").strip().splitlines():
+        try:
+            note = json.loads(line).get("note", "")
+        except json.JSONDecodeError:
+            continue
+        if note.startswith(prefix):
+            out.append(note[len(prefix):].strip())
+    return out
 
 # Dopamine menu: energy × context → options
 # Sideways language: "Some people like...", "There's always...", no commands
@@ -114,9 +148,28 @@ def main() -> int:
     if context not in MENU[energy]:
         context = "free"
 
-    options = MENU[energy][context]
+    action = os.environ.get("PX_DOPAMINE_ACTION", "suggest").lower()
+    persona = (load_session().get("persona") or "").lower().strip()
+
+    if action == "add":
+        item = os.environ.get("PX_DOPAMINE_ITEM", "").strip()
+        if not item:
+            payload = {"status": "error", "error": "PX_DOPAMINE_ITEM is required"}
+            log_event("dopamine_menu", payload); print(json.dumps(payload)); return 1
+        add_item(item, energy, context, persona)
+        speak(f"Added that to your menu. {energy} energy.", dry)
+        payload = {"status": "ok", "action": "add", "item": item,
+                   "energy": energy, "context": context, "dry": dry}
+        log_event("dopamine_menu", payload); print(json.dumps(payload)); return 0
+
+    pool = list(MENU[energy][context])
+    extra = obi_items(energy, context, persona)
+    if os.environ.get("PX_DOPAMINE_PICK_OBI_ONLY") == "1" and extra:
+        pool = extra
+    else:
+        pool = pool + extra
     # Pick two distinct options (sideways: offer choice, not a command)
-    picks = random.sample(options, min(2, len(options)))
+    picks = random.sample(pool, min(2, len(pool)))
 
     emote("curious", dry)
     speak("Some options.", dry)
@@ -128,8 +181,8 @@ def main() -> int:
         history_entry={"event": "dopamine_menu", "energy": energy,
                        "context": context, "ts": utc_timestamp()},
     )
-    payload = {"status": "ok", "energy": energy, "context": context,
-               "picks": picks, "dry": dry}
+    payload = {"status": "ok", "action": "suggest", "energy": energy,
+               "context": context, "picks": picks, "dry": dry}
     log_event("dopamine_menu", payload)
     print(json.dumps(payload))
     return 0
