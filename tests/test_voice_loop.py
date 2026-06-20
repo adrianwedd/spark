@@ -115,7 +115,6 @@ def test_validate_announce_single_target_from_allowed_list():
 
 
 def test_validate_record_sound():
-    from pxh.voice_loop import validate_action, ALLOWED_TOOLS
     assert "tool_record_sound" in ALLOWED_TOOLS
     tool, env = validate_action({"tool": "tool_record_sound",
                                  "params": {"name": "Obi Laugh", "seconds": 3}})
@@ -125,7 +124,27 @@ def test_validate_record_sound():
 
 
 def test_validate_record_sound_clamps_seconds():
-    from pxh.voice_loop import validate_action
     _, env = validate_action({"tool": "tool_record_sound",
                               "params": {"name": "x", "seconds": 99}})
     assert env["PX_RECORD_SECONDS"] == "15"
+
+
+def test_validate_play_sound_allows_recorded_name():
+    _, env = validate_action({"tool": "tool_play_sound", "params": {"name": "obi-laugh"}})
+    assert env["PX_SOUND"] == "obi-laugh"
+
+
+def test_validate_play_sound_rejects_unsafe():
+    for bad in ["../etc", "a/b", ""]:
+        with pytest.raises(VoiceLoopError):
+            validate_action({"tool": "tool_play_sound", "params": {"name": bad}})
+
+
+def test_validate_record_sound_rejects_empty_name():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_record_sound", "params": {"name": "  ", "seconds": 5}})
+
+
+def test_validate_record_sound_default_seconds():
+    _, env = validate_action({"tool": "tool_record_sound", "params": {"name": "x"}})
+    assert env["PX_RECORD_SECONDS"] == "5"

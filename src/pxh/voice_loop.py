@@ -663,9 +663,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         sanitized["PX_TEXT"] = text
     elif tool == "tool_play_sound":
         name = str(params.get("name", "")).lower().strip()
-        allowed = {"chime", "beep", "tada", "alert"}
-        if name not in allowed:
-            raise VoiceLoopError(f"unknown sound '{name}'; allowed: {sorted(allowed)}")
+        if not name or len(name) > 40 or not all(c.isalnum() or c == "-" for c in name):
+            raise VoiceLoopError(f"invalid sound name '{name}'")
         sanitized["PX_SOUND"] = name
     elif tool == "tool_record_sound":
         name = params.get("name")
