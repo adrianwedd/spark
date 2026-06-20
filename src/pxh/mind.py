@@ -451,6 +451,8 @@ ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
                         "research", "compose", "blog_essay", "message_obi"}
+# Sleep mode suppresses everything except passive wait/remember.
+SLEEP_ALLOWED_ACTIONS = {"wait", "remember"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -3004,6 +3006,12 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     # avoid double "FUCK YEAH!" or other duplication.
     # For weather_comment, the raw weather data needs rephrasing.
     session = load_session()
+
+    # Sleep mode: suppress all actions except passive wait/remember.
+    if session.get("spark_sleep_mode", False) and action not in SLEEP_ALLOWED_ACTIONS:
+        log(f"expression: suppressed {action} — sleep mode")
+        return
+
     persona = (session.get("persona") or "").lower().strip()
     needs_rephrase = action in ("weather_comment",)
     if persona and persona in PERSONA_VOICE_ENV:
