@@ -130,3 +130,20 @@ class TestSparkRunTool:
         from pxh import mcp_server
         out = mcp_server.spark_run_tool("tool_evil", {})
         assert out["status"] == "error"
+
+    def test_spark_run_tool_blocked_on_motion(self, monkeypatch):
+        from pxh import mcp_server
+        monkeypatch.setattr(mcp_server, "execute_tool",
+            lambda tool, env, dry, timeout=None: (2, "", "motion blocked"))
+        out = mcp_server.spark_run_tool("tool_status", {}, dry=False)
+        assert out["status"] == "blocked"
+        assert out["returncode"] == 2
+
+    def test_spark_run_tool_none_params(self, monkeypatch):
+        from pxh import mcp_server
+        captured = {}
+        monkeypatch.setattr(mcp_server, "execute_tool",
+            lambda tool, env, dry, timeout=None: captured.update({"tool": tool}) or (0, "{}", ""))
+        out = mcp_server.spark_run_tool("tool_status")   # no params arg — exercises params=None -> {}
+        assert out["status"] == "ok"
+        assert captured["tool"] == "tool_status"
