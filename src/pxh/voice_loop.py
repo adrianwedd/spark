@@ -755,10 +755,10 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         sanitized["PX_BREATHE_TYPE"] = btype
         sanitized["PX_BREATHE_ROUNDS"] = str(rounds)
     elif tool == "tool_dopamine_menu":
-        action = str(params.get("action", "suggest")).lower()
-        if action not in ("suggest", "add"):
+        dop_action = str(params.get("action", "suggest")).lower()
+        if dop_action not in ("suggest", "add"):
             raise VoiceLoopError("tool_dopamine_menu action must be suggest|add")
-        sanitized["PX_DOPAMINE_ACTION"] = action
+        sanitized["PX_DOPAMINE_ACTION"] = dop_action
         energy = str(params.get("energy", "medium")).lower()
         context = str(params.get("context", "free")).lower()
         if energy not in ("high", "medium", "low"):
@@ -767,7 +767,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             raise VoiceLoopError(f"invalid context '{context}'")
         sanitized["PX_DOPAMINE_ENERGY"] = energy
         sanitized["PX_DOPAMINE_CONTEXT"] = context
-        if action == "add":
+        if dop_action == "add":
             item = params.get("item")
             if not isinstance(item, str) or not item.strip():
                 raise VoiceLoopError("tool_dopamine_menu add requires an item")

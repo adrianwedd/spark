@@ -151,7 +151,6 @@ def test_validate_record_sound_default_seconds():
 
 
 def test_validate_dopamine_add():
-    from pxh.voice_loop import validate_action
     tool, env = validate_action({"tool": "tool_dopamine_menu",
         "params": {"action": "add", "item": "magnetic tiles",
                    "energy": "high", "context": "free"}})
@@ -163,8 +162,6 @@ def test_validate_dopamine_add():
 
 
 def test_validate_dopamine_add_requires_item():
-    import pytest
-    from pxh.voice_loop import validate_action, VoiceLoopError
     with pytest.raises(VoiceLoopError):
         validate_action({"tool": "tool_dopamine_menu",
                          "params": {"action": "add"}})
