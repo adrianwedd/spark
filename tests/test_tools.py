@@ -297,6 +297,7 @@ def test_tool_frigate_events_dry_run(isolated_project):
     assert payload["dry"] is True
     assert isinstance(payload["events"], list)
     assert len(payload["events"]) > 0
+    assert "summary" in payload
 
 
 def test_tool_record_sound_dry_run(isolated_project, tmp_path):
