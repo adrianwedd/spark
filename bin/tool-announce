@@ -34,8 +34,8 @@ from pxh import spark_config as cfg
 # deterministic in tests (e.g. START=99,END=0 -> never night; START=0,END=24 -> always).
 if os.environ.get("PX_ANNOUNCE_RELAY_URL"):
     cfg.ANNOUNCE_RELAY_URL = os.environ["PX_ANNOUNCE_RELAY_URL"]
-if os.environ.get("PX_HA_BASE_URL"):
-    cfg.HA_BASE_URL = os.environ["PX_HA_BASE_URL"]
+if os.environ.get("PX_HA_HOST"):
+    cfg.HA_BASE_URL = os.environ["PX_HA_HOST"]
 if os.environ.get("PX_NIGHT_SILENCE_START_H"):
     cfg.NIGHT_SILENCE_START_H = int(os.environ["PX_NIGHT_SILENCE_START_H"])
 if os.environ.get("PX_NIGHT_SILENCE_END_H"):

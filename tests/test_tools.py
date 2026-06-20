@@ -1137,7 +1137,7 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     env["PX_BYPASS_SUDO"] = "1"
     # Point both relay and HA at the stub via spark_config override env (see Step 5 note).
     env["PX_ANNOUNCE_RELAY_URL"] = base
-    env["PX_HA_BASE_URL"] = base
+    env["PX_HA_HOST"] = base
     env["ANNOUNCE_RELAY_TOKEN"] = "t"
     env["PX_HA_TOKEN"] = "t"
     env["PX_NIGHT_SILENCE_START_H"] = "99"   # force "never night" — deterministic
@@ -1166,7 +1166,7 @@ def _run_announce_against_stub(isolated_project, text, *, private):
         env["PX_ANNOUNCE_PRIVATE"] = "1"
     env["PX_BYPASS_SUDO"] = "1"
     env["PX_ANNOUNCE_RELAY_URL"] = base
-    env["PX_HA_BASE_URL"] = base
+    env["PX_HA_HOST"] = base
     env["ANNOUNCE_RELAY_TOKEN"] = "t"
     env["PX_HA_TOKEN"] = "t"
     env["PX_NIGHT_SILENCE_START_H"] = "99"

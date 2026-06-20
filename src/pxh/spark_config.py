@@ -4,6 +4,7 @@ This file is the primary target for SPARK's self-evolution system.
 SPARK can propose changes to this file via the 'evolve' action,
 which creates a PR for human review.
 """
+import os
 import random
 
 # True entropy RNG — os.urandom-backed, not seeded at import time
@@ -32,7 +33,7 @@ ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/w
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
 ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
-HA_BASE_URL              = "http://homeassistant.local:8123"  # Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
+HA_BASE_URL              = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")  # single PX_HA_HOST source of truth for the Pi→HA host (mind.HA_HOST aliases this). Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
 
 # Night silence bounds (Hobart time), applied via ZoneInfo("Australia/Hobart").
 # Sourced here so mind.py stops hardcoding 19/7.

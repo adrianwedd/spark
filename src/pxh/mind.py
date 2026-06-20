@@ -129,7 +129,7 @@ _SEMANTIC_PLACES: dict[str, str] = {
     "the shack":    "at-dads",
 }
 
-HA_HOST                = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")
+HA_HOST                = spark_config.HA_BASE_URL  # single source of truth (PX_HA_HOST); see spark_config
 HA_TOKEN               = os.environ.get("PX_HA_TOKEN", "")
 HA_DEBUG               = os.environ.get("PX_HA_DEBUG", "") == "1"
 HA_TIMEOUT_S           = 3
