@@ -896,8 +896,17 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
     # else: leave PX_DRY as inherited from the operator's environment
     for key, value in env_overrides.items():
         env[key] = value
-    # Inject persona voice settings if a persona is active in session
-    session_persona = load_session().get("persona") or ""
+    # Apply session-tuned base voice, then let persona override it (single read)
+    _sess = load_session()
+    _voice_map = {"voice_variant": "PX_VOICE_VARIANT",
+                  "voice_pitch": "PX_VOICE_PITCH",
+                  "voice_rate": "PX_VOICE_RATE"}
+    for skey, envkey in _voice_map.items():
+        val = _sess.get(skey)
+        if val:
+            env[envkey] = str(val)
+    # persona voice (if any) still overrides the tuned base voice:
+    session_persona = _sess.get("persona") or ""
     if session_persona and session_persona in PERSONA_VOICE_ENV:
         for k, v in PERSONA_VOICE_ENV[session_persona].items():
             env[k] = v

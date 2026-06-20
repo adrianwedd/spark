@@ -178,3 +178,21 @@ def test_validate_sleep():
 def test_validate_sleep_rejects_bad_action():
     with pytest.raises(VoiceLoopError):
         validate_action({"tool": "tool_sleep", "params": {"action": "bad"}})
+
+
+def test_execute_tool_applies_session_voice(monkeypatch, tmp_path):
+    import pxh.voice_loop as vl
+    captured = {}
+    monkeypatch.setattr(vl, "load_session", lambda: {
+        "voice_variant": "en+m1", "voice_pitch": "60", "voice_rate": "120"})
+
+    class _R:  returncode, stdout, stderr = 0, "{}", ""
+    def _fake_run(cmd, **kw):
+        captured.update(kw.get("env", {}))
+        return _R()
+    monkeypatch.setattr(vl.subprocess, "run", _fake_run)
+    monkeypatch.setitem(vl.TOOL_COMMANDS, "tool_status", vl.BIN_DIR / "tool-status")
+    vl.execute_tool("tool_status", {}, dry_mode=True)
+    assert captured["PX_VOICE_VARIANT"] == "en+m1"
+    assert captured["PX_VOICE_PITCH"] == "60"
+    assert captured["PX_VOICE_RATE"] == "120"
