@@ -1625,13 +1625,14 @@ async def config_backup():
     import pxh.runtime_config as rc
     import tempfile
     from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
     export = {"exported_at": utc_timestamp(), "session": load_session(), "runtime_config": rc.load()}
     f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
     json.dump(export, f, indent=2)
     f.close()
     return FileResponse(f.name, media_type="application/json",
                         filename="spark-config-backup.json",
-                        headers={"Content-Disposition": "attachment; filename=spark-config-backup.json"})
+                        background=BackgroundTask(os.unlink, f.name))
 
 
 @app.post("/api/v1/config/import", dependencies=[Depends(_verify_token)])

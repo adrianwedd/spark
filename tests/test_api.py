@@ -1400,3 +1400,58 @@ def test_config_backup_returns_json_attachment(isolated_project, monkeypatch):
     assert "session" in data
     assert "runtime_config" in data
     assert "exported_at" in data
+
+
+def test_config_backup_tempfile_cleanup(isolated_project, monkeypatch):
+    """config_backup returns 200 with valid JSON (regression guard for tempfile fix)."""
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.get("/api/v1/config/backup",
+                   headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 200
+    data = r.json()
+    assert "session" in data
+    assert "runtime_config" in data
+
+
+def test_config_import_whitelist(isolated_project, monkeypatch):
+    """config/import applies ONLY whitelisted keys; unknown keys are silently dropped."""
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    from pxh.state import load_session_readonly
+    import pxh.runtime_config as rc
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.post(
+        "/api/v1/config/import",
+        json={
+            "session": {"persona": "spark", "evil_key": "x"},
+            "runtime_config": {"mind_backend": "ollama", "bogus": 1},
+        },
+        headers={"Authorization": "Bearer test-token-abc123"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    # applied lists only the whitelisted keys that were present
+    assert "evil_key" not in data.get("applied", {}).get("session", [])
+    assert "bogus" not in data.get("applied", {}).get("runtime_config", [])
+    # persona is whitelisted; it should appear
+    assert "persona" in data.get("applied", {}).get("session", [])
+    # evil_key must not have been written into session state
+    session = load_session_readonly()
+    assert "evil_key" not in session
+    # bogus must not appear in runtime_config store
+    cfg = rc.load()
+    assert "bogus" not in cfg
