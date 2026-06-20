@@ -1560,6 +1560,27 @@ async def patch_voice(body: VoicePatch) -> Dict[str, Any]:
     return update_session(fields=fields)
 
 
+@app.post("/api/v1/voice/preview", dependencies=[Depends(_verify_token)])
+async def voice_preview(body: VoicePatch) -> JSONResponse:
+    s = load_session()
+    env = {"PX_TEXT": "Hello, I'm SPARK. This is how I sound."}
+    variant = body.variant or s.get("voice_variant")
+    pitch = body.pitch if body.pitch is not None else s.get("voice_pitch")
+    rate = body.rate if body.rate is not None else s.get("voice_rate")
+    if variant:
+        env["PX_VOICE_VARIANT"] = str(variant)
+    if pitch is not None:
+        env["PX_VOICE_PITCH"] = str(pitch)
+    if rate is not None:
+        env["PX_VOICE_RATE"] = str(rate)
+    dry = _resolve_dry(None)
+    loop = asyncio.get_running_loop()
+    rc, out, err = await loop.run_in_executor(
+        None, execute_tool, "tool_voice", env, dry, SYNC_TIMEOUT_DEFAULT)
+    return JSONResponse(status_code=200 if rc == 0 else 500,
+                        content={"status": "ok" if rc == 0 else "error", "returncode": rc})
+
+
 @app.post("/api/v1/session/history/clear", dependencies=[Depends(_verify_token)])
 async def clear_session_history() -> Dict[str, Any]:
     """Wipe session conversation history. Keeps all other session fields intact."""

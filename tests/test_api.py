@@ -1262,3 +1262,22 @@ def test_patch_voice_rejects_invalid(isolated_project, monkeypatch):
         r = client.patch("/api/v1/voice", json={}, headers=headers)
         assert r.status_code == 400
         assert "no voice fields provided" in r.json()["detail"]
+
+
+def test_voice_preview_invokes_tool_voice(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    seen = {}
+    def _fake_exec(tool, env, dry, timeout=None):
+        seen["tool"] = tool; seen["env"] = env; seen["dry"] = dry
+        return 0, "{}", ""
+    monkeypatch.setattr(_api, "execute_tool", _fake_exec)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"pitch": 50},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    assert seen["tool"] == "tool_voice"
+    assert seen["env"]["PX_VOICE_PITCH"] == "50"
+    assert "PX_TEXT" in seen["env"]
