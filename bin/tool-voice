@@ -89,10 +89,16 @@ def main() -> int:
             return result.returncode
     
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
+    try:
+        amplitude = int(os.environ.get("PX_VOICE_AMPLITUDE", "100"))
+    except ValueError:
+        amplitude = 100
+    amplitude = max(0, min(200, amplitude))
     payload = {
         "status": "ok",
         "dry": dry_mode,
         "text": text,
+        "amplitude": amplitude,
     }
 
     # Network TTS routing by persona
@@ -217,7 +223,8 @@ def main() -> int:
                     import re as _re
                     spoken = _re.sub(r'\bObi\b', 'Obee', text, flags=_re.IGNORECASE)
                     es_res = subprocess.run(
-                        [DEFAULT_PLAYER, "-v", voice_variant, "-p", pitch, "-s", rate, "--stdout", spoken],
+                        [DEFAULT_PLAYER, "-v", voice_variant, "-p", pitch, "-s", rate,
+                         "-a", str(amplitude), "--stdout", spoken],
                         capture_output=True,
                         text=False,
                         check=False,

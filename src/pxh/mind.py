@@ -451,6 +451,8 @@ ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
                         "research", "compose", "blog_essay", "message_obi"}
+# Sleep mode suppresses everything except passive wait/remember.
+SLEEP_ALLOWED_ACTIONS = {"wait", "remember"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -2668,7 +2670,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         append_thought(thought, persona=persona)
         return thought
 
-    effective_backend = "claude" if (MIND_BACKEND == "claude" or (MIND_BACKEND == "auto" and persona == "spark")) else "ollama"
+    try:
+        import pxh.runtime_config as _rc
+        _rt_override = _rc.load().get("mind_backend")
+    except Exception:
+        _rt_override = None
+    _effective_mind_backend = _rt_override or MIND_BACKEND
+    effective_backend = "claude" if (_effective_mind_backend == "claude" or (_effective_mind_backend == "auto" and persona == "spark")) else "ollama"
     log(f"reflecting... (backend={effective_backend}, persona={persona or 'default'})")
     t0 = time.monotonic()
     if persona == "spark":
@@ -3004,6 +3012,12 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     # avoid double "FUCK YEAH!" or other duplication.
     # For weather_comment, the raw weather data needs rephrasing.
     session = load_session()
+
+    # Sleep mode: suppress all actions except passive wait/remember.
+    if session.get("spark_sleep_mode", False) and action not in SLEEP_ALLOWED_ACTIONS:
+        log(f"expression: suppressed {action} — sleep mode")
+        return
+
     persona = (session.get("persona") or "").lower().strip()
     needs_rephrase = action in ("weather_comment",)
     if persona and persona in PERSONA_VOICE_ENV:

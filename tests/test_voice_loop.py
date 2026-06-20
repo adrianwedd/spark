@@ -112,3 +112,87 @@ def test_validate_announce_single_target_from_allowed_list():
     _, env = validate_action({"tool": "tool_announce", "params": {
         "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.nest_mini"]}})
     assert env["PX_ANNOUNCE_TARGETS"] == "media_player.nest_hub_max"
+
+
+def test_validate_record_sound():
+    assert "tool_record_sound" in ALLOWED_TOOLS
+    tool, env = validate_action({"tool": "tool_record_sound",
+                                 "params": {"name": "Obi Laugh", "seconds": 3}})
+    assert tool == "tool_record_sound"
+    assert env["PX_RECORD_NAME"] == "Obi Laugh"
+    assert env["PX_RECORD_SECONDS"] == "3"
+
+
+def test_validate_record_sound_clamps_seconds():
+    _, env = validate_action({"tool": "tool_record_sound",
+                              "params": {"name": "x", "seconds": 99}})
+    assert env["PX_RECORD_SECONDS"] == "15"
+
+
+def test_validate_play_sound_allows_recorded_name():
+    _, env = validate_action({"tool": "tool_play_sound", "params": {"name": "obi-laugh"}})
+    assert env["PX_SOUND"] == "obi-laugh"
+
+
+def test_validate_play_sound_rejects_unsafe():
+    for bad in ["../etc", "a/b", ""]:
+        with pytest.raises(VoiceLoopError):
+            validate_action({"tool": "tool_play_sound", "params": {"name": bad}})
+
+
+def test_validate_record_sound_rejects_empty_name():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_record_sound", "params": {"name": "  ", "seconds": 5}})
+
+
+def test_validate_record_sound_default_seconds():
+    _, env = validate_action({"tool": "tool_record_sound", "params": {"name": "x"}})
+    assert env["PX_RECORD_SECONDS"] == "5"
+
+
+def test_validate_dopamine_add():
+    tool, env = validate_action({"tool": "tool_dopamine_menu",
+        "params": {"action": "add", "item": "magnetic tiles",
+                   "energy": "high", "context": "free"}})
+    assert tool == "tool_dopamine_menu"
+    assert env["PX_DOPAMINE_ACTION"] == "add"
+    assert env["PX_DOPAMINE_ITEM"] == "magnetic tiles"
+    assert env["PX_DOPAMINE_ENERGY"] == "high"
+    assert env["PX_DOPAMINE_CONTEXT"] == "free"
+
+
+def test_validate_dopamine_add_requires_item():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_dopamine_menu",
+                         "params": {"action": "add"}})
+
+
+def test_validate_sleep():
+    from pxh.voice_loop import validate_action, ALLOWED_TOOLS
+    assert "tool_sleep" in ALLOWED_TOOLS
+    tool, env = validate_action({"tool": "tool_sleep", "params": {"action": "start"}})
+    assert tool == "tool_sleep"
+    assert env["PX_SLEEP_ACTION"] == "start"
+
+
+def test_validate_sleep_rejects_bad_action():
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_sleep", "params": {"action": "bad"}})
+
+
+def test_execute_tool_applies_session_voice(monkeypatch, tmp_path):
+    import pxh.voice_loop as vl
+    captured = {}
+    monkeypatch.setattr(vl, "load_session", lambda: {
+        "voice_variant": "en+m1", "voice_pitch": "60", "voice_rate": "120"})
+
+    class _R:  returncode, stdout, stderr = 0, "{}", ""
+    def _fake_run(cmd, **kw):
+        captured.update(kw.get("env", {}))
+        return _R()
+    monkeypatch.setattr(vl.subprocess, "run", _fake_run)
+    monkeypatch.setitem(vl.TOOL_COMMANDS, "tool_status", vl.BIN_DIR / "tool-status")
+    vl.execute_tool("tool_status", {}, dry_mode=True)
+    assert captured["PX_VOICE_VARIANT"] == "en+m1"
+    assert captured["PX_VOICE_PITCH"] == "60"
+    assert captured["PX_VOICE_RATE"] == "120"

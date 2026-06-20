@@ -106,3 +106,15 @@ def test_emit_message_obi_suppressed_no_announce(monkeypatch):
 
     mind._emit_message_obi("still waiting")
     assert fired == []   # no announce when the nudge is backoff-suppressed
+
+
+def test_expression_suppressed_while_sleep_mode(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mind, "load_session", lambda: {"spark_sleep_mode": True})
+    # any voice dispatch would call subprocess.run / _run_voice — capture it
+    monkeypatch.setattr(mind, "_run_voice", lambda *a, **k: calls.append(("voice", a, k)))
+    # force daytime so night-silence is NOT the thing suppressing
+    monkeypatch.setattr(mind, "_is_night_silence", lambda *a, **k: False)
+    mind.expression({"thought": "hi", "mood": "content", "action": "comment",
+                     "salience": 0.9, "text": "hello there"}, dry=True, awareness={})
+    assert calls == []   # comment suppressed while asleep

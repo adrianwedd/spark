@@ -80,6 +80,11 @@ def test_default_state_includes_robot_name(tmp_path, monkeypatch):
     assert loaded["robot_name"] == "Spark"
 
 
+def test_default_state_has_sleep_mode():
+    from pxh.state import default_state
+    assert default_state()["spark_sleep_mode"] is False
+
+
 # -- tail_lines (issue #140) --
 
 def test_tail_lines_returns_last_n(tmp_path):

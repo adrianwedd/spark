@@ -1192,3 +1192,279 @@ class TestRaceEndpoint:
 
         assert resp.status_code == 409
         assert resp.json()["status"] == "already_running"
+
+
+def test_patch_session_sleep_mode(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api
+    importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.patch("/api/v1/session", json={"spark_sleep_mode": True},
+                         headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    assert r.json()["spark_sleep_mode"] is True
+    from pxh.state import load_session
+    assert load_session()["spark_sleep_mode"] is True
+
+
+def test_patch_voice_writes_session(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.patch("/api/v1/voice", json={"pitch": 60, "rate": 120, "variant": "en+m1"},
+                         headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    from pxh.state import load_session
+    s = load_session()
+    assert s["voice_pitch"] == 60 and s["voice_rate"] == 120 and s["voice_variant"] == "en+m1"
+
+
+def test_patch_voice_rejects_bad_range(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.patch("/api/v1/voice", json={"pitch": 999},
+                         headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_patch_voice_rejects_invalid(isolated_project, monkeypatch):
+    """Test PATCH /voice rejection paths: rate range, variant, empty body."""
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    headers = {"Authorization": "Bearer testtoken"}
+
+    with TestClient(_api.app) as client:
+        # rate below range (80-200): 50 is invalid
+        r = client.patch("/api/v1/voice", json={"rate": 50}, headers=headers)
+        assert r.status_code == 400
+        assert "rate must be 80-200" in r.json()["detail"]
+
+        # rate above range: 999 is invalid
+        r = client.patch("/api/v1/voice", json={"rate": 999}, headers=headers)
+        assert r.status_code == 400
+        assert "rate must be 80-200" in r.json()["detail"]
+
+        # invalid variant: "fr" is not in VALID_VOICE_VARIANTS
+        r = client.patch("/api/v1/voice", json={"variant": "fr"}, headers=headers)
+        assert r.status_code == 400
+        assert "invalid variant" in r.json()["detail"]
+
+        # empty body: no fields provided
+        r = client.patch("/api/v1/voice", json={}, headers=headers)
+        assert r.status_code == 400
+        assert "no voice fields provided" in r.json()["detail"]
+
+
+def test_voice_preview_invokes_tool_voice(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    seen = {}
+    def _fake_exec(tool, env, dry, timeout=None):
+        seen["tool"] = tool; seen["env"] = env; seen["dry"] = dry
+        return 0, "{}", ""
+    monkeypatch.setattr(_api, "execute_tool", _fake_exec)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"pitch": 50},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    assert seen["tool"] == "tool_voice"
+    assert seen["env"]["PX_VOICE_PITCH"] == "50"
+    assert "PX_TEXT" in seen["env"]
+    assert seen["env"]["PX_TEXT"] == "Hello, I'm SPARK. This is how I sound."
+
+
+def test_voice_preview_rejects_invalid_variant(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"variant": "fr"},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_voice_preview_rejects_out_of_range_pitch(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"pitch": 999},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_voice_preview_rejects_out_of_range_rate(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"rate": 50},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_voice_preview_session_fallback_pitch(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    seen = {}
+    def _fake_exec(tool, env, dry, timeout=None):
+        seen["tool"] = tool; seen["env"] = env; seen["dry"] = dry
+        return 0, "{}", ""
+    monkeypatch.setattr(_api, "execute_tool", _fake_exec)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        headers = {"Authorization": "Bearer testtoken"}
+        # Set pitch via PATCH
+        client.patch("/api/v1/voice", json={"pitch": 40}, headers=headers)
+        # Preview with empty body — should fall back to session pitch
+        r = client.post("/api/v1/voice/preview", json={}, headers=headers)
+    assert r.status_code == 200
+    assert seen["env"]["PX_VOICE_PITCH"] == "40"
+
+
+def test_voice_preview_requires_auth(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={})
+    assert r.status_code == 401
+
+
+# -- Config endpoints --
+
+def test_patch_config_sets_mind_backend(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.patch("/api/v1/config",
+                     json={"mind_backend": "ollama"},
+                     headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 200
+    assert r.json()["mind_backend"] == "ollama"
+
+
+def test_patch_config_rejects_invalid_backend(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.patch("/api/v1/config",
+                     json={"mind_backend": "gpt4"},
+                     headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 400
+
+
+def test_config_backup_returns_json_attachment(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.get("/api/v1/config/backup",
+                   headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 200
+    assert "attachment" in r.headers.get("content-disposition", "")
+    data = r.json()
+    assert "session" in data
+    assert "runtime_config" in data
+    assert "exported_at" in data
+
+
+def test_config_backup_tempfile_cleanup(isolated_project, monkeypatch):
+    """config_backup returns 200 with valid JSON (regression guard for tempfile fix)."""
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.get("/api/v1/config/backup",
+                   headers={"Authorization": "Bearer test-token-abc123"})
+    assert r.status_code == 200
+    data = r.json()
+    assert "session" in data
+    assert "runtime_config" in data
+
+
+def test_config_import_whitelist(isolated_project, monkeypatch):
+    """config/import applies ONLY whitelisted keys; unknown keys are silently dropped."""
+    monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    from pxh import api
+    from pxh.state import load_session_readonly
+    import pxh.runtime_config as rc
+    api._load_token()
+    from fastapi.testclient import TestClient
+    client = TestClient(api.app, raise_server_exceptions=False)
+    r = client.post(
+        "/api/v1/config/import",
+        json={
+            "session": {"persona": "spark", "evil_key": "x"},
+            "runtime_config": {"mind_backend": "ollama", "bogus": 1},
+        },
+        headers={"Authorization": "Bearer test-token-abc123"},
+    )
+    assert r.status_code == 200
+    data = r.json()
+    # applied lists only the whitelisted keys that were present
+    assert "evil_key" not in data.get("applied", {}).get("session", [])
+    assert "bogus" not in data.get("applied", {}).get("runtime_config", [])
+    # persona is whitelisted; it should appear
+    assert "persona" in data.get("applied", {}).get("session", [])
+    # evil_key must not have been written into session state
+    session = load_session_readonly()
+    assert "evil_key" not in session
+    # bogus must not appear in runtime_config store
+    cfg = rc.load()
+    assert "bogus" not in cfg
+
+
+def test_dashboard_has_settings_tab(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        html = client.get("/").text
+    assert 'id="at-settings"' in html
+    assert "voice/preview" in html
+    assert "spark_sleep_mode" in html
+    assert 'exportConfig' in html
+    assert 'href="/api/v1/config/backup"' not in html

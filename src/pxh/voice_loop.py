@@ -40,6 +40,7 @@ ALLOWED_TOOLS = {
     "tool_photograph",
     "tool_qa",
     "tool_play_sound",
+    "tool_record_sound",
     "tool_face",
     "tool_describe_scene",
     "tool_frigate_events",
@@ -55,6 +56,7 @@ ALLOWED_TOOLS = {
     "tool_celebrate",
     "tool_transition",
     "tool_quiet",
+    "tool_sleep",
     "tool_breathe",
     "tool_dopamine_menu",
     "tool_sensory_check",
@@ -87,6 +89,7 @@ TOOL_COMMANDS = {
     "tool_photograph":     BIN_DIR / "tool-photograph",
     "tool_qa":             BIN_DIR / "tool-qa",
     "tool_play_sound":     BIN_DIR / "tool-play-sound",
+    "tool_record_sound":   BIN_DIR / "tool-record-sound",
     "tool_face":           BIN_DIR / "tool-face",
     "tool_describe_scene":   BIN_DIR / "tool-describe-scene",
     "tool_frigate_events":   BIN_DIR / "tool-frigate-events",
@@ -102,6 +105,7 @@ TOOL_COMMANDS = {
     "tool_celebrate":        BIN_DIR / "tool-celebrate",
     "tool_transition":       BIN_DIR / "tool-transition",
     "tool_quiet":            BIN_DIR / "tool-quiet",
+    "tool_sleep":            BIN_DIR / "tool-sleep",
     "tool_breathe":          BIN_DIR / "tool-breathe",
     "tool_dopamine_menu":    BIN_DIR / "tool-dopamine-menu",
     "tool_sensory_check":    BIN_DIR / "tool-sensory-check",
@@ -661,10 +665,16 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         sanitized["PX_TEXT"] = text
     elif tool == "tool_play_sound":
         name = str(params.get("name", "")).lower().strip()
-        allowed = {"chime", "beep", "tada", "alert"}
-        if name not in allowed:
-            raise VoiceLoopError(f"unknown sound '{name}'; allowed: {sorted(allowed)}")
+        if not name or len(name) > 40 or not all(c.isalnum() or c == "-" for c in name):
+            raise VoiceLoopError(f"invalid sound name '{name}'")
         sanitized["PX_SOUND"] = name
+    elif tool == "tool_record_sound":
+        name = params.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise VoiceLoopError("tool_record_sound requires a non-empty name")
+        sanitized["PX_RECORD_NAME"] = name.strip()[:60]
+        seconds = int(clamp(_num(params.get("seconds", 5), "seconds"), 1, 15))
+        sanitized["PX_RECORD_SECONDS"] = str(seconds)
     elif tool == "tool_face":
         pass  # no params required
     elif tool == "tool_describe_scene":
@@ -738,6 +748,11 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if act not in valid_actions:
             raise VoiceLoopError(f"tool_quiet action must be one of {sorted(valid_actions)}")
         sanitized["PX_QUIET_ACTION"] = act
+    elif tool == "tool_sleep":
+        act = str(params.get("action", "start")).lower()
+        if act not in ("start", "check", "end"):
+            raise VoiceLoopError("tool_sleep action must be start|check|end")
+        sanitized["PX_SLEEP_ACTION"] = act
     elif tool == "tool_breathe":
         valid_types = {"box", "478", "simple"}
         btype = str(params.get("type", "simple")).lower()
@@ -747,16 +762,23 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         sanitized["PX_BREATHE_TYPE"] = btype
         sanitized["PX_BREATHE_ROUNDS"] = str(rounds)
     elif tool == "tool_dopamine_menu":
-        valid_energy = {"high", "medium", "low"}
-        valid_context = {"free", "focus", "wind-down"}
+        dop_action = str(params.get("action", "suggest")).lower()
+        if dop_action not in ("suggest", "add"):
+            raise VoiceLoopError("tool_dopamine_menu action must be suggest|add")
+        sanitized["PX_DOPAMINE_ACTION"] = dop_action
         energy = str(params.get("energy", "medium")).lower()
         context = str(params.get("context", "free")).lower()
-        if energy not in valid_energy:
-            energy = "medium"
-        if context not in valid_context:
-            context = "free"
+        if energy not in ("high", "medium", "low"):
+            raise VoiceLoopError(f"invalid energy '{energy}'")
+        if context not in ("free", "focus", "wind-down"):
+            raise VoiceLoopError(f"invalid context '{context}'")
         sanitized["PX_DOPAMINE_ENERGY"] = energy
         sanitized["PX_DOPAMINE_CONTEXT"] = context
+        if dop_action == "add":
+            item = params.get("item")
+            if not isinstance(item, str) or not item.strip():
+                raise VoiceLoopError("tool_dopamine_menu add requires an item")
+            sanitized["PX_DOPAMINE_ITEM"] = item.strip()[:200]
     elif tool == "tool_sensory_check":
         valid_actions = {"ask", "record"}
         act = str(params.get("action", "ask")).lower()
@@ -874,8 +896,17 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
     # else: leave PX_DRY as inherited from the operator's environment
     for key, value in env_overrides.items():
         env[key] = value
-    # Inject persona voice settings if a persona is active in session
-    session_persona = load_session().get("persona") or ""
+    # Apply session-tuned base voice, then let persona override it (single read)
+    _sess = load_session()
+    _voice_map = {"voice_variant": "PX_VOICE_VARIANT",
+                  "voice_pitch": "PX_VOICE_PITCH",
+                  "voice_rate": "PX_VOICE_RATE"}
+    for skey, envkey in _voice_map.items():
+        val = _sess.get(skey)
+        if val:
+            env[envkey] = str(val)
+    # persona voice (if any) still overrides the tuned base voice:
+    session_persona = _sess.get("persona") or ""
     if session_persona and session_persona in PERSONA_VOICE_ENV:
         for k, v in PERSONA_VOICE_ENV[session_persona].items():
             env[k] = v

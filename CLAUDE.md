@@ -182,7 +182,11 @@ Cron on M5.local (every 5min): queries three Chipolo trackers → SSH-pushes `st
 
 ### MCP Server
 
-`bin/mcp-server` exposes 5 read-only tools via FastMCP (stdio): `spark_status`, `spark_thoughts`, `spark_awareness`, `spark_sonar`, `spark_vitals`. Registered in `.mcp.json`.
+`bin/mcp-server` exposes read-only tools and resources via FastMCP (stdio):
+- **Tools**: `spark_status`, `spark_thoughts`, `spark_awareness`, `spark_sonar`, `spark_vitals`, `spark_list_tools`, `spark_run_tool` (all SPARK tools, motion-gated, dry-by-default).
+- **Resources**: `spark://session`, `spark://thoughts`, `spark://notes` (state snapshots).
+
+Registered in `.mcp.json`.
 
 ### Announce Pipeline (tool-announce + M5 relay)
 

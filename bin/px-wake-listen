@@ -29,6 +29,7 @@ import threading
 import time
 import wave
 from pathlib import Path
+from pxh.wake_utils import effective_onset_rms
 
 LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
@@ -742,7 +743,7 @@ def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice
 
 
 def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
-                    aplay_device: str = "") -> str:
+                    aplay_device: str = "", onset_rms: int = SPEECH_ONSET_RMS) -> str:
     """Wait up to FOLLOWUP_TIMEOUT_S for speech onset, then record and transcribe.
 
     Retries on phantom/empty transcription rather than giving up immediately —
@@ -760,7 +761,7 @@ def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
             if time.monotonic() >= deadline:
                 return ""
             data = stream.read(CHUNK, exception_on_overflow=False)
-            if rms(data) >= SPEECH_ONSET_RMS:
+            if rms(data) >= onset_rms:
                 # Speech started — record the full utterance
                 onset = [data]
                 rest = record_utterance(stream, FOLLOWUP_MAX_S, FOLLOWUP_SILENCE_S)
@@ -840,8 +841,14 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             play_chime_listening(aplay_device)
             flush_stream(stream, chunks=15)
             log("persona conversation: listening for follow-up...")
+            try:
+                from pxh.state import load_session as _load_session_pf
+                _pf_sess = _load_session_pf()
+            except Exception:
+                _pf_sess = {}
             follow_text = record_followup(stream, model, stt, whisper, sensevoice,
-                                          aplay_device=aplay_device)
+                                          aplay_device=aplay_device,
+                                          onset_rms=effective_onset_rms(bool(_pf_sess.get("spark_sleep_mode", False))))
 
             if not follow_text:
                 log("persona conversation: silence — ending")
@@ -914,8 +921,14 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
 
             # Listen for follow-up (patient: 30s onset wait, 3.5s in-speech silence)
             log("conversation: listening for follow-up...")
+            try:
+                from pxh.state import load_session as _load_session_rc
+                _rc_sess = _load_session_rc()
+            except Exception:
+                _rc_sess = {}
             follow_text = record_followup(stream, model, stt, whisper, sensevoice,
-                                          aplay_device=aplay_device)
+                                          aplay_device=aplay_device,
+                                          onset_rms=effective_onset_rms(bool(_rc_sess.get("spark_sleep_mode", False))))
 
             if not follow_text:
                 log("conversation: silence — ending")

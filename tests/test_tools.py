@@ -192,6 +192,21 @@ def test_voice_single_json_contract(isolated_project):
         assert "status" in payload
 
 
+def test_tool_voice_amplitude_in_dry_payload(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_TEXT"] = "hello"; env["PX_VOICE_AMPLITUDE"] = "50"
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["status"] == "ok"
+    assert payload["amplitude"] == 50
+
+
+def test_tool_voice_amplitude_clamped(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_TEXT"] = "hi"; env["PX_VOICE_AMPLITUDE"] = "999"
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["amplitude"] == 200
+
+
 def test_tool_weather_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -243,6 +258,31 @@ def test_tool_play_sound_invalid_name(isolated_project):
     assert payload["status"] == "error"
 
 
+def test_tool_play_sound_allows_recorded_file(isolated_project, tmp_path):
+    sounds = tmp_path / "sounds"
+    sounds.mkdir()
+    (sounds / "obi-laugh.wav").write_bytes(b"RIFF0000WAVEfmt ")
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_SOUNDS_DIR"] = str(sounds)
+    env["PX_SOUND"] = "obi-laugh"
+    payload = parse_json(run_tool(["bin/tool-play-sound"], env))
+    assert payload["status"] == "ok"
+    assert payload["sound"] == "obi-laugh"
+
+
+def test_tool_play_sound_rejects_unknown(isolated_project, tmp_path):
+    sounds = tmp_path / "sounds"; sounds.mkdir()
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SOUNDS_DIR"] = str(sounds); env["PX_SOUND"] = "nope"
+    result = subprocess.run(
+        ["bin/tool-play-sound"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, check=False, env=env,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
+
+
 def test_tool_face_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -273,6 +313,32 @@ def test_tool_frigate_events_dry_run(isolated_project):
     assert isinstance(payload["events"], list)
     assert len(payload["events"]) > 0
     assert "summary" in payload
+
+
+def test_tool_record_sound_dry_run(isolated_project, tmp_path):
+    sounds = tmp_path / "sounds"; sounds.mkdir()
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SOUNDS_DIR"] = str(sounds)
+    env["PX_RECORD_NAME"] = "Obi Laugh!"; env["PX_RECORD_SECONDS"] = "3"
+    payload = parse_json(run_tool(["bin/tool-record-sound"], env))
+    assert payload["status"] == "ok"
+    assert payload["name"] == "obi-laugh"   # sanitised slug
+    assert payload["seconds"] == 3
+    assert payload["dry"] is True
+    # dry-run must NOT create a file
+    assert not (sounds / "obi-laugh.wav").exists()
+
+
+def test_tool_record_sound_requires_name(isolated_project, tmp_path):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SOUNDS_DIR"] = str(tmp_path / "sounds")
+    env["PX_RECORD_NAME"] = "   "
+    result = subprocess.run(
+        ["bin/tool-record-sound"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, check=False, env=env,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
 
 
 def test_tool_frigate_events_unreachable(isolated_project):
@@ -750,6 +816,30 @@ def test_tool_dopamine_menu_invalid_energy(isolated_project):
     assert payload["energy"] == "medium"
 
 
+def test_dopamine_add_then_suggest_includes_item(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_DOPAMINE_ACTION"] = "add"
+    env["PX_DOPAMINE_ITEM"] = "Watching a volcano video"
+    env["PX_DOPAMINE_ENERGY"] = "low"
+    env["PX_DOPAMINE_CONTEXT"] = "free"
+    add = parse_json(run_tool(["bin/tool-dopamine-menu"], env))
+    assert add["status"] == "ok"
+    assert add["action"] == "add"
+
+    # the note file lives under the isolated state dir, shared persona scope
+    notes = (isolated_project["state_dir"] / "notes.jsonl").read_text()
+    assert "[dopamine-item:low:free] Watching a volcano video" in notes
+
+    env2 = isolated_project["env"].copy()
+    env2["PX_DRY"] = "1"
+    env2["PX_DOPAMINE_ENERGY"] = "low"; env2["PX_DOPAMINE_CONTEXT"] = "free"
+    # force the Obi item into the pick set by making it the only candidate path:
+    env2["PX_DOPAMINE_PICK_OBI_ONLY"] = "1"   # test seam
+    sug = parse_json(run_tool(["bin/tool-dopamine-menu"], env2))
+    assert "Watching a volcano video" in sug["picks"]
+
+
 def test_tool_sensory_check_ask_dry(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -1218,3 +1308,22 @@ def test_tool_announce_resolves_single_target_from_multiple(isolated_project):
     payload = parse_json(run_tool(["bin/tool-announce"], env))
     assert payload["status"] == "dry"
     assert len(payload["targets"]) == 1
+
+
+def test_tool_sleep_start_sets_flag(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"; env["PX_SLEEP_ACTION"] = "start"
+    payload = parse_json(run_tool(["bin/tool-sleep"], env))
+    assert payload["status"] == "ok"
+    assert payload["sleep_mode"] is True
+    session = json.loads(isolated_project["session_path"].read_text())
+    assert session["spark_sleep_mode"] is True
+
+
+def test_tool_sleep_end_clears_flag(isolated_project):
+    env = isolated_project["env"].copy(); env["PX_DRY"] = "1"
+    run_tool(["bin/tool-sleep"], {**env, "PX_SLEEP_ACTION": "start"})
+    payload = parse_json(run_tool(["bin/tool-sleep"], {**env, "PX_SLEEP_ACTION": "end"}))
+    assert payload["sleep_mode"] is False
+    session = json.loads(isolated_project["session_path"].read_text())
+    assert session["spark_sleep_mode"] is False

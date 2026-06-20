@@ -104,3 +104,73 @@ class TestSparkVitals:
         result = json.loads(spark_vitals())
         assert "battery" not in result
         assert "ram_mb" in result
+
+
+class TestSparkListTools:
+    def test_spark_list_tools_covers_all(self):
+        from pxh import mcp_server
+        from pxh.voice_loop import ALLOWED_TOOLS
+        listed = mcp_server.spark_list_tools()
+        assert set(listed) >= ALLOWED_TOOLS
+
+
+class TestSparkRunTool:
+    def test_spark_run_tool_dry(self, monkeypatch):
+        from pxh import mcp_server
+        captured = {}
+        monkeypatch.setattr(mcp_server, "execute_tool",
+            lambda tool, env, dry, timeout=None: captured.update(
+                {"tool": tool, "dry": dry}) or (0, '{"status":"ok"}', ""))
+        out = mcp_server.spark_run_tool("tool_status", {})
+        assert captured["tool"] == "tool_status"
+        assert captured["dry"] is True   # safe default
+        assert out["returncode"] == 0
+
+    def test_spark_run_tool_rejects_unknown(self, monkeypatch):
+        from pxh import mcp_server
+        out = mcp_server.spark_run_tool("tool_evil", {})
+        assert out["status"] == "error"
+
+    def test_spark_run_tool_blocked_on_motion(self, monkeypatch):
+        from pxh import mcp_server
+        monkeypatch.setattr(mcp_server, "execute_tool",
+            lambda tool, env, dry, timeout=None: (2, "", "motion blocked"))
+        out = mcp_server.spark_run_tool("tool_status", {}, dry=False)
+        assert out["status"] == "blocked"
+        assert out["returncode"] == 2
+
+    def test_spark_run_tool_none_params(self, monkeypatch):
+        from pxh import mcp_server
+        captured = {}
+        monkeypatch.setattr(mcp_server, "execute_tool",
+            lambda tool, env, dry, timeout=None: captured.update({"tool": tool}) or (0, "{}", ""))
+        out = mcp_server.spark_run_tool("tool_status")   # no params arg — exercises params=None -> {}
+        assert out["status"] == "ok"
+        assert captured["tool"] == "tool_status"
+
+
+class TestResourceSession:
+    def test_resource_session_reads_state(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+        (tmp_path / "session.json").write_text('{"persona":"spark"}')
+        import importlib
+        import pxh.mcp_server as m
+        importlib.reload(m)
+        assert '"persona"' in m.resource_session()
+
+    def test_resource_thoughts_reads_state(self, state_dir):
+        lines = [json.dumps({"thought": f"thought {i}", "mood": "curious"})
+                 for i in range(15)]
+        (state_dir / "thoughts-spark.jsonl").write_text("\n".join(lines) + "\n")
+        result = mcp_mod.resource_thoughts()
+        assert '"thought"' in result
+        parsed = json.loads(result)
+        assert len(parsed) == 15
+
+    def test_resource_notes_reads_state(self, state_dir):
+        lines = [json.dumps({"note": f"note {i}"}) for i in range(5)]
+        (state_dir / "notes-spark.jsonl").write_text("\n".join(lines) + "\n")
+        result = mcp_mod.resource_notes()
+        assert '"note"' in result
+        parsed = json.loads(result)
+        assert len(parsed) == 5
