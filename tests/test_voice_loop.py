@@ -112,3 +112,20 @@ def test_validate_announce_single_target_from_allowed_list():
     _, env = validate_action({"tool": "tool_announce", "params": {
         "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.nest_mini"]}})
     assert env["PX_ANNOUNCE_TARGETS"] == "media_player.nest_hub_max"
+
+
+def test_validate_record_sound():
+    from pxh.voice_loop import validate_action, ALLOWED_TOOLS
+    assert "tool_record_sound" in ALLOWED_TOOLS
+    tool, env = validate_action({"tool": "tool_record_sound",
+                                 "params": {"name": "Obi Laugh", "seconds": 3}})
+    assert tool == "tool_record_sound"
+    assert env["PX_RECORD_NAME"] == "Obi Laugh"
+    assert env["PX_RECORD_SECONDS"] == "3"
+
+
+def test_validate_record_sound_clamps_seconds():
+    from pxh.voice_loop import validate_action
+    _, env = validate_action({"tool": "tool_record_sound",
+                              "params": {"name": "x", "seconds": 99}})
+    assert env["PX_RECORD_SECONDS"] == "15"

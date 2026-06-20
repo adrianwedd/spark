@@ -40,6 +40,7 @@ ALLOWED_TOOLS = {
     "tool_photograph",
     "tool_qa",
     "tool_play_sound",
+    "tool_record_sound",
     "tool_face",
     "tool_describe_scene",
     "tool_frigate_events",
@@ -87,6 +88,7 @@ TOOL_COMMANDS = {
     "tool_photograph":     BIN_DIR / "tool-photograph",
     "tool_qa":             BIN_DIR / "tool-qa",
     "tool_play_sound":     BIN_DIR / "tool-play-sound",
+    "tool_record_sound":   BIN_DIR / "tool-record-sound",
     "tool_face":           BIN_DIR / "tool-face",
     "tool_describe_scene":   BIN_DIR / "tool-describe-scene",
     "tool_frigate_events":   BIN_DIR / "tool-frigate-events",
@@ -665,6 +667,13 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if name not in allowed:
             raise VoiceLoopError(f"unknown sound '{name}'; allowed: {sorted(allowed)}")
         sanitized["PX_SOUND"] = name
+    elif tool == "tool_record_sound":
+        name = params.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise VoiceLoopError("tool_record_sound requires a non-empty name")
+        sanitized["PX_RECORD_NAME"] = name.strip()[:60]
+        seconds = int(clamp(_num(params.get("seconds", 5), "seconds"), 1, 15))
+        sanitized["PX_RECORD_SECONDS"] = str(seconds)
     elif tool == "tool_face":
         pass  # no params required
     elif tool == "tool_describe_scene":
