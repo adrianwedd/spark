@@ -1562,6 +1562,12 @@ async def patch_voice(body: VoicePatch) -> Dict[str, Any]:
 
 @app.post("/api/v1/voice/preview", dependencies=[Depends(_verify_token)])
 async def voice_preview(body: VoicePatch) -> JSONResponse:
+    if body.variant is not None and body.variant not in VALID_VOICE_VARIANTS:
+        raise HTTPException(status_code=400, detail=f"invalid variant: {body.variant!r}")
+    if body.pitch is not None and not (0 <= body.pitch <= 99):
+        raise HTTPException(status_code=400, detail="pitch must be 0-99")
+    if body.rate is not None and not (80 <= body.rate <= 200):
+        raise HTTPException(status_code=400, detail="rate must be 80-200")
     s = load_session()
     env = {"PX_TEXT": "Hello, I'm SPARK. This is how I sound."}
     variant = body.variant or s.get("voice_variant")

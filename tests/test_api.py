@@ -1281,3 +1281,67 @@ def test_voice_preview_invokes_tool_voice(isolated_project, monkeypatch):
     assert seen["tool"] == "tool_voice"
     assert seen["env"]["PX_VOICE_PITCH"] == "50"
     assert "PX_TEXT" in seen["env"]
+    assert seen["env"]["PX_TEXT"] == "Hello, I'm SPARK. This is how I sound."
+
+
+def test_voice_preview_rejects_invalid_variant(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"variant": "fr"},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_voice_preview_rejects_out_of_range_pitch(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"pitch": 999},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_voice_preview_rejects_out_of_range_rate(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={"rate": 50},
+                        headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 400
+
+
+def test_voice_preview_session_fallback_pitch(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    seen = {}
+    def _fake_exec(tool, env, dry, timeout=None):
+        seen["tool"] = tool; seen["env"] = env; seen["dry"] = dry
+        return 0, "{}", ""
+    monkeypatch.setattr(_api, "execute_tool", _fake_exec)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        headers = {"Authorization": "Bearer testtoken"}
+        # Set pitch via PATCH
+        client.patch("/api/v1/voice", json={"pitch": 40}, headers=headers)
+        # Preview with empty body — should fall back to session pitch
+        r = client.post("/api/v1/voice/preview", json={}, headers=headers)
+    assert r.status_code == 200
+    assert seen["env"]["PX_VOICE_PITCH"] == "40"
+
+
+def test_voice_preview_requires_auth(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.post("/api/v1/voice/preview", json={})
+    assert r.status_code == 401
