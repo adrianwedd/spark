@@ -104,3 +104,29 @@ class TestSparkVitals:
         result = json.loads(spark_vitals())
         assert "battery" not in result
         assert "ram_mb" in result
+
+
+class TestSparkListTools:
+    def test_spark_list_tools_covers_all(self):
+        from pxh import mcp_server
+        from pxh.voice_loop import ALLOWED_TOOLS
+        listed = mcp_server.spark_list_tools()
+        assert set(listed) >= ALLOWED_TOOLS
+
+
+class TestSparkRunTool:
+    def test_spark_run_tool_dry(self, monkeypatch):
+        from pxh import mcp_server
+        captured = {}
+        monkeypatch.setattr(mcp_server, "execute_tool",
+            lambda tool, env, dry, timeout=None: captured.update(
+                {"tool": tool, "dry": dry}) or (0, '{"status":"ok"}', ""))
+        out = mcp_server.spark_run_tool("tool_status", {})
+        assert captured["tool"] == "tool_status"
+        assert captured["dry"] is True   # safe default
+        assert out["returncode"] == 0
+
+    def test_spark_run_tool_rejects_unknown(self, monkeypatch):
+        from pxh import mcp_server
+        out = mcp_server.spark_run_tool("tool_evil", {})
+        assert out["status"] == "error"

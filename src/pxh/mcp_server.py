@@ -1,10 +1,14 @@
-"""SPARK MCP server — read-only tools for Claude Code dev sessions.
+"""SPARK MCP server — read-only and actionable tools for Claude Code dev sessions.
 
 Exposes SPARK's live state as MCP tools so Claude Code on the Pi (or remote)
 can inspect session, thoughts, sonar, awareness, and vitals without going
 through the REST API or voice loop.
 
-Phase 1: 5 read-only tools. No motion, no audio, no state mutation.
+Phase 1: 5 read-only tools (status, thoughts, awareness, sonar, vitals).
+Phase 2: spark_list_tools + spark_run_tool — run any SPARK tool via the voice
+loop's validate_action/execute_tool pipeline. dry=True by default (safe); set
+dry=False to actuate. Motion still gated by confirm_motion_allowed in session
+state (rc==2 → status "blocked").
 """
 from __future__ import annotations
 
@@ -14,6 +18,9 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from pxh.voice_loop import validate_action, execute_tool, VoiceLoopError
+from pxh.schemas import TOOL_SCHEMAS
+
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent.parent))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
@@ -22,7 +29,11 @@ mcp = FastMCP(
     "spark",
     instructions=(
         "SPARK is a PiCar-X robot with a three-layer cognitive architecture. "
-        "These tools let you read its live state. All tools are read-only."
+        "Use spark_status/thoughts/awareness/sonar/vitals to read live state. "
+        "Use spark_list_tools to see all available tools, then spark_run_tool "
+        "to execute them. spark_run_tool defaults to dry=True (safe simulation); "
+        "pass dry=False to actuate. Motion tools are additionally gated by "
+        "confirm_motion_allowed in session state (rc==2 → status 'blocked')."
     ),
 )
 
@@ -143,6 +154,36 @@ def spark_vitals() -> str:
     if not result:
         return json.dumps({"error": "no vitals data available"})
     return json.dumps(result, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Actionable tools — full-tool exposure via voice loop dispatch
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def spark_list_tools() -> dict:
+    """List every SPARK tool and its parameter schema."""
+    return TOOL_SCHEMAS
+
+
+@mcp.tool()
+def spark_run_tool(tool: str, params: dict | None = None, dry: bool = True) -> dict:
+    """Run a SPARK tool. dry=True (default) simulates; set dry=False to actuate.
+    Motion tools still require confirm_motion_allowed in session state.
+
+    Args:
+        tool: Tool name (e.g. "tool_status", "tool_forward").
+        params: Optional dict of tool parameters.
+        dry: If True (default), simulate without side effects. Pass False to actuate.
+    """
+    try:
+        validated_tool, env = validate_action({"tool": tool, "params": params or {}})
+    except VoiceLoopError as exc:
+        return {"status": "error", "error": str(exc)}
+    rc, out, err = execute_tool(validated_tool, env, dry)
+    status = "ok" if rc == 0 else ("blocked" if rc == 2 else "error")
+    return {"status": status, "returncode": rc,
+            "stdout": out[-4096:], "stderr": err[-2048:], "dry": dry}
 
 
 # ---------------------------------------------------------------------------
