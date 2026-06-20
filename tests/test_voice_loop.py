@@ -148,3 +148,23 @@ def test_validate_record_sound_rejects_empty_name():
 def test_validate_record_sound_default_seconds():
     _, env = validate_action({"tool": "tool_record_sound", "params": {"name": "x"}})
     assert env["PX_RECORD_SECONDS"] == "5"
+
+
+def test_validate_dopamine_add():
+    from pxh.voice_loop import validate_action
+    tool, env = validate_action({"tool": "tool_dopamine_menu",
+        "params": {"action": "add", "item": "magnetic tiles",
+                   "energy": "high", "context": "free"}})
+    assert tool == "tool_dopamine_menu"
+    assert env["PX_DOPAMINE_ACTION"] == "add"
+    assert env["PX_DOPAMINE_ITEM"] == "magnetic tiles"
+    assert env["PX_DOPAMINE_ENERGY"] == "high"
+    assert env["PX_DOPAMINE_CONTEXT"] == "free"
+
+
+def test_validate_dopamine_add_requires_item():
+    import pytest
+    from pxh.voice_loop import validate_action, VoiceLoopError
+    with pytest.raises(VoiceLoopError):
+        validate_action({"tool": "tool_dopamine_menu",
+                         "params": {"action": "add"}})
