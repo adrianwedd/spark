@@ -13,3 +13,9 @@ def test_schema_shape():
     for name, spec in TOOL_SCHEMAS.items():
         assert "description" in spec, f"{name} missing 'description'"
         assert "params" in spec and isinstance(spec["params"], dict), f"{name} missing 'params' dict"
+
+
+def test_announce_max_matches_constant():
+    from pxh.schemas import TOOL_SCHEMAS
+    from pxh.spark_config import ANNOUNCE_MAX_CHARS
+    assert TOOL_SCHEMAS["tool_announce"]["params"]["text"]["max"] == ANNOUNCE_MAX_CHARS

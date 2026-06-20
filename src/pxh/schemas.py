@@ -4,10 +4,12 @@ Hand-maintained alongside voice_loop.validate_action — test_schemas.py guards
 that every ALLOWED_TOOLS entry is covered.
 
 Schema shape per tool:
-    {"description": str, "params": {name: {"type", "required", and one of "range"/"enum"/"max"}}}
+    {"description": str, "params": {name: {"type", "required", and one of "range"/"enum"/"max"/"min"}}}
 
 No-param tools get "params": {}.
 """
+
+from pxh.spark_config import ANNOUNCE_MAX_CHARS
 
 TOOL_SCHEMAS: dict = {
     # --- No-param tools ---
@@ -135,8 +137,8 @@ TOOL_SCHEMAS: dict = {
     "tool_announce": {
         "description": "Announce text via Nest speakers through the HA relay",
         "params": {
-            "text":    {"type": "str",  "max": 500,    "required": True},
-            "targets": {"type": "list",                "required": False},
+            "text":    {"type": "str",  "max": ANNOUNCE_MAX_CHARS,    "required": True},
+            "targets": {"type": "list",                               "required": False},
         },
     },
 
@@ -306,19 +308,19 @@ TOOL_SCHEMAS: dict = {
     "tool_research": {
         "description": "Research a topic using Claude and web search",
         "params": {
-            "query": {"type": "str", "max": 500, "required": True},
+            "query": {"type": "str", "min": 5, "max": 500, "required": True},
         },
     },
     "tool_compose": {
         "description": "Compose a creative or factual piece on a topic",
         "params": {
-            "topic": {"type": "str", "max": 500, "required": True},
+            "topic": {"type": "str", "min": 3, "max": 500, "required": True},
         },
     },
     "tool_blog": {
         "description": "Write a blog post on a given topic",
         "params": {
-            "topic": {"type": "str", "max": 500, "required": True},
+            "topic": {"type": "str", "min": 5, "max": 500, "required": True},
         },
     },
     "tool_story": {
