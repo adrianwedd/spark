@@ -2595,7 +2595,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
           <option value="claude">claude</option><option value="ollama">ollama</option>
         </select>
         <div class="sec-hdr">Backup</div>
-        <a class="btn btn-muted" href="/api/v1/config/backup" download>&#x2B07; Export config</a>
+        <button class="btn btn-muted" onclick="exportConfig()">&#x2B07; Export config</button>
       </div>
     </div>
   </div>
@@ -2672,7 +2672,19 @@ async function voicePreview(){await api('/api/v1/voice/preview',{method:'POST',b
 async function voiceSave(){await api('/api/v1/voice',{method:'PATCH',body:JSON.stringify({pitch:+document.getElementById('set-pitch').value,rate:+document.getElementById('set-rate').value,variant:document.getElementById('set-variant').value})});}
 async function toggleSleep(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_sleep_mode:!s.spark_sleep_mode})});}catch(e){}loadSettings();}
 async function setBackend(v){await api('/api/v1/config',{method:'PATCH',body:JSON.stringify({mind_backend:v})});}
-async function loadSettings(){try{const s=await api('/api/v1/session');const bs=document.getElementById('btn-sleep');bs.textContent=s.spark_sleep_mode?'\U0001F634 Sleep: ON':'☀️ Sleep: OFF';bs.className='btn '+(s.spark_sleep_mode?'btn-danger':'btn-muted');}catch(e){}}
+async function exportConfig(){
+  try{
+    const r=await fetch('/api/v1/config/backup',{headers:{'Authorization':'Bearer '+tok()}});
+    if(!r.ok)return;
+    const blob=await r.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url;a.download='spark-config-backup.json';
+    document.body.appendChild(a);a.click();a.remove();
+    URL.revokeObjectURL(url);
+  }catch(e){}
+}
+async function loadSettings(){try{const s=await api('/api/v1/session');const bs=document.getElementById('btn-sleep');bs.textContent=s.spark_sleep_mode?'\U0001F634 Sleep: ON':'☀️ Sleep: OFF';bs.className='btn '+(s.spark_sleep_mode?'btn-danger':'btn-muted');if(s.voice_pitch!=null)document.getElementById('set-pitch').value=s.voice_pitch;if(s.voice_rate!=null)document.getElementById('set-rate').value=s.voice_rate;if(s.voice_variant)document.getElementById('set-variant').value=s.voice_variant;}catch(e){}}
 async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});addMsg('spark','History cleared ('+r.cleared+' entries removed).');}
 async function logEvt(){
   const mood=document.getElementById('sh-mood').value;

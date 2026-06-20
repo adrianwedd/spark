@@ -1466,3 +1466,5 @@ def test_dashboard_has_settings_tab(monkeypatch):
     assert 'id="at-settings"' in html
     assert "voice/preview" in html
     assert "spark_sleep_mode" in html
+    assert 'exportConfig' in html
+    assert 'href="/api/v1/config/backup"' not in html
