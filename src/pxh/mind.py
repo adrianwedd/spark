@@ -2752,6 +2752,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     eval_dur = result.get("eval_duration", 0) / 1e9
     tps = round(eval_toks / eval_dur, 1) if eval_dur > 0 else 0
 
+    # message_obi thoughts carry private DM content. Capture this BEFORE the
+    # similarity suppressor can flip `action` to "wait" — otherwise a near-duplicate
+    # DM would slip past the redaction branch below and leak raw text to the public
+    # thoughts log. The placeholder is also used for every local log/persist path.
+    is_private_dm = thought.get("action") == "message_obi"
+    display_text = "[private message to Obi]" if is_private_dm else thought["thought"]
+
     # Anti-repetition: check against ALL recent thoughts, not just the last
     max_sim = 0.0
     for prev in recent_thoughts:
@@ -2764,11 +2771,11 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         if sim > max_sim:
             max_sim = sim
     if max_sim > SIMILARITY_THRESHOLD:
-        log(f"thought suppressed (similarity {max_sim:.0%}): {thought['thought'][:80]}")
+        log(f"thought suppressed (similarity {max_sim:.0%}): {display_text[:80]}")
         thought["action"] = "wait"
         thought["salience"] = 0.0
 
-    log(f"thought: {thought['thought']}  mood={thought['mood']} "
+    log(f"thought: {display_text}  mood={thought['mood']} "
         f"action={thought['action']} salience={thought['salience']:.1f} "
         f"({elapsed:.1f}s, {tps} tok/s)")
 
@@ -2777,12 +2784,10 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if len(_mood_history) > 20:
         _mood_history[:] = _mood_history[-20:]
 
-    # message_obi thoughts contain private DM content — redact before writing to the log
-    # which feeds the public /api/v1/public/thoughts endpoint.
-    if thought.get("action") == "message_obi":
-        append_thought({**thought, "thought": "[private message to Obi]", "text": ""}, persona=persona)
-    else:
-        append_thought(thought, persona=persona)
+    # Redact private DM content before any persistence — the thoughts log feeds the
+    # public /api/v1/public/thoughts endpoint, and notes/logs are defense-in-depth.
+    persist_thought = {**thought, "thought": display_text, "text": ""} if is_private_dm else thought
+    append_thought(persist_thought, persona=persona)
 
     # Write mood state for px-alive servo coordination
     try:
@@ -2795,9 +2800,9 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     except Exception:
         pass
 
-    # Auto-remember high-salience thoughts (persona-scoped)
+    # Auto-remember high-salience thoughts (persona-scoped) — redacted if private.
     if thought["salience"] >= SALIENCE_THRESHOLD:
-        auto_remember(thought, persona=persona)
+        auto_remember(persist_thought, persona=persona)
 
     return thought
 

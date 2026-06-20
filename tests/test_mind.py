@@ -1,6 +1,44 @@
 """Tests for night-silence helper and announce action in pxh.mind."""
+import json
 import subprocess
 from pxh import mind
+
+
+_SECRET = "SECRET-DM-PAYLOAD-XYZ"
+
+
+def _drive_reflection(monkeypatch, *, recent, salience):
+    """Run reflection() with a stubbed LLM emitting a message_obi thought.
+
+    Returns dict capturing what append_thought / auto_remember received.
+    """
+    captured = {}
+    monkeypatch.setattr(mind, "call_llm", lambda *a, **k: {"response": json.dumps(
+        {"thought": _SECRET, "mood": "content", "action": "message_obi", "salience": salience})})
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: recent)
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought", lambda t, persona="": captured.__setitem__("appended", t))
+    monkeypatch.setattr(mind, "auto_remember", lambda t, persona="": captured.__setitem__("remembered", t))
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+    mind.reflection({"persona": ""}, dry=False)
+    return captured
+
+
+def test_reflection_redacts_private_dm_when_persisted(monkeypatch):
+    captured = _drive_reflection(monkeypatch, recent=[], salience=0.9)
+    assert captured["appended"]["thought"] == "[private message to Obi]"
+    assert _SECRET not in json.dumps(captured["appended"])
+    # high-salience -> auto-remembered, but redacted there too
+    assert _SECRET not in json.dumps(captured["remembered"])
+
+
+def test_reflection_redacts_private_dm_even_when_similarity_suppressed(monkeypatch):
+    # A near-duplicate DM is suppressed (action flipped to "wait"); the raw text
+    # must still never reach the public thoughts log.
+    captured = _drive_reflection(monkeypatch, recent=[{"thought": _SECRET}], salience=0.9)
+    assert _SECRET not in json.dumps(captured["appended"])
+    assert captured["appended"]["thought"] == "[private message to Obi]"
 
 
 def test_is_night_silence_uses_config_bounds():

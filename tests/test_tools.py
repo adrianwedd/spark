@@ -1155,6 +1155,46 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     assert any("/api/services/media_player/play_media" in p for p in paths)
 
 
+def _run_announce_against_stub(isolated_project, text, *, private):
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_ANNOUNCE_TEXT"] = text
+    if private:
+        env["PX_ANNOUNCE_PRIVATE"] = "1"
+    env["PX_BYPASS_SUDO"] = "1"
+    env["PX_ANNOUNCE_RELAY_URL"] = base
+    env["PX_HA_BASE_URL"] = base
+    env["ANNOUNCE_RELAY_TOKEN"] = "t"
+    env["PX_HA_TOKEN"] = "t"
+    env["PX_NIGHT_SILENCE_START_H"] = "99"
+    env["PX_NIGHT_SILENCE_END_H"] = "0"
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+    history = _json.loads(isolated_project["session_path"].read_text())["history"]
+    return payload, _json.dumps(history)
+
+
+def test_tool_announce_private_redacts_session_history(isolated_project):
+    payload, history_json = _run_announce_against_stub(
+        isolated_project, "SECRET-DM-PAYLOAD-XYZ", private=True)
+    assert payload["status"] == "ok"
+    # The private DM text must never land in local session bookkeeping.
+    assert "SECRET-DM-PAYLOAD-XYZ" not in history_json
+    assert "announce" in history_json   # entry still recorded, just redacted
+
+
+def test_tool_announce_public_keeps_session_history_text(isolated_project):
+    payload, history_json = _run_announce_against_stub(
+        isolated_project, "Dinner is ready", private=False)
+    assert payload["status"] == "ok"
+    assert "Dinner is ready" in history_json
+
+
 def test_tool_announce_suppressed_during_night_silence(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "0"

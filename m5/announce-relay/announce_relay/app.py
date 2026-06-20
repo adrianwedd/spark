@@ -111,6 +111,15 @@ def audio(name: str):
         base = d.resolve()
         candidate = (d / name).resolve()
         if candidate.parent == base and candidate.is_file():
+            # Enforce the private TTL at serve time too — the janitor only runs
+            # every JANITOR_INTERVAL_S, so an expired DM clip would otherwise stay
+            # fetchable (unauthenticated) for minutes past its stated TTL.
+            if d == config.PRIV_DIR:
+                age = time.time() - candidate.stat().st_mtime
+                if age >= config.PRIVATE_TTL_MIN * 60:
+                    with contextlib.suppress(OSError):
+                        candidate.unlink()
+                    raise HTTPException(404, "not found")
             return FileResponse(str(candidate), media_type="audio/wav")
     raise HTTPException(404, "not found")
 

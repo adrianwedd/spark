@@ -215,9 +215,12 @@ def main() -> int:
         if not cast_ok:
             payload["error"] = "no target accepted the cast"
         try:
+            # Private DMs (message_obi) must not leave their text in session
+            # bookkeeping — redact, mirroring the thoughts-log redaction in mind.py.
+            hist_text = "[private message to Obi]" if private else text[:80]
             update_session(
                 fields={"last_action": "tool_announce"},
-                history_entry={"event": "announce", "targets": cast_ok, "text": text[:80]},
+                history_entry={"event": "announce", "targets": cast_ok, "text": hist_text},
             )
         except Exception:
             pass   # session bookkeeping must never break the announce contract

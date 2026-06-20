@@ -94,6 +94,30 @@ def test_audio_404_for_unknown_id(client):
     assert r.status_code == 404
 
 
+def test_audio_expired_private_file_not_served(client, tmp_dirs, monkeypatch):
+    # A private DM audio past its TTL must not be fetchable even if the janitor
+    # (which only runs every JANITOR_INTERVAL_S) hasn't swept it yet.
+    import os
+    from announce_relay import config
+    monkeypatch.setattr(config, "PRIVATE_TTL_MIN", 3)
+    body = client.post("/announce", json={"text": "the secret", "cache": False}, headers=AUTH).json()
+    name = body["audio_url"].rsplit("/", 1)[-1]
+    path = tmp_dirs["priv"] / name
+    assert path.is_file()
+    old = path.stat().st_mtime - (config.PRIVATE_TTL_MIN * 60 + 1)
+    os.utime(path, (old, old))
+    r = client.get(f"/audio/{name}")
+    assert r.status_code == 404
+
+
+def test_audio_fresh_private_file_served(client):
+    body = client.post("/announce", json={"text": "still fresh", "cache": False}, headers=AUTH).json()
+    name = body["audio_url"].rsplit("/", 1)[-1]
+    r = client.get(f"/audio/{name}")
+    assert r.status_code == 200
+    assert r.content[:4] == b"RIFF"
+
+
 def test_startup_runs_janitor(monkeypatch):
     from announce_relay import app as appmod
     calls = []
