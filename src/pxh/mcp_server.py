@@ -157,6 +157,28 @@ def spark_vitals() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Resources: spark:// URIs for Claude Code sessions
+# ---------------------------------------------------------------------------
+
+@mcp.resource("spark://session")
+def resource_session() -> str:
+    """Current session.json."""
+    return json.dumps(_read_json(STATE_DIR / "session.json") or {}, indent=2)
+
+
+@mcp.resource("spark://thoughts")
+def resource_thoughts() -> str:
+    """Recent SPARK thoughts."""
+    return json.dumps(_read_jsonl_tail(STATE_DIR / "thoughts-spark.jsonl", 20), indent=2)
+
+
+@mcp.resource("spark://notes")
+def resource_notes() -> str:
+    """SPARK long-term notes."""
+    return json.dumps(_read_jsonl_tail(STATE_DIR / "notes-spark.jsonl", 20), indent=2)
+
+
+# ---------------------------------------------------------------------------
 # Phase 2: Actionable tools — full-tool exposure via voice loop dispatch
 # ---------------------------------------------------------------------------
 

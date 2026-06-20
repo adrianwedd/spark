@@ -147,3 +147,30 @@ class TestSparkRunTool:
         out = mcp_server.spark_run_tool("tool_status")   # no params arg — exercises params=None -> {}
         assert out["status"] == "ok"
         assert captured["tool"] == "tool_status"
+
+
+class TestResourceSession:
+    def test_resource_session_reads_state(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+        (tmp_path / "session.json").write_text('{"persona":"spark"}')
+        import importlib
+        import pxh.mcp_server as m
+        importlib.reload(m)
+        assert '"persona"' in m.resource_session()
+
+    def test_resource_thoughts_reads_state(self, state_dir):
+        lines = [json.dumps({"thought": f"thought {i}", "mood": "curious"})
+                 for i in range(15)]
+        (state_dir / "thoughts-spark.jsonl").write_text("\n".join(lines) + "\n")
+        result = mcp_mod.resource_thoughts()
+        assert '"thought"' in result
+        parsed = json.loads(result)
+        assert len(parsed) == 15
+
+    def test_resource_notes_reads_state(self, state_dir):
+        lines = [json.dumps({"note": f"note {i}"}) for i in range(5)]
+        (state_dir / "notes-spark.jsonl").write_text("\n".join(lines) + "\n")
+        result = mcp_mod.resource_notes()
+        assert '"note"' in result
+        parsed = json.loads(result)
+        assert len(parsed) == 5
