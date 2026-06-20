@@ -165,3 +165,11 @@ def test_validate_dopamine_add_requires_item():
     with pytest.raises(VoiceLoopError):
         validate_action({"tool": "tool_dopamine_menu",
                          "params": {"action": "add"}})
+
+
+def test_validate_sleep():
+    from pxh.voice_loop import validate_action, ALLOWED_TOOLS
+    assert "tool_sleep" in ALLOWED_TOOLS
+    tool, env = validate_action({"tool": "tool_sleep", "params": {"action": "start"}})
+    assert tool == "tool_sleep"
+    assert env["PX_SLEEP_ACTION"] == "start"

@@ -1192,3 +1192,16 @@ class TestRaceEndpoint:
 
         assert resp.status_code == 409
         assert resp.json()["status"] == "already_running"
+
+
+def test_patch_session_sleep_mode(isolated_project, monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    import importlib, pxh.api as _api
+    importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as client:
+        r = client.patch("/api/v1/session", json={"spark_sleep_mode": True},
+                         headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    assert r.json()["spark_sleep_mode"] is True

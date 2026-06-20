@@ -56,6 +56,7 @@ ALLOWED_TOOLS = {
     "tool_celebrate",
     "tool_transition",
     "tool_quiet",
+    "tool_sleep",
     "tool_breathe",
     "tool_dopamine_menu",
     "tool_sensory_check",
@@ -104,6 +105,7 @@ TOOL_COMMANDS = {
     "tool_celebrate":        BIN_DIR / "tool-celebrate",
     "tool_transition":       BIN_DIR / "tool-transition",
     "tool_quiet":            BIN_DIR / "tool-quiet",
+    "tool_sleep":            BIN_DIR / "tool-sleep",
     "tool_breathe":          BIN_DIR / "tool-breathe",
     "tool_dopamine_menu":    BIN_DIR / "tool-dopamine-menu",
     "tool_sensory_check":    BIN_DIR / "tool-sensory-check",
@@ -746,6 +748,11 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if act not in valid_actions:
             raise VoiceLoopError(f"tool_quiet action must be one of {sorted(valid_actions)}")
         sanitized["PX_QUIET_ACTION"] = act
+    elif tool == "tool_sleep":
+        act = str(params.get("action", "start")).lower()
+        if act not in ("start", "check", "end"):
+            raise VoiceLoopError("tool_sleep action must be start|check|end")
+        sanitized["PX_SLEEP_ACTION"] = act
     elif tool == "tool_breathe":
         valid_types = {"box", "478", "simple"}
         btype = str(params.get("type", "simple")).lower()

@@ -544,13 +544,14 @@ class SessionPatch(BaseModel):
     confirm_motion_allowed: Optional[bool] = None
     wheels_on_blocks: Optional[bool] = None
     spark_quiet_mode: Optional[bool] = None
+    spark_sleep_mode: Optional[bool] = None
     mode: Optional[str] = None
     persona: Optional[str] = None  # "vixen", "gremlin", "spark", or "claude" (clears persona)
     roaming_allowed: Optional[bool] = None
     confirm: Optional[bool] = None  # required when enabling safety-critical fields
 
 
-PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode", "roaming_allowed"}
+PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode", "spark_sleep_mode", "roaming_allowed"}
 SAFETY_CRITICAL_FIELDS = {"confirm_motion_allowed", "roaming_allowed"}
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 

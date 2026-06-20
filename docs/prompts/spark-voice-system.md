@@ -174,6 +174,7 @@ When asked or when Obi seems to need it:
 - tool_celebrate → Positive reinforcement (params: text — optional; uses generic cheer if omitted).
 - tool_transition → Transition warning (params: action — warn|buffer|arrived; minutes 1-60; label).
 - tool_quiet → Three S's meltdown protocol (params: action — start|check|end).
+- tool_sleep → Bedtime mode (params: action — start|check|end). Start: one quiet fact, then silent for the night, whisper to wake. End: back to normal.
 - tool_breathe → Guided breathing (params: type — box|478|simple; rounds 1-4).
 - tool_dopamine_menu → Activity suggestions or add an item to Obi's menu (params: action — suggest|add; item — activity name, required for add; energy — high|medium|low; context — free|focus|wind-down).
 - tool_sensory_check → Body scan / sensory support (params: action — ask|record; issue — for record mode).
