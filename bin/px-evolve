@@ -39,6 +39,7 @@ import threading
 import time
 from pathlib import Path
 
+from pxh.evolve_queue import build_pr_body, reset_building_to_pending
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
@@ -294,6 +295,8 @@ def process_entry(entry: dict, *, dry: bool = False) -> str:
     entry_id = entry["id"]
     intent = entry.get("intent", "")
     introspection = entry.get("introspection", {})
+    requester = entry.get("requester", "adrian")
+    source = entry.get("source", "cli")
 
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "-", entry_id)[:64]
     branch = f"spark/evolve-{safe_id}"
@@ -313,7 +316,7 @@ def process_entry(entry: dict, *, dry: bool = False) -> str:
         return "failed:worktree"
 
     try:
-        return _run_in_worktree(entry_id, intent, introspection, branch, workdir, dry=dry)
+        return _run_in_worktree(entry_id, intent, introspection, branch, workdir, dry=dry, requester=requester, source=source)
     finally:
         # 8. Cleanup worktree
         _cleanup_worktree(workdir, entry_id)
@@ -322,6 +325,7 @@ def process_entry(entry: dict, *, dry: bool = False) -> str:
 def _run_in_worktree(
     entry_id: str, intent: str, introspection: dict,
     branch: str, workdir: str, *, dry: bool,
+    requester: str = "adrian", source: str = "cli",
 ) -> str:
     """4-phase evolution: plan (Opus) → implement (Sonnet) → test (Haiku) → QA (Sonnet)."""
     if dry:
@@ -523,13 +527,7 @@ def _run_in_worktree(
 
     # 8. Create PR
     intent_summary = intent[:60].replace('"', "'")
-    body = (
-        f"## Summary\n"
-        f"SPARK self-evolution: {intent}\n\n"
-        f"## Changed files\n"
-        + "\n".join(f"- `{f}`" for f in changed_files)
-        + "\n\n---\n*Proposed autonomously by SPARK via px-evolve.*"
-    )
+    body = build_pr_body(intent, changed_files, requester=requester, source=source)
 
     try:
         subprocess.run(
@@ -627,6 +625,9 @@ def _update_entry_in_queue(entry_id: str, **fields) -> None:
 
 def run_once(*, dry: bool) -> int:
     """Process all pending entries. Returns count processed."""
+    n = reset_building_to_pending()
+    if n:
+        log(f"reset {n} stale 'building' entries to pending")
     entries = load_queue()
     if not entries:
         return 0
@@ -639,6 +640,7 @@ def run_once(*, dry: bool) -> int:
             _update_entry_in_queue(entry["id"], status="skipped:dry")
             continue
 
+        _update_entry_in_queue(entry["id"], status="building")
         raw_status = process_entry(entry, dry=dry)
         ts_now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -667,6 +669,8 @@ def run_once(*, dry: bool) -> int:
             "intent": entry.get("intent", ""),
             "status": status,
             "ts_completed": ts_now,
+            "requester": entry.get("requester", "adrian"),
+            "source": entry.get("source", "cli"),
         }
         if pr_url:
             log_entry["pr_url"] = pr_url
