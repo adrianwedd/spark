@@ -1353,3 +1353,35 @@ def test_obi_projects_requires_auth(monkeypatch, isolated_project):
     from fastapi.testclient import TestClient
     with TestClient(_api.app) as c:
         assert c.get("/api/v1/obi/projects").status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Task 7: dashboard panel + obi-chat projects summary
+# ---------------------------------------------------------------------------
+
+def test_dashboard_has_projects_tab(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        html = c.get("/").text
+    assert 'id="at-projects"' in html
+    assert "/api/v1/obi/projects" in html
+    assert "loadProjects" in html
+
+
+def test_obi_chat_prompt_includes_projects_summary(monkeypatch, isolated_project):
+    _api = _obi_client(monkeypatch, isolated_project)
+    import json
+    isolated_project["state_dir"].joinpath("evolve_queue.jsonl").write_text(
+        json.dumps({"id":"a","intent":"joke tool","status":"building","requester":"obi","ts":"t"}) + "\n")
+    captured = {}
+    async def _cap(prompt, system_prompt=None):
+        captured["prompt"] = prompt
+        return '{"reply":"building it!","evolve_action":"none","evolve_intent":null}'
+    monkeypatch.setattr(_api, "_call_claude_public", _cap)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        c.post("/api/v1/obi-chat", json={"message":"is my joke tool ready?"},
+               headers={"Authorization":"Bearer testtoken"})
+    assert "joke tool" in captured["prompt"] and "building" in captured["prompt"]

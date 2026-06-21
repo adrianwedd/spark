@@ -1474,6 +1474,18 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
     )
     prompt = history_block + f"\n<spark:assistant>"
 
+    from pxh.evolve_queue import read_queue, read_log
+    proj_lines = []
+    for rec in read_queue() + read_log():
+        if rec.get("requester") != "obi":
+            continue
+        st = _map_evolve_state(rec.get("status", ""))
+        if st:
+            proj_lines.append(f"- {rec.get('intent','')}: {st}")
+    proj_summary = ("\nObi's current projects:\n" + "\n".join(proj_lines[-5:])) if proj_lines else ""
+    if proj_summary:
+        prompt = proj_summary + "\n" + prompt
+
     try:
         reply = await asyncio.wait_for(
             _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT),
@@ -2571,6 +2583,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <button class="atab-btn"        id="at-tools"    onclick="swA('tools')">&#x1F6E0; Tools</button>
         <button class="atab-btn"        id="at-logs"     onclick="swA('logs')">&#x1F4CB; Logs</button>
         <button class="atab-btn"        id="at-parental" onclick="swA('parental')">&#x1F46A; Parental</button>
+        <button class="atab-btn"        id="at-projects" onclick="swA('projects')">&#x1F6E0; Projects</button>
       </div>
       <div id="ap-svc" class="apanel active" style="padding:16px;overflow-y:auto">
         <div id="svc-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px"></div>
@@ -2617,6 +2630,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <input id="sh-detail" placeholder="What happened?" style="background:var(--surface2);border:none;border-radius:8px;padding:10px 14px;color:var(--text);font-family:inherit;font-size:14px">
         <button class="btn btn-blue" onclick="logEvt()">&#x1F4DD; Log to sheets</button>
       </div>
+      <div id="ap-projects" class="apanel" style="padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
+        <div class="sec-hdr">Obi's Projects</div>
+        <div id="projects-list">Loading&#x2026;</div>
+      </div>
     </div>
   </div>
 </div>
@@ -2650,6 +2667,7 @@ function swA(name){
   document.getElementById('at-'+name).classList.add('active');
   document.getElementById('ap-'+name).classList.add('active');
   if(name==='logs')loadLog('px-mind');
+  if(name==='projects')loadProjects();
 }
 async function loadSvcs(){
   try{
@@ -2686,6 +2704,26 @@ async function loadParental(){
 }
 async function toggleMotion(){try{const s=await api('/api/v1/session');const on=!s.confirm_motion_allowed;const body={confirm_motion_allowed:on};if(on)body.confirm=true;await api('/api/v1/session',{method:'PATCH',body:JSON.stringify(body)});}catch(e){}loadParental();}
 async function toggleQuiet(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_quiet_mode:!s.spark_quiet_mode})});}catch(e){}loadParental();}
+async function loadProjects(){
+  try{
+    const d=await api('/api/v1/obi/projects');
+    const el=document.getElementById('projects-list');
+    el.textContent='';
+    if(!d.projects||!d.projects.length){el.textContent='No projects yet.';return;}
+    const labels={pending:'waiting',building:'building',ready:'ready',failed:'failed'};
+    for(const p of d.projects){
+      const row=document.createElement('div');
+      row.className='spark-stat';
+      row.textContent=p.intent+' — '+(labels[p.state]||p.state);
+      if(p.pr_url){
+        const a=document.createElement('a');
+        a.href=p.pr_url; a.target='_blank'; a.rel='noopener'; a.textContent=' PR';
+        row.appendChild(a);
+      }
+      el.appendChild(row);
+    }
+  }catch(e){}
+}
 async function setPersona(p){try{await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({persona:p})});}catch(e){}}
 async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});addMsg('spark','History cleared ('+r.cleared+' entries removed).');}
 async function logEvt(){
