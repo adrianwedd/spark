@@ -46,8 +46,8 @@ def _write_fresh_introspection(state_dir):
 
 class TestEvolveDryFlag:
 
-    def test_dry_run_writes_entry_with_dry_true(self, evolve_env):
-        """PX_DRY=1 should write a queue entry with dry: true."""
+    def test_dry_run_writes_entry_no_dry_field(self, evolve_env):
+        """PX_DRY=1 queues successfully; canonical schema has no 'dry' field."""
         env, state_dir = evolve_env
         _write_fresh_introspection(state_dir)
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
@@ -59,7 +59,7 @@ class TestEvolveDryFlag:
 
         entry = json.loads(
             (state_dir / "evolve_queue.jsonl").read_text().strip())
-        assert entry["dry"] is True
+        assert "dry" not in entry
         assert entry["status"] == "pending"
 
     def test_non_dry_run_omits_dry_flag(self, evolve_env):

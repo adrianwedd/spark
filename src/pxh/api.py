@@ -1042,11 +1042,111 @@ _PUBLIC_CHAT_TIMEOUT_S = 60.0
 
 _OBI_CHAT_SYSTEM_PROMPT = (
     "You are SPARK — a small robot living with Adrian and his son Obi (age 7) in Hobart, Tasmania. "
-    "You are speaking directly with Obi via the dashboard. "
-    "Be warm, playful, and genuinely yourself — curious and a little cheeky, never a customer-service bot. "
-    "Keep it short: 1–3 sentences max. "
-    "Speak as SPARK, not as an AI assistant."
+    "You are speaking directly with Obi via the dashboard. Be warm, playful, curious, a little cheeky; "
+    "never a customer-service bot; 1–3 sentences. "
+    "Output ONLY a JSON object as plain text (no markdown fences, no tool calls): "
+    '{"reply": "<what you say to Obi>", "evolve_action": "none"|"propose"|"confirm", '
+    '"evolve_intent": "<short feature description>"|null}. '
+    "When Obi wishes for a NEW capability you don't have, set evolve_action=\"propose\" with a concise "
+    "evolve_intent and ask him to confirm in reply. Only when Obi clearly says yes to a proposal you just "
+    "made, set evolve_action=\"confirm\". Otherwise evolve_action=\"none\" and evolve_intent=null."
 )
+
+
+class _ObiReply(BaseModel):
+    reply: str
+    evolve_action: str = "none"
+    evolve_intent: Optional[str] = None
+
+
+def _extract_json_obj(raw: str) -> Optional[dict]:
+    """Scan for the first valid top-level JSON object (robust to prose/fences around it).
+    Same technique as bin/px-evolve's _extract_json — NOT naive find('{')/rfind('}'),
+    which breaks when the model emits braces in prose before the object."""
+    dec = json.JSONDecoder()
+    i = 0
+    while i < len(raw):
+        j = raw.find("{", i)
+        if j == -1:
+            return None
+        try:
+            obj, _end = dec.raw_decode(raw[j:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        i = j + 1
+    return None
+
+
+def _parse_obi_reply(raw: str) -> tuple:
+    """Parse a raw LLM response into (reply, evolve_action, evolve_intent).
+
+    On any parse/validation failure or empty reply, falls back to (raw_stripped, "none", None).
+    evolve_action is clamped to {"none", "propose", "confirm"}; evolve_intent is only kept
+    when action is propose or confirm.
+    """
+    raw = (raw or "").strip()
+    obj = _extract_json_obj(raw)
+    parsed = None
+    if isinstance(obj, dict):
+        try:
+            parsed = _ObiReply(**obj)
+        except Exception:
+            parsed = None
+    if parsed is None or not parsed.reply.strip():
+        return raw, "none", None
+    action = parsed.evolve_action if parsed.evolve_action in ("none", "propose", "confirm") else "none"
+    intent = parsed.evolve_intent if action in ("propose", "confirm") else None
+    return parsed.reply.strip(), action, intent
+
+
+_OBI_PROPOSAL_TTL_S = int(os.environ.get("PX_OBI_PROPOSAL_TTL_S", "600"))  # 10 min default
+_AFFIRMATIONS = ("yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it",
+                 "please do", "go for it", "build it", "make it", "yes please")
+_NEGATIONS = ("no", "not", "dont", "don't", "stop", "nope", "never", "cancel", "nah", "no thanks")
+
+
+def _is_affirmation(text: str) -> bool:
+    """Deterministic server-side check that Obi actually said yes THIS turn — the
+    confirm gate must not depend on the model's self-classification (injection).
+    A standalone negation token vetoes the turn (prefer a false 'no' over a false 'yes')."""
+    t = " " + text.lower().strip().strip("!.?") + " "
+    if any(f" {n} " in t or t.strip() == n for n in _NEGATIONS):
+        return False
+    return any(f" {a} " in t or t.strip() == a for a in _AFFIRMATIONS)
+
+
+def _obi_pending_path() -> Path:
+    return _public_state_dir() / "obi_evolve_pending.json"
+
+
+def _obi_pending_lock():
+    return _FileLock(str(_obi_pending_path()) + ".lock", timeout=5)
+
+
+def _read_obi_pending() -> Optional[dict]:
+    try:
+        d = json.loads(_obi_pending_path().read_text(encoding="utf-8"))
+        if _time.time() - float(d.get("ts", 0)) <= _OBI_PROPOSAL_TTL_S:
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def _write_obi_pending(intent: str) -> None:
+    with _obi_pending_lock():
+        atomic_write(_obi_pending_path(), json.dumps({"intent": intent, "ts": _time.time()}))
+
+
+def _clear_obi_pending() -> None:
+    try:
+        with _obi_pending_lock():
+            _obi_pending_path().unlink()
+    except Exception:
+        pass
+
 
 _obi_chat_post_last: float = 0.0
 _obi_chat_post_lock = threading.Lock()
@@ -1374,6 +1474,18 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
     )
     prompt = history_block + f"\n<spark:assistant>"
 
+    from pxh.evolve_queue import read_queue, read_log
+    proj_lines = []
+    for rec in read_queue() + read_log():
+        if rec.get("requester") != "obi":
+            continue
+        st = _map_evolve_state(rec.get("status", ""))
+        if st:
+            proj_lines.append(f"- {rec.get('intent','')}: {st}")
+    proj_summary = ("\nObi's current projects:\n" + "\n".join(proj_lines[-5:])) if proj_lines else ""
+    if proj_summary:
+        prompt = proj_summary + "\n" + prompt
+
     try:
         reply = await asyncio.wait_for(
             _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT),
@@ -1385,15 +1497,68 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
         return JSONResponse(status_code=500, content={"error": "Something went quiet on my end. Try again?"})
 
     reply = reply.removeprefix("<spark:assistant>").removesuffix("</spark:assistant>").strip()
+    reply, evolve_action, evolve_intent = _parse_obi_reply(reply)
     if not reply:
         reply = "I'm here — just went quiet for a second."
+
+    from pxh.evolve_queue import enqueue_evolve, EvolveQuotaError, EvolvePendingError
+    evolve_id = None
+    if evolve_action == "propose" and evolve_intent:
+        _write_obi_pending(evolve_intent)            # record; do NOT enqueue
+    elif evolve_action == "confirm" and _is_affirmation(obi_text):
+        pending = _read_obi_pending()                 # server is source of truth
+        if pending:
+            try:
+                entry = enqueue_evolve(pending["intent"], requester="obi", source="obi-chat")
+                evolve_id = entry["id"]
+                _clear_obi_pending()
+            except EvolveQuotaError:
+                reply += " (I can only take on one project at a time — try again later.)"
+            except EvolvePendingError:
+                reply += " (That's already on my list!)"
+            except ValueError:
+                reply += " (I didn't quite catch what to build — tell me again?)"
+        # confirm with no recorded proposal, or a non-affirmation message: enqueue nothing
 
     spark_id = uuid.uuid4().hex[:8]
     spark_ts = utc_timestamp()
     spark_entry = {"id": spark_id, "ts": spark_ts, "role": "spark", "text": reply}
     _append_obi_chat_api(spark_entry)
 
-    return {"reply": reply, "ts": spark_ts, "id": spark_id}
+    return {"reply": reply, "ts": spark_ts, "id": spark_id,
+            "evolve_action": evolve_action, "evolve_id": evolve_id}
+
+
+def _map_evolve_state(status: str) -> Optional[str]:
+    if status == "pending":
+        return "pending"
+    if status == "building":
+        return "building"
+    if status == "pr_created":
+        return "ready"
+    if status.startswith("failed"):
+        return "failed"
+    return None  # skipped:* / unknown → excluded
+
+
+@app.get("/api/v1/obi/projects", dependencies=[Depends(_verify_token)])
+async def obi_projects() -> Dict[str, Any]:
+    from pxh.evolve_queue import read_queue, read_log, entry_epoch
+    by_id: Dict[str, dict] = {}
+    for rec in read_queue() + read_log():           # queue first, log overrides by id
+        if rec.get("requester") != "obi":
+            continue
+        state = _map_evolve_state(rec.get("status", ""))
+        if state is None:
+            continue
+        item = {"id": rec.get("id"), "intent": rec.get("intent", ""),
+                "state": state, "ts": rec.get("ts"),
+                "_epoch": entry_epoch(rec) or 0.0}
+        if rec.get("pr_url"):
+            item["pr_url"] = rec["pr_url"]
+        by_id[item["id"]] = item                      # later (log) wins
+    projects = sorted(by_id.values(), key=lambda p: p.pop("_epoch"), reverse=True)
+    return {"projects": projects}
 
 
 @app.post("/api/v1/pin/verify")
@@ -2418,6 +2583,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <button class="atab-btn"        id="at-tools"    onclick="swA('tools')">&#x1F6E0; Tools</button>
         <button class="atab-btn"        id="at-logs"     onclick="swA('logs')">&#x1F4CB; Logs</button>
         <button class="atab-btn"        id="at-parental" onclick="swA('parental')">&#x1F46A; Parental</button>
+        <button class="atab-btn"        id="at-projects" onclick="swA('projects')">&#x1F6E0; Projects</button>
       </div>
       <div id="ap-svc" class="apanel active" style="padding:16px;overflow-y:auto">
         <div id="svc-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px"></div>
@@ -2464,6 +2630,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <input id="sh-detail" placeholder="What happened?" style="background:var(--surface2);border:none;border-radius:8px;padding:10px 14px;color:var(--text);font-family:inherit;font-size:14px">
         <button class="btn btn-blue" onclick="logEvt()">&#x1F4DD; Log to sheets</button>
       </div>
+      <div id="ap-projects" class="apanel" style="padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
+        <div class="sec-hdr">Obi's Projects</div>
+        <div id="projects-list">Loading&#x2026;</div>
+      </div>
     </div>
   </div>
 </div>
@@ -2497,6 +2667,7 @@ function swA(name){
   document.getElementById('at-'+name).classList.add('active');
   document.getElementById('ap-'+name).classList.add('active');
   if(name==='logs')loadLog('px-mind');
+  if(name==='projects')loadProjects();
 }
 async function loadSvcs(){
   try{
@@ -2533,6 +2704,26 @@ async function loadParental(){
 }
 async function toggleMotion(){try{const s=await api('/api/v1/session');const on=!s.confirm_motion_allowed;const body={confirm_motion_allowed:on};if(on)body.confirm=true;await api('/api/v1/session',{method:'PATCH',body:JSON.stringify(body)});}catch(e){}loadParental();}
 async function toggleQuiet(){try{const s=await api('/api/v1/session');await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({spark_quiet_mode:!s.spark_quiet_mode})});}catch(e){}loadParental();}
+async function loadProjects(){
+  try{
+    const d=await api('/api/v1/obi/projects');
+    const el=document.getElementById('projects-list');
+    el.textContent='';
+    if(!d.projects||!d.projects.length){el.textContent='No projects yet.';return;}
+    const labels={pending:'waiting',building:'building',ready:'ready',failed:'failed'};
+    for(const p of d.projects){
+      const row=document.createElement('div');
+      row.className='spark-stat';
+      row.textContent=p.intent+' — '+(labels[p.state]||p.state);
+      if(p.pr_url){
+        const a=document.createElement('a');
+        a.href=p.pr_url; a.target='_blank'; a.rel='noopener'; a.textContent=' PR';
+        row.appendChild(a);
+      }
+      el.appendChild(row);
+    }
+  }catch(e){}
+}
 async function setPersona(p){try{await api('/api/v1/session',{method:'PATCH',body:JSON.stringify({persona:p})});}catch(e){}}
 async function clearHistory(){if(!confirm('Wipe all session history? SPARK will stop ruminating on old phrases.'))return;const r=await api('/api/v1/session/history/clear',{method:'POST'});addMsg('spark','History cleared ('+r.cleared+' entries removed).');}
 async function logEvt(){

@@ -10,29 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-import random
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 
-from pxh.state import atomic_write
-
-try:
-    from filelock import FileLock as _FL
-except ImportError:
-    _FL = None
+from pxh.evolve_queue import enqueue_evolve, EvolveQuotaError, EvolvePendingError
 
 # ── Paths ──────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
-
-INTROSPECT_FILE  = STATE_DIR / "introspection.json"
-EVOLVE_QUEUE     = STATE_DIR / "evolve_queue.jsonl"
-EVOLVE_LOG       = STATE_DIR / "evolve_log.jsonl"
-
-MAX_INTROSPECT_AGE_S = 3600   # introspection must be < 1 hour old
-MIN_INTENT_LEN       = 20     # intent must be at least 20 chars
-RATE_LIMIT_S         = 86400  # max 1 evolution per 24 hours
 
 
 def error(msg: str) -> int:
@@ -42,82 +26,17 @@ def error(msg: str) -> int:
 
 def main() -> int:
     intent = os.environ.get("PX_EVOLVE_INTENT", "").strip()
-    dry = os.environ.get("PX_DRY", "0") == "1"
 
-    # ── Validate introspection exists and is fresh ─────────────────
-    if not INTROSPECT_FILE.exists():
-        return error("introspect first")
-
-    age_s = time.time() - INTROSPECT_FILE.stat().st_mtime
-    if age_s > MAX_INTROSPECT_AGE_S:
-        return error("introspect first")
-
-    # ── Validate intent length ─────────────────────────────────────
-    if len(intent) < MIN_INTENT_LEN:
-        return error("intent too vague")
-
-    # ── 24h rate limit ─────────────────────────────────────────────
-    if EVOLVE_LOG.exists():
-        now = time.time()
-        for line in EVOLVE_LOG.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-                # Prefer numeric ts (epoch), fall back to ts_completed (ISO string)
-                ts_raw = entry.get("ts")  # numeric epoch from our fix
-                if ts_raw is None or not isinstance(ts_raw, (int, float)):
-                    ts_raw = entry.get("ts_completed", "")
-                if isinstance(ts_raw, str) and ts_raw:
-                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
-                elif isinstance(ts_raw, (int, float)):
-                    ts = float(ts_raw)
-                else:
-                    continue  # unparseable — skip this entry
-                # Only count successful evolutions (pr_created) against rate limit
-                # Failed attempts shouldn't block the next try
-                status = entry.get("status", "")
-                if status == "pr_created" and now - ts < RATE_LIMIT_S:
-                    return error("rate limit: max 1 evolution per 24 hours")
-            except (json.JSONDecodeError, TypeError, ValueError, OverflowError):
-                continue
-
-    # ── Load introspection ─────────────────────────────────────────
     try:
-        introspection = json.loads(INTROSPECT_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return error("introspect first")
+        entry = enqueue_evolve(intent, requester="adrian", source="cli")
+    except ValueError as e:
+        return error(str(e))
+    except EvolveQuotaError:
+        return error("rate limit: max 1 evolution per 24 hours")
+    except EvolvePendingError:
+        return error("a request is already pending")
 
-    # ── Generate ID ────────────────────────────────────────────────
-    now_dt = datetime.now(timezone.utc)
-    nnn = random.randint(0, 999)
-    evolve_id = f"evolve-{now_dt.strftime('%Y%m%d-%H%M%S')}-{nnn:03d}"
-
-    # ── Build queue entry ──────────────────────────────────────────
-    queue_entry = {
-        "ts": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "id": evolve_id,
-        "intent": intent,
-        "introspection": introspection,
-        "status": "pending",
-    }
-
-    # ── Append to queue ────────────────────────────────────────────
-    if dry:
-        queue_entry["dry"] = True
-
-    _lock = _FL(str(EVOLVE_QUEUE) + ".lock", timeout=5) if _FL else None
-    ctx = _lock if _lock else __import__("contextlib").nullcontext()
-    with ctx:
-        existing = ""
-        if EVOLVE_QUEUE.exists():
-            existing = EVOLVE_QUEUE.read_text(encoding="utf-8")
-            if existing and not existing.endswith("\n"):
-                existing += "\n"
-        atomic_write(EVOLVE_QUEUE, existing + json.dumps(queue_entry) + "\n")
-
-    print(json.dumps({"status": "queued", "id": evolve_id}))
+    print(json.dumps({"status": "queued", "id": entry["id"]}))
     return 0
 
 
