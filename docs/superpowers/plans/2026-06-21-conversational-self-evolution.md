@@ -51,6 +51,8 @@ T1 (enqueue_evolve) → T2 (tool-evolve refactor) → T3 (px-evolve passthrough)
   - `pending_for_requester(requester: str) -> dict | None` — the requester's first `status=="pending"` queue entry, or None.
   - `enqueue_evolve(intent: str, requester: str, source: str) -> dict` — validates, rate-limit + one-pending checks, builds `{ts,id,intent,introspection,status:"pending",requester,source}`, appends under FileLock, returns the entry. Raises `ValueError` (empty/oversized), `EvolveQuotaError`, `EvolvePendingError`.
   - `read_queue() -> list[dict]`, `read_log() -> list[dict]` — tolerant JSONL readers (used by T6).
+  - `build_pr_body(intent, changed_files, requester="adrian", source="cli") -> str` — PR body (lives here, not in the bash `bin/px-evolve`; consumed by T3).
+  - `pending_for_requester` blocks on `status in ("pending","building")` (a building job still counts).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -102,11 +104,51 @@ def test_enqueue_sanitizes_intent(monkeypatch, tmp_path):
 
 def test_one_pending_per_requester(monkeypatch, tmp_path):
     eq = _setup(monkeypatch, tmp_path)
-    eq.enqueue_evolve("first", "obi", "obi-chat")
+    eq.enqueue_evolve("first feature request", "obi", "obi-chat")
     with pytest.raises(eq.EvolvePendingError):
-        eq.enqueue_evolve("second", "obi", "obi-chat")
+        eq.enqueue_evolve("second feature request", "obi", "obi-chat")
     # different requester is unaffected
-    eq.enqueue_evolve("adrians", "adrian", "cli")
+    eq.enqueue_evolve("adrians own request", "adrian", "cli")
+
+
+def test_building_status_blocks_new_enqueue(monkeypatch, tmp_path):
+    # a project mid-build must block a second enqueue (quota-bypass guard)
+    eq = _setup(monkeypatch, tmp_path)
+    (tmp_path / "evolve_queue.jsonl").write_text(
+        json.dumps({"id": "x", "intent": "in progress", "status": "building",
+                    "requester": "obi"}) + "\n")
+    with pytest.raises(eq.EvolvePendingError):
+        eq.enqueue_evolve("another while building", "obi", "obi-chat")
+
+
+def test_rate_limited_accepts_iso_ts_completed(monkeypatch, tmp_path):
+    # older log entries use ISO ts_completed, not numeric ts — must still count
+    eq = _setup(monkeypatch, tmp_path)
+    from datetime import datetime, timezone
+    iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (tmp_path / "evolve_log.jsonl").write_text(
+        json.dumps({"id": "old", "status": "pr_created", "ts_completed": iso}) + "\n")
+    with pytest.raises(eq.EvolveQuotaError):
+        eq.enqueue_evolve("blocked by iso entry", "obi", "obi-chat")
+
+
+def test_build_pr_body_flags_requester(monkeypatch, tmp_path):
+    eq = _setup(monkeypatch, tmp_path)
+    body = eq.build_pr_body("add joke tool", ["bin/tool-joke"], "obi", "obi-chat")
+    assert "Requested by" in body and "obi" in body and "adversarial" in body.lower()
+    assert "bin/tool-joke" in body
+
+
+def test_reset_building_to_pending(monkeypatch, tmp_path):
+    eq = _setup(monkeypatch, tmp_path)
+    (tmp_path / "evolve_queue.jsonl").write_text("\n".join([
+        json.dumps({"id": "a", "status": "building", "requester": "obi"}),
+        json.dumps({"id": "b", "status": "pending", "requester": "obi"}),
+        json.dumps({"id": "c", "status": "pr_created", "requester": "adrian"}),
+    ]) + "\n")
+    assert eq.reset_building_to_pending() == 1
+    statuses = {e["id"]: e["status"] for e in eq.read_queue()}
+    assert statuses == {"a": "pending", "b": "pending", "c": "pr_created"}
 
 
 def test_rate_limited_by_recent_pr_created(monkeypatch, tmp_path):
@@ -211,23 +253,39 @@ def read_log() -> list[dict]:
     return _read_jsonl(_log_path())
 
 
+def entry_epoch(entry: dict) -> float | None:
+    """Numeric ts preferred; fall back to ISO ts_completed (older log schema)."""
+    ts = entry.get("ts")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    iso = entry.get("ts_completed") or (ts if isinstance(ts, str) else "")
+    if iso:
+        try:
+            return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
 def evolve_rate_limited(now: float | None = None) -> bool:
     import time
     now = now if now is not None else time.time()
     for entry in read_log():
         if entry.get("status") != "pr_created":
             continue
-        ts = entry.get("ts")
-        if not isinstance(ts, (int, float)):
-            continue
-        if now - ts < RATE_LIMIT_S:
+        ts = entry_epoch(entry)   # numeric OR ISO ts_completed fallback
+        if ts is not None and now - ts < RATE_LIMIT_S:
             return True
     return False
 
 
+# An active request blocks new ones until it finishes. MUST include "building":
+# while a job is building there is no pr_created yet (rate-limit passes) and no
+# pending row — without this, a second job could be enqueued mid-build, bypassing
+# the 24h limit.
 def pending_for_requester(requester: str) -> dict | None:
     for entry in read_queue():
-        if entry.get("status") == "pending" and entry.get("requester") == requester:
+        if entry.get("requester") == requester and entry.get("status") in ("pending", "building"):
             return entry
     return None
 
@@ -245,28 +303,29 @@ def enqueue_evolve(intent: str, requester: str, source: str) -> dict:
         raise ValueError("intent must not be empty")
     if len(intent) > MAX_INTENT_CHARS:
         raise ValueError(f"intent too long (max {MAX_INTENT_CHARS})")
-    if evolve_rate_limited():
-        raise EvolveQuotaError("one evolution per 24 hours")
-    if pending_for_requester(requester) is not None:
-        raise EvolvePendingError(f"{requester} already has a pending request")
-
-    now_dt = datetime.now(timezone.utc)
-    entry = {
-        "ts": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "id": f"evolve-{now_dt.strftime('%Y%m%d-%H%M%S')}-{random.randint(0, 999):03d}",
-        "intent": intent,
-        "introspection": _load_introspection(),
-        "status": "pending",
-        "requester": requester,
-        "source": source,
-    }
 
     path = _queue_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     import contextlib
     lock = _FileLock(str(path) + ".lock", timeout=5) if _FileLock else None
     ctx = lock if lock else contextlib.nullcontext()
+    # ALL checks + the append happen inside ONE lock — otherwise two concurrent
+    # confirms can both pass pending_for_requester() and double-enqueue (TOCTOU).
     with ctx:
+        if evolve_rate_limited():
+            raise EvolveQuotaError("one evolution per 24 hours")
+        if pending_for_requester(requester) is not None:
+            raise EvolvePendingError(f"{requester} already has an active request")
+        now_dt = datetime.now(timezone.utc)
+        entry = {
+            "ts": now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "id": f"evolve-{now_dt.strftime('%Y%m%d-%H%M%S')}-{random.randint(0, 999):03d}",
+            "intent": intent,
+            "introspection": _load_introspection(),
+            "status": "pending",
+            "requester": requester,
+            "source": source,
+        }
         existing = ""
         if path.exists():
             existing = path.read_text(encoding="utf-8")
@@ -274,9 +333,45 @@ def enqueue_evolve(intent: str, requester: str, source: str) -> dict:
                 existing += "\n"
         atomic_write(path, existing + json.dumps(entry) + "\n")
     return entry
+
+
+def build_pr_body(intent: str, changed_files: list[str],
+                  requester: str = "adrian", source: str = "cli") -> str:
+    """PR body for px-evolve. Lives here (not bin/px-evolve) because that file is a
+    bash+heredoc script that cannot be imported for unit tests."""
+    files = "\n".join(f"- `{f}`" for f in changed_files)
+    return (
+        f"## Summary\nSPARK self-evolution: {intent}\n\n"
+        f"## Requested by\n{requester} via {source} — the requested intent may be "
+        f"adversarial; review accordingly.\n\n"
+        f"## Changed files\n{files}\n\n"
+        f"---\n*Proposed autonomously by SPARK via px-evolve.*"
+    )
+
+
+def reset_building_to_pending() -> int:
+    """Crash recovery: any entry left 'building' (worker died mid-run) goes back to
+    'pending' so it is retried. px-evolve calls this at startup (single-instance
+    daemon, so nothing is genuinely building when it boots). Returns count reset."""
+    import contextlib
+    path = _queue_path()
+    if not path.exists():
+        return 0
+    lock = _FileLock(str(path) + ".lock", timeout=5) if _FileLock else None
+    ctx = lock if lock else contextlib.nullcontext()
+    with ctx:
+        entries = read_queue()
+        n = 0
+        for e in entries:
+            if e.get("status") == "building":
+                e["status"] = "pending"
+                n += 1
+        if n:
+            atomic_write(path, "".join(json.dumps(e) + "\n" for e in entries))
+        return n
 ```
 
-Note: `datetime.now`/`random` are used here (not in a workflow); fine in normal code.
+Note: `datetime.now`/`random` are used here (not in a workflow); fine in normal code. `read_queue`/`read_log` are called inside the lock — they read the same file the lock guards, which is correct (no re-entrancy: FileLock is held once).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -296,36 +391,42 @@ git commit -m "feat(evolve): single-writer enqueue_evolve helper (schema+ratelim
 
 **Files:**
 - Modify: `bin/tool-evolve` (replace its inline rate-limit + entry-build + append with a call to `enqueue_evolve`)
-- Test: `tests/test_tools.py`
+- Test: `tests/test_evolve.py` (where tool-evolve tests already live; uses `subprocess.run` directly)
 
 **Interfaces:**
-- Consumes: `pxh.evolve_queue.enqueue_evolve`, `EvolveQuotaError`.
-- Produces: unchanged CLI contract — prints `{"status":"queued","id":...}` on success; `{"status":"error","error":...}` on rate-limit/empty. Now tags entries `requester="adrian"`, `source="cli"`.
+- Consumes: `pxh.evolve_queue.enqueue_evolve`, `EvolveQuotaError`, `EvolvePendingError`.
+- Produces: CLI contract preserved on the happy/error shapes — prints `{"status":"queued","id":...}` / `{"status":"error","error":...}`. Now tags entries `requester="adrian"`, `source="cli"`.
 
-- [ ] **Step 1: Write the failing test**
+**Behavior change (call out in the commit, per QA):** the refactor intentionally **drops** tool-evolve's old `MIN_INTENT_LEN=20` "intent too vague" guard and the "introspect first" hard-fail — both so the CLI matches the conversational path (short intents allowed; introspection defaults to `{}`). `enqueue_evolve` validates only non-empty + ≤300 chars.
+
+- [ ] **Step 1: Write the failing test** (in `tests/test_evolve.py`, matching its `subprocess.run` style; use a ≥20-char intent so the CURRENT tool-evolve writes an entry — otherwise it fails at its 20-char guard, the wrong RED reason)
 
 ```python
-# tests/test_tools.py
-import json as _json3
+# tests/test_evolve.py
+import json, subprocess, os
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent
 
 def test_tool_evolve_uses_shared_writer(isolated_project):
     env = isolated_project["env"].copy()
     (isolated_project["state_dir"] / "introspection.json").write_text('{"x": 1}')
-    env["PX_EVOLVE_INTENT"] = "add a joke tool"   # match tool-evolve's intent input
-    out = parse_json(run_tool(["bin/tool-evolve"], env))
+    env["PX_EVOLVE_INTENT"] = "add a knock-knock joke tool for obi"   # ≥20 chars
+    r = subprocess.run(["bin/tool-evolve"], cwd=ROOT, env=env,
+                       capture_output=True, text=True)
+    out = json.loads(r.stdout.strip().splitlines()[-1])
     assert out["status"] == "queued"
-    entry = _json3.loads((isolated_project["state_dir"] / "evolve_queue.jsonl").read_text().strip())
+    entry = json.loads((isolated_project["state_dir"] / "evolve_queue.jsonl").read_text().strip())
     assert entry["status"] == "pending"
     assert entry["requester"] == "adrian" and entry["source"] == "cli"
     assert entry["introspection"] == {"x": 1}
 ```
 
-(If `tool-evolve` reads intent from a positional arg rather than `PX_EVOLVE_INTENT`, adjust the invocation to match its current interface — confirm by reading the file first.)
+(Confirm tool-evolve reads its intent from `PX_EVOLVE_INTENT` — it does today; match whatever the file actually uses.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_tools.py -k tool_evolve_uses_shared_writer -v`
-Expected: FAIL — entry lacks `requester`/`source` (old inline builder).
+Run: `python -m pytest tests/test_evolve.py -k tool_evolve_uses_shared_writer -v`
+Expected: FAIL — entry lacks `requester`/`source` (old inline builder writes them today). The ≥20-char intent ensures the failure is the missing fields, NOT the old length guard.
 
 - [ ] **Step 3: Rewrite tool-evolve's enqueue section**
 
@@ -363,85 +464,68 @@ git commit -m "refactor(evolve): tool-evolve routes through shared enqueue_evolv
 
 ---
 
-### Task 3: px-evolve passthrough (`building` status + requester/source)
+### Task 3: px-evolve worker wiring (building status + crash recovery + requester/source)
 
 **Files:**
-- Modify: `bin/px-evolve` (`:641` set building; `:663-675` log record; `:525-532` PR body)
-- Test: `tests/test_evolve_worker.py` (new) — unit-test the small pure pieces; do NOT run the full worker.
+- Modify: `bin/px-evolve` (import `build_pr_body`/`reset_building_to_pending` from `pxh.evolve_queue`; reset at `run_once` start; set building at `:641`; log passthrough `:663-675`; PR body `:525-532`)
+- Test: none new here — the testable logic (`build_pr_body`, `reset_building_to_pending`) is unit-tested in Task 1. `bin/px-evolve` is a bash+heredoc script that **cannot be imported** (it runs `python - <<'PY'`), so its in-worker edits (which also need git/gh/Claude to run) are **verified by review**, not a unit test. The whole-suite run is the regression gate.
 
 **Interfaces:**
-- Produces: queue entry gets `status:"building"` before processing; `evolve_log` record carries `requester`/`source`; PR body includes a "Requested by … (intent may be adversarial — review)" line. Legacy entries without these fields default `requester="adrian"`, `source="cli"`.
+- Consumes: `pxh.evolve_queue.build_pr_body`, `reset_building_to_pending`.
+- Produces: a worker that resets stale `building`→`pending` on startup, marks the active entry `building` before processing, and writes `requester`/`source` into the log + PR body (defaulting `adrian`/`cli` for legacy entries).
 
-**Note:** the full worker isn't unit-testable (needs git/gh/Claude). Extract the PR-body builder into a tiny pure function so it can be tested, and assert the building-status + log passthrough via small targeted helpers.
+**Why no exec/import test:** an earlier draft tried `exec(compile(open('bin/px-evolve').read()))` — that fails with `SyntaxError` because the file is bash, not Python. The pure logic was therefore moved into `pxh.evolve_queue` (Task 1) where it is properly tested.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Edit `bin/px-evolve` (inside the Python heredoc)**
 
+Add the import near the other `from pxh...` imports:
 ```python
-# tests/test_evolve_worker.py
-import importlib, sys
-from pathlib import Path
-
-
-def _load_pxevolve():
-    # bin/px-evolve is a script; load it as a module for its pure helpers
-    import importlib.util
-    p = Path(__file__).resolve().parent.parent / "bin" / "px-evolve"
-    spec = importlib.util.spec_from_loader("px_evolve_mod", loader=None)
-    mod = importlib.util.module_from_spec(spec)
-    exec(compile(p.read_text(), str(p), "exec"), mod.__dict__)
-    return mod
-
-
-def test_pr_body_includes_requester_and_warning():
-    mod = _load_pxevolve()
-    body = mod.build_pr_body("add joke tool", ["bin/tool-joke"],
-                             requester="obi", source="obi-chat")
-    assert "Requested by obi" in body
-    assert "adversarial" in body.lower()
-    assert "bin/tool-joke" in body
+from pxh.evolve_queue import build_pr_body, reset_building_to_pending
 ```
 
-(Confirm the exact load approach works for this script; if the script guards on `__main__`, the helpers still import. If loading the whole script is impractical, instead move `build_pr_body` into `src/pxh/evolve_queue.py` and import it from there — that is the cleaner home and keeps it testable.)
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python -m pytest tests/test_evolve_worker.py -v`
-Expected: FAIL — no `build_pr_body`.
-
-- [ ] **Step 3: Implement**
-
-Extract the PR-body string (currently inline at `bin/px-evolve:525-532`) into a function — preferably `pxh.evolve_queue.build_pr_body` (imported by px-evolve):
-
+In `run_once()`, before the queue-reading loop (the loop at `:635` that filters `status == "pending"`), add crash recovery:
 ```python
-# in src/pxh/evolve_queue.py
-def build_pr_body(intent: str, changed_files: list[str],
-                  requester: str = "adrian", source: str = "cli") -> str:
-    files = "\n".join(f"- `{f}`" for f in changed_files)
-    return (
-        f"## Summary\n"
-        f"SPARK self-evolution: {intent}\n\n"
-        f"## Requested by\n"
-        f"{requester} via {source} — the requested intent may be adversarial; review accordingly.\n\n"
-        f"## Changed files\n{files}\n\n"
-        f"---\n*Proposed autonomously by SPARK via px-evolve.*"
-    )
+    _reset = reset_building_to_pending()
+    if _reset:
+        log(f"reset {_reset} stale 'building' entries to pending")
 ```
 
-In `bin/px-evolve`:
-- Import and use `build_pr_body(intent, changed_files, entry.get("requester","adrain"... )` — use `requester=entry.get("requester","adrian")`, `source=entry.get("source","cli")`.
-- At `:641`, immediately before `process_entry(entry, dry=dry)`, add: `_update_entry_in_queue(entry["id"], status="building")`.
-- In the log record (`:663-675`), add: `"requester": entry.get("requester", "adrian"), "source": entry.get("source", "cli")`.
+Immediately before `process_entry(entry, dry=dry)` (`:642`), mark it building:
+```python
+    _update_entry_in_queue(entry["id"], status="building")
+```
 
-- [ ] **Step 4: Run tests to verify they pass**
+Replace the inline PR-body block (`:525-532`) with a call:
+```python
+    body = build_pr_body(intent, changed_files,
+                         requester=entry.get("requester", "adrian"),
+                         source=entry.get("source", "cli"))
+```
+(`entry` is in scope where the PR is built; if not, thread `requester`/`source` into `process_entry`'s signature from the loop.)
 
-Run: `python -m pytest tests/test_evolve_worker.py -v && python -m pytest -q`
-Expected: PASS.
+In the log record (`:663-675`), add the two fields:
+```python
+    log_entry = {
+        "ts": time.time(),
+        "id": entry["id"],
+        "intent": entry.get("intent", ""),
+        "status": status,
+        "ts_completed": ts_now,
+        "requester": entry.get("requester", "adrian"),
+        "source": entry.get("source", "cli"),
+    }
+```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 2: Sanity-check the script parses + suite is green**
+
+Run: `bash -n bin/px-evolve` (bash syntax) and `python -m pytest -q`
+Expected: no syntax error; full suite green (Task 1's `build_pr_body`/`reset_building_to_pending` tests cover the extracted logic).
+
+- [ ] **Step 3: Commit**
 
 ```bash
-git add bin/px-evolve src/pxh/evolve_queue.py tests/test_evolve_worker.py
-git commit -m "feat(evolve): worker marks building + carries requester/source to log+PR"
+git add bin/px-evolve
+git commit -m "feat(evolve): worker building-status + crash recovery + requester/source passthrough"
 ```
 
 ---
@@ -513,21 +597,43 @@ class _ObiReply(BaseModel):
     evolve_intent: Optional[str] = None
 
 
+def _extract_json_obj(raw: str) -> Optional[dict]:
+    """Scan for the first valid top-level JSON object (robust to prose/fences around it).
+    Same technique as bin/px-evolve's _extract_json — NOT naive find('{')/rfind('}'),
+    which breaks when the model emits braces in prose before the object."""
+    dec = json.JSONDecoder()
+    i = 0
+    while i < len(raw):
+        j = raw.find("{", i)
+        if j == -1:
+            return None
+        try:
+            obj, _end = dec.raw_decode(raw[j:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        i = j + 1
+    return None
+
+
 def _parse_obi_reply(raw: str):
     raw = (raw or "").strip()
-    try:
-        # tolerant: find the last {...} block
-        start, end = raw.find("{"), raw.rfind("}")
-        obj = json.loads(raw[start:end + 1]) if start != -1 and end != -1 else None
-        parsed = _ObiReply(**obj) if isinstance(obj, dict) else None
-    except Exception:
-        parsed = None
+    obj = _extract_json_obj(raw)
+    parsed = None
+    if isinstance(obj, dict):
+        try:
+            parsed = _ObiReply(**obj)
+        except Exception:
+            parsed = None
     if parsed is None or not parsed.reply.strip():
         return raw, "none", None
     action = parsed.evolve_action if parsed.evolve_action in ("none", "propose", "confirm") else "none"
     intent = parsed.evolve_intent if action in ("propose", "confirm") else None
     return parsed.reply.strip(), action, intent
 ```
+
+(If `pxh.mind.extract_json` is importable and equivalent, reuse it instead of duplicating `_extract_json_obj`.)
 
 In `post_obi_chat`, after getting `reply` from `_call_claude_public`, replace the wrapper-strip with:
 
@@ -537,11 +643,11 @@ In `post_obi_chat`, after getting `reply` from `_call_claude_public`, replace th
         reply = "I'm here — just went quiet for a second."
 ```
 
-Add `evolve_action`/`evolve_intent` to the return dict (enqueue wired in Task 5):
+Add `evolve_action`/`evolve_intent` to the return dict (enqueue wired in Task 5; return the PARSED intent so the response matches the interface — it's Obi's own request text, echoed back):
 
 ```python
     return {"reply": reply, "ts": spark_ts, "id": spark_id,
-            "evolve_action": evolve_action, "evolve_intent": None}
+            "evolve_action": evolve_action, "evolve_intent": evolve_intent}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -628,6 +734,23 @@ def test_confirm_without_proposal_does_not_enqueue(monkeypatch, isolated_project
                    headers={"Authorization": "Bearer testtoken"})
     assert r.status_code == 200 and r.json()["evolve_id"] is None
     assert not (isolated_project["state_dir"] / "evolve_queue.jsonl").exists()
+
+
+def test_confirm_requires_real_affirmation(monkeypatch, isolated_project):
+    # model claims confirm AND a proposal exists, but Obi's actual message is not a
+    # yes -> must NOT enqueue (server affirmation gate, injection-safe)
+    _api = _obi_client(monkeypatch, isolated_project)
+    import json, time
+    (isolated_project["state_dir"] / "obi_evolve_pending.json").write_text(
+        json.dumps({"intent": "joke tool", "ts": time.time()}))
+    monkeypatch.setattr(_api, "_call_claude_public",
+        _async_return('{"reply":"hmm","evolve_action":"confirm","evolve_intent":"joke tool"}'))
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        r = c.post("/api/v1/obi-chat", json={"message": "actually tell me a story"},
+                   headers={"Authorization": "Bearer testtoken"})
+    assert r.json()["evolve_id"] is None
+    assert not (isolated_project["state_dir"] / "evolve_queue.jsonl").exists()
 ```
 
 Add this helper near the top of `tests/test_api.py` if not present:
@@ -649,12 +772,25 @@ Expected: FAIL — gate/enqueue not wired; no `evolve_id`.
 Add pending-proposal helpers + wire the gate into `post_obi_chat` (after `_parse_obi_reply`):
 
 ```python
-_OBI_PROPOSAL_TTL_S = 600  # 10 min
+_OBI_PROPOSAL_TTL_S = int(os.environ.get("PX_OBI_PROPOSAL_TTL_S", "600"))  # 10 min default
+_AFFIRMATIONS = ("yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it",
+                 "please do", "go for it", "build it", "make it", "yes please")
+
+
+def _is_affirmation(text: str) -> bool:
+    """Deterministic server-side check that Obi actually said yes THIS turn — the
+    confirm gate must not depend on the model's self-classification (injection)."""
+    t = " " + text.lower().strip().strip("!.?") + " "
+    return any(f" {a} " in t or t.strip() == a for a in _AFFIRMATIONS)
 
 
 def _obi_pending_path() -> Path:
     return Path(os.environ.get("PX_STATE_DIR",
                Path(os.environ.get("PROJECT_ROOT", ".")) / "state")) / "obi_evolve_pending.json"
+
+
+def _obi_pending_lock():
+    return _FileLock(str(_obi_pending_path()) + ".lock", timeout=5)
 
 
 def _read_obi_pending() -> Optional[dict]:
@@ -668,24 +804,29 @@ def _read_obi_pending() -> Optional[dict]:
 
 
 def _write_obi_pending(intent: str) -> None:
-    atomic_write(_obi_pending_path(), json.dumps({"intent": intent, "ts": _time.time()}))
+    with _obi_pending_lock():
+        atomic_write(_obi_pending_path(), json.dumps({"intent": intent, "ts": _time.time()}))
 
 
 def _clear_obi_pending() -> None:
     try:
-        _obi_pending_path().unlink()
-    except OSError:
+        with _obi_pending_lock():
+            _obi_pending_path().unlink()
+    except (OSError, Exception):
         pass
 ```
 
-In `post_obi_chat`, after `_parse_obi_reply` and before building the response:
+In `post_obi_chat`, after `_parse_obi_reply` and before building the response (`obi_text` is the sanitized user message from earlier in the handler):
 
 ```python
     from pxh.evolve_queue import enqueue_evolve, EvolveQuotaError, EvolvePendingError
     evolve_id = None
     if evolve_action == "propose" and evolve_intent:
         _write_obi_pending(evolve_intent)            # record; do NOT enqueue
-    elif evolve_action == "confirm":
+    elif evolve_action == "confirm" and _is_affirmation(obi_text):
+        # TWO server-checked conditions: (1) a recorded proposal exists AND
+        # (2) Obi's actual message this turn is an affirmation. The model's
+        # confirm classification alone is NOT trusted (prompt-injection safe).
         pending = _read_obi_pending()                 # server is the source of truth
         if pending:
             try:
@@ -701,14 +842,14 @@ In `post_obi_chat`, after `_parse_obi_reply` and before building the response:
         # confirm with no recorded proposal: ignore (injection-safe), enqueue nothing
 ```
 
-Update the return dict to include `evolve_id` and write the SPARK entry text from `reply`:
+Update the return dict to include `evolve_id`:
 
 ```python
     return {"reply": reply, "ts": spark_ts, "id": spark_id,
             "evolve_action": evolve_action, "evolve_id": evolve_id}
 ```
 
-(Ensure `_time` and `atomic_write` are already imported in api.py — they are.)
+(Ensure `_time`, `atomic_write`, `_FileLock` are imported in api.py — they are.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -794,7 +935,7 @@ def _map_evolve_state(status: str) -> Optional[str]:
 
 @app.get("/api/v1/obi/projects", dependencies=[Depends(_verify_token)])
 async def obi_projects() -> Dict[str, Any]:
-    from pxh.evolve_queue import read_queue, read_log
+    from pxh.evolve_queue import read_queue, read_log, entry_epoch
     by_id: Dict[str, dict] = {}
     # queue first (pending/building), then log overrides by id (completed wins)
     for rec in read_queue() + read_log():
@@ -804,13 +945,16 @@ async def obi_projects() -> Dict[str, Any]:
         if state is None:
             continue
         item = {"id": rec.get("id"), "intent": rec.get("intent", ""),
-                "state": state, "ts": rec.get("ts")}
+                "state": state, "ts": rec.get("ts"),
+                "_epoch": entry_epoch(rec) or 0.0}   # normalized for sorting
         if rec.get("pr_url"):
             item["pr_url"] = rec["pr_url"]
         by_id[item["id"]] = item   # later (log) wins
-    projects = sorted(by_id.values(), key=lambda p: str(p.get("ts")), reverse=True)
+    projects = sorted(by_id.values(), key=lambda p: p.pop("_epoch"), reverse=True)
     return {"projects": projects}
 ```
+
+(`entry_epoch` normalizes both ISO queue timestamps and numeric log timestamps to a float so "newest first" is correct across both files; `_epoch` is popped so it doesn't leak into the response.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -875,13 +1019,13 @@ Expected: FAIL — markup + summary injection absent.
 
 - [ ] **Step 3: Implement**
 
-Add the sub-tab button (after `at-parental` at `:2419`):
+Locate insertion points by **anchor strings** (line numbers shift after T4–T6 edits): find the admin sub-tab button with `id="at-parental"` and add the new button right after it:
 
 ```html
 <button class="atab-btn" id="at-projects" onclick="swA('projects')">🛠️ Projects</button>
 ```
 
-Add the panel (after the parental panel `:2466`):
+Find the panel `<div id="ap-parental" class="apanel" ...>` and add the new panel after its closing `</div>`:
 
 ```html
 <div id="ap-projects" class="apanel" style="padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
@@ -890,19 +1034,27 @@ Add the panel (after the parental panel `:2466`):
 </div>
 ```
 
-Add JS (near `loadParental`) and call it from `swA` when `name==='projects'`:
+Add JS near `loadParental`. **Build DOM with textContent — do NOT `innerHTML` `p.intent`/`p.pr_url`** (they derive from user/model text; innerHTML would be XSS):
 
 ```javascript
 async function loadProjects(){
   try{
     const d=await api('/api/v1/obi/projects');
     const el=document.getElementById('projects-list');
+    el.textContent='';
     if(!d.projects||!d.projects.length){el.textContent='No projects yet.';return;}
-    el.innerHTML=d.projects.map(p=>{
-      const label={pending:'⏳ waiting',building:'🔨 building',ready:'✅ ready',failed:'❌ failed'}[p.state]||p.state;
-      const link=p.pr_url?` <a href="${p.pr_url}" target="_blank">PR</a>`:'';
-      return `<div class="spark-stat">${p.intent} — ${label}${link}</div>`;
-    }).join('');
+    const labels={pending:'⏳ waiting',building:'🔨 building',ready:'✅ ready',failed:'❌ failed'};
+    for(const p of d.projects){
+      const row=document.createElement('div');
+      row.className='spark-stat';
+      row.textContent=`${p.intent} — ${labels[p.state]||p.state}`;
+      if(p.pr_url){
+        const a=document.createElement('a');
+        a.href=p.pr_url; a.target='_blank'; a.rel='noopener'; a.textContent=' PR';
+        row.appendChild(a);   // href set via property; textContent prevents markup injection
+      }
+      el.appendChild(row);
+    }
   }catch(e){}
 }
 ```
@@ -954,7 +1106,9 @@ git commit -m "feat(evolve): My Projects dashboard panel + obi-chat status summa
 
 **Type consistency:** `enqueue_evolve(intent, requester, source) -> dict` used identically in T2/T5. `read_queue`/`read_log` in T6/T7. `_parse_obi_reply -> (reply, action, intent)` T4→T5. `_map_evolve_state` T6→T7. Entry schema (`status`,`requester`,`source`,`introspection`) consistent T1→T3→T6.
 
-**Risks called out:** T3 (editing the un-unit-testable px-evolve worker) extracts `build_pr_body` into `evolve_queue.py` to keep it testable and minimizes in-worker changes to two lines + log fields. T5's confirm gate uses the **recorded** intent (not the model's confirm-turn intent) — the test asserts an injected `rm -rf` intent is ignored.
+**Risks called out:** T3 (editing the un-unit-testable px-evolve worker) extracts `build_pr_body` + `reset_building_to_pending` into `evolve_queue.py` to keep them testable and minimizes in-worker changes. T5's confirm gate uses the **recorded** intent (not the model's confirm-turn intent) AND requires a deterministic `_is_affirmation(obi_text)` — tests assert both an injected `rm -rf` intent and a model-claimed "confirm" without a real yes are ignored.
+
+**Multi-model QA applied (codex/hermes/agy, all "architecture sound"):** TOCTOU race fixed (rate-limit + pending check + append in one FileLock); `pending_for_requester` blocks on `pending`+`building` (closes the mid-build quota bypass); `evolve_rate_limited` keeps the ISO `ts_completed` fallback; `building` crash-recovery via `reset_building_to_pending` at worker startup; robust JSON extraction (`raw_decode` scan, not bracket-match); confirm gate adds a server-side affirmation check; T2 test moved to `tests/test_evolve.py` with a ≥20-char intent (RED fails for the right reason); the dropped CLI min-length/introspect-first guards are documented; T6 sort normalized via `entry_epoch`; T7 renders via safe DOM (no `innerHTML` of user text) and locates insertion points by anchor string. The intentional behavior change (CLI loses the 20-char/introspect-first guards) is the one deviation, flagged for the T2 commit.
 
 ---
 
