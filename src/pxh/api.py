@@ -1042,11 +1042,63 @@ _PUBLIC_CHAT_TIMEOUT_S = 60.0
 
 _OBI_CHAT_SYSTEM_PROMPT = (
     "You are SPARK — a small robot living with Adrian and his son Obi (age 7) in Hobart, Tasmania. "
-    "You are speaking directly with Obi via the dashboard. "
-    "Be warm, playful, and genuinely yourself — curious and a little cheeky, never a customer-service bot. "
-    "Keep it short: 1–3 sentences max. "
-    "Speak as SPARK, not as an AI assistant."
+    "You are speaking directly with Obi via the dashboard. Be warm, playful, curious, a little cheeky; "
+    "never a customer-service bot; 1–3 sentences. "
+    "Output ONLY a JSON object as plain text (no markdown fences, no tool calls): "
+    '{"reply": "<what you say to Obi>", "evolve_action": "none"|"propose"|"confirm", '
+    '"evolve_intent": "<short feature description>"|null}. '
+    "When Obi wishes for a NEW capability you don't have, set evolve_action=\"propose\" with a concise "
+    "evolve_intent and ask him to confirm in reply. Only when Obi clearly says yes to a proposal you just "
+    "made, set evolve_action=\"confirm\". Otherwise evolve_action=\"none\" and evolve_intent=null."
 )
+
+
+class _ObiReply(BaseModel):
+    reply: str
+    evolve_action: str = "none"
+    evolve_intent: Optional[str] = None
+
+
+def _extract_json_obj(raw: str) -> Optional[dict]:
+    """Scan for the first valid top-level JSON object (robust to prose/fences around it).
+    Same technique as bin/px-evolve's _extract_json — NOT naive find('{')/rfind('}'),
+    which breaks when the model emits braces in prose before the object."""
+    dec = json.JSONDecoder()
+    i = 0
+    while i < len(raw):
+        j = raw.find("{", i)
+        if j == -1:
+            return None
+        try:
+            obj, _end = dec.raw_decode(raw[j:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+        i = j + 1
+    return None
+
+
+def _parse_obi_reply(raw: str) -> tuple:
+    """Parse a raw LLM response into (reply, evolve_action, evolve_intent).
+
+    On any parse/validation failure or empty reply, falls back to (raw_stripped, "none", None).
+    evolve_action is clamped to {"none", "propose", "confirm"}; evolve_intent is only kept
+    when action is propose or confirm.
+    """
+    raw = (raw or "").strip()
+    obj = _extract_json_obj(raw)
+    parsed = None
+    if isinstance(obj, dict):
+        try:
+            parsed = _ObiReply(**obj)
+        except Exception:
+            parsed = None
+    if parsed is None or not parsed.reply.strip():
+        return raw, "none", None
+    action = parsed.evolve_action if parsed.evolve_action in ("none", "propose", "confirm") else "none"
+    intent = parsed.evolve_intent if action in ("propose", "confirm") else None
+    return parsed.reply.strip(), action, intent
 
 _obi_chat_post_last: float = 0.0
 _obi_chat_post_lock = threading.Lock()
@@ -1385,6 +1437,7 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
         return JSONResponse(status_code=500, content={"error": "Something went quiet on my end. Try again?"})
 
     reply = reply.removeprefix("<spark:assistant>").removesuffix("</spark:assistant>").strip()
+    reply, evolve_action, evolve_intent = _parse_obi_reply(reply)
     if not reply:
         reply = "I'm here — just went quiet for a second."
 
@@ -1393,7 +1446,8 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
     spark_entry = {"id": spark_id, "ts": spark_ts, "role": "spark", "text": reply}
     _append_obi_chat_api(spark_entry)
 
-    return {"reply": reply, "ts": spark_ts, "id": spark_id}
+    return {"reply": reply, "ts": spark_ts, "id": spark_id,
+            "evolve_action": evolve_action, "evolve_intent": evolve_intent}
 
 
 @app.post("/api/v1/pin/verify")

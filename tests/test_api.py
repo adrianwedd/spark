@@ -1192,3 +1192,35 @@ class TestRaceEndpoint:
 
         assert resp.status_code == 409
         assert resp.json()["status"] == "already_running"
+
+
+# ---------------------------------------------------------------------------
+# Obi-chat parse helpers (Task 4)
+# ---------------------------------------------------------------------------
+
+def _async_return(value):
+    async def _f(*a, **k):
+        return value
+    return _f
+
+
+def test_parse_obi_reply_json(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    reply, action, intent = _api._parse_obi_reply(
+        '{"reply": "Cool idea!", "evolve_action": "propose", "evolve_intent": "joke tool"}')
+    assert reply == "Cool idea!" and action == "propose" and intent == "joke tool"
+
+
+def test_parse_obi_reply_fallback_on_garbage(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    reply, action, intent = _api._parse_obi_reply("just plain text, not json")
+    assert reply == "just plain text, not json" and action == "none" and intent is None
+
+
+def test_parse_obi_reply_unknown_action_is_none(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    _, action, _ = _api._parse_obi_reply('{"reply":"hi","evolve_action":"hack","evolve_intent":"x"}')
+    assert action == "none"
