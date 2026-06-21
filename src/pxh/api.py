@@ -1517,6 +1517,38 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
             "evolve_action": evolve_action, "evolve_id": evolve_id}
 
 
+def _map_evolve_state(status: str) -> Optional[str]:
+    if status == "pending":
+        return "pending"
+    if status == "building":
+        return "building"
+    if status == "pr_created":
+        return "ready"
+    if status.startswith("failed"):
+        return "failed"
+    return None  # skipped:* / unknown → excluded
+
+
+@app.get("/api/v1/obi/projects", dependencies=[Depends(_verify_token)])
+async def obi_projects() -> Dict[str, Any]:
+    from pxh.evolve_queue import read_queue, read_log, entry_epoch
+    by_id: Dict[str, dict] = {}
+    for rec in read_queue() + read_log():           # queue first, log overrides by id
+        if rec.get("requester") != "obi":
+            continue
+        state = _map_evolve_state(rec.get("status", ""))
+        if state is None:
+            continue
+        item = {"id": rec.get("id"), "intent": rec.get("intent", ""),
+                "state": state, "ts": rec.get("ts"),
+                "_epoch": entry_epoch(rec) or 0.0}
+        if rec.get("pr_url"):
+            item["pr_url"] = rec["pr_url"]
+        by_id[item["id"]] = item                      # later (log) wins
+    projects = sorted(by_id.values(), key=lambda p: p.pop("_epoch"), reverse=True)
+    return {"projects": projects}
+
+
 @app.post("/api/v1/pin/verify")
 async def verify_pin(body: PinRequest, request: Request) -> JSONResponse:
     """Verify the admin PIN. Public endpoint — no Bearer token required."""

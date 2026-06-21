@@ -1315,3 +1315,41 @@ def test_is_affirmation_rejects_negations(monkeypatch):
     assert _api._is_affirmation("yes please") is True
     assert _api._is_affirmation("okay!") is True
     assert _api._is_affirmation("do it") is True
+
+
+# ---------------------------------------------------------------------------
+# obi/projects endpoint (Task 6)
+# ---------------------------------------------------------------------------
+
+def test_obi_projects_merges_and_maps(monkeypatch, isolated_project):
+    _api = _obi_client(monkeypatch, isolated_project)
+    import json, time
+    sd = isolated_project["state_dir"]
+    # queue: one obi pending, one obi building, one adrian pending (filtered out),
+    # and one completed id that ALSO appears in the log (log must win)
+    sd.joinpath("evolve_queue.jsonl").write_text("\n".join([
+        json.dumps({"id":"a","intent":"joke","status":"pending","requester":"obi","ts":"t1"}),
+        json.dumps({"id":"b","intent":"dance","status":"building","requester":"obi","ts":"t2"}),
+        json.dumps({"id":"c","intent":"adr","status":"pending","requester":"adrian","ts":"t3"}),
+        json.dumps({"id":"d","intent":"facts","status":"pr_created","requester":"obi","ts":"t4"}),
+    ]) + "\n")
+    sd.joinpath("evolve_log.jsonl").write_text(
+        json.dumps({"id":"d","intent":"facts","status":"pr_created","requester":"obi",
+                    "ts":time.time(),"pr_url":"https://x/pull/9"}) + "\n")
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        r = c.get("/api/v1/obi/projects", headers={"Authorization":"Bearer testtoken"})
+    assert r.status_code == 200
+    items = {p["id"]: p for p in r.json()["projects"]}
+    assert "c" not in items                       # adrian filtered out
+    assert items["a"]["state"] == "pending"
+    assert items["b"]["state"] == "building"
+    assert items["d"]["state"] == "ready" and items["d"]["pr_url"].endswith("/pull/9")
+    assert sum(1 for p in r.json()["projects"] if p["id"] == "d") == 1   # deduped
+
+
+def test_obi_projects_requires_auth(monkeypatch, isolated_project):
+    _api = _obi_client(monkeypatch, isolated_project)
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        assert c.get("/api/v1/obi/projects").status_code == 401
