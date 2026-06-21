@@ -106,3 +106,13 @@ def test_old_pr_created_does_not_block(monkeypatch, tmp_path):
         json.dumps({"ts": time.time() - 90000, "id": "old", "status": "pr_created"}) + "\n")
     entry = eq.enqueue_evolve("allowed", "obi", "obi-chat")
     assert entry["status"] == "pending"
+
+
+def test_enqueue_raises_if_filelock_unavailable(monkeypatch, tmp_path):
+    # filelock is a hard dependency — if it's somehow missing, writes must fail loudly
+    # rather than running unlocked (TOCTOU on concurrent enqueues)
+    eq = _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(eq, "_FileLock", None)
+    with pytest.raises(RuntimeError, match="filelock"):
+        eq.enqueue_evolve("some intent", "obi", "obi-chat")
+    assert not (tmp_path / "evolve_queue.jsonl").exists()

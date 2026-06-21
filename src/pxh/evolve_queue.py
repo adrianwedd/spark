@@ -129,12 +129,12 @@ def enqueue_evolve(intent: str, requester: str, source: str) -> dict:
 
     path = _queue_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    import contextlib
-    lock = _FileLock(str(path) + ".lock", timeout=5) if _FileLock else None
-    ctx = lock if lock else contextlib.nullcontext()
+    if _FileLock is None:
+        raise RuntimeError("filelock is required for evolve_queue writes")
+    lock = _FileLock(str(path) + ".lock", timeout=5)
     # ALL checks + the append happen inside ONE lock — otherwise two concurrent
     # confirms can both pass pending_for_requester() and double-enqueue (TOCTOU).
-    with ctx:
+    with lock:
         if evolve_rate_limited():
             raise EvolveQuotaError("one evolution per 24 hours")
         if pending_for_requester(requester) is not None:
@@ -176,13 +176,13 @@ def reset_building_to_pending() -> int:
     """Crash recovery: any entry left 'building' (worker died mid-run) goes back to
     'pending' so it is retried. px-evolve calls this at startup (single-instance
     daemon, so nothing is genuinely building when it boots). Returns count reset."""
-    import contextlib
     path = _queue_path()
     if not path.exists():
         return 0
-    lock = _FileLock(str(path) + ".lock", timeout=5) if _FileLock else None
-    ctx = lock if lock else contextlib.nullcontext()
-    with ctx:
+    if _FileLock is None:
+        raise RuntimeError("filelock is required for evolve_queue writes")
+    lock = _FileLock(str(path) + ".lock", timeout=5)
+    with lock:
         entries = read_queue()
         n = 0
         for e in entries:
