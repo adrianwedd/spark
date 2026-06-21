@@ -1100,6 +1100,7 @@ def _parse_obi_reply(raw: str) -> tuple:
     intent = parsed.evolve_intent if action in ("propose", "confirm") else None
     return parsed.reply.strip(), action, intent
 
+
 _obi_chat_post_last: float = 0.0
 _obi_chat_post_lock = threading.Lock()
 _OBI_CHAT_MIN_INTERVAL_S = 10.0  # max 1 message per 10 s

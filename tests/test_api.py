@@ -1222,5 +1222,5 @@ def test_parse_obi_reply_fallback_on_garbage(monkeypatch):
 def test_parse_obi_reply_unknown_action_is_none(monkeypatch):
     monkeypatch.setenv("PX_API_TOKEN", "testtoken")
     import importlib, pxh.api as _api; importlib.reload(_api)
-    _, action, _ = _api._parse_obi_reply('{"reply":"hi","evolve_action":"hack","evolve_intent":"x"}')
-    assert action == "none"
+    _, action, intent = _api._parse_obi_reply('{"reply":"hi","evolve_action":"hack","evolve_intent":"x"}')
+    assert action == "none" and intent is None
