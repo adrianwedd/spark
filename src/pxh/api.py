@@ -1104,12 +1104,16 @@ def _parse_obi_reply(raw: str) -> tuple:
 _OBI_PROPOSAL_TTL_S = int(os.environ.get("PX_OBI_PROPOSAL_TTL_S", "600"))  # 10 min default
 _AFFIRMATIONS = ("yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it",
                  "please do", "go for it", "build it", "make it", "yes please")
+_NEGATIONS = ("no", "not", "dont", "don't", "stop", "nope", "never", "cancel", "nah", "no thanks")
 
 
 def _is_affirmation(text: str) -> bool:
     """Deterministic server-side check that Obi actually said yes THIS turn — the
-    confirm gate must not depend on the model's self-classification (injection)."""
+    confirm gate must not depend on the model's self-classification (injection).
+    A standalone negation token vetoes the turn (prefer a false 'no' over a false 'yes')."""
     t = " " + text.lower().strip().strip("!.?") + " "
+    if any(f" {n} " in t or t.strip() == n for n in _NEGATIONS):
+        return False
     return any(f" {a} " in t or t.strip() == a for a in _AFFIRMATIONS)
 
 

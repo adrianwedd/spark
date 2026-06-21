@@ -1303,3 +1303,15 @@ def test_confirm_requires_real_affirmation(monkeypatch, isolated_project):
                    headers={"Authorization": "Bearer testtoken"})
     assert r.json()["evolve_id"] is None
     assert not (isolated_project["state_dir"] / "evolve_queue.jsonl").exists()
+
+
+def test_is_affirmation_rejects_negations(monkeypatch):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    assert _api._is_affirmation("no, do not do it") is False
+    assert _api._is_affirmation("nope") is False
+    assert _api._is_affirmation("stop") is False
+    # genuine affirmations still pass
+    assert _api._is_affirmation("yes please") is True
+    assert _api._is_affirmation("okay!") is True
+    assert _api._is_affirmation("do it") is True
