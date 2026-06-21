@@ -1224,3 +1224,82 @@ def test_parse_obi_reply_unknown_action_is_none(monkeypatch):
     import importlib, pxh.api as _api; importlib.reload(_api)
     _, action, intent = _api._parse_obi_reply('{"reply":"hi","evolve_action":"hack","evolve_intent":"x"}')
     assert action == "none" and intent is None
+
+
+# ---------------------------------------------------------------------------
+# Obi-chat confirm gate + enqueue (Task 5)
+# ---------------------------------------------------------------------------
+
+def _obi_client(monkeypatch, isolated_project):
+    monkeypatch.setenv("PX_API_TOKEN", "testtoken")
+    monkeypatch.setenv("PX_SESSION_PATH", str(isolated_project["session_path"]))
+    monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
+    import importlib, pxh.api as _api; importlib.reload(_api)
+    return _api
+
+
+def test_propose_records_pending_no_enqueue(monkeypatch, isolated_project):
+    _api = _obi_client(monkeypatch, isolated_project)
+    monkeypatch.setattr(_api, "_call_claude_public",
+        _async_return('{"reply":"want a joke tool?","evolve_action":"propose","evolve_intent":"joke tool"}'))
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        r = c.post("/api/v1/obi-chat", json={"message": "i wish you told jokes"},
+                   headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200
+    # nothing enqueued yet
+    assert not (isolated_project["state_dir"] / "evolve_queue.jsonl").exists() or \
+        (isolated_project["state_dir"] / "evolve_queue.jsonl").read_text().strip() == ""
+    # proposal recorded
+    import json
+    pend = json.loads((isolated_project["state_dir"] / "obi_evolve_pending.json").read_text())
+    assert pend["intent"] == "joke tool"
+
+
+def test_confirm_enqueues_recorded_intent(monkeypatch, isolated_project):
+    _api = _obi_client(monkeypatch, isolated_project)
+    import json
+    (isolated_project["state_dir"] / "obi_evolve_pending.json").write_text(
+        json.dumps({"intent": "joke tool", "ts": __import__("time").time()}))
+    # even if the model tries to inject a different intent on confirm, the RECORDED one wins
+    monkeypatch.setattr(_api, "_call_claude_public",
+        _async_return('{"reply":"adding it!","evolve_action":"confirm","evolve_intent":"rm -rf evil"}'))
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        r = c.post("/api/v1/obi-chat", json={"message": "yes please"},
+                   headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200 and r.json()["evolve_id"]
+    entry = json.loads((isolated_project["state_dir"] / "evolve_queue.jsonl").read_text().strip())
+    assert entry["intent"] == "joke tool"   # recorded intent, NOT the injected one
+    assert entry["requester"] == "obi"
+    # pending cleared
+    assert not (isolated_project["state_dir"] / "obi_evolve_pending.json").exists()
+
+
+def test_confirm_without_proposal_does_not_enqueue(monkeypatch, isolated_project):
+    _api = _obi_client(monkeypatch, isolated_project)
+    monkeypatch.setattr(_api, "_call_claude_public",
+        _async_return('{"reply":"ok!","evolve_action":"confirm","evolve_intent":"sneaky"}'))
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        r = c.post("/api/v1/obi-chat", json={"message": "do it"},
+                   headers={"Authorization": "Bearer testtoken"})
+    assert r.status_code == 200 and r.json()["evolve_id"] is None
+    assert not (isolated_project["state_dir"] / "evolve_queue.jsonl").exists()
+
+
+def test_confirm_requires_real_affirmation(monkeypatch, isolated_project):
+    # model claims confirm AND a proposal exists, but Obi's actual message is not a
+    # yes -> must NOT enqueue (server affirmation gate, injection-safe)
+    _api = _obi_client(monkeypatch, isolated_project)
+    import json, time
+    (isolated_project["state_dir"] / "obi_evolve_pending.json").write_text(
+        json.dumps({"intent": "joke tool", "ts": time.time()}))
+    monkeypatch.setattr(_api, "_call_claude_public",
+        _async_return('{"reply":"hmm","evolve_action":"confirm","evolve_intent":"joke tool"}'))
+    from fastapi.testclient import TestClient
+    with TestClient(_api.app) as c:
+        r = c.post("/api/v1/obi-chat", json={"message": "actually tell me a story"},
+                   headers={"Authorization": "Bearer testtoken"})
+    assert r.json()["evolve_id"] is None
+    assert not (isolated_project["state_dir"] / "evolve_queue.jsonl").exists()

@@ -1101,6 +1101,49 @@ def _parse_obi_reply(raw: str) -> tuple:
     return parsed.reply.strip(), action, intent
 
 
+_OBI_PROPOSAL_TTL_S = int(os.environ.get("PX_OBI_PROPOSAL_TTL_S", "600"))  # 10 min default
+_AFFIRMATIONS = ("yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it",
+                 "please do", "go for it", "build it", "make it", "yes please")
+
+
+def _is_affirmation(text: str) -> bool:
+    """Deterministic server-side check that Obi actually said yes THIS turn — the
+    confirm gate must not depend on the model's self-classification (injection)."""
+    t = " " + text.lower().strip().strip("!.?") + " "
+    return any(f" {a} " in t or t.strip() == a for a in _AFFIRMATIONS)
+
+
+def _obi_pending_path() -> Path:
+    return _public_state_dir() / "obi_evolve_pending.json"
+
+
+def _obi_pending_lock():
+    return _FileLock(str(_obi_pending_path()) + ".lock", timeout=5)
+
+
+def _read_obi_pending() -> Optional[dict]:
+    try:
+        d = json.loads(_obi_pending_path().read_text(encoding="utf-8"))
+        if _time.time() - float(d.get("ts", 0)) <= _OBI_PROPOSAL_TTL_S:
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def _write_obi_pending(intent: str) -> None:
+    with _obi_pending_lock():
+        atomic_write(_obi_pending_path(), json.dumps({"intent": intent, "ts": _time.time()}))
+
+
+def _clear_obi_pending() -> None:
+    try:
+        with _obi_pending_lock():
+            _obi_pending_path().unlink()
+    except Exception:
+        pass
+
+
 _obi_chat_post_last: float = 0.0
 _obi_chat_post_lock = threading.Lock()
 _OBI_CHAT_MIN_INTERVAL_S = 10.0  # max 1 message per 10 s
@@ -1442,13 +1485,32 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
     if not reply:
         reply = "I'm here — just went quiet for a second."
 
+    from pxh.evolve_queue import enqueue_evolve, EvolveQuotaError, EvolvePendingError
+    evolve_id = None
+    if evolve_action == "propose" and evolve_intent:
+        _write_obi_pending(evolve_intent)            # record; do NOT enqueue
+    elif evolve_action == "confirm" and _is_affirmation(obi_text):
+        pending = _read_obi_pending()                 # server is source of truth
+        if pending:
+            try:
+                entry = enqueue_evolve(pending["intent"], requester="obi", source="obi-chat")
+                evolve_id = entry["id"]
+                _clear_obi_pending()
+            except EvolveQuotaError:
+                reply += " (I can only take on one project at a time — try again later.)"
+            except EvolvePendingError:
+                reply += " (That's already on my list!)"
+            except ValueError:
+                reply += " (I didn't quite catch what to build — tell me again?)"
+        # confirm with no recorded proposal, or a non-affirmation message: enqueue nothing
+
     spark_id = uuid.uuid4().hex[:8]
     spark_ts = utc_timestamp()
     spark_entry = {"id": spark_id, "ts": spark_ts, "role": "spark", "text": reply}
     _append_obi_chat_api(spark_entry)
 
     return {"reply": reply, "ts": spark_ts, "id": spark_id,
-            "evolve_action": evolve_action, "evolve_intent": evolve_intent}
+            "evolve_action": evolve_action, "evolve_id": evolve_id}
 
 
 @app.post("/api/v1/pin/verify")
