@@ -35,7 +35,7 @@ def handle_sigint(signum, frame):
 def build_go2rtc_config(args) -> dict:
     """go2rtc config that runs rpicam-vid as a local RTSP source.
 
-    Frigate (on pi5-hailo) pulls from rtsp://192.168.1.29:{port}/{stream}.
+    Frigate (on pi5-hailo) pulls from rtsp://192.168.0.236:{port}/{stream}.
     The exec: source starts rpicam-vid on demand when a consumer connects.
     """
     rpicam_cmd = (

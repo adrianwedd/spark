@@ -13,7 +13,7 @@
 Copy these verbatim into every task's mental model — they are project-wide invariants from the spec:
 
 - **Relay port `7862`** (not 7861 — Pi's `px-tts-glados` owns 7861). Afterwords stays on **`127.0.0.1:7860`**, never rebound to `0.0.0.0`.
-- **All cast/audio URLs use M5's IP `192.168.1.171`, never `M5.local`** — Nest devices can't resolve mDNS (constraint #6).
+- **All cast/audio URLs use M5's IP `192.168.0.100`, never `M5.local`** — Nest devices can't resolve mDNS (constraint #6).
 - **`/audio/<id>.wav` is unauthenticated** — Chromecast can't send auth headers (constraint #5). Validate `<id>` against `^[a-f0-9-]{16,36}\.wav$` and resolve strictly within the audio dirs (no path traversal).
 - **Pre-synthesize to a complete file, then cast** — synth is ~2–8 s warm, ~33 s cold; never stream live (constraint #2).
 - **v1 casts to a SINGLE entity** — no HA speaker group exists; multiple distinct targets echo (constraint #7).
@@ -30,7 +30,7 @@ Copy these verbatim into every task's mental model — they are project-wide inv
 
 These are throwaway manual tests run against the real Nest + HA. **Do not start Task 1 until both pass**, because their outcome pins config values and may add a transcode requirement.
 
-- [ ] **G1 — WAV-on-Cast.** Serve a static 24 kHz mono WAV from M5 by IP (e.g. `python3 -m http.server 7862` in a dir holding `test.wav`, reachable at `http://192.168.1.171:7862/test.wav`). From HA Developer Tools → Actions, call `media_player.play_media` with that URL to a Nest and confirm it **audibly plays**.
+- [ ] **G1 — WAV-on-Cast.** Serve a static 24 kHz mono WAV from M5 by IP (e.g. `python3 -m http.server 7862` in a dir holding `test.wav`, reachable at `http://192.168.0.100:7862/test.wav`). From HA Developer Tools → Actions, call `media_player.play_media` with that URL to a Nest and confirm it **audibly plays**.
   - **If it plays:** record `media_content_type` that worked. Proceed.
   - **If it does NOT play:** the relay must transcode WAV→MP3 (`Content-Type: audio/mpeg`, `.mp3` extension). Note this; fold the transcode into Task 4's `synthesize()` (add an ffmpeg/`lameenc` step) and change the served extension/regex accordingly before proceeding.
 - [ ] **G2 — Correct entity + media_content_type.** In HA Developer Tools → States, find which `media_player.*` entity for the Nest Hub Max actually exposes `group_members` / casts (`nest_hub_max` vs `nest_hub_max_2`). Cast the G1 test URL to candidate entities; identify the one that works and the `media_content_type` value that works (`audio/wav` MIME vs HA's `"music"`).
@@ -94,7 +94,7 @@ def test_announce_constants_present_and_safe():
     # Ships OFF until the relay is live on M5
     assert cfg.ANNOUNCE_ENABLED is False
     # IP-based, never M5.local (Nest can't resolve mDNS)
-    assert "192.168.1.171" in cfg.ANNOUNCE_RELAY_URL
+    assert "192.168.0.100" in cfg.ANNOUNCE_RELAY_URL
     assert "M5.local" not in cfg.ANNOUNCE_RELAY_URL
     assert cfg.ANNOUNCE_VOICE == "data"
     # v1 casts to exactly one default entity (no speaker group -> echo)
@@ -121,7 +121,7 @@ Append to `src/pxh/spark_config.py` after the `OBI_CHAT_*` block (~line 21).
 ```python
 # --- Announce pipeline (data-voice over Google Nest) ----------------------
 ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
-ANNOUNCE_RELAY_URL       = "http://192.168.1.171:7862"   # IP, not M5.local (Nest mDNS)
+ANNOUNCE_RELAY_URL       = "http://192.168.0.100:7862"   # IP, not M5.local (Nest mDNS)
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
 ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
@@ -182,7 +182,7 @@ def _csv(name: str, default: str) -> list[str]:
 
 RELAY_TOKEN        = os.environ.get("ANNOUNCE_RELAY_TOKEN", "")
 AFTERWORDS_URL     = os.environ.get("AFTERWORDS_URL", "http://127.0.0.1:7860")
-PUBLIC_BASE_URL    = os.environ.get("RELAY_PUBLIC_BASE_URL", "http://192.168.1.171:7862")
+PUBLIC_BASE_URL    = os.environ.get("RELAY_PUBLIC_BASE_URL", "http://192.168.0.100:7862")
 
 DATA_DIR           = Path(os.environ.get("RELAY_DATA_DIR", str(Path(__file__).resolve().parent.parent / "data")))
 CACHE_DIR          = DATA_DIR / "cache"
@@ -650,7 +650,7 @@ def test_announce_public_returns_ip_url_and_caches(client):
     r = client.post("/announce", json={"text": "hello there", "cache": True}, headers=AUTH)
     assert r.status_code == 200
     body = r.json()
-    assert body["audio_url"].startswith("http://192.168.1.171:7862/audio/")
+    assert body["audio_url"].startswith("http://192.168.0.100:7862/audio/")
     assert body["cached"] is False  # first call synthesizes
     assert body["duration_s"] > 0
     # second identical call hits cache
@@ -953,7 +953,7 @@ pytest>=8.0   # tests only
 # Copy to .env on M5 and fill in. Loaded by install.sh into the launchd plist env.
 ANNOUNCE_RELAY_TOKEN=change-me-long-random
 AFTERWORDS_URL=http://127.0.0.1:7860
-RELAY_PUBLIC_BASE_URL=http://192.168.1.171:7862
+RELAY_PUBLIC_BASE_URL=http://192.168.0.100:7862
 RELAY_DATA_DIR=/Users/<m5user>/announce-relay-data
 RELAY_ALLOWED_VOICES=data
 RELAY_MAX_TEXT_BYTES=600
@@ -1361,7 +1361,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         body = _json.loads(self.rfile.read(length) or b"{}")
         _StubHandler.captured.append(("POST", self.path, body))
         if self.path.endswith("/announce"):
-            self._send(200, {"audio_url": "http://192.168.1.171:7862/audio/abc123.wav",
+            self._send(200, {"audio_url": "http://192.168.0.100:7862/audio/abc123.wav",
                              "voice": "data", "cached": False, "duration_s": 1.2})
         else:  # HA play_media
             self._send(200, [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])
@@ -1945,7 +1945,7 @@ git commit -m "docs: document announce pipeline in CLAUDE.md"
 - [ ] **Step 5: Rollout (manual, gated — do NOT flip until verified live)**
 
 In order:
-1. Deploy relay to M5: `scp -r m5/announce-relay <m5>:~/ && ssh <m5> 'cd announce-relay && cp .env.example .env'`, edit `.env` (set `ANNOUNCE_RELAY_TOKEN`, `RELAY_DATA_DIR`), then `./install.sh`. Confirm `curl http://192.168.1.171:7862/health` from the Pi returns `status: ok` (proves LAN reachability by IP).
+1. Deploy relay to M5: `scp -r m5/announce-relay <m5>:~/ && ssh <m5> 'cd announce-relay && cp .env.example .env'`, edit `.env` (set `ANNOUNCE_RELAY_TOKEN`, `RELAY_DATA_DIR`), then `./install.sh`. Confirm `curl http://192.168.0.100:7862/health` from the Pi returns `status: ok` (proves LAN reachability by IP).
 2. End-to-end manual smoke from the Pi with `ANNOUNCE_ENABLED` still `False` but tool runnable directly:
    ```bash
    ANNOUNCE_RELAY_TOKEN=<token> PX_HA_TOKEN=<token> \

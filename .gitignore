@@ -9,7 +9,6 @@ state/spark-reflect/.*.tmp
 logs_test/
 .DS_Store
 models/
-|
 picar-x-hacking/
 state/session.json.lock
 state/timers.jsonl
@@ -57,6 +56,16 @@ state/debug_reports.jsonl
 state/compositions-spark.jsonl
 state/*.tmp
 state/.*.tmp
+state/px-blog.pid
+state/px-evolve.pid
+state/.px-blog-pid.*
+state/post_queue.jsonl.bak-*
+state/findmyhub.json
+state/obi_location.json
+state/obi_chat.jsonl
+state/obi_chat_meta.json
+state/exploration.jsonl
+state/exploration_meta.json
 photos/
 .env
 bin/go2rtc

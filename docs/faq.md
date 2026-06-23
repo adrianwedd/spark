@@ -101,7 +101,7 @@ No. The camera stream never leaves your house.
 
 Here's the full picture:
 
-**The camera stream is local-only.** go2rtc — the software that reads from the Pi's camera and turns it into an RTSP video stream — only listens on `192.168.1.29:8554`. That's a private LAN address. It is not forwarded through the router, not relayed through a cloud service, and not reachable from the internet. Someone would need to be physically on your Wi-Fi network to access the stream at all.
+**The camera stream is local-only.** go2rtc — the software that reads from the Pi's camera and turns it into an RTSP video stream — only listens on `192.168.0.236:8554`. That's a private LAN address. It is not forwarded through the router, not relayed through a cloud service, and not reachable from the internet. Someone would need to be physically on your Wi-Fi network to access the stream at all.
 
 **Frigate runs on your LAN.** The object detection service (Frigate, running on a separate device on your home network) pulls the camera stream to detect people. It runs entirely locally. The detections — a confidence score, a bounding box, and a timestamp — are written to a small JSON file on the Pi. No video is transmitted to any external server.
 

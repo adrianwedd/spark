@@ -1115,7 +1115,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         body = _json.loads(self.rfile.read(length) or b"{}")
         _StubHandler.captured.append(("POST", self.path, body))
         if self.path.endswith("/announce"):
-            self._send(200, {"audio_url": "http://192.168.1.171:7862/audio/abc123.wav",
+            self._send(200, {"audio_url": "http://192.168.0.100:7862/audio/abc123.wav",
                              "voice": "data", "cached": False, "duration_s": 1.2})
         else:  # HA play_media
             self._send(200, [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])

@@ -69,7 +69,7 @@ def test_announce_constants_present_and_safe():
     # Ships OFF until the relay is live on M5
     assert cfg.ANNOUNCE_ENABLED is False
     # IP-based, never M5.local (Nest can't resolve mDNS)
-    assert "192.168.1.171" in cfg.ANNOUNCE_RELAY_URL
+    assert "192.168.0.100" in cfg.ANNOUNCE_RELAY_URL
     assert "M5.local" not in cfg.ANNOUNCE_RELAY_URL
     assert cfg.ANNOUNCE_VOICE == "data"
     # v1 casts to exactly one default entity (no speaker group -> echo)

@@ -23,7 +23,7 @@ OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
 
 # --- Announce pipeline (data-voice over Google Nest) ----------------------
 ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
-ANNOUNCE_RELAY_URL       = "http://192.168.1.171:7862"   # IP, not M5.local (Nest mDNS) — MUST be a DHCP reservation for M5; if M5's lease changes, the entire announce pipeline breaks silently
+ANNOUNCE_RELAY_URL       = "http://192.168.0.100:7862"   # IP, not M5.local (Nest mDNS) — MUST be a DHCP reservation for M5; if M5's lease changes, the entire announce pipeline breaks silently
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
 ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]

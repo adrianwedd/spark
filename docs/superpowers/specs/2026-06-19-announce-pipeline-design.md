@@ -19,7 +19,7 @@ Nest microphone). A listen path is deferred to a separate spike.
 ## Constraints discovered during exploration (verified)
 
 1. **Afterwords TTS is localhost-only** — `127.0.0.1:7860` on M5
-   (`192.168.1.171`), launchd-managed, 203 voices including `data`. Verified by
+   (`192.168.0.100`), launchd-managed, 203 voices including `data`. Verified by
    `lsof` (binds `127.0.0.1` only) and by the Pi failing to reach M5:7860 by
    **both hostname and IP** (`http 000`). Note: `bin/tool-voice` *defaults*
    `PX_TTS_SPARK`/`PX_TTS_VIXEN` to `http://M5.local:7860`, but that path is
@@ -38,7 +38,7 @@ Nest microphone). A listen path is deferred to a separate spike.
 5. **Chromecast can't send auth headers** when fetching media → the audio URL it
    loads must be unauthenticated.
 6. **Google Nest can't resolve `.local`/mDNS** (hardcoded public DNS) → the
-   `audio_url` must use M5's **IP** (`192.168.1.171`), never `M5.local`.
+   `audio_url` must use M5's **IP** (`192.168.0.100`), never `M5.local`.
 7. **No HA speaker group exists** — casting to multiple distinct `media_player`
    entities plays them out of sync (echo). v1 targets a **single** entity.
 8. **Castable entity is ambiguous** — the entities exposing `group_members`
@@ -63,7 +63,7 @@ because failure invalidates parts of the design:
 ## Architecture
 
 ```
-SPARK trigger                       M5 (192.168.1.171)
+SPARK trigger                       M5 (192.168.0.100)
 (voice loop / px-mind /     ┌──────────────────────────────────┐
  message_obi)               │  announce-relay  :7862 (LAN)      │
       │                     │     POST /announce {text,voice}   │
@@ -111,7 +111,7 @@ on the LAN.
     length, RIFF/WAVE header. Reject+error otherwise (don't cache error pages).
     Serialize synth jobs (afterwords is single-model) to bound concurrency.
   - Atomic write (`.tmp` + `os.replace`).
-- Response 200: `{"audio_url": "http://192.168.1.171:7862/audio/<id>.wav",
+- Response 200: `{"audio_url": "http://192.168.0.100:7862/audio/<id>.wav",
   "voice", "cached", "duration_s"}` (IP-based URL — see constraint #6).
 - Errors: `400` empty/oversized/bad-voice, `401` bad token, `429` rate-limited,
   `502` afterwords error, `504` synth timeout.
@@ -179,7 +179,7 @@ $PX_HA_TOKEN`):
 ```
 POST {HA_BASE_URL}/api/services/media_player/play_media
 { "entity_id": "media_player.<castable>",
-  "media_content_id": "http://192.168.1.171:7862/audio/<id>.wav",
+  "media_content_id": "http://192.168.0.100:7862/audio/<id>.wav",
   "media_content_type": "<audio/wav | music — pinned by gate G2>" }
 ```
 
@@ -190,7 +190,7 @@ string or list; v1 uses one entity per constraint #7.)
 
 ```python
 ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
-ANNOUNCE_RELAY_URL       = "http://192.168.1.171:7862"   # IP, not M5.local (#6)
+ANNOUNCE_RELAY_URL       = "http://192.168.0.100:7862"   # IP, not M5.local (#6)
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo (#7); IDs pinned by gate G2.
 ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
