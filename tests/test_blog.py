@@ -3,6 +3,7 @@ import datetime as dt
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -501,3 +502,72 @@ class TestParseTitleBody:
         title, body = ns["_parse_title_body"]("")
         assert title == ""
         assert body == ""
+
+
+# ---------------------------------------------------------------------------
+# _qa_gate() — QA circuit breaker (mirrors bin/px-post's run_qa_gate breaker)
+# ---------------------------------------------------------------------------
+
+def _mock_run_result(stdout="YES", returncode=0, stderr=""):
+    """Create a mock subprocess.CompletedProcess."""
+    result = MagicMock()
+    result.stdout = stdout
+    result.stderr = stderr
+    result.returncode = returncode
+    return result
+
+
+class TestQaGateBreaker:
+    @pytest.fixture(autouse=True)
+    def _reset_qa_breaker(self, blog_mod):
+        """Reset the circuit breaker state before and after each test."""
+        ns, _, _ = blog_mod
+        breaker = ns["_qa_breaker"]
+        orig = dict(breaker)
+        breaker["failures"] = 0
+        breaker["open_until"] = 0.0
+        yield
+        breaker.update(orig)
+
+    def test_qa_circuit_breaker_opens_after_consecutive_failures(self, blog_mod, _reset_qa_breaker):
+        """After 3 failures the breaker opens; 4th call skips subprocess entirely."""
+        ns, _, _ = blog_mod
+        breaker = ns["_qa_breaker"]
+        blog_subprocess = ns["subprocess"]
+        with patch.object(blog_subprocess, "run",
+                           side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=30)) as mock_run:
+            for _ in range(3):
+                assert ns["_qa_gate"]("thought") is None
+            assert breaker["failures"] == 3
+            assert breaker["open_until"] > 0
+
+            call_count_before = mock_run.call_count
+            result = ns["_qa_gate"]("thought")
+            assert result is None
+            assert mock_run.call_count == call_count_before  # no new subprocess call
+
+    def test_qa_circuit_breaker_resets_on_success(self, blog_mod, _reset_qa_breaker):
+        """A successful call resets the failure counter to 0."""
+        ns, _, _ = blog_mod
+        breaker = ns["_qa_breaker"]
+        blog_subprocess = ns["subprocess"]
+        breaker["failures"] = 2
+
+        with patch.object(blog_subprocess, "run", return_value=_mock_run_result("YES")):
+            result = ns["_qa_gate"]("a good blog post")
+        assert result == "pass"
+        assert breaker["failures"] == 0
+
+    def test_qa_circuit_breaker_reopens_after_cooldown(self, blog_mod, _reset_qa_breaker):
+        """After the cooldown expires the breaker resets and subprocess is called again."""
+        ns, _, _ = blog_mod
+        breaker = ns["_qa_breaker"]
+        blog_subprocess = ns["subprocess"]
+        breaker["failures"] = 3
+        breaker["open_until"] = 0  # already elapsed
+
+        with patch.object(blog_subprocess, "run", return_value=_mock_run_result("YES")) as mock_run:
+            result = ns["_qa_gate"]("thought after cooldown")
+        assert mock_run.call_count == 1
+        assert result == "pass"
+        assert breaker["failures"] == 0

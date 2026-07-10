@@ -60,6 +60,9 @@ POLL_INTERVAL = 60
 # How many days back to scan for unwritten daily posts (handles power outages)
 DAILY_CATCHUP_DAYS = 30
 
+# QA circuit breaker: skip Claude calls after repeated failures
+_qa_breaker = {"failures": 0, "open_until": 0.0, "threshold": 3, "cooldown": 300}
+
 # Schedule (Hobart time)
 SCHEDULE = {
     "daily":   {"hour": 22, "minute": 0},
@@ -578,7 +581,18 @@ Keep it under 2000 words."""
 # ---------------------------------------------------------------------------
 
 def _qa_gate(text: str) -> str | None:
-    """Run Claude QA gate on blog text. Returns 'pass', 'rejected', 'ambiguous', or None on error."""
+    """Run Claude QA gate on blog text. Returns 'pass', 'rejected', 'ambiguous', or None on error.
+
+    A circuit breaker opens after 3 consecutive failures, skipping QA calls
+    for 5 minutes (returns None immediately). Resets on any success.
+    """
+    if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
+        if time.monotonic() < _qa_breaker["open_until"]:
+            return None
+        else:
+            log(f"qa breaker: cooldown elapsed, retrying (was {_qa_breaker['failures']} consecutive failures)")
+            _qa_breaker["failures"] = 0
+
     claude_bin = (os.environ.get("PX_CLAUDE_BIN")
                   or shutil.which("claude")
                   or "/home/pi/.local/bin/claude")
@@ -597,8 +611,13 @@ def _qa_gate(text: str) -> str | None:
         )
         if result.returncode != 0:
             log(f"qa gate error: claude exit {result.returncode}")
+            _qa_breaker["failures"] += 1
+            if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
+                _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
+                log(f"qa breaker: OPEN after {_qa_breaker['failures']} failures — skipping for {_qa_breaker['cooldown']}s")
             return None
         resp = result.stdout.strip().lower()
+        _qa_breaker["failures"] = 0
         if resp.startswith("yes"):
             return "pass"
         elif resp.startswith("no"):
@@ -608,9 +627,17 @@ def _qa_gate(text: str) -> str | None:
             return "ambiguous"
     except subprocess.TimeoutExpired:
         log("qa gate timeout (30s)")
+        _qa_breaker["failures"] += 1
+        if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
+            _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
+            log(f"qa breaker: OPEN after {_qa_breaker['failures']} failures — skipping for {_qa_breaker['cooldown']}s")
         return None
     except Exception as exc:
         log(f"qa gate error: {exc}")
+        _qa_breaker["failures"] += 1
+        if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
+            _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
+            log(f"qa breaker: OPEN after {_qa_breaker['failures']} failures — skipping for {_qa_breaker['cooldown']}s")
         return None
 
 
