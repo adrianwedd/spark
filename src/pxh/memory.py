@@ -68,7 +68,7 @@ def load_memories(persona: str = "spark") -> list[dict]:
                     out.append(rec)
             except json.JSONDecodeError:
                 continue
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     return out
 
@@ -176,7 +176,7 @@ def _thoughts_last_24h(persona: str = "spark",
                     out.append(rec)
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     return out
 
@@ -237,61 +237,64 @@ def consolidate(dry: bool = False, persona: str = "spark",
     """Distill the last 24h of thoughts into durable memories. Never raises."""
     if dry:
         return {"status": "dry"}
-    thoughts = _thoughts_last_24h(persona, now=now)
-    if len(thoughts) < MIN_THOUGHTS:
-        return {"status": "skipped", "reason": f"only {len(thoughts)} thoughts in 24h"}
-
-    thought_lines = "\n".join(
-        f'- [{t.get("mood", "?")}/{t.get("action", "?")}/sal {t.get("salience", "?")}] '
-        f'{t.get("thought", "")}' for t in thoughts[-200:])
-    outcome_lines = ""
     try:
-        from pxh.state import load_session
-        events = [e for e in (load_session().get("history") or [])[-30:]
-                  if e.get("event") == "mind" and e.get("outcome")]
-        if events:
-            outcome_lines = "\n\nRecent action outcomes:\n" + "\n".join(
-                f'- {e.get("action", "?")}: {e.get("outcome", "")}' for e in events)
-    except Exception:
-        pass
-    intent_line = ""
-    try:
-        from pxh.intention import get_active_goal
-        goal = get_active_goal(persona)
-        if goal:
-            intent_line = f"\n\nCurrent intention: {goal}"
-    except Exception:
-        pass
-    existing = load_memories(persona)
-    existing_lines = ""
-    if existing:
-        existing_lines = "\n\nExisting recent memories (do not restate):\n" + "\n".join(
-            f'- {m["text"]}' for m in existing[-20:])
+        thoughts = _thoughts_last_24h(persona, now=now)
+        if len(thoughts) < MIN_THOUGHTS:
+            return {"status": "skipped", "reason": f"only {len(thoughts)} thoughts in 24h"}
 
-    prompt = (CONSOLIDATION_PROMPT + "\nThoughts from the last 24 hours:\n"
-              + thought_lines + outcome_lines + intent_line + existing_lines)
+        thought_lines = "\n".join(
+            f'- [{t.get("mood", "?")}/{t.get("action", "?")}/sal {t.get("salience", "?")}] '
+            f'{t.get("thought", "")}' for t in thoughts[-200:])
+        outcome_lines = ""
+        try:
+            from pxh.state import load_session
+            events = [e for e in (load_session().get("history") or [])[-30:]
+                      if e.get("event") == "mind" and e.get("outcome")]
+            if events:
+                outcome_lines = "\n\nRecent action outcomes:\n" + "\n".join(
+                    f'- {e.get("action", "?")}: {e.get("outcome", "")}' for e in events)
+        except Exception:
+            pass
+        intent_line = ""
+        try:
+            from pxh.intention import get_active_goal
+            goal = get_active_goal(persona)
+            if goal:
+                intent_line = f"\n\nCurrent intention: {goal}"
+        except Exception:
+            pass
+        existing = load_memories(persona)
+        existing_lines = ""
+        if existing:
+            existing_lines = "\n\nExisting recent memories (do not restate):\n" + "\n".join(
+                f'- {m["text"]}' for m in existing[-20:])
 
-    import pxh.claude_session as claude_session
-    try:
-        result = claude_session.run_claude_session(
-            "consolidate", prompt, timeout=180, allowed_tools="")
-    except claude_session.SessionBudgetExhausted as exc:
-        return {"status": "failed", "error": str(exc)}
+        prompt = (CONSOLIDATION_PROMPT + "\nThoughts from the last 24 hours:\n"
+                  + thought_lines + outcome_lines + intent_line + existing_lines)
+
+        import pxh.claude_session as claude_session
+        try:
+            result = claude_session.run_claude_session(
+                "consolidate", prompt, timeout=180, allowed_tools="")
+        except claude_session.SessionBudgetExhausted as exc:
+            return {"status": "failed", "error": str(exc)}
+        except Exception as exc:
+            return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+        if result.returncode != 0:
+            return {"status": "failed", "error": f"claude exit {result.returncode}"}
+
+        candidates = _parse_memory_array(result.stdout)
+        if not candidates:
+            return {"status": "failed",
+                    "error": f"no parseable memories in response: {result.stdout[:200]!r}"}
+        fresh = _dedupe(candidates, existing, now=now)
+        ts = utc_timestamp()
+        records = [{"ts": ts, "date": ts[:10], "text": c["text"], "tags": c["tags"],
+                    "importance": c["importance"], "source": "consolidation"} for c in fresh]
+        append_memories(records, persona)
+        return {"status": "ok", "written": len(records), "candidates": len(candidates)}
     except Exception as exc:
         return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
-    if result.returncode != 0:
-        return {"status": "failed", "error": f"claude exit {result.returncode}"}
-
-    candidates = _parse_memory_array(result.stdout)
-    if not candidates:
-        return {"status": "failed",
-                "error": f"no parseable memories in response: {result.stdout[:200]!r}"}
-    fresh = _dedupe(candidates, existing, now=now)
-    ts = utc_timestamp()
-    records = [{"ts": ts, "date": ts[:10], "text": c["text"], "tags": c["tags"],
-                "importance": c["importance"], "source": "consolidation"} for c in fresh]
-    append_memories(records, persona)
-    return {"status": "ok", "written": len(records), "candidates": len(candidates)}
 
 
 def consolidation_meta_file() -> Path:
@@ -300,7 +303,9 @@ def consolidation_meta_file() -> Path:
 
 def maybe_consolidate(dry: bool = False, persona: str = "spark",
                       now: dt.datetime | None = None) -> dict | None:
-    """Once-per-Hobart-date gate for consolidate(). None = not now."""
+    """Once-per-Hobart-date gate for consolidate(). None = not now, or dry mode."""
+    if dry:
+        return None
     local = (now or dt.datetime.now(HOBART_TZ)).astimezone(HOBART_TZ)
     if not (CONSOLIDATION_WINDOW[0] <= local.hour < CONSOLIDATION_WINDOW[1]):
         return None
@@ -317,10 +322,18 @@ def maybe_consolidate(dry: bool = False, persona: str = "spark",
         return None
     meta["attempts"] = meta.get("attempts", 0) + 1
     meta_f.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write(meta_f, json.dumps(meta) + "\n")
+    try:
+        atomic_write(meta_f, json.dumps(meta) + "\n")
+    except OSError as exc:
+        # Fail closed: if we can't record the attempt, don't spend the LLM
+        # session — an unrecorded attempt would defeat the attempt cap.
+        return {"status": "failed", "error": f"meta stamp write failed: {exc}"}
 
     result = consolidate(dry=dry, persona=persona, now=now)
     if result.get("status") in ("ok", "dry", "skipped"):
         meta["done"] = True
-        atomic_write(meta_f, json.dumps(meta) + "\n")
+        try:
+            atomic_write(meta_f, json.dumps(meta) + "\n")
+        except OSError:
+            pass
     return result

@@ -213,3 +213,42 @@ def test_maybe_consolidate_fresh_date_resets_attempts():
     with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 1}) as mc:
         assert memory.maybe_consolidate(now=day2)["status"] == "ok"
     assert mc.call_count == 1
+
+
+# --- regression tests: review findings --------------------------------------
+
+
+def test_consolidate_never_raises_on_invalid_utf8():
+    """Finding 1: invalid UTF-8 in thoughts/memories files must not raise
+    UnicodeDecodeError out of consolidate() — it's called from the mind
+    daemon's tick loop, which must never see a raise."""
+    thoughts_f = memory._state_dir() / "thoughts-spark.jsonl"
+    thoughts_f.parent.mkdir(parents=True, exist_ok=True)
+    thoughts_f.write_bytes(b"\xff\xfe not json\n")
+    mem_f = memory.memories_file()
+    mem_f.parent.mkdir(parents=True, exist_ok=True)
+    mem_f.write_bytes(b"\xff\xfe not json\n")
+
+    res = memory.consolidate()
+    assert isinstance(res, dict)
+    assert res.get("status") in ("failed", "skipped")
+
+
+def test_maybe_consolidate_dry_returns_none_and_writes_nothing():
+    """Finding 2: a dry-run daemon must not consolidate or mutate any state."""
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    assert memory.maybe_consolidate(dry=True, now=at3) is None
+    assert not memory.consolidation_meta_file().exists()
+
+
+def test_maybe_consolidate_fails_closed_when_meta_stamp_write_fails():
+    """Finding 3: if the pre-call attempt stamp can't be written, we must not
+    spend the LLM session — consolidate() must not be called, and the
+    failure must be reported rather than raised."""
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    with patch.object(memory, "atomic_write", side_effect=OSError("disk full")), \
+         patch.object(memory, "consolidate") as mc:
+        res = memory.maybe_consolidate(now=at3)
+    mc.assert_not_called()
+    assert isinstance(res, dict)
+    assert res.get("status") == "failed"
