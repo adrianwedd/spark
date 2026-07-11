@@ -755,3 +755,22 @@ class TestGenerationFailureCap:
         mock_run.assert_not_called()
         blog_data = ns["load_blog"]()
         assert not ns["post_exists"](blog_data, pid)
+
+
+class TestBackfillRespectsFailureCap:
+    def test_backfill_skips_capped_post_without_claude_call(self, blog_mod):
+        """run_backfill() must honor the failure cap too — a manual --backfill
+        must not burn sessions retrying a permanently-skipped post_id."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        pid = ns["id_for_post"]("daily", today.replace(hour=22, minute=0, second=0, microsecond=0))
+        for _ in range(3):
+            ns["record_generation_failure"](pid, "empty body")
+        assert ns["is_generation_skipped"](pid) is True
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()) as mock_run:
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                ns["run_backfill"](dry=False)
+
+        mock_run.assert_not_called()
