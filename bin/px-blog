@@ -607,7 +607,9 @@ def _qa_gate(text: str) -> str | None:
         result = subprocess.run(
             [claude_bin, "-p", prompt,
              "--no-session-persistence", "--output-format", "text", "--allowedTools", ""],
-            capture_output=True, text=True, timeout=30, env=env,
+            # 90s: claude CLI cold-start on the Pi is routinely 15-80s — a
+            # tighter timeout fails even when Claude is perfectly healthy.
+            capture_output=True, text=True, timeout=90, env=env,
         )
         if result.returncode != 0:
             log(f"qa gate error: claude exit {result.returncode}")
@@ -626,7 +628,7 @@ def _qa_gate(text: str) -> str | None:
             log(f"qa gate ambiguous: {result.stdout.strip()[:80]}")
             return "ambiguous"
     except subprocess.TimeoutExpired:
-        log("qa gate timeout (30s)")
+        log("qa gate timeout (90s)")
         _qa_breaker["failures"] += 1
         if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
             _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
