@@ -1468,3 +1468,62 @@ def test_reflection_injects_active_intention(tmp_path, monkeypatch):
         monkeypatch, {"persona": "spark", "time_period": "afternoon"})
     assert "map the hallway this week" in ctx
     assert "current intention" in ctx.lower()
+
+
+def test_consolidation_tick_spark_logs_result(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate",
+                        lambda dry: {"status": "ok", "written": 2})
+    monkeypatch.setattr(pxh.mind, "log", lambda msg: calls.append(msg))
+    pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)
+    assert any("consolidation: ok" in c and "wrote 2" in c for c in calls)
+
+
+def test_consolidation_tick_none_is_silent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate", lambda dry: None)
+    monkeypatch.setattr(pxh.mind, "log", lambda msg: calls.append(msg))
+    pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)
+    assert calls == []
+
+
+def test_consolidation_tick_never_raises(monkeypatch):
+    def boom(dry):
+        raise RuntimeError("disk exploded")
+    calls = []
+    monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate", boom)
+    monkeypatch.setattr(pxh.mind, "log", lambda msg: calls.append(msg))
+    pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)  # must not raise
+    assert any("consolidation error" in c for c in calls)
+
+
+def test_consolidation_tick_skips_other_personas(monkeypatch):
+    called = []
+    monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate",
+                        lambda dry: called.append(1))
+    pxh.mind._consolidation_tick({"persona": "gremlin"}, dry=False)
+    pxh.mind._consolidation_tick({}, dry=False)
+    assert called == []
+
+
+def test_reflection_survives_memory_retrieval_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    def boom(*a, **k):
+        raise RuntimeError("retrieval broke")
+    monkeypatch.setattr(pxh.mind.spark_memory, "retrieve_memories", boom)
+    monkeypatch.setattr(pxh.mind, "load_notes", lambda n, persona="": ["a raw note"])
+    ctx = _capture_reflection_context(
+        monkeypatch, {"persona": "spark", "time_period": "afternoon"})
+    assert "Your long-term memories" in ctx  # fallback still fires
+    assert "a raw note" in ctx
+
+
+def test_reflection_survives_intention_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    def boom(*a, **k):
+        raise RuntimeError("intention broke")
+    monkeypatch.setattr(pxh.mind.intention_mod, "format_for_context", boom)
+    ctx = _capture_reflection_context(
+        monkeypatch, {"persona": "spark", "time_period": "afternoon"})
+    assert ctx  # reflection completed and produced a context
+    assert "current intention" not in ctx.lower()

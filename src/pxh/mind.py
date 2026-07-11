@@ -3549,6 +3549,20 @@ def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
     )
 
 
+def _consolidation_tick(session: dict, dry: bool) -> None:
+    """Nightly memory consolidation (02:00-06:00 Hobart, once per date, SPARK only).
+    Never raises — the mind loop must survive any consolidation failure."""
+    if (session.get("persona") or "").lower().strip() != "spark":
+        return
+    try:
+        _cons = spark_memory.maybe_consolidate(dry=dry)
+        if _cons is not None:
+            _detail = _cons.get("error") or _cons.get("reason") or f"wrote {_cons.get('written', 0)}"
+            log(f"consolidation: {_cons.get('status')} — {_detail}")
+    except Exception as exc:
+        log(f"consolidation error: {exc}")
+
+
 def mind_loop(args) -> None:
     """Main cognitive loop."""
     prev_awareness: dict = {}
@@ -3597,14 +3611,7 @@ def mind_loop(args) -> None:
         prev_awareness = awareness
 
         # Nightly memory consolidation (02:00–06:00 Hobart, once per date, SPARK only)
-        if (session.get("persona") or "").lower().strip() == "spark":
-            try:
-                _cons = spark_memory.maybe_consolidate(dry=args.dry_run)
-                if _cons is not None:
-                    _detail = _cons.get("error") or _cons.get("reason") or f"wrote {_cons.get('written', 0)}"
-                    log(f"consolidation: {_cons.get('status')} — {_detail}")
-            except Exception as exc:
-                log(f"consolidation error: {exc}")
+        _consolidation_tick(session, args.dry_run)
 
         # Any transition resets the backoff (something is happening)
         if transitions:
