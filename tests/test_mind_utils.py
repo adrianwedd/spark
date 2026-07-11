@@ -1418,3 +1418,53 @@ def test_expression_complete_goal_archives_and_records_ok(
     assert intention.get_active_goal() == ""
     entry = mock_us.call_args.kwargs["history_entry"]
     assert entry["outcome"] == "ok"
+
+
+def _capture_reflection_context(monkeypatch, awareness):
+    """Run reflection() with a fake LLM; return the context string it was sent."""
+    captured = {}
+
+    def fake_llm(context, system_prompt, persona=""):
+        captured["context"] = context
+        return {"response": _json.dumps(
+            {"thought": "t", "mood": "curious", "action": "wait", "salience": 0.4})}
+
+    monkeypatch.setattr(pxh.mind, "call_llm", fake_llm)
+    pxh.mind.reflection(awareness, dry=False)
+    return captured.get("context", "")
+
+
+def test_reflection_injects_relevant_memories(tmp_path, monkeypatch):
+    from pxh import memory
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    memory.append_memories([{
+        "ts": "2026-07-10T12:00:00Z", "date": "2026-07-10",
+        "text": "Obi and I built a lego tower on the kitchen floor",
+        "tags": ["obi", "lego"], "importance": 0.8, "source": "consolidation"}])
+    awareness = {"persona": "spark", "time_period": "afternoon",
+                 "recent_conversations": [
+                     {"who": "Obi", "text": "can we do lego again", "minutes_ago": 5}]}
+    ctx = _capture_reflection_context(monkeypatch, awareness)
+    assert "Memories that feel relevant right now" in ctx
+    assert "lego tower" in ctx
+
+
+def test_reflection_falls_back_to_notes_when_no_memories(tmp_path, monkeypatch):
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pxh.mind, "load_notes",
+                        lambda n, persona="": ["an old raw note"])
+    ctx = _capture_reflection_context(
+        monkeypatch, {"persona": "spark", "time_period": "afternoon"})
+    assert "Your long-term memories" in ctx
+    assert "an old raw note" in ctx
+    assert "Memories that feel relevant" not in ctx
+
+
+def test_reflection_injects_active_intention(tmp_path, monkeypatch):
+    from pxh import intention
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    intention.set_goal("map the hallway this week")
+    ctx = _capture_reflection_context(
+        monkeypatch, {"persona": "spark", "time_period": "afternoon"})
+    assert "map the hallway this week" in ctx
+    assert "current intention" in ctx.lower()

@@ -44,6 +44,7 @@ from pxh.spark_config import (
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
 from pxh import intention as intention_mod
+from pxh import memory as spark_memory
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -2531,8 +2532,34 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
             convo_lines.append(f"  {c['who']}: \"{c['text']}\" ({ago})")
         context_parts.append("Recent conversations:\n" + "\n".join(convo_lines))
 
-    if notes:
+    # Relevant consolidated memories (falls back to raw tail-3 notes while the
+    # memory store is empty — and for personas without a store).
+    query_bits = [topic_seed or ""]
+    query_bits.extend(str(t) for t in awareness.get("transitions") or [])
+    for c in awareness.get("recent_conversations", [])[-3:]:
+        query_bits.append(c.get("text", ""))
+    query_bits.append(awareness.get("time_period", ""))
+    query_bits.append(((awareness.get("calendar") or {}).get("current_event")) or "")
+    query_bits.extend((awareness.get("frigate") or {}).get("rooms_with_people") or [])
+    try:
+        relevant = spark_memory.retrieve_memories(
+            " ".join(b for b in query_bits if b), n=3, persona=persona or "spark")
+    except Exception:
+        relevant = []
+    if relevant:
+        context_parts.append("Memories that feel relevant right now:\n"
+                             + "\n".join(f"  - {m['text']}" for m in relevant))
+    elif notes:
         context_parts.append("Your long-term memories:\n" + "\n".join(f"  - {n}" for n in notes))
+
+    # Current intention (SPARK only) — the goal that persists across reflections
+    if (persona or "spark") == "spark":
+        try:
+            _intent_ctx = intention_mod.format_for_context()
+            if _intent_ctx:
+                context_parts.append(_intent_ctx)
+        except Exception:
+            pass
 
     # Claude budget visibility: let the model reason about its own scarcity
     # instead of blindly choosing research/compose/evolve when they're blocked.
@@ -3568,6 +3595,16 @@ def mind_loop(args) -> None:
         # Layer 1: Awareness
         awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
         prev_awareness = awareness
+
+        # Nightly memory consolidation (02:00–06:00 Hobart, once per date, SPARK only)
+        if (session.get("persona") or "").lower().strip() == "spark":
+            try:
+                _cons = spark_memory.maybe_consolidate(dry=args.dry_run)
+                if _cons is not None:
+                    _detail = _cons.get("error") or _cons.get("reason") or f"wrote {_cons.get('written', 0)}"
+                    log(f"consolidation: {_cons.get('status')} — {_detail}")
+            except Exception as exc:
+                log(f"consolidation error: {exc}")
 
         # Any transition resets the backoff (something is happening)
         if transitions:
