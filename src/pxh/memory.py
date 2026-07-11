@@ -19,7 +19,6 @@ from pathlib import Path
 from filelock import FileLock
 
 from pxh.state import atomic_write
-from pxh.time import utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -118,10 +117,18 @@ def retrieve_memories(query: str, n: int = 3, persona: str = "spark",
         ((score_memory(m, q, now=now), i) for i, m in enumerate(memories)),
         key=lambda t: (-t[0], -t[1]))
     chosen = [i for s, i in scored if s > 0][:n]
-    if len(chosen) < n:  # pad with the most recent memories not already chosen
-        for i in range(len(memories) - 1, -1, -1):
-            if i not in chosen:
-                chosen.append(i)
-            if len(chosen) >= n:
-                break
+    if len(chosen) < n:  # pad with the most-recent memories (by parsed ts) not already chosen
+        chosen_set = set(chosen)
+
+        def _pad_key(i: int) -> tuple[int, float, int]:
+            try:
+                ts = dt.datetime.fromisoformat(
+                    str(memories[i].get("ts", "")).replace("Z", "+00:00"))
+                return (0, -ts.timestamp(), -i)
+            except (ValueError, TypeError):
+                return (1, 0.0, -i)
+
+        remaining = sorted(
+            (i for i in range(len(memories)) if i not in chosen_set), key=_pad_key)
+        chosen.extend(remaining[:n - len(chosen)])
     return [memories[i] for i in chosen[:n]]

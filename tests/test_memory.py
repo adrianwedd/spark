@@ -70,6 +70,17 @@ def test_retrieve_pads_with_most_recent_when_few_hits():
     assert out[1]["text"] == "delta echo foxtrot"  # newest non-hit pads
 
 
+def test_retrieve_pads_by_timestamp_not_insertion_order():
+    memory.append_memories([
+        _mem("bravo charlie delta", ts="2026-07-10T00:00:00Z"),   # newest ts, index 0
+        _mem("echo foxtrot golf", ts="2026-06-01T00:00:00Z"),     # oldest ts, index 1
+        _mem("Obi built a lego tower", ts="2026-07-05T00:00:00Z"),
+    ])
+    out = memory.retrieve_memories("lego", n=2, now=NOW)
+    assert "lego" in out[0]["text"]
+    assert out[1]["text"] == "bravo charlie delta"  # newest by ts, despite index 0
+
+
 def test_retrieve_empty_store_returns_empty():
     assert memory.retrieve_memories("anything") == []
 
