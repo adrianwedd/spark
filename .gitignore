@@ -20,6 +20,9 @@ track.png
 cache/
 state/notes.jsonl
 state/notes-*.jsonl
+state/intention-*.json
+state/memories-*.jsonl
+state/consolidation_meta.json
 state/notes.jsonl.vixen-backup
 state/conversation-*.jsonl
 state/awareness.json
