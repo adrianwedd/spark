@@ -43,6 +43,7 @@ from pxh.spark_config import (
     OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
+from pxh import intention as intention_mod
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -445,7 +446,8 @@ VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_
                  "time_check", "calendar_check", "morning_fact",
                  "introspect", "evolve",
                  "research", "compose", "self_debug", "blog_essay",
-                 "message_obi", "announce"}
+                 "message_obi", "announce",
+                 "set_goal", "update_goal", "complete_goal"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
@@ -456,7 +458,8 @@ ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
 # Actions permitted during night silence and absence: silent cognitive work
 # (no audio, no servo motion) is exactly what idle hours are for.
 NIGHT_ALLOWED_ACTIONS = {"wait", "remember", "research", "compose",
-                         "introspect", "self_debug"}
+                         "introspect", "self_debug",
+                         "set_goal", "update_goal", "complete_goal"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -3410,6 +3413,20 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 log("expression: announce has no text — skipping")
             else:
                 _dispatch_announce(text)
+
+        elif action in ("set_goal", "update_goal", "complete_goal"):
+            # In-process state writes — no subprocess, no audio, night-safe.
+            _goal_fn = {"set_goal": intention_mod.set_goal,
+                        "update_goal": intention_mod.update_goal,
+                        "complete_goal": intention_mod.complete_goal}[action]
+            _res = _goal_fn(text)
+            if _res.get("status") == "ok":
+                outcome = "ok"
+            elif _res.get("status") == "no_active_intention":
+                outcome = "failed: no active intention — use set_goal first"
+            else:
+                outcome = f"failed: {_res.get('error', _res.get('status', '?'))}"
+            log(f"expression: {action} {outcome} — {text[:80]}")
 
         else:
             log(f"expression: unhandled action: {action}")

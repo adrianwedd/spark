@@ -625,6 +625,7 @@ def test_valid_actions_includes_new_actions():
         "introspect", "evolve",
         "research", "compose", "self_debug", "blog_essay",
         "message_obi", "announce",
+        "set_goal", "update_goal", "complete_goal",
     }
     assert VALID_ACTIONS == expected
 
@@ -1371,3 +1372,49 @@ def test_load_notes_skips_records_without_note(tmp_path, monkeypatch):
     monkeypatch.setattr(pxh.mind, "notes_file_for_persona", lambda p: nf)
     notes = pxh.mind.load_notes(2, "spark")
     assert notes == ["older real memory", "newest real memory"]
+
+
+# ---------------------------------------------------------------------------
+# Continuity sprint: goal actions
+# ---------------------------------------------------------------------------
+
+
+def test_goal_actions_are_valid_and_night_allowed():
+    from pxh.mind import VALID_ACTIONS, NIGHT_ALLOWED_ACTIONS, ABSENT_GATED_ACTIONS
+    for a in ("set_goal", "update_goal", "complete_goal"):
+        assert a in VALID_ACTIONS
+        assert a in NIGHT_ALLOWED_ACTIONS
+        assert a not in ABSENT_GATED_ACTIONS
+
+
+def test_expression_set_goal_writes_intention_and_records_ok(
+        _mock_awareness_and_battery, tmp_path, monkeypatch):
+    from pxh import intention
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    with patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("set_goal", text="map the hallway this week"), dry=True)
+    assert intention.get_active_goal() == "map the hallway this week"
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"] == "ok"
+
+
+def test_expression_update_goal_without_active_records_failed(
+        _mock_awareness_and_battery, tmp_path, monkeypatch):
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    with patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("update_goal", text="progress on nothing"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"].startswith("failed:")
+    assert "no active intention" in entry["outcome"]
+
+
+def test_expression_complete_goal_archives_and_records_ok(
+        _mock_awareness_and_battery, tmp_path, monkeypatch):
+    from pxh import intention
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    intention.set_goal("finish the map")
+    with patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("complete_goal", text="mapped every corner"), dry=True)
+    assert intention.get_active_goal() == ""
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"] == "ok"
