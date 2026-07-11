@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# px-update-reboot — Gracefully stop all SPARK services, update system, reboot.
+set -euo pipefail
+
+echo "=== Stopping SPARK services ==="
+SERVICES=(
+    px-mind
+    px-post
+    px-blog
+    px-evolve
+    px-wake-listen
+    px-alive
+    px-api-server
+    px-battery-poll
+    px-frigate-stream
+    px-tts-glados
+)
+
+for svc in "${SERVICES[@]}"; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo "  Stopping $svc..."
+        sudo systemctl stop "$svc"
+    else
+        echo "  $svc already stopped"
+    fi
+done
+
+echo ""
+echo "=== All services stopped ==="
+echo ""
+echo "=== Updating system packages ==="
+sudo apt update && sudo apt upgrade -y && sudo apt autoremove -y && sudo apt autoclean -y
+
+echo ""
+echo "=== Rebooting ==="
+sudo reboot now
