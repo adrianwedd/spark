@@ -144,8 +144,8 @@ HA_CALENDAR_INTERVAL_S = 300   # refresh every 5 min
 HA_SLEEP_INTERVAL_S    = 3600  # refresh sleep data every hour (doesn't change intraday)
 HA_CALENDAR_HORIZON_H  = 8    # look ahead 8 hours
 HA_CONTEXT_ENTITIES = {
-    "adrian_on_call": "binary_sensor.macbook_air_camera_in_use",
-    "adrian_mic_active": "binary_sensor.macbook_air_audio_input_in_use",
+    "adrian_on_call": "binary_sensor.m5_macbook_air_camera_in_use",
+    "adrian_mic_active": "binary_sensor.m5_macbook_air_audio_input_in_use",
     "office_light": "light.office_light",
     "media_player": "media_player.shack_speakers",
 }
@@ -1159,7 +1159,9 @@ def _fetch_ha_context(dry: bool = False) -> dict | None:
             log("ha_context: skipped — no PX_HA_TOKEN")
         return None
 
-    import concurrent.futures
+    import threading
+    result_box: dict = {}
+
     def _do_fetch():
         if HA_DEBUG:
             log(f"ha_context: fetching {len(HA_CONTEXT_ENTITIES)} entities...")
@@ -1187,15 +1189,23 @@ def _fetch_ha_context(dry: bool = False) -> dict | None:
                 log(f"ha_context: result: {result}")
             else:
                 log("ha_context: no data returned")
-        return result if result else None
+        result_box["value"] = result if result else None
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_do_fetch)
-            return future.result(timeout=5)
-    except concurrent.futures.TimeoutError:
-        log("ha_context: global timeout (5s) — HA unreachable")
-        return None
+        # Daemon thread + join(timeout) instead of ThreadPoolExecutor: a `with
+        # ThreadPoolExecutor(...)` block's __exit__ calls shutdown(wait=True),
+        # which blocks until the worker finishes regardless of a timed-out
+        # future.result() — silently turning the "5s global timeout" into a
+        # ~12s wait (4 entities x HA_TIMEOUT_S). A daemon thread we simply
+        # stop waiting on (and let finish quietly in the background) actually
+        # bounds this call to 5s.
+        thread = threading.Thread(target=_do_fetch, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        if thread.is_alive():
+            log("ha_context: global timeout (5s) — HA unreachable")
+            return None
+        return result_box.get("value")
     except Exception as exc:
         log(f"ha_context: unexpected error: {exc}")
         return None

@@ -53,13 +53,14 @@ def test_falls_back_to_m1_ollama_when_claude_fails():
 # ── Tier-3 fallback: Claude + M1 fail → local Ollama succeeds ──────
 
 def test_falls_back_to_local_ollama_when_m1_fails():
-    call_count = [0]
-
+    # Distinguish by URL: M5 and cloud requests fail; localhost succeeds.
+    # call_count-based mocking is fragile because _resolve_ollama_model makes
+    # extra urlopen calls (api/ps + api/tags) before the actual generate request.
     def urlopen_side(req, timeout=30):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            raise urllib.error.URLError("M1 unreachable")
-        return _fake_ollama_cm("running on fumes")  # return full CM, not unwrapped
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "M5.local" in url or "localhost" not in url:
+            raise urllib.error.URLError("M5 unreachable")
+        return _fake_ollama_cm("running on fumes")
 
     # Local fallback is opt-in via PX_MIND_LOCAL_OLLAMA=1
     old_val = os.environ.get("PX_MIND_LOCAL_OLLAMA")
@@ -69,7 +70,6 @@ def test_falls_back_to_local_ollama_when_m1_fails():
              patch("urllib.request.urlopen", side_effect=urlopen_side):
             result = call_llm("prompt", "system", persona="spark")
 
-        assert call_count[0] == 2, f"expected 2 urlopen calls, got {call_count[0]}"
         assert "error" not in result
         assert "fumes" in result["response"]
     finally:
