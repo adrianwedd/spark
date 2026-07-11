@@ -52,11 +52,18 @@ STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 BLOG_FILE = STATE_DIR / "blog.json"
 BLOG_LOG = STATE_DIR / "blog_log.jsonl"
+BLOG_FAILURES_FILE = STATE_DIR / "blog_failures.json"
 THOUGHTS_FILE = STATE_DIR / "thoughts-spark.jsonl"
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 BLOG_LIMIT = 500
 MIN_THOUGHTS_FOR_DAILY = 3
 POLL_INTERVAL = 60
+# Per-post-ID generation failure cap — after this many failed generation
+# attempts (empty body/response, title-only, exceptions), a post_id is
+# marked skipped and never retried. Breaks the retry doom loop where a
+# single stubborn post (e.g. a weekly Haiku keeps returning title-only)
+# burns a Claude session on every poll cycle forever.
+FAILURE_CAP = 3
 # How many days back to scan for unwritten daily posts (handles power outages)
 DAILY_CATCHUP_DAYS = 30
 
@@ -227,6 +234,75 @@ def post_exists(blog_data: dict | list, post_id: str) -> bool:
     posts = blog_data.get("posts", [])
     skipped = blog_data.get("skipped", [])
     return any(p.get("id") == post_id for p in posts) or post_id in skipped
+
+
+# ---------------------------------------------------------------------------
+# Per-post-ID generation failure tracking (retry doom-loop breaker)
+# ---------------------------------------------------------------------------
+
+def load_blog_failures() -> dict:
+    """Read BLOG_FAILURES_FILE, return {} if missing/corrupt (never crashes)."""
+    if not BLOG_FAILURES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(BLOG_FAILURES_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_blog_failures(data: dict) -> None:
+    """Atomic write of BLOG_FAILURES_FILE."""
+    atomic_write(BLOG_FAILURES_FILE, json.dumps(data, indent=2) + "\n")
+
+
+def is_generation_skipped(post_id: str) -> bool:
+    """True if post_id has been given up on (hit the failure cap or was QA-rejected)."""
+    return bool(load_blog_failures().get(post_id, {}).get("skipped", False))
+
+
+def record_generation_failure(post_id: str, error: str) -> None:
+    """Record a Claude-session-consuming generation failure for post_id.
+
+    Budget/cooldown blocks (SessionBudgetExhausted) and dry-run skips must
+    NOT go through this path — they don't consume a session and aren't the
+    post's fault. At FAILURE_CAP failures the post is marked skipped so the
+    backlog enumeration stops retrying it.
+    """
+    with _blog_lock(BLOG_FAILURES_FILE):
+        data = load_blog_failures()
+        entry = data.get(post_id, {"failures": 0, "last_error": None, "skipped": False})
+        entry["failures"] = entry.get("failures", 0) + 1
+        entry["last_error"] = error
+        entry["ts"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if entry["failures"] >= FAILURE_CAP:
+            entry["skipped"] = True
+            log(f"giving up on {post_id} after {FAILURE_CAP} failed generations")
+        data[post_id] = entry
+        save_blog_failures(data)
+
+
+def record_qa_rejected(post_id: str) -> None:
+    """Mark post_id permanently skipped after a QA rejection — terminal, no 3-strike count."""
+    with _blog_lock(BLOG_FAILURES_FILE):
+        data = load_blog_failures()
+        entry = data.get(post_id, {"failures": 0})
+        entry["last_error"] = "qa_rejected"
+        entry["skipped"] = True
+        entry["ts"] = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data[post_id] = entry
+        save_blog_failures(data)
+
+
+def clear_generation_failure(post_id: str) -> None:
+    """Clear recorded failure state for post_id after a successful generation."""
+    with _blog_lock(BLOG_FAILURES_FILE):
+        data = load_blog_failures()
+        if post_id in data:
+            del data[post_id]
+            save_blog_failures(data)
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +721,7 @@ def _qa_gate(text: str) -> str | None:
 
 def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, dry: bool = False) -> dict | None:
     """Generate a blog post. Returns post dict or None if skipped."""
+    pid = id_for_post(post_type, target_date)
     if post_type == "daily":
         thoughts = gather_thoughts(target_date)
         thoughts_raw = _load_thoughts_raw(target_date)
@@ -684,13 +761,15 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         return None
     except SessionBudgetExhausted as exc:
         log(f"budget exhausted for {post_type}: {exc}")
-        raise  # propagate to main loop so it can sleep until budget resets
+        raise  # propagate to main loop so it can sleep until budget resets — not a post failure
     except Exception as exc:
         log(f"generation failed for {post_type}: {exc}")
+        record_generation_failure(pid, f"generation failed: {exc}")
         return None
 
     if not raw_text:
         log(f"empty response for {post_type}")
+        record_generation_failure(pid, "empty response")
         return None
 
     # Parse title + body. Strip LLM preamble lines ("I'll write...", "Here is...",
@@ -700,6 +779,8 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
 
     if not body:
         log(f"empty body for {post_type} — LLM returned title only")
+        log(f"raw response for {pid} (first 300 chars): {raw_text[:300]!r}")
+        record_generation_failure(pid, "empty body")
         return None
 
     if not title:
@@ -711,6 +792,7 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         qa_result = _qa_gate(body)
         if qa_result == "rejected":
             log(f"QA rejected {post_type}: {title[:60]}")
+            record_qa_rejected(pid)
             return None
         if qa_result is None:
             log(f"QA gate error for {post_type} — publishing anyway (safety net)")
@@ -724,7 +806,7 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
     post_ts = period_end.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     post = {
-        "id": id_for_post(post_type, target_date),
+        "id": pid,
         "type": post_type,
         "title": title,
         "body": body,
@@ -753,6 +835,7 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
                     child_moods[cm] = child_moods.get(cm, 0) + 1
         post["mood"] = max(child_moods, key=child_moods.get) if child_moods else "content"
 
+    clear_generation_failure(pid)
     return post
 
 
@@ -779,6 +862,14 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
 
         pid = id_for_post(post_type, target_date)
         if post_exists(blog_data, pid):
+            continue
+
+        if is_generation_skipped(pid):
+            # Gave up on this post_id after repeated failed generations or a
+            # QA rejection (state/blog_failures.json) — do not burn another
+            # Claude session retrying it. Logged every cycle (cheap, no
+            # session consumed) rather than tracking a "already logged" flag.
+            log(f"skipping {pid}: exceeded generation failure cap, not retrying")
             continue
 
         log(f"generating {post_type} post: {pid}")

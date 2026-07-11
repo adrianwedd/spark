@@ -571,3 +571,187 @@ class TestQaGateBreaker:
         assert mock_run.call_count == 1
         assert result == "pass"
         assert breaker["failures"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-post-ID generation failure cap (breaks the retry doom loop, Task 6)
+# ---------------------------------------------------------------------------
+
+class TestGenerationFailureCap:
+
+    def test_record_failure_marks_skipped_after_cap(self, blog_mod):
+        """3 recorded failures for a post_id sets skipped=True with the last error."""
+        ns, state_dir, _ = blog_mod
+        pid = "blog-2026w26-weekly"
+
+        for _ in range(3):
+            ns["record_generation_failure"](pid, "empty body")
+
+        data = ns["load_blog_failures"]()
+        assert data[pid]["failures"] == 3
+        assert data[pid]["skipped"] is True
+        assert data[pid]["last_error"] == "empty body"
+        assert ns["is_generation_skipped"](pid) is True
+
+    def test_record_failure_not_skipped_before_cap(self, blog_mod):
+        """Fewer than 3 failures does not mark the post skipped."""
+        ns, _, _ = blog_mod
+        pid = "blog-2026w27-weekly"
+
+        ns["record_generation_failure"](pid, "empty body")
+        ns["record_generation_failure"](pid, "empty response")
+
+        data = ns["load_blog_failures"]()
+        assert data[pid]["failures"] == 2
+        assert data[pid].get("skipped", False) is False
+        assert ns["is_generation_skipped"](pid) is False
+
+    def test_generate_post_empty_body_increments_failure(self, blog_mod):
+        """generate_post recording an empty-body failure increments the counter."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        pid = ns["id_for_post"]("daily", today)
+
+        mock_result = MagicMock()
+        mock_result.stdout = "Only A Title Line With No Body At All"
+        mock_result.model_used = "claude-haiku-4-5-20251001"
+
+        with patch("pxh.claude_session.run_claude_session", return_value=mock_result):
+            post = ns["generate_post"]("daily", today, {"posts": []})
+
+        assert post is None
+        data = ns["load_blog_failures"]()
+        assert data[pid]["failures"] == 1
+        assert data[pid]["last_error"] == "empty body"
+
+    def test_generate_post_empty_body_logs_raw_response_excerpt(self, blog_mod):
+        """Empty-body failures log a repr() excerpt of the raw LLM response."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+
+        raw = "Only A Title Line With No Body At All"
+        mock_result = MagicMock()
+        mock_result.stdout = raw
+        mock_result.model_used = "claude-haiku-4-5-20251001"
+
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        with patch("pxh.claude_session.run_claude_session", return_value=mock_result):
+            post = ns["generate_post"]("daily", today, {"posts": []})
+
+        assert post is None
+        joined = "\n".join(logged)
+        assert repr(raw) in joined, f"expected raw response repr() in logs, got: {logged}"
+
+    def test_budget_exhausted_does_not_increment_failure(self, blog_mod):
+        """SessionBudgetExhausted must not count against the failure cap."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        pid = ns["id_for_post"]("daily", today)
+
+        from pxh.claude_session import SessionBudgetExhausted
+
+        with patch("pxh.claude_session.run_claude_session",
+                   side_effect=SessionBudgetExhausted("daily cap reached")):
+            with pytest.raises(SessionBudgetExhausted):
+                ns["generate_post"]("daily", today, {"posts": []})
+
+        data = ns["load_blog_failures"]()
+        assert pid not in data
+
+    def test_dry_run_does_not_increment_failure(self, blog_mod):
+        """Dry-run skips (no Claude call made) must not count against the cap."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        pid = ns["id_for_post"]("daily", today)
+
+        post = ns["generate_post"]("daily", today, {"posts": []}, dry=True)
+
+        assert post is None
+        data = ns["load_blog_failures"]()
+        assert pid not in data
+
+    def test_qa_rejected_marks_skipped_immediately(self, blog_mod):
+        """A single QA rejection is terminal — no 3-strike counting."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        pid = ns["id_for_post"]("daily", today)
+        blog_subprocess = ns["subprocess"]
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.object(blog_subprocess, "run", return_value=_mock_run_result("NO")):
+                post = ns["generate_post"]("daily", today, {"posts": []})
+
+        assert post is None
+        data = ns["load_blog_failures"]()
+        assert data[pid]["skipped"] is True
+        assert data[pid]["last_error"] == "qa_rejected"
+        assert ns["is_generation_skipped"](pid) is True
+
+    def test_success_clears_failure_entry(self, blog_mod):
+        """A successful generation clears any prior recorded failure state."""
+        ns, state_dir, _ = blog_mod
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        pid = ns["id_for_post"]("daily", today)
+
+        ns["record_generation_failure"](pid, "empty body")
+        ns["record_generation_failure"](pid, "empty body")
+        assert ns["load_blog_failures"]()[pid]["failures"] == 2
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                post = ns["generate_post"]("daily", today, {"posts": []})
+
+        assert post is not None
+        data = ns["load_blog_failures"]()
+        assert pid not in data
+
+    def test_corrupt_blog_failures_treated_as_empty(self, blog_mod):
+        """A corrupt blog_failures.json must not crash the daemon."""
+        ns, state_dir, _ = blog_mod
+        (state_dir / "blog_failures.json").write_text("NOT JSON")
+
+        data = ns["load_blog_failures"]()
+        assert data == {}
+        assert ns["is_generation_skipped"]("blog-whatever") is False
+
+        # Recording a new failure over a corrupt file should not crash and
+        # should replace the corrupt content with valid state.
+        ns["record_generation_failure"]("blog-whatever", "empty body")
+        data2 = ns["load_blog_failures"]()
+        assert data2["blog-whatever"]["failures"] == 1
+
+    def test_pending_enumeration_skips_capped_weekly_without_claude_call(self, blog_mod):
+        """run_once() must not call Claude for a post_id that already hit the failure cap."""
+        ns, state_dir, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        days_since_sunday = (now.weekday() + 1) % 7
+        last_sunday = now - dt.timedelta(days=days_since_sunday)
+        # Use the catch-up (previous Sunday) branch, which is time-of-day independent.
+        prev_sunday = last_sunday - dt.timedelta(days=7)
+
+        dailies = []
+        for i in range(7):
+            day = prev_sunday - dt.timedelta(days=6 - i)
+            dailies.append(_make_daily_post(day, title=f"Day {i + 1}"))
+        _write_blog_with_posts(state_dir, dailies)
+
+        pid = ns["id_for_post"]("weekly", prev_sunday)
+        for _ in range(3):
+            ns["record_generation_failure"](pid, "empty body")
+        assert ns["is_generation_skipped"](pid) is True
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()) as mock_run:
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                ns["run_once"](dry=False)
+
+        mock_run.assert_not_called()
+        blog_data = ns["load_blog"]()
+        assert not ns["post_exists"](blog_data, pid)
