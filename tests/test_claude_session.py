@@ -399,3 +399,48 @@ class TestBlogSessionType:
     def test_blog_exempt_from_global_cooldown(self):
         from pxh.claude_session import _GLOBAL_COOLDOWN_EXEMPT
         assert "blog" in _GLOBAL_COOLDOWN_EXEMPT
+
+
+# ---------------------------------------------------------------------------
+# budget_summary — one-line budget state for reflection context
+# ---------------------------------------------------------------------------
+
+
+class TestBudgetSummary:
+    def test_reports_global_and_per_type_counts(self, tmp_path):
+        import pxh.claude_session as cs
+        sd = _make_state_dir(tmp_path)
+        _write_session_log(sd, [
+            {"ts": _ts_ago(3600), "type": "blog"},
+            {"ts": _ts_ago(7200), "type": "research"},
+        ])
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"):
+            s = cs.budget_summary()
+        assert "2/8" in s
+        assert "research 1/3" in s
+        assert "blog 1/5" in s
+
+    def test_flags_blocked_types(self, tmp_path):
+        import pxh.claude_session as cs
+        sd = _make_state_dir(tmp_path)
+        # research at quota (3 used), spaced out beyond cooldowns
+        _write_session_log(sd, [
+            {"ts": _ts_ago(30000), "type": "research"},
+            {"ts": _ts_ago(20000), "type": "research"},
+            {"ts": _ts_ago(10000), "type": "research"},
+        ])
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"):
+            s = cs.budget_summary()
+        assert "research" in s
+        # research must be marked unavailable in some form
+        assert "research 3/3" in s
+        low = s.lower()
+        assert ("blocked" in low) or ("unavailable" in low)
+
+    def test_empty_log(self, tmp_path):
+        import pxh.claude_session as cs
+        sd = _make_state_dir(tmp_path)
+        _write_session_log(sd, [])
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"):
+            s = cs.budget_summary()
+        assert "0/8" in s

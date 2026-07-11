@@ -106,3 +106,53 @@ def test_emit_message_obi_suppressed_no_announce(monkeypatch):
 
     mind._emit_message_obi("still waiting")
     assert fired == []   # no announce when the nudge is backoff-suppressed
+
+
+# ---------------------------------------------------------------------------
+# Close-the-loops sprint: budget visibility + explore injection
+# ---------------------------------------------------------------------------
+
+
+def test_reflection_context_includes_budget_summary(monkeypatch):
+    """The reflection prompt carries today's Claude budget so SPARK can choose wisely."""
+    captured = {}
+
+    def _fake_llm(prompt, system, persona=""):
+        captured["prompt"] = prompt
+        return {"response": json.dumps(
+            {"thought": "x", "mood": "content", "action": "wait", "salience": 0.2})}
+
+    import pxh.claude_session as cs
+    monkeypatch.setattr(cs, "budget_summary", lambda: "3/8 used (BUDGET-MARKER)")
+    monkeypatch.setattr(mind, "call_llm", _fake_llm)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "auto_remember", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+    mind.reflection({"persona": ""}, dry=False)
+    assert "BUDGET-MARKER" in captured["prompt"]
+
+
+def test_inject_explore_reaches_spark_prompt():
+    """The explore action must land inside SPARK's actual action enum (regression:
+    the old string-replace silently stopped matching when message_obi was appended)."""
+    from pxh import spark_config
+    out = mind._inject_explore(spark_config._SPARK_REFLECTION_SUFFIX)
+    assert 'message_obi, explore"' in out
+
+
+def test_inject_explore_reaches_generic_prompt():
+    out = mind._inject_explore(mind.REFLECTION_SYSTEM)
+    assert ", explore\"" in out
+
+
+def test_inject_explore_no_enum_returns_unchanged():
+    assert mind._inject_explore("no action enum here") == "no action enum here"
+
+
+def test_inject_explore_injects_exactly_once():
+    from pxh import spark_config
+    out = mind._inject_explore(spark_config._SPARK_REFLECTION_SUFFIX)
+    assert out.count(", explore") == 1

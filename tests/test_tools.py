@@ -1218,3 +1218,62 @@ def test_tool_announce_resolves_single_target_from_multiple(isolated_project):
     payload = parse_json(run_tool(["bin/tool-announce"], env))
     assert payload["status"] == "dry"
     assert len(payload["targets"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# tool-research / tool-compose: outputs must be visible to reflection memory
+# ---------------------------------------------------------------------------
+
+import types as _types
+from pathlib import Path as _Path
+
+_TOOLS_ROOT = _Path(__file__).parent.parent
+
+
+def _load_tool_heredoc(name, monkeypatch, tmp_path, extra_env=None):
+    """Exec a bin/tool-* embedded Python heredoc into a namespace with a fake
+    pxh.claude_session so main() can run without a live Claude CLI."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("PX_DRY", "0")
+    for k, v in (extra_env or {}).items():
+        monkeypatch.setenv(k, v)
+
+    fake_cs = _types.ModuleType("pxh.claude_session")
+    fake_cs.SessionBudgetExhausted = type("SessionBudgetExhausted", (Exception,), {})
+    fake_cs.run_claude_session = lambda **kw: _types.SimpleNamespace(
+        returncode=0, stdout="A thoughtful multi-paragraph exploration of the topic.",
+        model_used="claude-haiku-test")
+    monkeypatch.setitem(sys.modules, "pxh.claude_session", fake_cs)
+
+    text = (_TOOLS_ROOT / "bin" / name).read_text(encoding="utf-8")
+    py = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    ns = {"__name__": f"{name.replace('-', '_')}_mod"}
+    exec(compile(py, name, "exec"), ns)  # noqa: S102 — loading our own tool code for testing
+    return ns
+
+
+def test_tool_research_writes_note_key(tmp_path, monkeypatch, capsys):
+    """Research results must carry a 'note' key so load_notes() can surface them."""
+    ns = _load_tool_heredoc("tool-research", monkeypatch, tmp_path,
+                            {"PX_RESEARCH_QUERY": "why is the sky blue"})
+    ns["main"]()
+    out = json.loads(capsys.readouterr().out.strip())
+    assert out["status"] == "ok"
+    rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
+    assert rec.get("note", "").startswith("Research: why is the sky blue")
+    assert "exploration" in rec["note"]  # includes a response excerpt
+
+
+def test_tool_compose_writes_note_record(tmp_path, monkeypatch, capsys):
+    """Compositions must leave a note in notes-spark.jsonl (full text stays in compositions file)."""
+    ns = _load_tool_heredoc("tool-compose", monkeypatch, tmp_path,
+                            {"PX_COMPOSE_TOPIC": "the wind in the eucalyptus"})
+    ns["main"]()
+    out = json.loads(capsys.readouterr().out.strip())
+    assert out["status"] == "ok"
+    # full text still lands in compositions file
+    comp = json.loads((tmp_path / "compositions-spark.jsonl").read_text().strip())
+    assert comp["text"].startswith("A thoughtful")
+    # and a note summary lands in notes
+    note_rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
+    assert note_rec.get("note", "").startswith("Composed: the wind in the eucalyptus")

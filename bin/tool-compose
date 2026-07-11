@@ -87,6 +87,26 @@ def main():
     except OSError:
         pass
 
+    # Leave a note in long-term memory so reflection knows this piece exists
+    # (full text stays in the compositions file).
+    note_entry = {
+        "ts": entry["ts"],
+        "type": "compose",
+        "note": f"Composed: {topic} — {result.stdout.strip()[:150]}",
+    }
+    notes_file = STATE_DIR / "notes-spark.jsonl"
+    try:
+        _lock = _FL(str(notes_file) + ".lock", timeout=5) if _FL else None
+        if _lock:
+            with _lock:
+                with open(notes_file, "a") as f:
+                    f.write(json.dumps(note_entry) + "\n")
+        else:
+            with open(notes_file, "a") as f:
+                f.write(json.dumps(note_entry) + "\n")
+    except OSError:
+        pass
+
     print(json.dumps({"status": "ok", "topic": topic, "length": len(result.stdout)}))
 
 

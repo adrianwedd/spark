@@ -250,6 +250,29 @@ def _append_session_entry(entry: dict) -> None:
             f.write(json.dumps(entry) + "\n")
 
 
+def budget_summary() -> str:
+    """One-line summary of today's session usage, for injection into the
+    px-mind reflection context so SPARK can reason about its own budget."""
+    if BUDGET_DISABLED:
+        return ""
+    today = _today_entries(_load_session_log())
+    by_type: dict[str, int] = {}
+    for e in today:
+        t = e.get("type", "?")
+        by_type[t] = by_type.get(t, 0) + 1
+    per_type = ", ".join(
+        f"{t} {by_type.get(t, 0)}/{q}" for t, q in _TYPE_QUOTAS.items())
+    summary = f"{len(today)}/{DAILY_CAP} sessions used ({per_type})."
+    blocked = []
+    for t in _TYPE_QUOTAS:
+        reason = check_budget(t)
+        if reason:
+            blocked.append(f"{t} ({reason})")
+    if blocked:
+        summary += " Currently blocked: " + "; ".join(blocked) + "."
+    return summary
+
+
 def run_claude_session(
     session_type: str,
     prompt: str,

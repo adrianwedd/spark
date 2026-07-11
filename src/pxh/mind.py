@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import struct
 import subprocess
@@ -450,7 +451,12 @@ CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", 
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
-                        "research", "compose", "blog_essay", "message_obi"}
+                        "blog_essay", "message_obi"}
+
+# Actions permitted during night silence and absence: silent cognitive work
+# (no audio, no servo motion) is exactly what idle hours are for.
+NIGHT_ALLOWED_ACTIONS = {"wait", "remember", "research", "compose",
+                         "introspect", "self_debug"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -1659,16 +1665,39 @@ def load_notes(n: int = 5, persona: str = "") -> list[str]:
         return []
     try:
         lines = notes_file.read_text(encoding="utf-8").strip().splitlines()
-        notes = []
-        for line in lines[-n:]:
+        notes: list[str] = []
+        # Walk backwards collecting the last N *real* notes: legacy research
+        # records carry no "note" key and must not blank the memory window.
+        for line in reversed(lines):
+            if len(notes) >= n:
+                break
             try:
                 record = json.loads(line)
-                notes.append(record.get("note", ""))
             except json.JSONDecodeError:
                 continue
+            note = (record.get("note") or "").strip()
+            if note:
+                notes.append(note)
+        notes.reverse()
         return notes
     except Exception:
         return []
+
+
+_ACTION_ENUM_RE = re.compile(r'("action": "one of: [^"]+?)(")')
+
+
+def _inject_explore(system_prompt: str) -> str:
+    """Insert 'explore' into the prompt's action enum, wherever it currently ends.
+
+    Replaces the old exact-string .replace(), which silently became a no-op
+    when message_obi was appended to the enum after it was written.
+    """
+    new_prompt, n = _ACTION_ENUM_RE.subn(r'\1, explore\2', system_prompt, count=1)
+    if not n:
+        log("explore injection: action enum not found in prompt — explore not offered")
+        return system_prompt
+    return new_prompt
 
 
 def text_similarity(a: str, b: str) -> float:
@@ -2502,6 +2531,16 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if notes:
         context_parts.append("Your long-term memories:\n" + "\n".join(f"  - {n}" for n in notes))
 
+    # Claude budget visibility: let the model reason about its own scarcity
+    # instead of blindly choosing research/compose/evolve when they're blocked.
+    try:
+        from pxh.claude_session import budget_summary
+        _budget = budget_summary()
+        if _budget:
+            context_parts.append(f"Your Claude session budget today: {_budget}")
+    except Exception:
+        pass  # best-effort — never block reflection on budget bookkeeping
+
     if _last_spoken_text:
         context_parts.append(f"What you said last time (DO NOT repeat this): \"{_last_spoken_text}\"")
 
@@ -2701,10 +2740,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
 
     explore_available = _can_explore(session, aw_data)
     if explore_available:
-        system_prompt = system_prompt.replace(
-            'research, compose, self_debug, blog_essay"',
-            'research, compose, self_debug, blog_essay, explore"'
-        )
+        system_prompt = _inject_explore(system_prompt)
 
     # Exploration hints for context
     explore_hints = []
@@ -2935,6 +2971,21 @@ def _emit_message_obi(text: str) -> None:
     log(f"expression: message_obi written (id={msg_id})")
 
 
+def _tool_outcome(result) -> str:
+    """Summarize a cognitive tool's JSON stdout as 'ok' or 'failed: <why>'.
+
+    tool-research/tool-compose/tool-blog print {"status": ...} and exit 0 even
+    on budget exhaustion, so the return code alone says nothing.
+    """
+    try:
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError, AttributeError, TypeError):
+        return "ok" if result.returncode == 0 else f"failed: rc={result.returncode}"
+    if out.get("status") == "ok":
+        return "ok"
+    return f"failed: {out.get('error', 'unknown error')}"
+
+
 def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     """Layer 3: act on a thought."""
     global _last_spoken_text, _last_morning_fact_date
@@ -2943,10 +2994,11 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     if action == "wait":
         return
 
-    # Hard night silence: 19:00–07:00 Hobart time — unconditional, no sensor dependencies
+    # Hard night silence: 19:00–07:00 Hobart time — unconditional, no sensor
+    # dependencies. Silent cognitive actions are exempt (NIGHT_ALLOWED_ACTIONS).
     _night_hour = dt.datetime.now(HOBART_TZ).hour
     if _is_night_silence(_night_hour):
-        if action not in ("wait", "remember"):
+        if action not in NIGHT_ALLOWED_ACTIONS:
             log(f"expression: suppressed {action} — night silence "
                 f"({NIGHT_SILENCE_START_H:02d}:00–{NIGHT_SILENCE_END_H:02d}:00)")
             return
@@ -3024,6 +3076,10 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         log(f"expressing: action={action} persona={persona} rephrase={needs_rephrase}")
     else:
         log(f"expressing: action={action}")
+
+    # Cognitive tools report success/failure via JSON stdout; recorded into
+    # session history so the next reflection can see what actually happened.
+    outcome: str | None = None
 
     try:
         if action == "greet":
@@ -3284,7 +3340,8 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
             result = subprocess.run(
                 [str(BIN_DIR / "tool-research")],
                 capture_output=True, text=True, check=False, env=env, timeout=360)
-            log(f"expression: research completed rc={result.returncode}")
+            outcome = _tool_outcome(result)
+            log(f"expression: research {outcome}")
 
         elif action == "compose":
             env["PX_COMPOSE_TOPIC"] = text[:500]
@@ -3292,7 +3349,8 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
             result = subprocess.run(
                 [str(BIN_DIR / "tool-compose")],
                 capture_output=True, text=True, check=False, env=env, timeout=360)
-            log(f"expression: compose completed rc={result.returncode}")
+            outcome = _tool_outcome(result)
+            log(f"expression: compose {outcome}")
 
         elif action == "blog_essay":
             env["PX_BLOG_TOPIC"] = text[:500]
@@ -3300,7 +3358,8 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
             result = subprocess.run(
                 [str(BIN_DIR / "tool-blog")],
                 capture_output=True, text=True, check=False, env=env, timeout=360)
-            log(f"expression: blog_essay completed rc={result.returncode}")
+            outcome = _tool_outcome(result)
+            log(f"expression: blog_essay {outcome}")
 
         elif action == "self_debug":
             log("expression: self_debug triggered — gathering diagnostics")
@@ -3362,14 +3421,17 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         log(f"expression error: {exc}\n{traceback.format_exc()}")
 
     # Record in session history
+    history_entry = {
+        "event": "mind",
+        "mood": thought.get("mood", ""),
+        "action": action,
+        "thought": text,
+    }
+    if outcome:
+        history_entry["outcome"] = outcome
     update_session(
         fields={"last_action": "px_mind"},
-        history_entry={
-            "event": "mind",
-            "mood": thought.get("mood", ""),
-            "action": action,
-            "thought": text,
-        },
+        history_entry=history_entry,
     )
 
 

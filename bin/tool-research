@@ -70,6 +70,9 @@ def main():
         "query": query,
         "response": result.stdout.strip(),
         "model": result.model_used,
+        # "note" is what load_notes() surfaces into reflection context —
+        # records without it are invisible to SPARK's memory.
+        "note": f"Research: {query} — {result.stdout.strip()[:200]}",
     }
 
     notes_file = STATE_DIR / "notes-spark.jsonl"

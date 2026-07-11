@@ -1260,3 +1260,114 @@ def test_findmyhub_arrival_empty_input_returns_empty():
     from pxh.mind import _detect_findmyhub_arrivals
     assert _detect_findmyhub_arrivals({}) == []
     assert _detect_findmyhub_arrivals(None) == []  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Close-the-loops sprint: action-outcome feedback, night cognition, notes schema
+# ---------------------------------------------------------------------------
+
+
+def test_expression_research_records_failed_outcome(_mock_awareness_and_battery):
+    """A budget-blocked research action records a 'failed:' outcome in session history."""
+    mock_result = MagicMock(
+        returncode=0,
+        stdout=_json.dumps({"status": "error",
+                            "error": "budget exhausted: research quota reached (3/3)"}),
+        stderr="")
+    with patch("subprocess.run", return_value=mock_result), \
+         patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("research"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"].startswith("failed:")
+    assert "budget exhausted" in entry["outcome"]
+
+
+def test_expression_research_records_ok_outcome(_mock_awareness_and_battery):
+    """A successful research action records outcome='ok' in session history."""
+    mock_result = MagicMock(
+        returncode=0,
+        stdout=_json.dumps({"status": "ok", "query": "q", "length": 512}),
+        stderr="")
+    with patch("subprocess.run", return_value=mock_result), \
+         patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("research"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"] == "ok"
+
+
+def test_expression_compose_records_failed_outcome(_mock_awareness_and_battery):
+    """compose parses tool JSON stdout the same way research does."""
+    mock_result = MagicMock(
+        returncode=0,
+        stdout=_json.dumps({"status": "error", "error": "budget exhausted: compose quota reached (2/2)"}),
+        stderr="")
+    with patch("subprocess.run", return_value=mock_result), \
+         patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("compose"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert "budget exhausted" in entry.get("outcome", "")
+
+
+def test_expression_speech_actions_have_no_outcome_key(_mock_awareness_and_battery):
+    """Actions without structured tool output must not grow a bogus outcome key."""
+    with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+         patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("look_around"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert "outcome" not in entry
+
+
+def test_night_silence_allows_silent_cognitive_actions(tmp_path):
+    """research/compose/introspect run during night silence — they make no sound."""
+    import datetime as _dt2
+    aw_file = tmp_path / "awareness.json"
+    bat_file = tmp_path / "battery.json"
+    log_file = tmp_path / "px-mind.log"
+    aw_file.write_text(_json.dumps({"obi_mode": "calm"}))
+    bat_file.write_text(_json.dumps({"pct": 80, "charging": False}))
+    old = (pxh.mind.AWARENESS_FILE, pxh.mind.BATTERY_FILE, pxh.mind.LOG_FILE)
+    pxh.mind.AWARENESS_FILE, pxh.mind.BATTERY_FILE, pxh.mind.LOG_FILE = aw_file, bat_file, log_file
+    try:
+        _late = _dt2.datetime(2025, 6, 15, 23, 0, 0, tzinfo=pxh.mind.HOBART_TZ)
+        with patch("pxh.mind.dt") as mock_dt:
+            mock_dt.datetime.now.return_value = _late
+            mock_dt.datetime.fromisoformat = _dt2.datetime.fromisoformat
+            mock_dt.timezone = _dt2.timezone
+            mock_dt.timedelta = _dt2.timedelta
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="{}", stderr="")) as mock_run, \
+                 patch.object(pxh.mind, "update_session"):
+                expression(_thought("research"), dry=True)
+                expression(_thought("compose"), dry=True)
+                expression(_thought("introspect"), dry=True)
+                expression(_thought("comment"), dry=True)  # spoken — must stay suppressed
+        called = str(mock_run.call_args_list)
+        assert "tool-research" in called
+        assert "tool-compose" in called
+        assert "tool-introspect" in called
+        assert "tool-voice" not in called
+        assert "night silence" in log_file.read_text()  # comment was suppressed
+    finally:
+        pxh.mind.AWARENESS_FILE, pxh.mind.BATTERY_FILE, pxh.mind.LOG_FILE = old
+
+
+def test_absent_mode_no_longer_gates_research_and_compose():
+    """Silent cognitive work is exactly what absent/idle time is for."""
+    assert "research" not in pxh.mind.ABSENT_GATED_ACTIONS
+    assert "compose" not in pxh.mind.ABSENT_GATED_ACTIONS
+    # Spoken/visible actions stay gated
+    assert "comment" in pxh.mind.ABSENT_GATED_ACTIONS
+    assert "greet" in pxh.mind.ABSENT_GATED_ACTIONS
+
+
+def test_load_notes_skips_records_without_note(tmp_path, monkeypatch):
+    """Legacy research/compose records (no 'note' key) must not blank the memory window."""
+    nf = tmp_path / "notes-spark.jsonl"
+    nf.write_text("\n".join([
+        _json.dumps({"ts": "t1", "type": "research", "query": "q", "response": "r"}),
+        _json.dumps({"ts": "t2", "note": "older real memory"}),
+        _json.dumps({"ts": "t3", "note": ""}),
+        _json.dumps({"ts": "t4", "note": "newest real memory"}),
+    ]) + "\n")
+    monkeypatch.setattr(pxh.mind, "notes_file_for_persona", lambda p: nf)
+    notes = pxh.mind.load_notes(2, "spark")
+    assert notes == ["older real memory", "newest real memory"]
