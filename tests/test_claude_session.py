@@ -444,3 +444,29 @@ class TestBudgetSummary:
         with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"):
             s = cs.budget_summary()
         assert "0/8" in s
+
+
+# ---------------------------------------------------------------------------
+# Consolidate Session Type (Task 2)
+# ---------------------------------------------------------------------------
+
+def test_consolidate_session_type_registered():
+    from pxh import claude_session as cs
+    assert cs._model_for_type("consolidate").startswith("claude-haiku")
+    assert cs._TYPE_QUOTAS["consolidate"] == 1
+    assert cs._TYPE_COOLDOWNS["consolidate"] == 72000
+    assert cs._PRIORITY["consolidate"] == 2
+    assert cs._ENV_OVERRIDES["consolidate"] == "PX_CLAUDE_MODEL_CONSOLIDATE"
+
+
+def test_consolidate_quota_one_per_day(tmp_path, monkeypatch):
+    import datetime as dt
+    import json
+    from pxh import claude_session as cs
+    log = tmp_path / "claude_sessions.jsonl"
+    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    log.write_text(json.dumps({"ts": now, "type": "consolidate"}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(cs, "SESSION_LOG", log)
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", False)
+    reason = cs.check_budget("consolidate")
+    assert reason is not None and "quota" in reason
