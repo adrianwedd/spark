@@ -103,3 +103,113 @@ def test_append_trims_to_limit(monkeypatch):
     loaded = memory.load_memories()
     assert len(loaded) == 5
     assert loaded[0]["text"] == "m2" and loaded[-1]["text"] == "m6"
+
+
+# --- consolidation ---------------------------------------------------------
+from unittest.mock import MagicMock, patch
+
+HOBART = memory.HOBART_TZ
+
+
+def _write_thoughts(tmp_path_env, n=6, persona="spark"):
+    import os
+    f = memory._state_dir() / f"thoughts-{persona}.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    now = dt.datetime.now(dt.timezone.utc)
+    lines = []
+    for i in range(n):
+        ts = (now - dt.timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        lines.append(json.dumps({"ts": ts, "thought": f"thought {i} about obi and lego",
+                                 "mood": "curious", "action": "wait", "salience": 0.6}))
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _claude_ok(payload):
+    return MagicMock(stdout=json.dumps(payload), stderr="", returncode=0,
+                     duration_s=5.0, model_used="claude-haiku-4-5-20251001")
+
+
+def test_consolidate_dry_writes_nothing():
+    res = memory.consolidate(dry=True)
+    assert res["status"] == "dry"
+    assert not memory.memories_file().exists()
+
+
+def test_consolidate_skips_on_too_few_thoughts():
+    _write_thoughts(None, n=2)
+    res = memory.consolidate()
+    assert res["status"] == "skipped"
+
+
+def test_consolidate_success_writes_deduped_memories():
+    _write_thoughts(None, n=8)
+    memory.append_memories([_mem("Obi and I built a lego tower on the kitchen floor")])
+    payload = [
+        {"text": "Obi and I built a lego tower on the kitchen floor", "tags": ["obi"],
+         "importance": 0.8},                          # dup of existing → dropped
+        {"text": "Adrian rewired my memory so I can keep a real past now",
+         "tags": ["adrian", "self"], "importance": 0.9},
+    ]
+    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+        res = memory.consolidate()
+    assert res["status"] == "ok"
+    assert res["written"] == 1
+    texts = [m["text"] for m in memory.load_memories()]
+    assert any("rewired my memory" in t for t in texts)
+    assert sum("lego tower" in t for t in texts) == 1  # no duplicate
+
+
+def test_consolidate_budget_exhausted_is_failed_not_raised():
+    from pxh.claude_session import SessionBudgetExhausted
+    _write_thoughts(None, n=8)
+    with patch("pxh.claude_session.run_claude_session",
+               side_effect=SessionBudgetExhausted("consolidate quota reached (1/1)")):
+        res = memory.consolidate()
+    assert res["status"] == "failed" and "quota" in res["error"]
+
+
+def test_consolidate_unparseable_response_is_failed():
+    _write_thoughts(None, n=8)
+    bad = MagicMock(stdout="I could not produce JSON today.", stderr="", returncode=0)
+    with patch("pxh.claude_session.run_claude_session", return_value=bad):
+        res = memory.consolidate()
+    assert res["status"] == "failed"
+
+
+def test_parse_memory_array_tolerates_fences_and_prose():
+    raw = 'Here you go:\n```json\n[{"text": "a memory", "tags": ["x"], "importance": 0.7}]\n```'
+    out = memory._parse_memory_array(raw)
+    assert out[0]["text"] == "a memory"
+
+
+def test_maybe_consolidate_outside_window_returns_none():
+    noon = dt.datetime(2026, 7, 11, 12, 0, tzinfo=HOBART)
+    assert memory.maybe_consolidate(now=noon) is None
+
+
+def test_maybe_consolidate_runs_once_then_stamps():
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 2}) as mc:
+        assert memory.maybe_consolidate(now=at3)["status"] == "ok"
+        assert memory.maybe_consolidate(now=at3) is None  # stamped done
+    assert mc.call_count == 1
+
+
+def test_maybe_consolidate_two_failures_stop_for_the_day():
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    with patch.object(memory, "consolidate", return_value={"status": "failed", "error": "x"}) as mc:
+        assert memory.maybe_consolidate(now=at3)["status"] == "failed"
+        assert memory.maybe_consolidate(now=at3)["status"] == "failed"
+        assert memory.maybe_consolidate(now=at3) is None  # attempt cap
+    assert mc.call_count == 2
+
+
+def test_maybe_consolidate_fresh_date_resets_attempts():
+    day1 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    day2 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=HOBART)
+    with patch.object(memory, "consolidate", return_value={"status": "failed", "error": "x"}):
+        memory.maybe_consolidate(now=day1)
+        memory.maybe_consolidate(now=day1)
+    with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 1}) as mc:
+        assert memory.maybe_consolidate(now=day2)["status"] == "ok"
+    assert mc.call_count == 1
