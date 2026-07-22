@@ -2255,7 +2255,16 @@ def call_ollama(prompt: str, system: str,
     _timeout = 90 if _host in (LOCAL_OLLAMA_HOST, OLLAMA_CLOUD_HOST) else 30
     try:
         with urllib.request.urlopen(req, timeout=_timeout) as resp:
-            return json.loads(resp.read())
+            body = json.loads(resp.read())
+        # A 200 with an empty "response" isn't success — e.g. a thinking-capable
+        # model can burn the whole num_predict budget on a <think> block and
+        # never emit an answer (done_reason="length"). Treat it as a failure so
+        # call_llm() falls through to the next tier instead of silently
+        # returning nothing.
+        if not str(body.get("response", "")).strip():
+            _host_failure_until[_host] = time.monotonic() + _HOST_FAILURE_BACKOFF_S
+            return {"error": f"ollama {_model}@{_host} returned empty response (done_reason={body.get('done_reason')})"}
+        return body
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return {"error": f"ollama model '{_model}' not found on {_host} (404)"}

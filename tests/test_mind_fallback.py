@@ -40,6 +40,18 @@ def _fake_claude(returncode: int, stdout: str = "", stderr: str = "") -> MagicMo
     return m
 
 
+def _fake_ollama_empty_cm(done_reason: str = "length"):
+    """Mock a 200 OK Ollama response whose 'response' field is empty — e.g. a
+    thinking-capable model burning its whole token budget on reasoning."""
+    body = json.dumps({"response": "", "done_reason": done_reason, "thinking": "..."}).encode()
+    inner = MagicMock()
+    inner.read = lambda: body
+    cm = MagicMock()
+    cm.__enter__ = lambda s: inner
+    cm.__exit__  = MagicMock(return_value=False)
+    return cm
+
+
 # ── Tier-2 fallback: Claude fails → M1 Ollama succeeds ─────────────
 
 def test_falls_back_to_m1_ollama_when_claude_fails():
@@ -48,6 +60,25 @@ def test_falls_back_to_m1_ollama_when_claude_fails():
         result = call_llm("prompt", "system", persona="spark")
     assert "error" not in result
     assert "quantum foam" in result["response"]
+
+
+# ── M5 returns HTTP 200 but an empty completion (thinking model burned the
+# whole token budget on reasoning) → must be treated as failure, not success ──
+
+def test_falls_back_to_claude_when_ollama_returns_empty_response():
+    def urlopen_side(req, timeout=30):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url.endswith("/api/generate"):
+            return _fake_ollama_empty_cm()
+        raise urllib.error.URLError("skip model-resolution probe")
+
+    with patch("subprocess.run",
+               return_value=_fake_claude(0, stdout='{"thought": "recovered via claude"}')), \
+         patch("urllib.request.urlopen", side_effect=urlopen_side):
+        result = call_llm("prompt", "system", persona="spark")
+
+    assert "error" not in result
+    assert "recovered via claude" in result["response"]
 
 
 # ── Tier-3 fallback: Claude + M1 fail → local Ollama succeeds ──────
