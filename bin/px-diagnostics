@@ -96,7 +96,12 @@ def main() -> int:
     battery_pct: Optional[float] = status_payload.get("battery_pct")
     telemetry["battery_ok"] = battery_ok
     telemetry["battery_pct"] = battery_pct
-    stdout_status = status_info.get("stdout", "")
+    nested_stdout = status_payload.get("stdout")
+    stdout_status = (
+        nested_stdout
+        if isinstance(nested_stdout, str)
+        else status_info.get("stdout", "")
+    )
     voltage_match = re.search(r"Battery estimate:\s*([0-9.]+)\s*V", stdout_status)
     if voltage_match:
         try:
@@ -125,7 +130,7 @@ def main() -> int:
     sensor_check["distance_cm"] = distance
     if distance is None:
         sensor_check["status"] = "warn"
-    sensor_check["raw"] = stdout[-512:]
+    sensor_check["raw"] = stdout
     results["checks"].append(sensor_check)
     telemetry["ultrasonic_cm"] = distance
     if "grayscale" in sensor_check:

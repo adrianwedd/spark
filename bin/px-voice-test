@@ -6,7 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/px-env"
 
-PHRASE="${1:-Hi Obi! I'm SPARK your robot friend. How are you today?}"
+DEFAULT_PHRASE="Hi Obi! I'm SPARK, your robot friend. How are you today?"
+PHRASE="${1:-$DEFAULT_PHRASE}"
 DEVICE="${PX_VOICE_DEVICE:-robothat}"
 
 say() {

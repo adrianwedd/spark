@@ -39,6 +39,19 @@ def test_px_diagnostics_dry_run(tmp_path):
     assert "sensors" in names
     assert "speaker" in names
     assert "microphone" in names
+    sensors = next(check for check in summary["checks"] if check["name"] == "sensors")
+    assert sensors["raw"].startswith("PiCar-X Telemetry Snapshot")
+    assert '\\"stdout\\"' not in sensors["raw"]
+
+
+def test_px_voice_test_has_valid_shell_syntax():
+    subprocess.run(
+        ["bash", "-n", "bin/px-voice-test"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
 
 def test_px_dance_dry_run(tmp_path):
     log_dir = tmp_path / "logs"
