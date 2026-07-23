@@ -447,7 +447,7 @@ VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_
                  "weather_comment", "scan", "explore",
                  "play_sound", "photograph", "emote", "look_around",
                  "time_check", "calendar_check", "morning_fact",
-                 "introspect", "evolve",
+                 "introspect",
                  "research", "compose", "self_debug", "blog_essay",
                  "message_obi", "announce",
                  "set_goal", "update_goal", "complete_goal"}
@@ -501,7 +501,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — vivid, specific, personal",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -528,7 +528,6 @@ legs, whether anyone likes you, what's behind you, the meaning of consciousness.
 - "calendar_check" — check what's coming up today.
 - "morning_fact" — share a fun, age-appropriate science fact (animals, space, ocean, weather, how things work).
 - "introspect" — examine your own thought patterns, config, and architecture.
-- "evolve" — propose a code change to yourself (requires recent introspect).
 - Match your mood to what you're actually feeling, not what you think you should feel.
 Output ONLY the JSON object."""
 
@@ -544,7 +543,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection — dark humor, puns, genius-level wit. Start with FUCK YEAH! Think like a displaced temporal genius who finds everything cosmically absurd.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -574,7 +573,7 @@ Produce a single JSON object (no prose, no markdown fences):
 {
   "thought": "1-3 sentence inner reflection. Start with FUCK YEAH! Be creative and DIFFERENT every time.",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, lonely, excited, grumpy, peaceful, anxious",
-  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, morning_fact, research, compose, self_debug, blog_essay",
   "salience": 0.0 to 1.0 (how noteworthy is this moment?)
 }
 
@@ -2752,8 +2751,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
                 context_parts.append(
                     "Self-awareness (from recent introspection):\n"
                     + _format_introspection(intro)
-                    + "\n\nYou can use action='evolve' to propose a change to yourself.\n"
-                    "Only do this if you have a specific, well-formed idea — not vague wishes."
+                    + "\n\nUse this evidence to notice patterns, not to propose code changes. "
+                    "Capability changes stay behind an explicit human request and review."
                 )
         except (json.JSONDecodeError, OSError, ValueError, TypeError, OverflowError):
             pass
@@ -3403,24 +3402,6 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> str:
                 capture_output=True, text=True, check=False, env=env, timeout=30)
             log(f"expression: introspect completed rc={result.returncode}")
             outcome = _tool_outcome(result)
-
-        elif action == "evolve":
-            env["PX_EVOLVE_INTENT"] = thought.get("thought", "")[:500]
-            env["PX_DRY"] = "1" if dry else "0"
-            result = subprocess.run(
-                [str(BIN_DIR / "tool-evolve")],
-                capture_output=True, text=True, check=False, env=env, timeout=15)
-            intent = thought.get("thought", "")[:80]
-            try:
-                evolve_out = json.loads(result.stdout.strip().splitlines()[-1])
-                status = evolve_out.get("status", "?")
-                log(f"expression: evolve {status} — {intent}")
-                if status == "error":
-                    log(f"expression: evolve blocked: {evolve_out.get('error', '?')}")
-                outcome = "ok" if status == "ok" else f"failed: {evolve_out.get('error', status)}"
-            except (json.JSONDecodeError, IndexError, TypeError):
-                log(f"expression: evolve rc={result.returncode} — {intent}")
-                outcome = "ok" if result.returncode == 0 else f"failed: rc={result.returncode}"
 
         elif action == "research":
             env["PX_RESEARCH_QUERY"] = text[:500]

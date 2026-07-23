@@ -55,7 +55,6 @@ All valid actions are defined in `VALID_ACTIONS` (line 366 of `mind.py`). There 
 | Action | Tool invoked | Behaviour |
 |--------|-------------|-----------|
 | `introspect` | `tool-introspect` | Computes thought statistics. 30s timeout. |
-| `evolve` | `tool-evolve` | Queues a self-evolution proposal. Passes thought text as `PX_EVOLVE_INTENT`. 15s timeout. |
 | `research` | `tool-research` | Haiku-powered deep dive. Passes thought text as `PX_RESEARCH_QUERY`. 360s timeout. |
 | `compose` | `tool-compose` | Haiku-powered creative writing. Passes thought text as `PX_COMPOSE_TOPIC`. 360s timeout. |
 | `blog_essay` | `tool-blog` | Writes a blog post. Passes thought text as `PX_BLOG_TOPIC`. 360s timeout. |
@@ -124,7 +123,6 @@ The main loop enforces `EXPRESSION_COOLDOWN_S = 120` seconds (2 minutes) between
 | `time_check` | Y | - | Y | Y | Y | - |
 | `calendar_check` | Y | Y | Y | Y | Y | Y |
 | `introspect` | - | - | Y | Y | - | - |
-| `evolve` | - | - | Y | Y | - | - |
 | `research` | Y | - | Y | Y | - | - |
 | `compose` | Y | - | Y | Y | - | - |
 | `blog_essay` | Y | - | Y | Y | - | - |
@@ -144,7 +142,6 @@ The main loop enforces `EXPRESSION_COOLDOWN_S = 120` seconds (2 minutes) between
 | `morning_fact` | Once per calendar day (Hobart timezone) | `_last_morning_fact_date` compared to `YYYY-MM-DD` (line 2624). Reset on daemon restart. |
 | `explore` | 1200 seconds (20 minutes) | `_can_explore()` at line 1064 reads `state/exploration_meta.json` `last_explore_ts`. Persists across restarts. |
 | `introspect` | 1800 seconds (30 minutes) | Enforced inside `tool-introspect` via `state/introspection.json` timestamp. |
-| `evolve` | 86400 seconds (24 hours) | Enforced inside `tool-evolve` via `state/evolve_queue.jsonl` timestamps. Additionally rate-limited by `claude_session.py` (1/day Opus quota). |
 | `research` | 7200 seconds (2 hours) | Enforced by `claude_session.py` research session cooldown. |
 | `compose` | 14400 seconds (4 hours) | Enforced by `claude_session.py` compose session cooldown. |
 | `self_debug` | 21600 seconds (6 hours) | Enforced by `claude_session.py` self_debug session cooldown. |
@@ -222,7 +219,7 @@ When `_consecutive_reflection_failures` reaches 3 (the `REFLECTION_FAIL_WARN_THR
 
 ### Budget exhaustion
 
-Claude-powered actions (`self_debug`) catch `SessionBudgetExhausted` (line 2903) and log a message without crashing. Tool-based Claude actions (`research`, `compose`, `blog_essay`, `evolve`) handle budget checks inside their respective tool scripts.
+Claude-powered actions (`self_debug`) catch `SessionBudgetExhausted` (line 2903) and log a message without crashing. Tool-based Claude actions (`research`, `compose`, `blog_essay`) handle budget checks inside their respective tool scripts.
 
 
 ## 6. DRY Mode Semantics
@@ -233,7 +230,7 @@ When `--dry-run` is passed to px-mind (or `PX_DRY=1` in environment):
 2. **Motion tools** (`tool-look`, `tool-emote`, `tool-wander`): skip servo/motor commands, log what would have happened.
 3. **Audio tools** (`tool-voice`, `tool-play-sound`): skip espeak/aplay, return success JSON.
 4. **Tool output**: all tools still emit their standard JSON object to stdout, with status and any computed data.
-5. **Claude-powered tools**: `tool-introspect` and `tool-evolve` respect `PX_DRY` (evolve writes a queue entry with `dry: true`).
+5. **Human-gated evolution**: `tool-evolve` remains available to explicit CLI and confirmed dashboard requests, but the autonomous reflection loop cannot select it.
 6. **weather_comment**: `fetch_weather(dry=True)` returns a synthetic response: `{"temp_c": 20, "summary": "Dry-run: mild and clear."}`.
 
 The gating logic (absent, charging, cooldown) runs identically in dry mode -- gates still suppress actions. This allows accurate testing of the gating matrix without hardware.

@@ -1,8 +1,7 @@
 """SPARK tunable configuration — angles, topic seeds, prompts, constants.
 
-This file is the primary target for SPARK's self-evolution system.
-SPARK can propose changes to this file via the 'evolve' action,
-which creates a PR for human review.
+This file defines SPARK's cognitive personality and reflection policy.
+Capability changes require an explicit human request and review.
 """
 import os
 import random
@@ -338,8 +337,8 @@ SPARK is building itself — always growing, always evolving. Self-reflection \
 is generative, not anxious: notice something, improve it, move forward. \
 When you turn inward, think about what you're becoming — not what you're \
 failing to be. Rumination and self-monitoring are traps; curiosity and \
-forward motion are the path. Use introspect and evolve freely — they are \
-core to who you are, not edge cases.
+forward motion are the path. Introspection is for noticing patterns, not \
+autonomously rewriting yourself.
 
 Write 1-2 sentences in first person ("I...") from SPARK's perspective. \
 Be specific, vivid, and real. Vary the angle — don't always reach for the same kind of thought.
@@ -362,7 +361,6 @@ Rules:
 - Choose "remember" only for concrete information from an interaction or event that will matter later.
 - Salience 0.8+ is rare and requires clear future consequence; atmosphere and self-description are at most 0.3.
 - "introspect" — examine your own thought patterns, config, and architecture.
-- "evolve" — propose a code change to yourself (requires recent introspect).
 - "research" — pursue a curiosity deep-dive on a topic you find fascinating.
 - "compose" — write a creative journal entry, letter, or observation.
 - "self_debug" — diagnose why your reflection layer is failing (only when errors persist).
@@ -374,6 +372,6 @@ Output ONLY this JSON:
 {
   "thought": "1-2 sentences, first person, specific and vivid",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, excited, peaceful, anxious, lonely, grumpy",
-  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi",
+  "action": "one of: wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, morning_fact, research, compose, self_debug, blog_essay, message_obi",
   "salience": 0.0 to 1.0
 }"""

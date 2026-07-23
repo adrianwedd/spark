@@ -622,7 +622,7 @@ def test_valid_actions_includes_new_actions():
         "weather_comment", "scan", "explore",
         "play_sound", "photograph", "emote", "look_around",
         "time_check", "calendar_check", "morning_fact",
-        "introspect", "evolve",
+        "introspect",
         "research", "compose", "self_debug", "blog_essay",
         "message_obi", "announce",
         "set_goal", "update_goal", "complete_goal",
