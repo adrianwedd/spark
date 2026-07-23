@@ -1034,6 +1034,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     dry = args.dry_run or os.environ.get("PX_BLOG_DRY", "0") != "0"
+    automation_enabled = os.environ.get("PX_BLOG_AUTOMATION", "0") == "1"
+    if not args.once and not args.backfill and not automation_enabled:
+        log(
+            "scheduled automation disabled; set PX_BLOG_AUTOMATION=1 to enable "
+            "or use --once/--backfill explicitly"
+        )
+        return 0
 
     # Single-instance guard (PID file)
     STATE_DIR.mkdir(parents=True, exist_ok=True)

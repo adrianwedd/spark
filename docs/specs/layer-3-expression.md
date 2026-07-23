@@ -57,7 +57,6 @@ All valid actions are defined in `VALID_ACTIONS` (line 366 of `mind.py`). There 
 | `introspect` | `tool-introspect` | Computes thought statistics. 30s timeout. |
 | `research` | `tool-research` | Haiku-powered deep dive. Passes thought text as `PX_RESEARCH_QUERY`. 360s timeout. |
 | `compose` | `tool-compose` | Haiku-powered creative writing. Passes thought text as `PX_COMPOSE_TOPIC`. 360s timeout. |
-| `blog_essay` | `tool-blog` | Writes a blog post. Passes thought text as `PX_BLOG_TOPIC`. 360s timeout. |
 | `self_debug` | `run_claude_session()` | Sonnet with read-only tools (`Read,Glob,Grep`). Triggered by consecutive reflection failures. Saves to `state/debug_reports.jsonl`. 600s timeout. Not a subprocess tool -- calls `claude_session.run_claude_session()` directly. |
 
 ### No-op
@@ -75,7 +74,7 @@ Expression is subject to five independent gate checks, evaluated in order at the
 
 Suppressed when `obi_mode` is `absent`, `at-school`, or `at-mums`.
 
-Actions gated: `greet`, `comment`, `weather_comment`, `scan`, `play_sound`, `time_check`, `calendar_check`, `photograph`, `look_around`, `morning_fact`, `explore`, `research`, `compose`, `blog_essay`.
+Actions gated: `greet`, `comment`, `weather_comment`, `scan`, `play_sound`, `time_check`, `calendar_check`, `photograph`, `look_around`, `morning_fact`, `explore`, `research`, `compose`.
 
 ### Gate 2: Calendar-driven modes (lines 2546-2556)
 
@@ -125,7 +124,6 @@ The main loop enforces `EXPRESSION_COOLDOWN_S = 120` seconds (2 minutes) between
 | `introspect` | - | - | Y | Y | - | - |
 | `research` | Y | - | Y | Y | - | - |
 | `compose` | Y | - | Y | Y | - | - |
-| `blog_essay` | Y | - | Y | Y | - | - |
 | `self_debug` | - | - | Y | Y | - | - |
 
 
@@ -195,7 +193,7 @@ Most tools have explicit timeouts passed to `subprocess.run()`:
 | `tool-evolve` | 15s |
 | `tool-describe-scene` (photograph) | 120s |
 | `tool-wander` (explore) | 240s |
-| `tool-research`, `tool-compose`, `tool-blog` | 360s |
+| `tool-research`, `tool-compose` | 360s |
 | `run_claude_session` (self_debug) | 600s |
 
 Long-running tools (`explore`, `photograph`) use `Popen` with SIGTERM-first graceful shutdown: on `TimeoutExpired`, send `SIGTERM`, wait 15s, then `SIGKILL` if still alive. This is necessary because `subprocess.run(timeout=)` sends `SIGKILL` directly, which prevents cleanup (motor stop, servo reset).
@@ -219,7 +217,7 @@ When `_consecutive_reflection_failures` reaches 3 (the `REFLECTION_FAIL_WARN_THR
 
 ### Budget exhaustion
 
-Claude-powered actions (`self_debug`) catch `SessionBudgetExhausted` (line 2903) and log a message without crashing. Tool-based Claude actions (`research`, `compose`, `blog_essay`) handle budget checks inside their respective tool scripts.
+Claude-powered actions (`self_debug`) catch `SessionBudgetExhausted` (line 2903) and log a message without crashing. Tool-based Claude actions (`research`, `compose`) handle budget checks inside their respective tool scripts.
 
 
 ## 6. DRY Mode Semantics

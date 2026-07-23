@@ -623,7 +623,7 @@ def test_valid_actions_includes_new_actions():
         "play_sound", "photograph", "emote", "look_around",
         "time_check", "calendar_check", "morning_fact",
         "introspect",
-        "research", "compose", "self_debug", "blog_essay",
+        "research", "compose", "self_debug",
         "message_obi", "announce",
         "set_goal", "update_goal", "complete_goal",
     }
@@ -717,13 +717,8 @@ def test_explore_injection_after_enum_expansion():
         "_SPARK_REFLECTION_SUFFIX": _SPARK_REFLECTION_SUFFIX,
     }
 
-    # The injection target is the LAST action before the closing quote
-    inject_target = 'blog_essay"'
-    inject_result = 'blog_essay, explore"'
-
     for name, prompt in prompts.items():
-        # Simulate the injection that reflection() does
-        injected = prompt.replace(inject_target, inject_result)
+        injected = pxh.mind._inject_explore(prompt)
         assert "explore" in injected, f"{name} failed: 'explore' not in injected prompt"
 
 

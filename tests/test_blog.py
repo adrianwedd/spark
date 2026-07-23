@@ -448,6 +448,15 @@ def test_skip_backoff_is_reasonable():
     assert backoff <= 600, f"SKIP_BACKOFF_S={backoff} is too long (max 600)"
 
 
+def test_daemon_automation_is_opt_in(blog_mod, monkeypatch):
+    """The always-on service must not spend quota unless explicitly enabled."""
+    ns, state_dir, _ = blog_mod
+    monkeypatch.delenv("PX_BLOG_AUTOMATION", raising=False)
+    ns["run_once"] = MagicMock(side_effect=AssertionError("unexpected generation"))
+    assert ns["main"]([]) == 0
+    assert not (state_dir / "px-blog.pid").exists()
+
+
 # -- Title/body parser (issue #144) --
 
 class TestParseTitleBody:

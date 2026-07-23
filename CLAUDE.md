@@ -155,7 +155,9 @@ Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap.
 
 ### Self-Evolution (px-evolve)
 
-SPARK proposes code changes via GitHub PR. Human approval required — changes never auto-apply.
+Code changes can be requested explicitly through the CLI or confirmed dashboard flow,
+then proposed via GitHub PR. The autonomous reflection loop cannot initiate evolution.
+Human approval is required — changes never auto-apply.
 
 **Safety constraints:**
 - **Whitelist**: `src/pxh/spark_config.py`, `src/pxh/mind.py`, `src/pxh/voice_loop.py`, `bin/tool-*` (new only), `tests/`, `docs/prompts/`
@@ -164,7 +166,10 @@ SPARK proposes code changes via GitHub PR. Human approval required — changes n
 
 ### Blog (px-blog)
 
-Scheduled writer (daily/weekly/monthly/essay) + voice-triggered (`tool-blog`). Posts to `state/blog.json` envelope, served at `GET /api/v1/public/blog`. OG meta rewriting via `site/workers/og-rewrite.js` (same Cloudflare Worker pattern as `/thought/*`).
+Manual writer (`bin/px-blog --once` / `--backfill`, or `tool-blog`). Scheduled
+daily/weekly/monthly generation is off by default after sustained rejection churn;
+set `PX_BLOG_AUTOMATION=1` to opt in. Posts use the `state/blog.json` envelope,
+served at `GET /api/v1/public/blog`.
 
 ### Home Assistant Integration
 
@@ -247,7 +252,7 @@ See `src/pxh/api.py` for full endpoint list.
 | `px-api-server` | `bin/px-api-server` | pi | always, 2s |
 | `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10s |
 | `px-evolve` | `bin/px-evolve` | pi | on-failure, 30s |
-| `px-blog` | `bin/px-blog` | pi | on-failure, 30s |
+| `px-blog` | `bin/px-blog` | pi | exits unless `PX_BLOG_AUTOMATION=1` |
 | `px-tts-glados` | GLaDOS TTS :7861 | pi | always, 10s |
 | `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 10s |
 
