@@ -2868,7 +2868,18 @@ async function doPhoto(){
     const d=document.createElement('div');
     d.style.cssText='max-width:85%;border-radius:18px 18px 18px 4px;background:var(--surface2);align-self:flex-start;overflow:hidden';
     const lab=document.createElement('div');lab.style.cssText='font-size:10px;font-weight:800;color:var(--spark);padding:8px 12px 0';lab.textContent='\u25b8 DESCRIBE SCENE';d.appendChild(lab);
-    if(r.path){const fn=r.path.split('/').pop();const img=document.createElement('img');img.src='/photos/'+fn;img.style.cssText='width:100%;max-width:320px;display:block';d.appendChild(img);}
+    if(r.path){
+      const fn=r.path.split('/').pop();
+      const photo=await fetch('/photos/'+encodeURIComponent(fn),{headers:{'Authorization':'Bearer '+tok()}});
+      if(photo.ok){
+        const img=document.createElement('img');
+        const objectUrl=URL.createObjectURL(await photo.blob());
+        img.src=objectUrl;
+        img.onload=()=>URL.revokeObjectURL(objectUrl);
+        img.style.cssText='width:100%;max-width:320px;display:block';
+        d.appendChild(img);
+      }
+    }
     const p=document.createElement('div');p.style.cssText='padding:8px 12px 12px;font-size:15px;line-height:1.5;font-weight:600;color:var(--text)';p.textContent=desc;d.appendChild(p);
     feed.appendChild(d);feed.scrollTop=feed.scrollHeight;
   }catch(e){th.remove();addMsg('spark','Error: '+e.message,'tool_describe_scene');}
@@ -2976,7 +2987,7 @@ setInterval(pollRaceLive,2000);
 </body></html>"""
 
 
-@app.get("/photos/{filename}")
+@app.get("/photos/{filename}", dependencies=[Depends(_verify_token)])
 async def serve_photo(filename: str):
     from fastapi.responses import FileResponse
     import re

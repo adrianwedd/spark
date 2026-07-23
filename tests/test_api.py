@@ -53,6 +53,32 @@ class TestHealth:
         assert "checks" in data
         assert isinstance(data["checks"], dict)
 
+
+class TestPhotoPrivacy:
+    def test_household_photo_requires_auth(self, api_client, auth_headers, tmp_path, monkeypatch):
+        from pxh import api as api_mod
+
+        photos = tmp_path / "photos"
+        photos.mkdir()
+        (photos / "capture.jpg").write_bytes(b"\xff\xd8private-photo\xff\xd9")
+        monkeypatch.setattr(api_mod, "PROJECT_ROOT", tmp_path)
+
+        assert api_client.get("/photos/capture.jpg").status_code == 401
+        response = api_client.get("/photos/capture.jpg", headers=auth_headers)
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/jpeg"
+        assert response.content == b"\xff\xd8private-photo\xff\xd9"
+
+    def test_photo_filename_guard_still_applies(self, api_client, auth_headers):
+        response = api_client.get("/photos/not-an-image.png", headers=auth_headers)
+        assert response.status_code == 404
+
+    def test_dashboard_loads_photos_with_bearer_token(self, api_client):
+        html = api_client.get("/").text
+        assert "fetch('/photos/'+encodeURIComponent(fn)" in html
+        assert "'Authorization':'Bearer '+tok()" in html
+        assert "URL.createObjectURL(await photo.blob())" in html
+
     def test_health_includes_thoughts_freshness(self, api_client):
         """Health endpoint reports thoughts staleness."""
         r = api_client.get("/api/v1/health")
