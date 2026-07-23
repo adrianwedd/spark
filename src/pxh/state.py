@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import random
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 try:
-    from filelock import FileLock
+    from filelock import FileLock, Timeout as FileLockTimeout
 except ImportError:
     FileLock = None  # deferred — only needed by session lock functions
+    FileLockTimeout = None
 
 from .logging import log_event
 from .time import utc_timestamp
@@ -19,7 +23,12 @@ from .time import utc_timestamp
 _log = logging.getLogger("pxh.state")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-LOCK_TIMEOUT_S = 10  # seconds — fail fast rather than hang forever
+SESSION_LOCK_TIMEOUT_S = 0.25
+SESSION_LOCK_ATTEMPTS = 4
+
+
+class SessionBusyError(RuntimeError):
+    """Raised when a session write cannot acquire its bounded shared lock."""
 
 
 def _trim_corrupt_backups(path: Path, keep: int = 3) -> None:
@@ -198,38 +207,98 @@ def _require_filelock():
         )
 
 
-def ensure_session() -> Path:
+def _session_lock_path(path: Path) -> Path:
+    root = Path(os.environ.get(
+        "PX_SESSION_LOCK_DIR",
+        str(Path(tempfile.gettempdir()) / "pxh-session-locks"),
+    ))
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o1777)
+    except OSError:
+        pass
+    key = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:24]
+    return root / f"{key}.lock"
+
+
+@contextmanager
+def _session_write_lock(path: Path):
     _require_filelock()
+    timeout = float(os.environ.get("PX_SESSION_LOCK_TIMEOUT", SESSION_LOCK_TIMEOUT_S))
+    attempts = int(os.environ.get("PX_SESSION_LOCK_ATTEMPTS", SESSION_LOCK_ATTEMPTS))
+    lock = FileLock(str(_session_lock_path(path)), timeout=timeout, mode=0o666)
+    for attempt in range(max(1, attempts)):
+        try:
+            lock.acquire()
+            try:
+                _session_lock_path(path).chmod(0o666)
+            except OSError:
+                pass
+            break
+        except FileLockTimeout as exc:
+            if attempt + 1 >= attempts:
+                raise SessionBusyError(
+                    f"session state busy after {max(1, attempts)} bounded attempts"
+                ) from exc
+            time.sleep(random.uniform(0.01, 0.04))
+    try:
+        yield
+    finally:
+        if lock.is_locked:
+            lock.release()
+
+
+def _read_session_snapshot(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default_state()
+
+
+def _load_session_for_write(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        if TEMPLATE_PATH.exists():
+            try:
+                return json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return default_state()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = default_state()
+        corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
+        try:
+            path.rename(corrupt_backup)
+        except OSError:
+            pass
+        _trim_corrupt_backups(path, keep=3)
+        log_event(
+            "state-corruption",
+            {"path": str(path), "message": "session.json was corrupt; reset to default state"},
+        )
+        return data
+
+
+def ensure_session() -> Path:
     path = session_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    with _session_write_lock(path):
         if not path.exists():
-            if TEMPLATE_PATH.exists():
-                atomic_write(path, TEMPLATE_PATH.read_text(encoding="utf-8"))
-            else:
-                atomic_write(path, json.dumps(default_state(), indent=2) + "\n")
+            data = _load_session_for_write(path)
+            atomic_write(path, json.dumps(data, indent=2) + "\n")
     return path
 
 
 def load_session() -> Dict[str, Any]:
-    path = ensure_session()
-    lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    """Read an atomic session snapshot without waiting for a writer."""
+    path = session_path()
+    if not path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            _log.warning("session.json corrupt — resetting to defaults: %s", path)
-            corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
-            try:
-                path.rename(corrupt_backup)
-                _log.warning("corrupt session backed up to %s", corrupt_backup)
-            except OSError:
-                pass
-            _trim_corrupt_backups(path, keep=3)
-            data = default_state()
-            atomic_write(path, json.dumps(data, indent=2) + "\n")
-            return data
+            ensure_session()
+        except SessionBusyError:
+            return default_state()
+    return _read_session_snapshot(path)
 
 
 def load_session_readonly() -> Dict[str, Any]:
@@ -239,17 +308,13 @@ def load_session_readonly() -> Dict[str, Any]:
     os.replace — readers always see a complete file. May return slightly
     stale data during a concurrent write, which is acceptable for display.
     """
-    path = session_path()
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default_state()
+    return _read_session_snapshot(session_path())
 
 
 def save_session(data: Dict[str, Any]) -> None:
-    path = ensure_session()
-    lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    path = session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _session_write_lock(path):
         atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
@@ -258,21 +323,10 @@ def update_session(
     history_entry: Optional[Dict[str, Any]] = None,
     history_limit: int = 100,
 ) -> Dict[str, Any]:
-    # Call ensure_session BEFORE acquiring the lock — ensure_session acquires
-    # the same lock internally and FileLock is not reentrant.
-    path = ensure_session()
-    lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = default_state()
-            corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
-            try:
-                path.rename(corrupt_backup)
-            except OSError:
-                pass
-            log_event("state-corruption", {"path": str(path), "message": "session.json was corrupt; reset to default state"})
+    path = session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _session_write_lock(path):
+        data = _load_session_for_write(path)
 
         if fields:
             data.update(fields)

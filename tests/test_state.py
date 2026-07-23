@@ -1,6 +1,9 @@
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pxh.state as state
+import pytest
 
 def test_update_session_appends_history(tmp_path, monkeypatch):
     session_file = tmp_path / "session.json"
@@ -18,6 +21,79 @@ def test_update_session_appends_history(tmp_path, monkeypatch):
     data = state.load_session()
     assert len(data["history"]) == 100
     assert data["history"][0]["event"].startswith("e")
+
+
+def test_session_reads_do_not_wait_for_write_lock(tmp_path, monkeypatch):
+    from filelock import FileLock
+
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    monkeypatch.setenv("PX_SESSION_LOCK_DIR", str(tmp_path / "locks"))
+    state.save_session({"persona": "spark", "history": []})
+
+    holder = FileLock(str(state._session_lock_path(session_file)), mode=0o666)
+    holder.acquire()
+    try:
+        started = time.monotonic()
+        data = state.load_session()
+        elapsed = time.monotonic() - started
+    finally:
+        holder.release()
+
+    assert data["persona"] == "spark"
+    assert elapsed < 0.1
+
+
+def test_session_write_contention_is_bounded(tmp_path, monkeypatch):
+    from filelock import FileLock
+
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    monkeypatch.setenv("PX_SESSION_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("PX_SESSION_LOCK_TIMEOUT", "0.03")
+    monkeypatch.setenv("PX_SESSION_LOCK_ATTEMPTS", "2")
+    state.save_session({"history": []})
+
+    holder = FileLock(str(state._session_lock_path(session_file)), mode=0o666)
+    holder.acquire()
+    try:
+        started = time.monotonic()
+        with pytest.raises(state.SessionBusyError):
+            state.update_session(fields={"mode": "live"})
+        elapsed = time.monotonic() - started
+    finally:
+        holder.release()
+
+    assert elapsed < 0.2
+
+
+def test_session_lock_is_cross_user_writable(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    monkeypatch.setenv("PX_SESSION_LOCK_DIR", str(tmp_path / "locks"))
+
+    state.update_session(fields={"mode": "live"})
+
+    lock_path = state._session_lock_path(session_file)
+    assert lock_path.stat().st_mode & 0o777 == 0o666
+    assert lock_path.parent != session_file.parent
+
+
+def test_concurrent_session_updates_preserve_history(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    monkeypatch.setenv("PX_SESSION_LOCK_DIR", str(tmp_path / "locks"))
+    monkeypatch.setenv("PX_SESSION_LOCK_TIMEOUT", "0.5")
+    monkeypatch.setenv("PX_SESSION_LOCK_ATTEMPTS", "10")
+
+    def append(index: int):
+        state.update_session(history_entry={"event": f"worker-{index}"}, history_limit=100)
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        list(executor.map(append, range(30)))
+
+    events = {entry["event"] for entry in state.load_session()["history"]}
+    assert events == {f"worker-{index}" for index in range(30)}
 
 
 def test_rotate_log_under_threshold(tmp_path):

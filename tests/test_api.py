@@ -179,6 +179,25 @@ class TestSession:
         )
         assert resp.status_code == 400
 
+    def test_session_contention_returns_retryable_503(
+        self, api_client, auth_headers, monkeypatch
+    ):
+        from pxh import api
+        from pxh.state import SessionBusyError
+
+        def busy_update(**kwargs):
+            raise SessionBusyError("busy")
+
+        monkeypatch.setattr(api, "update_session", busy_update)
+        response = api_client.patch(
+            "/api/v1/session",
+            headers=auth_headers,
+            json={"listening": True},
+        )
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        assert response.json()["status"] == "busy"
+
 
 # -- Tool execution --
 

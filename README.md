@@ -374,7 +374,7 @@ The persona is derived at runtime from `session.json → persona` in every proce
 
 ### 9. Session State — The Shared Source of Truth
 
-`state/session.json` is the nervous system of the whole platform. Every process reads and writes it; all writes go through `FileLock` to prevent corruption:
+`state/session.json` is the nervous system of the whole platform. Writers serialize once through a short, cross-user lock in `/tmp/pxh-session-locks`; atomic `os.replace` lets readers take complete snapshots without waiting. Contention retries are bounded, and authenticated API writes return retryable `503` responses rather than stalling for ten seconds.
 
 ```json
 {
@@ -621,7 +621,7 @@ Persona routing is session-only. The child deployment accepts SPARK; adult deplo
 
 | Module | Purpose |
 |--------|---------|
-| `state.py` | Thread-safe `session.json` via `FileLock`. `atomic_write()`, `rotate_log()`, `ensure_session()`. |
+| `state.py` | Lock-free atomic session reads, bounded cross-user write locking, `atomic_write()`, and log rotation. |
 | `mind.py` | Cognitive loop daemon (3,300+ lines). Three-layer architecture: awareness, reflection, expression. `bin/px-mind` is a thin launcher. |
 | `voice_loop.py` | Supervisor loop. `ALLOWED_TOOLS` whitelist, `TOOL_COMMANDS` dispatch, `validate_action()`. Watchdog (30s) in voice mode only. |
 | `api.py` | FastAPI app, port 8420. In-memory job registry for async wander. Single-worker only. |
@@ -753,7 +753,7 @@ picar-x-hacking/
 │   ├── run-voice-loop{,-claude,-ollama}  # Voice backend launchers
 │   └── claude-voice-bridge       # Claude stdin adapter
 ├── src/pxh/                      # Python library (10 modules)
-│   ├── state.py                  # FileLock session, atomic_write, rotate_log
+│   ├── state.py                  # Atomic session snapshots + bounded writer lock
 │   ├── mind.py                   # Cognitive loop daemon (3,300+ lines)
 │   ├── voice_loop.py             # Supervisor + tool dispatch
 │   ├── api.py                    # FastAPI REST API

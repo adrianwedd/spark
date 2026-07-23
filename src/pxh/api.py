@@ -32,7 +32,14 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .persona_policy import ADULT_PERSONAS, allowed_session_personas, runtime_persona
-from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
+from .state import (
+    SessionBusyError,
+    atomic_write,
+    load_session,
+    load_session_readonly,
+    update_session,
+    tail_lines,
+)
 from .time import utc_timestamp
 from .voice_loop import (
     ALLOWED_TOOLS,
@@ -1367,6 +1374,15 @@ from fastapi.exceptions import RequestValidationError
 @app.exception_handler(RequestValidationError)
 async def _validation_error_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=400, content={"error": str(exc.errors()[0]["msg"])})
+
+
+@app.exception_handler(SessionBusyError)
+async def _session_busy_handler(request: Request, exc: SessionBusyError):
+    return JSONResponse(
+        status_code=503,
+        content={"status": "busy", "error": "session state is briefly busy; retry"},
+        headers={"Retry-After": "1"},
+    )
 
 
 def _sanitize_chat_text(text: str) -> str:
