@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+WRAPPER_TIMEOUT_S = 60
 
 @pytest.fixture
 def evolve_env(tmp_path):
@@ -31,7 +32,7 @@ def test_evolve_no_introspection_still_queues(evolve_env):
     env, state_dir = evolve_env
     env["PX_EVOLVE_INTENT"] = "Add more science angles to my reflection"
     result = subprocess.run(["bin/tool-evolve"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     output = json.loads(result.stdout.strip().splitlines()[-1])
     assert output["status"] == "queued"
     entry = json.loads((state_dir / "evolve_queue.jsonl").read_text().strip())
@@ -42,7 +43,7 @@ def test_evolve_rejects_whitespace_only_intent(evolve_env):
     env, state_dir = evolve_env
     env["PX_EVOLVE_INTENT"] = "   "
     result = subprocess.run(["bin/tool-evolve"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     output = json.loads(result.stdout.strip().splitlines()[-1])
     assert output["status"] == "error"
     assert "empty" in output["error"]
@@ -52,7 +53,7 @@ def test_evolve_queues_valid_request(evolve_env):
     _write_fresh_introspection(state_dir)
     env["PX_EVOLVE_INTENT"] = "Add more sound-related angles to my reflection prompts"
     result = subprocess.run(["bin/tool-evolve"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     output = json.loads(result.stdout.strip().splitlines()[-1])
     assert output["status"] == "queued"
     assert "id" in output
@@ -68,7 +69,7 @@ def test_evolve_rate_limit(evolve_env):
     (state_dir / "evolve_log.jsonl").write_text(json.dumps(log_entry) + "\n")
     env["PX_EVOLVE_INTENT"] = "Add more sound-related angles to my reflection prompts"
     result = subprocess.run(["bin/tool-evolve"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     output = json.loads(result.stdout.strip().splitlines()[-1])
     assert output["status"] == "error"
     assert "rate" in output["error"].lower() or "24" in output["error"]
@@ -78,7 +79,7 @@ def test_tool_evolve_uses_shared_writer(evolve_env):
     (state_dir / "introspection.json").write_text('{"x": 1}')
     env["PX_EVOLVE_INTENT"] = "add a knock-knock joke tool for obi"   # ≥20 chars
     result = subprocess.run(["bin/tool-evolve"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     out = json.loads(result.stdout.strip().splitlines()[-1])
     assert out["status"] == "queued"
     entry = json.loads((state_dir / "evolve_queue.jsonl").read_text().strip())

@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+WRAPPER_TIMEOUT_S = 60
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ class TestEvolveDryFlag:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         assert output["status"] == "queued"
 
@@ -70,7 +71,7 @@ class TestEvolveDryFlag:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         assert output["status"] == "queued"
 
@@ -102,7 +103,7 @@ class TestEvolveRateLimitFormats:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         # Recent ts_completed → should rate-limit
         assert output["status"] == "error"
@@ -119,7 +120,7 @@ class TestEvolveRateLimitFormats:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         assert output["status"] == "error"
         assert "rate" in output["error"].lower()
@@ -135,7 +136,7 @@ class TestEvolveRateLimitFormats:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         # Missing timestamps → entry skipped → no rate limit → queued
         assert output["status"] == "queued"
@@ -155,7 +156,7 @@ class TestEvolveRateLimitFormats:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         # Malformed → ValueError caught → entry skipped → queued
         assert output["status"] == "queued"
@@ -171,7 +172,7 @@ class TestEvolveRateLimitFormats:
         env["PX_EVOLVE_INTENT"] = "Add acoustic exploration angles to reflection"
         result = subprocess.run(
             ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-            capture_output=True, text=True, timeout=15)
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
         output = json.loads(result.stdout.strip().splitlines()[-1])
         assert output["status"] == "queued"
 

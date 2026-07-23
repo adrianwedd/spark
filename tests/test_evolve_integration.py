@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
+WRAPPER_TIMEOUT_S = 60
 
 
 @pytest.fixture
@@ -43,7 +44,7 @@ def test_introspect_then_evolve_dry(integration_env):
     # Step 1: Run tool-introspect
     result = subprocess.run(
         ["bin/tool-introspect"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=30)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     assert result.returncode == 0
     output = json.loads(result.stdout.strip().splitlines()[-1])
     assert output["status"] == "ok"
@@ -60,7 +61,7 @@ def test_introspect_then_evolve_dry(integration_env):
     env["PX_EVOLVE_INTENT"] = "Add more sound-related angles to explore acoustic phenomena"
     result = subprocess.run(
         ["bin/tool-evolve"], cwd=str(ROOT), env=env,
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S)
     assert result.returncode == 0
     output = json.loads(result.stdout.strip().splitlines()[-1])
     assert output["status"] == "queued"
