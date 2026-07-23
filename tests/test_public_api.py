@@ -27,6 +27,8 @@ def public_client(isolated_project, monkeypatch):
     monkeypatch.setenv("PROJECT_ROOT", str(ROOT))
 
     from pxh import api
+    api._public_rate_store.clear()
+    api._rate_limit_store.clear()
     api._load_token()
 
     from fastapi.testclient import TestClient

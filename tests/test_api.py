@@ -31,6 +31,8 @@ def api_client(isolated_project, monkeypatch):
 
     from pxh import api
     monkeypatch.setattr(api, "FORCE_DRY", True)
+    api._public_rate_store.clear()
+    api._rate_limit_store.clear()
     api._load_token()
 
     from fastapi.testclient import TestClient
