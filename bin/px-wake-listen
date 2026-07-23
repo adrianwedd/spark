@@ -76,27 +76,11 @@ else:
     except Exception:
         DEFAULT_WAKE = "hey robot"
 
-# Persona config: prompt file, voice settings, and fallback chat tool
-PERSONAS = {
-    "vixen": {
-        "prompt": str(PROJECT_ROOT / "docs" / "prompts" / "persona-vixen.md"),
-        "chat_tool": str(PROJECT_ROOT / "bin" / "tool-chat-vixen"),
-        "voice_env": {
-            "PX_VOICE_VARIANT": "en+f4",
-            "PX_VOICE_PITCH": "72",
-            "PX_VOICE_RATE": "135",
-        },
-    },
-    "gremlin": {
-        "prompt": str(PROJECT_ROOT / "docs" / "prompts" / "persona-gremlin.md"),
-        "chat_tool": str(PROJECT_ROOT / "bin" / "tool-chat"),
-        "voice_env": {
-            "PX_VOICE_VARIANT": "en+croak",
-            "PX_VOICE_PITCH": "20",
-            "PX_VOICE_RATE": "180",
-        },
-    },
-} if adult_personas_enabled() else {}
+PERSONAS = {}
+if adult_personas_enabled():
+    from pxh.adult_personas import wake_personas
+
+    PERSONAS = wake_personas(PROJECT_ROOT)
 DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-claude")
 DEFAULT_STT_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-streaming-zipformer-en-2023-06-26")
 DEFAULT_SENSEVOICE_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
