@@ -6,8 +6,7 @@ Requires:
   - px-alive systemd service running (tests will yield it via SIGUSR1)
   - sudo access (PX_BYPASS_SUDO is NOT set)
 
-Run with:  sudo .venv/bin/python -m pytest tests/test_tools_live.py -v -s
-Skip with: pytest -m "not live"
+Run with:  sudo .venv/bin/python -m pytest tests/test_tools_live.py --run-live -v -s
 """
 import json
 import os
@@ -36,10 +35,13 @@ def _is_hardware_available():
         return False
 
 
-# Skip the entire module if hardware is not available
-_hw_ok = _is_hardware_available()
-if not _hw_ok:
-    pytestmark = [pytestmark, pytest.mark.skip(reason="PiCar-X hardware not available")]
+@pytest.fixture(scope="module", autouse=True)
+def require_live_hardware(request):
+    """Probe hardware only after the operator explicitly enables live tests."""
+    if not request.config.getoption("--run-live"):
+        pytest.skip("requires explicit --run-live opt-in")
+    if not _is_hardware_available():
+        pytest.skip("PiCar-X hardware not available")
 
 
 def live_env(**extra):

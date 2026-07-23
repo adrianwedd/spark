@@ -277,13 +277,22 @@ def test_tool_frigate_events_dry_run(isolated_project):
 
 def test_tool_frigate_events_unreachable(isolated_project):
     """tool-frigate-events should fail gracefully when Frigate is not reachable."""
+    import socket
+
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    unused_port = probe.getsockname()[1]
+
     env = isolated_project["env"].copy()
-    env["PX_FRIGATE_HOST"] = "http://127.0.0.1:19999"  # nothing listening there
-    result = subprocess.run(
-        ["bin/tool-frigate-events"],
-        cwd=PROJECT_ROOT,
-        capture_output=True, text=True, env=env, timeout=10,
-    )
+    env["PX_FRIGATE_HOST"] = f"http://127.0.0.1:{unused_port}"
+    try:
+        result = subprocess.run(
+            ["bin/tool-frigate-events"],
+            cwd=PROJECT_ROOT,
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+    finally:
+        probe.close()
     payload = parse_json(result.stdout.strip())
     assert payload["status"] == "error"
     assert "frigate" in payload["error"].lower() or "reach" in payload["error"].lower()

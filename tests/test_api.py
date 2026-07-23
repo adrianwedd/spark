@@ -623,23 +623,32 @@ class TestServiceControl:
         assert "confirm" in resp.json()["error"]
 
     def test_service_stop_with_confirm(self, api_client, auth_headers):
-        """POST /services/{name}/stop with confirm passes gate (may fail on systemctl)."""
-        resp = api_client.post(
-            "/api/v1/services/px-alive/stop",
-            headers=auth_headers,
-            json={"confirm": True},
-        )
-        # Won't be 400 — confirm gate passed (may be 200 or 500 depending on systemctl)
-        assert resp.status_code != 400
+        """Confirmed stop is simulated while the API is in dry mode."""
+        with unittest.mock.patch("pxh.api.subprocess.run") as mock_run:
+            resp = api_client.post(
+                "/api/v1/services/px-alive/stop",
+                headers=auth_headers,
+                json={"confirm": True},
+            )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "status": "ok",
+            "service": "px-alive",
+            "action": "stop",
+            "dry": True,
+        }
+        mock_run.assert_not_called()
 
     def test_service_start_no_confirm_needed(self, api_client, auth_headers):
-        """POST /services/{name}/start does not require confirm."""
-        resp = api_client.post(
-            "/api/v1/services/px-alive/start",
-            headers=auth_headers,
-        )
-        # start doesn't require confirm — should not be 400 for missing confirm
-        assert resp.status_code != 400 or "confirm" not in resp.json().get("error", "")
+        """Start needs no confirmation and is simulated in dry mode."""
+        with unittest.mock.patch("pxh.api.subprocess.run") as mock_run:
+            resp = api_client.post(
+                "/api/v1/services/px-alive/start",
+                headers=auth_headers,
+            )
+        assert resp.status_code == 200
+        assert resp.json()["dry"] is True
+        mock_run.assert_not_called()
 
 
 class TestPinVerify:

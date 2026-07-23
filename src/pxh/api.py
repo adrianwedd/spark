@@ -2119,6 +2119,13 @@ _MANAGED_SERVICES = {"px-alive", "px-wake-listen", "px-mind", "px-api-server"}
 
 def _run_systemctl(action: str, service: str) -> Dict[str, Any]:
     """Run systemctl {action} {service}. Returns status dict."""
+    if _resolve_dry(None):
+        return {
+            "status": "ok",
+            "service": service,
+            "action": action,
+            "dry": True,
+        }
     try:
         result = subprocess.run(
             ["sudo", "systemctl", action, service],

@@ -220,16 +220,17 @@ def main() -> int:
 
     # ── Evolve PR outcomes ────────────────────────────────────────
     evolve_outcomes = []
-    try:
-        pr_result = subprocess.run(
-            ["gh", "pr", "list", "--state", "all", "--search", "head:spark/evolve-",
-             "--json", "number,state,title,mergedAt", "--limit", "5"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if pr_result.returncode == 0:
-            evolve_outcomes = json.loads(pr_result.stdout)
-    except Exception:
-        pass
+    if not dry_mode:
+        try:
+            pr_result = subprocess.run(
+                ["gh", "pr", "list", "--state", "all", "--search", "head:spark/evolve-",
+                 "--json", "number,state,title,mergedAt", "--limit", "5"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if pr_result.returncode == 0:
+                evolve_outcomes = json.loads(pr_result.stdout)
+        except Exception:
+            pass
 
     # ── Assemble introspection payload ─────────────────────────────
     introspection = {
