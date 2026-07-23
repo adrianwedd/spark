@@ -164,12 +164,12 @@ def _is_night_silence(hour: int) -> bool:
     return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
 
 
-def _dispatch_announce(text: str, private: bool = False) -> None:
-    """Fire bin/tool-announce off the critical path (non-blocking). No-op if disabled."""
+def _dispatch_announce(text: str, private: bool = False) -> str:
+    """Fire bin/tool-announce off the critical path and report what happened."""
     if not spark_config.ANNOUNCE_ENABLED:
-        return
+        return "suppressed: announcements disabled"
     if not text or not text.strip():
-        return
+        return "failed: empty announcement"
     env = os.environ.copy()
     env["PX_ANNOUNCE_TEXT"] = text.strip()[:spark_config.ANNOUNCE_MAX_CHARS]
     if private:
@@ -178,8 +178,10 @@ def _dispatch_announce(text: str, private: bool = False) -> None:
         subprocess.Popen([str(BIN_DIR / "tool-announce")], env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log("expression: announce dispatched (non-blocking)")
+        return "ok"
     except Exception as e:
         log(f"expression: announce dispatch failed: {e}")
+        return f"failed: announce dispatch: {e}"
 
 
 def _daytime_action_hint(hour_override: int | None = None) -> str:
@@ -2529,6 +2531,14 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     persona = runtime_persona(awareness.get("persona") or session.get("persona"))
     recent_thoughts = load_recent_thoughts(20, persona=persona)
     recent_history = (session.get("history") or [])[-5:]
+    recent_outcomes = [
+        {
+            "action": item.get("action"),
+            "outcome": item.get("outcome"),
+        }
+        for item in recent_history
+        if item.get("event") == "mind" and item.get("outcome")
+    ]
     notes = load_notes(3, persona=persona)
     focus = _reflection_focus(awareness)
 
@@ -2547,6 +2557,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         f"Recent events:\n{json.dumps(recent_history, indent=2)}",
         f"Attention mode: {focus}.",
     ]
+    if recent_outcomes:
+        context_parts.append(
+            "Recent action outcomes:\n"
+            f"{json.dumps(recent_outcomes, indent=2)}\n"
+            "Use these results: do not repeat a failed or suppressed action unless "
+            "the relevant conditions have changed."
+        )
 
     ambient_recent = sum(
         _is_ambient_rumination(str(item.get("thought", "")))
@@ -2999,11 +3016,11 @@ def _write_obi_chat_meta(meta: dict) -> None:
         log(f"obi_chat: failed to write meta: {exc}")
 
 
-def _emit_message_obi(text: str) -> None:
+def _emit_message_obi(text: str) -> str:
     """Write a message_obi nudge (with exponential backoff) and announce it to Obi."""
     if not text:
         log("expression: message_obi has no text — skipping")
-        return
+        return "failed: empty message"
     now_ts = time.time()
     last_spark_ts, last_obi_ts = _read_obi_chat_timestamps()
     meta = _read_obi_chat_meta()
@@ -3019,7 +3036,7 @@ def _emit_message_obi(text: str) -> None:
         if elapsed < backoff_s:
             log(f"expression: suppressed message_obi — awaiting reply "
                 f"(backoff {backoff_s:.0f}s, elapsed {elapsed:.0f}s)")
-            return                                       # suppressed -> NO announce
+            return "suppressed: awaiting Obi reply"
         # Nudge: backoff expired, double for next time
         backoff_s = min(backoff_s * 2, OBI_CHAT_MAX_BACKOFF_S)
         log(f"expression: message_obi nudge — backoff doubled to {backoff_s:.0f}s")
@@ -3030,8 +3047,11 @@ def _emit_message_obi(text: str) -> None:
     entry = {"id": msg_id, "ts": utc_timestamp(), "role": "spark", "text": text[:500]}
     _append_obi_chat(entry)
     _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
-    _dispatch_announce(text, private=True)               # Obi HEARS the DM in the data voice
+    announce_outcome = _dispatch_announce(text, private=True)
     log(f"expression: message_obi written (id={msg_id})")
+    if announce_outcome.startswith("failed:"):
+        return f"partial: message written; {announce_outcome}"
+    return "ok"
 
 
 def _tool_outcome(result) -> str:
@@ -3049,13 +3069,36 @@ def _tool_outcome(result) -> str:
     return f"failed: {out.get('error', 'unknown error')}"
 
 
-def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
+def _record_expression_outcome(thought: dict, outcome: str) -> str:
+    """Persist the link between a chosen action and what actually happened."""
+    history_entry = {
+        "event": "mind",
+        "thought_ts": thought.get("ts"),
+        "mood": thought.get("mood", ""),
+        "action": thought.get("action", "wait"),
+        "thought": thought.get("thought", ""),
+        "outcome": outcome,
+    }
+    try:
+        update_session(
+            fields={
+                "last_action": "px_mind",
+                "last_action_outcome": outcome,
+            },
+            history_entry=history_entry,
+        )
+    except Exception as exc:
+        log(f"expression: outcome persistence failed: {exc}")
+    return outcome
+
+
+def expression(thought: dict, dry: bool, awareness: dict | None = None) -> str:
     """Layer 3: act on a thought."""
     global _last_spoken_text, _last_morning_fact_date
 
     action = thought.get("action", "wait")
     if action == "wait":
-        return
+        return _record_expression_outcome(thought, "suppressed: wait selected")
 
     # Hard night silence: 19:00–07:00 Hobart time — unconditional, no sensor
     # dependencies. Silent cognitive actions are exempt (NIGHT_ALLOWED_ACTIONS).
@@ -3064,7 +3107,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         if action not in NIGHT_ALLOWED_ACTIONS:
             log(f"expression: suppressed {action} — night silence "
                 f"({NIGHT_SILENCE_START_H:02d}:00–{NIGHT_SILENCE_END_H:02d}:00)")
-            return
+            return _record_expression_outcome(thought, "suppressed: night silence")
 
     # Gate speech on obi_mode: at night when Obi is absent, suppress non-essential actions
     _aw = awareness or {}
@@ -3077,26 +3120,26 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     log(f"expression: obi_mode={_obi_mode} hour={_aw.get('hour','?')} action={action}")
     if _obi_mode == "absent" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — obi_mode=absent (night, Obi likely asleep)")
-        return
+        return _record_expression_outcome(thought, "suppressed: Obi absent")
     if _obi_mode == "at-school" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — Obi at school (calendar)")
-        return
+        return _record_expression_outcome(thought, "suppressed: Obi at school")
     if _obi_mode == "at-mums" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — Obi at Mum's (calendar)")
-        return
+        return _record_expression_outcome(thought, "suppressed: Obi at Mum's")
 
     # Calendar-driven mode shifts
     _cal = _aw.get("calendar", {}) if isinstance(_aw, dict) else {}
     _current_event = (_cal.get("current_event") or "").lower()
     if "decompress" in _current_event and action in ("greet", "comment", "scan", "calendar_check"):
         log(f"expression: suppressed {action} — after-school decompress (low-demand mode)")
-        return
+        return _record_expression_outcome(thought, "suppressed: decompression")
     if "quiet time" in _current_event:
         log(f"expression: suppressed {action} — quiet time (calendar)")
-        return
+        return _record_expression_outcome(thought, "suppressed: quiet time")
     if "bedtime" in _current_event and action not in ("wait", "remember"):
         log(f"expression: suppressed {action} — bedtime routine (calm mode)")
-        return
+        return _record_expression_outcome(thought, "suppressed: bedtime")
 
     # Suppress speech when Adrian is on a call or mic is active
     ha_ctx = _aw.get("ha_context") or {}
@@ -3104,7 +3147,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         if action in ("greet", "greet_arrival", "comment", "weather_comment", "play_sound",
                        "time_check", "calendar_check", "photograph"):
             log(f"expression: suppressed {action} — Adrian on call/mic active")
-            return
+            return _record_expression_outcome(thought, "suppressed: Adrian on call")
 
     # Gate on charging: suppress servo-related actions when plugged in
     try:
@@ -3114,7 +3157,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         _charging = False
     if _charging and action in CHARGING_GATED_ACTIONS:
         log(f"expression: suppressed {action} — battery charging")
-        return
+        return _record_expression_outcome(thought, "suppressed: charging")
 
     text = thought.get("thought", "")
     env = os.environ.copy()
@@ -3142,24 +3185,24 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
 
     # Cognitive tools report success/failure via JSON stdout; recorded into
     # session history so the next reflection can see what actually happened.
-    outcome: str | None = None
+    outcome = "ok"
 
     try:
         if action == "greet":
             # Use tool-voice (not tool-perform) to avoid GPIO collision with px-alive
             env["PX_TEXT"] = text[:2000]
-            _run_voice(env, label="greet")
+            outcome = _tool_outcome(_run_voice(env, label="greet"))
             _last_spoken_text = text[:200]
 
         elif action == "greet_arrival":
             # Greet someone who just arrived home (reactive response from Find Hub transition)
             env["PX_TEXT"] = text[:2000]
-            _run_voice(env, label="greet_arrival")
+            outcome = _tool_outcome(_run_voice(env, label="greet_arrival"))
             _last_spoken_text = text[:200]
 
         elif action == "comment":
             env["PX_TEXT"] = text[:2000]
-            _run_voice(env, label="comment")
+            outcome = _tool_outcome(_run_voice(env, label="comment"))
             _last_spoken_text = text[:200]
 
         elif action == "weather_comment":
@@ -3169,39 +3212,47 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 env["PX_TEXT"] = weather["summary"][:2000]
             else:
                 env["PX_TEXT"] = text[:2000]
-            _run_voice(env, label="weather_comment")
+            outcome = _tool_outcome(_run_voice(env, label="weather_comment"))
             _last_spoken_text = env["PX_TEXT"][:200]
 
         elif action == "morning_fact":
             today = dt.datetime.now(HOBART_TZ).strftime("%Y-%m-%d")
             if _last_morning_fact_date == today:
                 log("expression: morning_fact already told today — skipping")
+                outcome = "suppressed: morning fact already told"
             elif text:
                 _last_morning_fact_date = today
                 env["PX_TEXT"] = text[:2000]
-                _run_voice(env, label="morning_fact")
+                outcome = _tool_outcome(_run_voice(env, label="morning_fact"))
                 _last_spoken_text = text[:200]
+            else:
+                outcome = "failed: empty morning fact"
 
         elif action == "scan":
             # Awareness already reads sonar every 30s; just speak the thought
             if text:
                 env["PX_TEXT"] = text[:2000]
-                _run_voice(env, label="scan")
+                outcome = _tool_outcome(_run_voice(env, label="scan"))
                 _last_spoken_text = text[:200]
+            else:
+                outcome = "failed: empty scan comment"
 
         elif action == "remember":
             env["PX_NOTE"] = text[:500]
-            subprocess.run(
+            result = subprocess.run(
                 [str(BIN_DIR / "tool-remember")],
                 capture_output=True, text=True, check=False, env=env, timeout=10,
             )
+            outcome = _tool_outcome(result)
 
         elif action == "look_at":
             # px-alive handles physical servo movement; px-mind just speaks the thought
             if text:
                 env["PX_TEXT"] = text[:2000]
-                _run_voice(env, label="look_at")
+                outcome = _tool_outcome(_run_voice(env, label="look_at"))
                 _last_spoken_text = text[:200]
+            else:
+                outcome = "failed: empty look comment"
 
         elif action == "explore":
             log("expression: initiating exploration")
@@ -3213,7 +3264,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 pass
             if not _can_explore(session, awareness_data):
                 log("expression: explore gates failed on re-check")
-                return
+                return _record_expression_outcome(thought, "suppressed: explore safety gate")
 
             # Update exploration_meta (establishes cooldown)
             meta_path = STATE_DIR / "exploration_meta.json"
@@ -3260,10 +3311,17 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                         explore_result = json.loads(stdout.strip().splitlines()[-1])
                         obs = explore_result.get("observations", 0)
                         log(f"expression: exploration complete — {obs} observations")
+                        outcome = (
+                            "ok"
+                            if explore_result.get("status") == "ok"
+                            else f"failed: {explore_result.get('error', 'exploration error')}"
+                        )
                     except (json.JSONDecodeError, IndexError):
                         log(f"expression: exploration finished (rc={proc.returncode})")
+                        outcome = "ok" if proc.returncode == 0 else f"failed: rc={proc.returncode}"
             except Exception as exc:
                 log(f"expression: exploration error: {exc}")
+                outcome = f"failed: {exc}"
 
             # Post-exploration thought
             try:
@@ -3283,8 +3341,9 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         elif action == "play_sound":
             sound = MOOD_TO_SOUND.get(thought.get("mood", ""), "chime")
             env["PX_SOUND"] = sound
-            subprocess.run([str(BIN_DIR / "tool-play-sound")],
-                           capture_output=True, text=True, check=False, env=env, timeout=15)
+            result = subprocess.run([str(BIN_DIR / "tool-play-sound")],
+                                    capture_output=True, text=True, check=False, env=env, timeout=15)
+            outcome = _tool_outcome(result)
 
         elif action == "photograph":
             # tool-describe-scene is self-contained: yield_alive, capture, vision, speak
@@ -3294,6 +3353,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
             try:
                 proc.communicate(timeout=120)
+                outcome = "ok" if proc.returncode == 0 else f"failed: rc={proc.returncode}"
             except subprocess.TimeoutExpired:
                 log("expression: photograph timed out — sending SIGTERM")
                 proc.terminate()
@@ -3303,31 +3363,38 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                     log("expression: photograph SIGTERM ignored — SIGKILL")
                     proc.kill()
                     proc.communicate()
+                outcome = "failed: photograph timeout"
 
         elif action == "emote":
             emote_name = MOOD_TO_EMOTE.get(thought.get("mood", ""), "idle")
             env["PX_EMOTE"] = emote_name
-            subprocess.run([str(BIN_DIR / "tool-emote")],
-                           capture_output=True, text=True, check=False, env=env, timeout=15)
+            result = subprocess.run([str(BIN_DIR / "tool-emote")],
+                                    capture_output=True, text=True, check=False, env=env, timeout=15)
+            outcome = _tool_outcome(result)
 
         elif action == "look_around":
             env["PX_PAN"] = str(_SYS_RNG.randint(-40, 40))
             env["PX_TILT"] = str(_SYS_RNG.randint(-10, 30))
-            subprocess.run([str(BIN_DIR / "tool-look")],
-                           capture_output=True, text=True, check=False, env=env, timeout=15)
+            result = subprocess.run([str(BIN_DIR / "tool-look")],
+                                    capture_output=True, text=True, check=False, env=env, timeout=15)
+            outcome = _tool_outcome(result)
             if text:
                 env["PX_TEXT"] = text[:2000]
-                _run_voice(env, label="look_around")
+                voice_outcome = _tool_outcome(_run_voice(env, label="look_around"))
+                if voice_outcome != "ok":
+                    outcome = voice_outcome
 
         elif action == "time_check":
-            subprocess.run([str(BIN_DIR / "tool-time")],
-                           capture_output=True, text=True, check=False, env=env, timeout=15)
+            result = subprocess.run([str(BIN_DIR / "tool-time")],
+                                    capture_output=True, text=True, check=False, env=env, timeout=15)
+            outcome = _tool_outcome(result)
 
         elif action == "calendar_check":
             env["PX_CALENDAR_ACTION"] = "next"
             env.setdefault("PX_CALENDAR_ID", CALENDAR_ID)
-            subprocess.run([str(BIN_DIR / "tool-gws-calendar")],
-                           capture_output=True, text=True, check=False, env=env, timeout=60)
+            result = subprocess.run([str(BIN_DIR / "tool-gws-calendar")],
+                                    capture_output=True, text=True, check=False, env=env, timeout=60)
+            outcome = _tool_outcome(result)
 
         elif action == "introspect":
             env["PX_DRY"] = "1" if dry else "0"
@@ -3335,6 +3402,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 [str(BIN_DIR / "tool-introspect")],
                 capture_output=True, text=True, check=False, env=env, timeout=30)
             log(f"expression: introspect completed rc={result.returncode}")
+            outcome = _tool_outcome(result)
 
         elif action == "evolve":
             env["PX_EVOLVE_INTENT"] = thought.get("thought", "")[:500]
@@ -3349,8 +3417,10 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 log(f"expression: evolve {status} — {intent}")
                 if status == "error":
                     log(f"expression: evolve blocked: {evolve_out.get('error', '?')}")
+                outcome = "ok" if status == "ok" else f"failed: {evolve_out.get('error', status)}"
             except (json.JSONDecodeError, IndexError, TypeError):
                 log(f"expression: evolve rc={result.returncode} — {intent}")
+                outcome = "ok" if result.returncode == 0 else f"failed: rc={result.returncode}"
 
         elif action == "research":
             env["PX_RESEARCH_QUERY"] = text[:500]
@@ -3413,21 +3483,26 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 except OSError:
                     pass
                 log(f"expression: self_debug completed — {len(result.stdout)}B output")
+                outcome = (
+                    "ok"
+                    if result.returncode == 0
+                    else f"failed: self-debug rc={result.returncode}"
+                )
             except SessionBudgetExhausted as exc:
                 log(f"expression: self_debug budget exhausted: {exc}")
+                outcome = f"failed: {exc}"
             except ImportError:
                 log("expression: self_debug skipped — claude_session not available")
+                outcome = "failed: self-debug unavailable"
             except Exception as exc:
                 log(f"expression: self_debug error: {exc}")
+                outcome = f"failed: {exc}"
 
         elif action == "message_obi":
-            _emit_message_obi(text)
+            outcome = _emit_message_obi(text)
 
         elif action == "announce":
-            if not text:
-                log("expression: announce has no text — skipping")
-            else:
-                _dispatch_announce(text)
+            outcome = _dispatch_announce(text)
 
         elif action in ("set_goal", "update_goal", "complete_goal"):
             # In-process state writes — no subprocess, no audio, night-safe.
@@ -3445,26 +3520,17 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
 
         else:
             log(f"expression: unhandled action: {action}")
+            outcome = "failed: unhandled action"
 
     except subprocess.TimeoutExpired:
         log(f"expression timed out: {action} (possible voice contention — another process may hold voice.lock)")
+        outcome = "failed: timeout"
     except Exception as exc:
         import traceback
         log(f"expression error: {exc}\n{traceback.format_exc()}")
+        outcome = f"failed: {exc}"
 
-    # Record in session history
-    history_entry = {
-        "event": "mind",
-        "mood": thought.get("mood", ""),
-        "action": action,
-        "thought": text,
-    }
-    if outcome:
-        history_entry["outcome"] = outcome
-    update_session(
-        fields={"last_action": "px_mind"},
-        history_entry=history_entry,
-    )
+    return _record_expression_outcome(thought, outcome)
 
 
 def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
@@ -3667,6 +3733,9 @@ def mind_loop(args) -> None:
                     last_expression_mono = now
                 else:
                     log(f"expression suppressed (cooldown): {thought['action']}")
+                    _record_expression_outcome(
+                        thought, "suppressed: expression cooldown"
+                    )
             else:
                 # Idle thought — apply backoff so we reflect less often when nobody's around
                 if not transitions:

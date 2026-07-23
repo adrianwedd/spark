@@ -138,8 +138,9 @@ def test_dispatch_announce_disabled_is_noop(monkeypatch):
     calls = []
     monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", False)
     monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
-    mind._dispatch_announce("hello")
+    outcome = mind._dispatch_announce("hello")
     assert calls == []
+    assert outcome == "suppressed: announcements disabled"
 
 
 def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch):
@@ -151,8 +152,9 @@ def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch):
 
     monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
     monkeypatch.setattr(mind.subprocess, "Popen", _FakePopen)
-    mind._dispatch_announce("hello", private=True)
+    outcome = mind._dispatch_announce("hello", private=True)
     assert len(calls) == 1
+    assert outcome == "ok"
     _, kwargs = calls[0]
     assert kwargs["env"]["PX_ANNOUNCE_TEXT"] == "hello"
     assert kwargs["env"]["PX_ANNOUNCE_PRIVATE"] == "1"
@@ -161,15 +163,18 @@ def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch):
 def test_emit_message_obi_fires_private_announce(monkeypatch):
     fired = []
     monkeypatch.setattr(mind, "_dispatch_announce",
-                        lambda text, private=False: fired.append((text, private)))
+                        lambda text, private=False: (
+                            fired.append((text, private)) or "ok"
+                        ))
     # Stub the obi-chat IO so the helper reaches the "write entry" path (not suppressed).
     monkeypatch.setattr(mind, "_read_obi_chat_timestamps", lambda: (0.0, 0.0))
     monkeypatch.setattr(mind, "_read_obi_chat_meta", lambda: {})
     monkeypatch.setattr(mind, "_append_obi_chat", lambda entry: None)
     monkeypatch.setattr(mind, "_write_obi_chat_meta", lambda meta: None)
 
-    mind._emit_message_obi("Obi, are you there?")
+    outcome = mind._emit_message_obi("Obi, are you there?")
     assert fired == [("Obi, are you there?", True)]
+    assert outcome == "ok"
 
 
 def test_emit_message_obi_suppressed_no_announce(monkeypatch):
@@ -184,8 +189,9 @@ def test_emit_message_obi_suppressed_no_announce(monkeypatch):
     monkeypatch.setattr(mind, "_append_obi_chat", lambda entry: None)
     monkeypatch.setattr(mind, "_write_obi_chat_meta", lambda meta: None)
 
-    mind._emit_message_obi("still waiting")
+    outcome = mind._emit_message_obi("still waiting")
     assert fired == []   # no announce when the nudge is backoff-suppressed
+    assert outcome == "suppressed: awaiting Obi reply"
 
 
 # ---------------------------------------------------------------------------

@@ -1309,13 +1309,38 @@ def test_expression_compose_records_failed_outcome(_mock_awareness_and_battery):
     assert "budget exhausted" in entry.get("outcome", "")
 
 
-def test_expression_speech_actions_have_no_outcome_key(_mock_awareness_and_battery):
-    """Actions without structured tool output must not grow a bogus outcome key."""
+def test_expression_speech_actions_record_outcome(_mock_awareness_and_battery):
+    """Every attempted action records its actual outcome."""
     with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
          patch.object(pxh.mind, "update_session") as mock_us:
         expression(_thought("look_around"), dry=True)
     entry = mock_us.call_args.kwargs["history_entry"]
-    assert "outcome" not in entry
+    assert entry["outcome"] == "ok"
+
+
+def test_expression_night_suppression_records_reason(tmp_path):
+    """Safety gates remain visible to the next reflection as outcomes."""
+    import datetime as _dt2
+
+    late = _dt2.datetime(2025, 6, 15, 23, 0, 0, tzinfo=pxh.mind.HOBART_TZ)
+    with patch("pxh.mind.dt") as mock_dt, \
+         patch.object(pxh.mind, "update_session") as mock_us:
+        mock_dt.datetime.now.return_value = late
+        expression(_thought("comment"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"] == "suppressed: night silence"
+
+
+def test_expression_message_obi_records_backoff_suppression(
+        _mock_awareness_and_battery):
+    """A backoff-suppressed message is not misreported as successful."""
+    with patch.object(
+            pxh.mind, "_emit_message_obi",
+            return_value="suppressed: awaiting Obi reply"), \
+         patch.object(pxh.mind, "update_session") as mock_us:
+        expression(_thought("message_obi"), dry=True)
+    entry = mock_us.call_args.kwargs["history_entry"]
+    assert entry["outcome"] == "suppressed: awaiting Obi reply"
 
 
 def test_night_silence_allows_silent_cognitive_actions(tmp_path):
