@@ -568,14 +568,14 @@ bin/px-api-server --dry-run    # FORCE_DRY — remote callers cannot override
 | GET | `/api/v1/public/status` | Live SPARK status: persona, mood, last thought |
 | GET | `/api/v1/public/vitals` | System vitals: CPU, RAM, temp, battery, disk |
 | GET | `/api/v1/public/sonar` | Latest sonar reading from `sonar_live.json` |
-| GET | `/api/v1/public/awareness` | Awareness snapshot: mode, Frigate, ambient, weather, time context |
-| GET | `/api/v1/public/history` | Ring buffer of up to 60 vitals readings (~30 min) |
+| GET | `/api/v1/public/awareness` | Weather, time context, and coarse household activity delayed by at least 15 minutes |
+| GET | `/api/v1/public/history` | Delayed vitals history with presence and acoustic measurements removed |
 | GET | `/api/v1/public/thoughts` | Recent SPARK thoughts (newest first, `?limit=12`) |
 | GET | `/api/v1/public/feed` | SPARK's public thought feed (for social posting) |
 | GET | `/api/v1/public/services` | Service status dict (used by web UI) |
 | POST | `/api/v1/public/chat` | Lightweight public chat with SPARK (rate-limited) |
 | POST | `/api/v1/pin/verify` | Verify admin PIN (issues Bearer token for authenticated endpoints) |
-| GET | `/photos/{filename}` | Serve captured photos (used by web UI photo button) |
+| GET | `/photos/{filename}` | Serve captured photos to authenticated household dashboard sessions |
 
 **Authenticated (Bearer token)**
 

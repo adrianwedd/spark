@@ -105,7 +105,7 @@ Here's the full picture:
 
 **Frigate runs on your LAN.** The object detection service (Frigate, running on a separate device on your home network) pulls the camera stream to detect people. It runs entirely locally. The detections — a confidence score, a bounding box, and a timestamp — are written to a small JSON file on the Pi. No video is transmitted to any external server.
 
-**SPARK doesn't store video.** The robot itself never records or stores images from the live camera. When SPARK takes a photo on request, it captures a single still frame, describes it via Claude, and holds it in `state/photos/`. Those photos never leave the Pi unless you explicitly download them.
+**SPARK doesn't store video.** The robot itself never records or stores images from the live camera. When SPARK takes a photo on request, it captures a single still frame, describes it via Claude, and stores it locally. Captured photos are available only through the authenticated household dashboard; the public site exposes generated thought cards, not household camera captures.
 
 **What is publicly accessible** is SPARK's mood, last thought, and system status — the live dashboard at spark.wedd.au reads these from a Cloudflare Tunnel endpoint. That endpoint serves anonymised state data (things like "mood: contemplative, last comment: 42 minutes ago"). It does not serve video, photos, session history, or anything identifying.
 
