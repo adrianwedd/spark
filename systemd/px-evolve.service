@@ -1,6 +1,8 @@
 [Unit]
 Description=SPARK Self-Evolution Daemon
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -10,8 +12,6 @@ WorkingDirectory=/home/pi/picar-x-hacking
 ExecStart=/home/pi/picar-x-hacking/bin/px-evolve
 Restart=on-failure
 RestartSec=30
-StartLimitBurst=5
-StartLimitIntervalSec=300
 EnvironmentFile=-/home/pi/picar-x-hacking/.env
 Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000

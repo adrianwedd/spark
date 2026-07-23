@@ -124,6 +124,8 @@ Boot
 
 **`px-wake-listen`** loads the Vosk grammar model (~40 MB) and sits in a tight capture loop on the USB microphone at 44100 Hz.
 
+Checked-in child units are the deployment source of truth. Run `bin/px-systemd-sync` to report drift. After review, `sudo bin/px-systemd-sync --apply` atomically installs changed units, removes the denied adult TTS unit, reloads systemd, and reports which services require a controlled restart or reboot.
+
 ### 2. Launching SPARK
 
 ```bash

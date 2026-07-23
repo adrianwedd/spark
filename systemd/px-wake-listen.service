@@ -11,7 +11,7 @@ WorkingDirectory=/home/pi/picar-x-hacking
 Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
-Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/home/pi/.local/bin:/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PX_ENABLE_ADULT_PERSONAS=0
 # Ensure PulseAudio is running (idempotent) and audio hardware is ready
 ExecStartPre=/usr/bin/pulseaudio --start
