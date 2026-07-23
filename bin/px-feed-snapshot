@@ -1,30 +1,10 @@
 #!/usr/bin/env bash
-# px-feed-snapshot — Copy state/feed.json to site/data/ and push if changed.
-# Designed for cron: */30 * * * * /home/pi/picar-x-hacking/bin/px-feed-snapshot
+# Legacy cron compatibility shim.
+#
+# Feed data is runtime state served by /api/v1/public/feed. Committing it from
+# cron polluted branch history and hid push failures, so this helper must never
+# write to Git. It remains executable until installed crontabs are removed.
 set -euo pipefail
-source "$(dirname "$0")/px-env"
 
-SRC="$PROJECT_ROOT/state/feed.json"
-DST="$PROJECT_ROOT/site/data/feed.json"
-
-# Nothing to snapshot if feed doesn't exist yet
-[ -f "$SRC" ] || exit 0
-
-cp "$SRC" "$DST"
-
-cd "$PROJECT_ROOT"
-
-# Exit if nothing changed
-git diff --quiet site/data/feed.json 2>/dev/null && exit 0
-
-git add site/data/feed.json
-git commit -m "data: update feed snapshot"
-
-# Pull with rebase; abort on conflict to avoid committing merge markers
-if ! git pull --rebase --quiet 2>/dev/null; then
-  git rebase --abort 2>/dev/null || true
-  echo "px-feed-snapshot: rebase conflict, skipping push" >&2
-  exit 1
-fi
-
-git push --quiet 2>/dev/null || true
+printf '%s\n' \
+  '{"status":"disabled","reason":"feed is served by the live API; remove the px-feed-snapshot cron entry"}'

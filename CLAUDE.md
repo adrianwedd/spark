@@ -171,6 +171,13 @@ daily/weekly/monthly generation is off by default after sustained rejection chur
 set `PX_BLOG_AUTOMATION=1` to opt in. Posts use the `state/blog.json` envelope,
 served at `GET /api/v1/public/blog`.
 
+### Public Feed
+
+`state/feed.json` is runtime data served by `GET /api/v1/public/feed`; it is not
+version-controlled content. `bin/px-feed-snapshot` is a non-writing compatibility
+shim for old crontabs. Remove any installed 30-minute snapshot cron entry rather
+than re-enabling Git commits.
+
 ### Home Assistant Integration
 
 Custom conversation component at `ha/custom_components/spark_conversation/` routes Nest Mini/Hub Max voice commands through `POST /api/v1/public/chat`.

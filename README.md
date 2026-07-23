@@ -344,7 +344,7 @@ px-post (every 60s poll, every 300s flush)
  ├── queue_thought()      — append to state/post_queue.jsonl
  └── flush_queue()        — one entry per cycle:
       ├── run_qa_gate()   — Claude CLI binary YES/NO quality check (15s timeout)
-      ├── write_feed()    — append to state/feed.json (served by /api/v1/public/feed)
+      ├── write_feed()    — append to runtime state/feed.json (served by /api/v1/public/feed)
       └── BlueskyClient   — post to Bluesky (truncate at 300 chars, word boundary)
 ```
 
