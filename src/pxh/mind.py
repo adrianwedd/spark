@@ -45,6 +45,12 @@ from pxh.spark_config import (
 )
 from pxh import intention as intention_mod
 from pxh.persona_policy import runtime_persona
+from pxh.context_format import (
+    format_calendar as _format_calendar_context,
+    format_household as _format_ha_context,
+    format_introspection as _format_introspection,
+    format_routines as _format_routine_context,
+)
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -1143,26 +1149,6 @@ def _fetch_ha_routines(dry: bool = False) -> dict | None:
     return result if result else None
 
 
-def _format_routine_context(routines: dict | None) -> str:
-    """Format routine signals for the reflection prompt."""
-    if not routines:
-        return ""
-    parts = []
-    if routines.get("meds_taken") is False:
-        parts.append("Meds not yet taken today")
-    elif routines.get("meds_taken") is True:
-        parts.append("Meds taken today")
-    water = routines.get("water_mins_ago")
-    if water is not None:
-        if water > 120:
-            parts.append(f"Last water was {water // 60} hours ago")
-        elif water > 60:
-            parts.append("Water about an hour ago")
-    if parts:
-        return "Routine status: " + ". ".join(parts)
-    return ""
-
-
 def _fetch_ha_context(dry: bool = False) -> dict | None:
     """Query HA for office context with a global 5s timeout."""
     if dry or not HA_TOKEN:
@@ -1220,61 +1206,6 @@ def _fetch_ha_context(dry: bool = False) -> dict | None:
     except Exception as exc:
         log(f"ha_context: unexpected error: {exc}")
         return None
-
-
-def _format_ha_context(ctx: dict | None) -> str:
-    """Format HA context signals for the reflection prompt."""
-    if not ctx:
-        return ""
-    parts = []
-    if ctx.get("adrian_on_call"):
-        parts.append("Adrian is on a video call — be quiet or whisper")
-    elif ctx.get("adrian_mic_active"):
-        parts.append("Adrian's microphone is active — be quiet")
-    if ctx.get("office_light"):
-        parts.append("Office light is on — Adrian is likely working")
-    if ctx.get("media_playing"):
-        title = ctx.get("media_title", "")
-        parts.append(f"Music playing: {title}" if title else "Music is playing")
-    if parts:
-        return "Household context: " + ". ".join(parts)
-    return ""
-
-
-def _format_calendar_context(events: list[dict]) -> str:
-    """Format top 3 calendar events for the reflection prompt."""
-    if not events:
-        return ""
-    lines = []
-    for ev in events[:3]:
-        mins = ev["starts_in_mins"]
-        title = ev["title"]
-        loc_part = f" at {ev['location']}" if ev.get("location") else ""
-
-        if mins < 0:
-            lines.append(f"Happening now: {title}{loc_part} (started {abs(mins)} minutes ago)")
-        elif mins < 60:
-            lines.append(f"Coming up: {title}{loc_part} in {mins} minutes")
-        else:
-            hours = mins // 60
-            lines.append(f"Later: {title}{loc_part} in {hours} hours")
-    return "\n".join(lines)
-
-
-def _format_introspection(intro: dict) -> str:
-    """Format introspection dict into concise reflection context (~300 tokens)."""
-    parts = []
-    moods = intro.get("mood_distribution", {})
-    if moods:
-        top = sorted(moods.items(), key=lambda x: -x[1])[:5]
-        parts.append("Moods: " + ", ".join(f"{m} {p:.0f}%" for m, p in top))
-    config = intro.get("config", {})
-    if config:
-        parts.append("Config: " + ", ".join(f"{k}={v}" for k, v in config.items()))
-    history = intro.get("evolve_history", [])
-    if history:
-        parts.append(f"Evolution history: {len(history)} previous proposals")
-    return "\n".join(parts) if parts else "No introspection data available."
 
 
 def read_battery() -> dict | None:
