@@ -34,6 +34,9 @@ LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
 PID_FILE = Path(os.environ.get("PX_WAKE_PID", LOG_DIR / "px-wake-listen.pid"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from pxh.persona_policy import adult_personas_enabled, runtime_persona
 
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
@@ -64,9 +67,8 @@ if _px_wake_word_env:
     DEFAULT_WAKE = _px_wake_word_env
 else:
     try:
-        sys.path.insert(0, str(PROJECT_ROOT / "src"))
         from pxh.state import load_session as _init_load_session
-        _init_persona = (_init_load_session().get("persona") or "").lower().strip()
+        _init_persona = runtime_persona(_init_load_session().get("persona"))
         if _init_persona == "spark":
             DEFAULT_WAKE = "hey spark"
         else:
@@ -94,9 +96,7 @@ PERSONAS = {
             "PX_VOICE_RATE": "180",
         },
     },
-}
-# Legacy mapping used for utterance keyword routing
-PERSONA_WAKE = {f"hey {name}": cfg["chat_tool"] for name, cfg in PERSONAS.items()}
+} if adult_personas_enabled() else {}
 DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-claude")
 DEFAULT_STT_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-streaming-zipformer-en-2023-06-26")
 DEFAULT_SENSEVOICE_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
@@ -957,7 +957,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
     wake_phrase = args.wake_word.lower().strip()
     # Include all valid wake phrases so Vosk can recognise them all;
     # without this, e.g. "hey spark" collapses to just "hey" and never triggers.
-    _extra_wake = ["hey spark"] + list(PERSONA_WAKE.keys())
+    _extra_wake = ["hey spark"]
     all_wake_phrases = [wake_phrase] + [p for p in _extra_wake if p != wake_phrase] + ["[unk]"]
     grammar = json.dumps(all_wake_phrases)
     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
@@ -972,8 +972,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
         frames_per_buffer=CHUNK,
     )
     stream.start_stream()
-    persona_names = [k.split()[-1] for k in PERSONA_WAKE]
-    log(f"listening for wake word: '{wake_phrase}' or 'hey spark' / 'hey vixen' / 'hey gremlin'")
+    log(f"listening for wake word: '{wake_phrase}' or 'hey spark'")
 
     # Ambient sound tracking for px-mind
     STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
@@ -1072,9 +1071,9 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
 
                     # Check session for persistent persona (set via API)
                     from pxh.state import load_session as _load_session
-                    session_persona = (_load_session().get("persona") or "").lower().strip()
+                    session_persona = runtime_persona(_load_session().get("persona"))
                     
-                    # Route: session persona > utterance keyword > default claude
+                    # Adult routing is session-only and requires deployment opt-in.
                     routed_persona = None
                     utterance_lower = text_out.lower()
                     
@@ -1091,23 +1090,6 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                                 ).strip()
                         if utterance_lower:
                             text_out = utterance_lower
-                    else:
-                        # Fallback: check utterance for persona keyword
-                        for persona_name in PERSONAS:
-                            if persona_name in utterance_lower:
-                                routed_persona = persona_name
-                                # Strip the persona name from the utterance so it's clean input
-                                import re as _re
-                                clean_utterance = _re.sub(
-                                    rf"\b(talk to |ask |hey |speak to |call )?{persona_name}\b[,:]?\s*",
-                                    "", utterance_lower, count=1,
-                                ).strip()
-                                if not clean_utterance:
-                                    clean_utterance = "hello"
-                                log(f"persona routed: {persona_name} (utterance: {clean_utterance!r})")
-                                text_out = clean_utterance
-                                break
-
                     if routed_persona:
                         # --- Persona conversation (Claude voice loop + persona prompt) ---
                         run_persona_conversation(
@@ -1128,7 +1110,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                     # Reset wake recognizer after conversation ends
                     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
                     resample_state = None
-                    log(f"listening for wake word: '{wake_phrase}' (also: hey spark, hey vixen, hey gremlin)")
+                    log(f"listening for wake word: '{wake_phrase}' (also: hey spark)")
 
     finally:
         stream.stop_stream()
@@ -1189,7 +1171,7 @@ def main(argv) -> int:
             )
         except Exception as exc2:
             log(f"enable_speaker (subprocess) failed: {exc2}")
-    log(f"personas available: {', '.join(persona_names)} (say name after wake word)")
+    log(f"adult personas enabled: {', '.join(persona_names) if persona_names else 'no'}")
 
     def _shutdown(sig, _frame):
         log(f"signal {sig} — stopping")

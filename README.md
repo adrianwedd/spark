@@ -94,10 +94,10 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 | Persona | Launcher | Voice | Character |
 |---|---|---|---|
 | **SPARK** | `bin/px-spark` | `en+m3`, pitch 82, rate 120 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
-| **GREMLIN** | session `persona=gremlin` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama. |
-| **VIXEN** | session `persona=vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama. |
+| **GREMLIN** | adult deployment only | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama. |
+| **VIXEN** | adult deployment only | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama. |
 
-GREMLIN and VIXEN are adult-oriented jailbroken personas running on Ollama — they are not active when SPARK is in use. Persona routing: session `persona` field, then utterance keywords.
+The checked-in child-facing systemd services explicitly set `PX_ENABLE_ADULT_PERSONAS=0`. GREMLIN and VIXEN require a separate adult deployment with `PX_ENABLE_ADULT_PERSONAS=1`, then an authenticated session update. They have no dashboard controls or spoken routing. A stale adult value in `session.json` is treated as `spark` by child processes.
 
 ---
 
@@ -611,7 +611,7 @@ Anti-hallucination filters: `temperature=0`, `no_speech_threshold=0.6`. Post-fil
 
 Multi-turn conversation: 5 follow-up turns by default.
 
-Persona routing: checks session `persona` field, then utterance keywords.
+Persona routing is session-only. The child deployment accepts SPARK; adult deployments must explicitly opt in before authenticated session switching can select GREMLIN or VIXEN.
 
 ---
 
@@ -693,11 +693,10 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/                           # 716 tests total (25 require live hardware)
-python -m pytest tests/ -m "not live"             # 691 tests (dry-run, no hardware)
+python -m pytest tests/                           # live hardware tests skip by default
 python -m pytest tests/test_tools.py -v
 python -m pytest tests/test_api.py -v
-sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (require Pi)
+sudo .venv/bin/python -m pytest tests/test_tools_live.py --run-live -v -s  # explicit live run; wheels on blocks
 ```
 
 ---
@@ -727,6 +726,7 @@ sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (requir
 | `CODEX_CHAT_CMD` | Override LLM CLI command | set by launcher |
 | `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout | `30` |
 | `PX_PERSONA` | Active persona (`spark` / `vixen` / `gremlin`) | from session |
+| `PX_ENABLE_ADULT_PERSONAS` | Permit adult persona configuration and session switching | `0` in child services |
 | `PX_OLLAMA_HOST` | Ollama server for cognitive reflection | `http://M5.local:11434` |
 
 ---

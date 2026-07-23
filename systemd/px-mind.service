@@ -11,6 +11,7 @@ Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PX_ENABLE_ADULT_PERSONAS=0
 ExecStart=/home/pi/picar-x-hacking/bin/px-mind
 Restart=always
 RestartSec=10

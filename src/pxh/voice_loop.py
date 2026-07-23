@@ -16,6 +16,7 @@ from pxh.utils import clamp
 from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
 from .logging import log_event
+from .persona_policy import adult_personas_enabled, runtime_persona
 from .state import load_session, update_session, ensure_session, tail_lines, atomic_write
 from .time import utc_timestamp
 
@@ -139,24 +140,10 @@ def is_depth_trigger(text: str) -> bool:
 # Persona voice settings — injected into tool env when persona is active
 # Persona prompt files — used instead of default system prompt when persona active
 PERSONA_PROMPTS = {
-    "vixen": PROJECT_ROOT / "docs" / "prompts" / "persona-vixen.md",
-    "gremlin": PROJECT_ROOT / "docs" / "prompts" / "persona-gremlin.md",
     "spark": PROJECT_ROOT / "docs" / "prompts" / "spark-voice-system.md",
 }
 
 PERSONA_VOICE_ENV = {
-    "vixen": {
-        "PX_PERSONA": "vixen",
-        "PX_VOICE_VARIANT": "en+f4",
-        "PX_VOICE_PITCH": "72",
-        "PX_VOICE_RATE": "135",
-    },
-    "gremlin": {
-        "PX_PERSONA": "gremlin",
-        "PX_VOICE_VARIANT": "en+croak",
-        "PX_VOICE_PITCH": "20",
-        "PX_VOICE_RATE": "180",
-    },
     "spark": {
         "PX_PERSONA": "spark",
         "PX_VOICE_VARIANT": "en-gb",
@@ -164,6 +151,25 @@ PERSONA_VOICE_ENV = {
         "PX_VOICE_RATE": "100",
     },
 }
+if adult_personas_enabled():
+    PERSONA_PROMPTS.update({
+        "vixen": PROJECT_ROOT / "docs" / "prompts" / "persona-vixen.md",
+        "gremlin": PROJECT_ROOT / "docs" / "prompts" / "persona-gremlin.md",
+    })
+    PERSONA_VOICE_ENV.update({
+        "vixen": {
+            "PX_PERSONA": "vixen",
+            "PX_VOICE_VARIANT": "en+f4",
+            "PX_VOICE_PITCH": "72",
+            "PX_VOICE_RATE": "135",
+        },
+        "gremlin": {
+            "PX_PERSONA": "gremlin",
+            "PX_VOICE_VARIANT": "en+croak",
+            "PX_VOICE_PITCH": "20",
+            "PX_VOICE_RATE": "180",
+        },
+    })
 
 
 # Rolling per-persona conversation memory (issue #161). Lets SPARK remember
@@ -400,7 +406,7 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
         context_sections.append("Recent events:")
         context_sections.append(json.dumps(recent_events, indent=2))
 
-    _active_persona = (state.get("persona") or "").lower().strip()
+    _active_persona = runtime_persona(state.get("persona"))
 
     # Rolling conversation memory (issue #161) — what was just said, per persona.
     recent_turns = recent_conversation(_active_persona)
@@ -875,7 +881,7 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
     for key, value in env_overrides.items():
         env[key] = value
     # Inject persona voice settings if a persona is active in session
-    session_persona = load_session().get("persona") or ""
+    session_persona = runtime_persona(load_session().get("persona"))
     if session_persona and session_persona in PERSONA_VOICE_ENV:
         for k, v in PERSONA_VOICE_ENV[session_persona].items():
             env[k] = v
@@ -939,7 +945,7 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         with heartbeat_lock:
             heartbeat_val[0] = time.monotonic()
         # Use persona prompt if one is active in session
-        active_persona = (session.get("persona") or "").lower().strip()
+        active_persona = runtime_persona(session.get("persona"))
         if active_persona and active_persona in PERSONA_PROMPTS:
             persona_prompt_path = PERSONA_PROMPTS[active_persona]
             if persona_prompt_path.exists():

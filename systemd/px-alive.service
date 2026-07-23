@@ -8,6 +8,7 @@ Type=simple
 User=root
 WorkingDirectory=/home/pi/picar-x-hacking
 Environment=HOME=/home/pi
+Environment=PX_ENABLE_ADULT_PERSONAS=0
 ExecStart=/home/pi/picar-x-hacking/bin/px-alive --no-face
 Restart=always
 RestartSec=15

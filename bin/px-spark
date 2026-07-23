@@ -13,6 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
+export PX_ENABLE_ADULT_PERSONAS=0
 
 # Short-circuit --help/-h before persona activation or greeting
 for arg in "$@"; do

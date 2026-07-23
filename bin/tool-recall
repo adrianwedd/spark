@@ -20,6 +20,7 @@ from pathlib import Path
 
 from filelock import FileLock
 from pxh.logging import log_event
+from pxh.persona_policy import runtime_persona
 from pxh.state import load_session, update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
@@ -52,7 +53,7 @@ def load_notes(limit: int, notes_file: Path) -> list[str]:
 
 def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
-    persona = (load_session().get("persona") or "").lower().strip()
+    persona = runtime_persona(load_session().get("persona"))
     notes_file = notes_file_for_persona(persona)
     try:
         limit = int(os.environ.get("PX_RECALL_LIMIT", "5"))

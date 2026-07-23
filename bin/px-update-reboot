@@ -13,7 +13,6 @@ SERVICES=(
     px-api-server
     px-battery-poll
     px-frigate-stream
-    px-tts-glados
 )
 
 for svc in "${SERVICES[@]}"; do

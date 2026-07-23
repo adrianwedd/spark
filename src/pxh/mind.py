@@ -44,6 +44,7 @@ from pxh.spark_config import (
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
 from pxh import intention as intention_mod
+from pxh.persona_policy import runtime_persona
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -1508,7 +1509,7 @@ def battery_emergency_shutdown(pct: int, dry: bool) -> None:
     log(f"BATTERY CRITICAL: {pct}% — emergency shutdown")
     device = os.environ.get("PX_VOICE_DEVICE", "")
     env = os.environ.copy()
-    persona = (load_session().get("persona") or "").lower()
+    persona = runtime_persona(load_session().get("persona"))
     env.update(PERSONA_VOICE_ENV.get(persona, {}))
 
     _play_alarm_beeps(6, device)
@@ -1533,7 +1534,7 @@ def battery_warn_comment(pct: int, dry: bool) -> None:
         log(f"dry: battery warn {pct}%")
         return
     env = os.environ.copy()
-    persona = (load_session().get("persona") or "").lower()
+    persona = runtime_persona(load_session().get("persona"))
     env.update(PERSONA_VOICE_ENV.get(persona, {}))
     if pct <= BATTERY_WARN_15:
         msg = (f"I'm getting really worried — my battery is at {pct} percent. "
@@ -1982,7 +1983,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "battery_volts": battery["volts"] if battery else None,
         "battery_charging": battery.get("charging", False) if battery else False,
         "listening": session.get("listening", False),
-        "persona": session.get("persona"),
+        "persona": runtime_persona(session.get("persona")),
         "transitions": transitions,
         "system": system_stats,
     }
@@ -2491,7 +2492,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     global _last_spoken_text
 
     session = load_session()
-    persona = (awareness.get("persona") or session.get("persona") or "").lower().strip()
+    persona = runtime_persona(awareness.get("persona") or session.get("persona"))
     recent_thoughts = load_recent_thoughts(5, persona=persona)
     recent_history = (session.get("history") or [])[-5:]
     notes = load_notes(3, persona=persona)
@@ -3069,7 +3070,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     # avoid double "FUCK YEAH!" or other duplication.
     # For weather_comment, the raw weather data needs rephrasing.
     session = load_session()
-    persona = (session.get("persona") or "").lower().strip()
+    persona = runtime_persona(session.get("persona"))
     needs_rephrase = action in ("weather_comment",)
     if persona and persona in PERSONA_VOICE_ENV:
         for k, v in PERSONA_VOICE_ENV[persona].items():
@@ -3460,7 +3461,7 @@ def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
     if not templates:
         return
 
-    persona = (awareness.get("persona") or "").lower().strip()
+    persona = runtime_persona(awareness.get("persona"))
     phrases = templates.get(persona, templates["default"])
 
     # Day/night split: dict with "day"/"night" keys (used by spark someone_left)

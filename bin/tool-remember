@@ -20,6 +20,7 @@ from pathlib import Path
 
 from filelock import FileLock
 from pxh.logging import log_event
+from pxh.persona_policy import runtime_persona
 from pxh.state import load_session, update_session
 from pxh.time import utc_timestamp
 
@@ -36,7 +37,7 @@ def notes_file_for_persona(persona: str) -> Path:
 
 def main() -> int:
     text = os.environ.get("PX_NOTE", "").strip()
-    persona = (load_session().get("persona") or "").lower().strip()
+    persona = runtime_persona(load_session().get("persona"))
     NOTES_FILE = notes_file_for_persona(persona)
     NOTES_LOCK = FileLock(str(NOTES_FILE) + ".lock", timeout=10)
     if not text:

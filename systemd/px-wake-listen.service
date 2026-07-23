@@ -1,5 +1,5 @@
 [Unit]
-Description=PiCar-X Wake Word Listener (hey spark / hey robot / hey vixen / hey gremlin)
+Description=PiCar-X Child Wake Word Listener (hey spark / hey robot)
 After=network.target sound.target
 Wants=sound.target
 
@@ -12,6 +12,7 @@ Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PX_ENABLE_ADULT_PERSONAS=0
 # Ensure PulseAudio is running (idempotent) and audio hardware is ready
 ExecStartPre=/usr/bin/pulseaudio --start
 ExecStartPre=/bin/sleep 3

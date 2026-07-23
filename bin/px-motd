@@ -420,7 +420,6 @@ def section_services() -> list[str]:
         ("px-api-server",     "api"),
         ("px-post",           "post"),
         ("px-frigate-stream", "cam"),
-        ("px-tts-glados",     "tts"),
         ("cloudflared",       "tunnel"),
     ]
 

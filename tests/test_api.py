@@ -27,6 +27,7 @@ def api_client(isolated_project, monkeypatch):
     monkeypatch.setenv("LOG_DIR", str(isolated_project["log_dir"]))
     monkeypatch.setenv("PX_STATE_DIR", str(isolated_project["state_dir"]))
     monkeypatch.setenv("PROJECT_ROOT", str(ROOT))
+    monkeypatch.delenv("PX_ENABLE_ADULT_PERSONAS", raising=False)
 
     from pxh import api
     api._load_token()
@@ -344,15 +345,21 @@ class TestMotionGate:
         assert data["confirm_motion_allowed"] is True
         assert data["wheels_on_blocks"] is True
 
-    def test_patch_persona_vixen(self, api_client, auth_headers):
+    @pytest.mark.parametrize("persona", ["vixen", "gremlin"])
+    def test_patch_adult_persona_rejected_by_child_deployment(
+        self, api_client, auth_headers, persona
+    ):
         resp = api_client.patch(
             "/api/v1/session", headers=auth_headers,
-            json={"persona": "vixen"},
+            json={"persona": persona},
         )
-        assert resp.status_code == 200
-        assert resp.json()["persona"] == "vixen"
+        assert resp.status_code == 403
+        assert "child-facing deployment" in resp.json()["detail"]
 
-    def test_patch_persona_gremlin(self, api_client, auth_headers):
+    def test_patch_adult_persona_requires_explicit_deployment_opt_in(
+        self, api_client, auth_headers, monkeypatch
+    ):
+        monkeypatch.setenv("PX_ENABLE_ADULT_PERSONAS", "1")
         resp = api_client.patch(
             "/api/v1/session", headers=auth_headers,
             json={"persona": "gremlin"},
@@ -361,10 +368,9 @@ class TestMotionGate:
         assert resp.json()["persona"] == "gremlin"
 
     def test_patch_persona_clear_with_claude(self, api_client, auth_headers):
-        # Set a persona first
         api_client.patch(
             "/api/v1/session", headers=auth_headers,
-            json={"persona": "vixen"},
+            json={"persona": "spark"},
         )
         # Clear it with "claude"
         resp = api_client.patch(
@@ -377,7 +383,7 @@ class TestMotionGate:
     def test_patch_persona_clear_with_empty(self, api_client, auth_headers):
         api_client.patch(
             "/api/v1/session", headers=auth_headers,
-            json={"persona": "gremlin"},
+            json={"persona": "spark"},
         )
         resp = api_client.patch(
             "/api/v1/session", headers=auth_headers,
@@ -392,6 +398,19 @@ class TestMotionGate:
             json={"persona": "batman"},
         )
         assert resp.status_code == 400
+
+    def test_session_projects_stale_adult_persona_as_spark(
+        self, api_client, auth_headers, isolated_project
+    ):
+        isolated_project["session_path"].write_text('{"persona":"vixen"}')
+        resp = api_client.get("/api/v1/session", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["persona"] == "spark"
+
+    def test_child_dashboard_has_no_adult_persona_controls(self, api_client):
+        html = api_client.get("/").text
+        assert "setPersona('vixen')" not in html
+        assert "setPersona('gremlin')" not in html
 
     def test_patch_confirm_motion_allowed_false(self, api_client, auth_headers):
         """PATCH can explicitly set confirm_motion_allowed back to False."""

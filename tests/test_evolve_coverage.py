@@ -303,6 +303,6 @@ class TestPublicServicesExpansion:
             expected = {
                 "px-mind", "px-alive", "px-wake-listen", "px-battery-poll",
                 "px-api-server", "px-post", "px-frigate-stream",
-                "px-tts-glados", "px-evolve", "cloudflared",
+                "px-evolve", "cloudflared",
             }
             assert set(data.keys()) == expected

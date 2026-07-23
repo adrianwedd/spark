@@ -31,6 +31,7 @@ from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .persona_policy import ADULT_PERSONAS, allowed_session_personas, runtime_persona
 from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
@@ -608,17 +609,13 @@ class SessionPatch(BaseModel):
     wheels_on_blocks: Optional[bool] = None
     spark_quiet_mode: Optional[bool] = None
     mode: Optional[str] = None
-    persona: Optional[str] = None  # "vixen", "gremlin", "spark", or "claude" (clears persona)
+    persona: Optional[str] = None  # "spark" or "claude" (clears); adult deployments opt in
     roaming_allowed: Optional[bool] = None
     confirm: Optional[bool] = None  # required when enabling safety-critical fields
 
 
 PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode", "roaming_allowed"}
 SAFETY_CRITICAL_FIELDS = {"confirm_motion_allowed", "roaming_allowed"}
-VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
-
-
-
 class PinRequest(BaseModel):
     pin: str = Field(min_length=1, max_length=16)
 
@@ -1684,6 +1681,7 @@ async def list_tools() -> Dict[str, List[str]]:
 @app.get("/api/v1/session", dependencies=[Depends(_verify_token)])
 async def get_session() -> Dict[str, Any]:
     data = load_session()
+    data["persona"] = runtime_persona(data.get("persona"))
     # Redact history to last 10 entries (not full conversation log)
     if "history" in data:
         data["history"] = data["history"][-10:]
@@ -1723,8 +1721,13 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
         p = (fields["persona"] or "").lower().strip()
         if p in ("claude", ""):
             fields["persona"] = None  # clear persona → default Claude
-        elif p not in VALID_PERSONAS:
-            raise HTTPException(status_code=400, detail=f"invalid persona: {p!r} (valid: vixen, gremlin, spark, claude)")
+        elif p in ADULT_PERSONAS and p not in allowed_session_personas():
+            raise HTTPException(
+                status_code=403,
+                detail="adult personas are disabled in the child-facing deployment",
+            )
+        elif p not in allowed_session_personas():
+            raise HTTPException(status_code=400, detail=f"invalid persona: {p!r}")
         else:
             fields["persona"] = p
     return update_session(fields=fields)
@@ -2020,7 +2023,7 @@ def _do_chat_turn(text: str, dry: bool) -> Dict[str, Any]:
     """Run one LLM turn: build prompt → LLM → parse action → execute tool."""
     session = load_session()
     # Pick system prompt based on active persona
-    active_persona = (session.get("persona") or "").lower().strip()
+    active_persona = runtime_persona(session.get("persona"))
     prompt_path = PERSONA_PROMPTS.get(active_persona, _DEFAULT_PROMPT_PATH)
     if not prompt_path.exists():
         prompt_path = _DEFAULT_PROMPT_PATH
@@ -2080,7 +2083,7 @@ async def chat(body: ChatRequest) -> JSONResponse:
 # controls which ones the auth'd endpoint can stop/restart.
 _PUBLIC_SERVICES = frozenset({
     "px-mind", "px-alive", "px-wake-listen", "px-battery-poll", "px-api-server",
-    "px-post", "px-frigate-stream", "px-tts-glados", "px-evolve", "cloudflared",
+    "px-post", "px-frigate-stream", "px-evolve", "cloudflared",
 })
 _PUBLIC_SERVICE_STATES = frozenset({"active", "activating", "failed", "inactive", "unknown"})
 
@@ -2659,10 +2662,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'Nunito
         <div class="sec-hdr">Quiet mode</div>
         <button class="btn btn-muted" id="btn-quiet" onclick="toggleQuiet()">Loading&#x2026;</button>
         <div class="sec-hdr">Persona</div>
-        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px">
           <button class="btn btn-muted" onclick="setPersona('spark')">&#x1F31F; spark</button>
-          <button class="btn btn-muted" onclick="setPersona('gremlin')">&#x1F479; gremlin</button>
-          <button class="btn btn-muted" onclick="setPersona('vixen')">&#x1F98A; vixen</button>
           <button class="btn btn-muted" onclick="setPersona('')">&#x25CB; none</button>
         </div>
         <div class="sec-hdr">Session</div>

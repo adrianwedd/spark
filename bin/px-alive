@@ -180,7 +180,13 @@ def read_session_persona() -> str:
     """Read persona from session.json without pxh (system python3, no venv)."""
     try:
         data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
-        return str(data.get("persona", "")).lower().strip()
+        persona = str(data.get("persona", "")).lower().strip()
+        adult_enabled = os.environ.get("PX_ENABLE_ADULT_PERSONAS", "").lower() in {
+            "1", "true", "yes", "on",
+        }
+        if persona in {"gremlin", "vixen"} and not adult_enabled:
+            return "spark"
+        return persona
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return ""
 
