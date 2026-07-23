@@ -401,65 +401,28 @@ def _read_wifi_dbm() -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 import collections as _collections
+from pxh.public_telemetry import (
+    ACTIVITY_DELAY_S as _PUBLIC_ACTIVITY_DELAY_S,
+    delayed_activity as _project_delayed_activity,
+    project_history as _project_public_history,
+)
 
 _history_buf: "_collections.deque[Dict[str, Any]]" = _collections.deque(maxlen=2880)
 _history_lock = threading.Lock()
-_PUBLIC_ACTIVITY_DELAY_S = 15 * 60
-_PUBLIC_ACTIVITY_ACTIVE_RMS = 500
-_PRIVATE_HISTORY_FIELDS = frozenset({"ambient_rms", "person_present"})
-
-
-def _history_sample_epoch(sample: Dict[str, Any]) -> Optional[float]:
-    """Return a history sample's UTC epoch, or None when its timestamp is invalid."""
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat(str(sample["ts"]).replace("Z", "+00:00")).timestamp()
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def _delayed_public_activity(now: Optional[float] = None) -> tuple[str, Optional[int]]:
     """Project a delayed, coarse activity signal from private sensor history."""
-    now_epoch = _time.time() if now is None else now
-    cutoff = now_epoch - _PUBLIC_ACTIVITY_DELAY_S
     with _history_lock:
         samples = list(_history_buf)
-
-    for sample in reversed(samples):
-        sample_epoch = _history_sample_epoch(sample)
-        if sample_epoch is None or sample_epoch > cutoff:
-            continue
-        person_present = sample.get("person_present")
-        ambient_rms = sample.get("ambient_rms")
-        if person_present is True:
-            activity = "active"
-        elif isinstance(ambient_rms, (int, float)):
-            activity = "active" if ambient_rms >= _PUBLIC_ACTIVITY_ACTIVE_RMS else "quiet"
-        elif person_present is False:
-            activity = "quiet"
-        else:
-            activity = "unknown"
-        return activity, max(0, round(now_epoch - sample_epoch))
-    return "unknown", None
+    return _project_delayed_activity(samples, now)
 
 
 def _public_history_projection(limit: int, now: Optional[float] = None) -> list[Dict[str, Any]]:
     """Return delayed history without household-presence or acoustic measurements."""
-    now_epoch = _time.time() if now is None else now
-    cutoff = now_epoch - _PUBLIC_ACTIVITY_DELAY_S
     with _history_lock:
         samples = list(_history_buf)
-
-    projected = []
-    for sample in samples:
-        sample_epoch = _history_sample_epoch(sample)
-        if sample_epoch is None or sample_epoch > cutoff:
-            continue
-        projected.append({
-            key: value for key, value in sample.items()
-            if key not in _PRIVATE_HISTORY_FIELDS
-        })
-    return projected[-limit:]
+    return _project_public_history(samples, limit, now)
 
 
 def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, Any]":
