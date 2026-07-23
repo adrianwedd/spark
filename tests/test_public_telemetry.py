@@ -1,6 +1,11 @@
 import datetime as dt
 
-from pxh.public_telemetry import ACTIVITY_DELAY_S, delayed_activity, project_history
+from pxh.public_telemetry import (
+    ACTIVITY_DELAY_S,
+    delayed_activity,
+    project_history,
+    public_weather_summary,
+)
 
 
 def _ts(epoch: float) -> str:
@@ -31,3 +36,12 @@ def test_project_history_strips_private_inputs():
         now=now,
     )
     assert result == [{"ts": _ts(now - ACTIVITY_DELAY_S), "cpu_pct": 12}]
+
+
+def test_public_weather_summary_keeps_weather_but_not_station():
+    assert public_weather_summary(
+        "At Grove, it's 12 degrees Celsius with a light breeze."
+    ) == "At the local weather station, it's 12 degrees Celsius with a light breeze."
+    assert public_weather_summary(
+        "Weather at Grove."
+    ) == "Local weather report."

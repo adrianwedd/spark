@@ -4,6 +4,7 @@ The API owns sampling and storage; this module owns the public boundary.
 """
 
 from datetime import datetime
+import re
 import time
 from typing import Any, Iterable, Optional
 
@@ -11,6 +12,24 @@ from typing import Any, Iterable, Optional
 ACTIVITY_DELAY_S = 15 * 60
 ACTIVE_AMBIENT_RMS = 500
 PRIVATE_HISTORY_FIELDS = frozenset({"ambient_rms", "person_present"})
+
+
+def public_weather_summary(summary: Any) -> Any:
+    """Keep useful weather prose while removing the observation-station name."""
+    if not isinstance(summary, str):
+        return summary
+    redacted = re.sub(
+        r"^At [^,]+,",
+        "At the local weather station,",
+        summary,
+        count=1,
+    )
+    return re.sub(
+        r"^Weather at [^.]+\.",
+        "Local weather report.",
+        redacted,
+        count=1,
+    )
 
 
 def sample_epoch(sample: dict[str, Any]) -> Optional[float]:

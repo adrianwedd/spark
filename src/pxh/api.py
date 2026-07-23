@@ -405,6 +405,7 @@ from pxh.public_telemetry import (
     ACTIVITY_DELAY_S as _PUBLIC_ACTIVITY_DELAY_S,
     delayed_activity as _project_delayed_activity,
     project_history as _project_public_history,
+    public_weather_summary as _public_weather_summary,
 )
 
 _history_buf: "_collections.deque[Dict[str, Any]]" = _collections.deque(maxlen=2880)
@@ -827,7 +828,7 @@ async def public_awareness() -> Dict[str, Any]:
             "gust_kmh": raw_weather.get("gust_kmh"),
             "humidity_pct": raw_weather.get("humidity_pct"),
             "rain_24h_mm": raw_weather.get("rain_24h_mm"),
-            "summary": raw_weather.get("summary"),
+            "summary": _public_weather_summary(raw_weather.get("summary")),
         }
     else:
         weather_out = None
