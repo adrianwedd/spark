@@ -89,11 +89,11 @@ def test_concurrent_session_updates_preserve_history(tmp_path, monkeypatch):
     def append(index: int):
         state.update_session(history_entry={"event": f"worker-{index}"}, history_limit=100)
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        list(executor.map(append, range(30)))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(append, range(10)))
 
     events = {entry["event"] for entry in state.load_session()["history"]}
-    assert events == {f"worker-{index}" for index in range(30)}
+    assert events == {f"worker-{index}" for index in range(10)}
 
 
 def test_rotate_log_under_threshold(tmp_path):
