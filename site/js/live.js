@@ -91,15 +91,9 @@
     }
     if (awarenessR.status === 'fulfilled') {
       const a = awarenessR.value;
-      state.obi_mode             = a.obi_mode;
-      state.person_present       = a.person_present;
-      state.frigate_score        = a.frigate_score;
-      state.detections           = a.detections;
-      state.ha_presence          = a.ha_presence;
-      state.ambient_level        = a.ambient_level;
-      state.ambient_rms          = a.ambient_rms;
+      state.activity             = a.activity;
+      state.activity_age_seconds = a.activity_age_seconds;
       state.weather              = a.weather;
-      state.minutes_since_speech = a.minutes_since_speech;
       state.time_period          = a.time_period;
       anySuccess = true;
     }
@@ -123,7 +117,6 @@
         disk_pct:        state.disk_pct        != null ? state.disk_pct        : null,
         battery_pct:     state.battery_pct     != null ? state.battery_pct     : null,
         sonar_cm:        state.sonar_cm        != null ? state.sonar_cm        : null,
-        ambient_rms:     state.ambient_rms     != null ? state.ambient_rms     : null,
         tokens_in:       state.tokens_in       != null ? state.tokens_in       : null,
         tokens_out:      state.tokens_out      != null ? state.tokens_out      : null,
         weather_temp_c:  state.weather?.temp_c  != null ? state.weather.temp_c  : null,
@@ -188,17 +181,6 @@
     var mood = (window._sparkMood || '').toLowerCase();
     dot.style.background = (mood ? _moodColor(mood) : null) || '#c48b6e';
     dot.title = mood ? ('SPARK is feeling ' + mood) : 'SPARK is online';
-  }
-
-  // ── Waveform 2s tick ─────────────────────────────────────────────────────
-
-  function tickWaveform() {
-    const canvas = document.getElementById('waveform-canvas');
-    if (!canvas) return;
-    // Re-measure width from CSS layout on each tick (handles resize/orientation)
-    var cssW = canvas.offsetWidth || canvas.parentElement?.offsetWidth || 160;
-    if (cssW > 10) canvas.width = cssW;
-    SparkCharts.drawWaveform(canvas, state.ambient_rms || 0);
   }
 
   // ── Hydrate from cache (zero-flash on load) ───────────────────────────────
@@ -458,7 +440,6 @@
   }
 
   var pollTimer      = setInterval(poll, POLL_MS);
-  var waveformTimer  = setInterval(tickWaveform, 2_000);
   var dotTimer       = setInterval(_updateDot, 10_000);
   var thoughtsTimer  = setInterval(fetchThoughts, THOUGHTS_POLL_MS);
 
@@ -466,19 +447,16 @@
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) {
       clearInterval(pollTimer);
-      clearInterval(waveformTimer);
       clearInterval(dotTimer);
       clearInterval(thoughtsTimer);
     } else {
       // Clear any stale timers before creating new ones (dedup guard)
       clearInterval(pollTimer);
-      clearInterval(waveformTimer);
       clearInterval(dotTimer);
       clearInterval(thoughtsTimer);
       poll();            // immediate refresh on return
       fetchThoughts();
       pollTimer      = setInterval(poll, POLL_MS);
-      waveformTimer  = setInterval(tickWaveform, 2_000);
       dotTimer       = setInterval(_updateDot, 10_000);
       thoughtsTimer  = setInterval(fetchThoughts, THOUGHTS_POLL_MS);
     }

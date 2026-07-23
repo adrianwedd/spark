@@ -241,9 +241,8 @@ class TestPublicAwareness:
     def test_has_required_keys(self, public_client):
         resp = public_client.get("/api/v1/public/awareness")
         data = resp.json()
-        for key in ("obi_mode", "person_present", "frigate_score",
-                    "ambient_level", "ambient_rms", "weather",
-                    "minutes_since_speech", "time_period", "wifi_dbm", "ts"):
+        for key in ("activity", "activity_age_seconds", "weather",
+                    "time_period", "wifi_dbm", "ts"):
             assert key in data, f"missing key: {key}"
 
     def test_wifi_dbm_read_from_system_stats(self, public_client, state_dir):
@@ -261,20 +260,20 @@ class TestPublicAwareness:
         # No awareness.json → all fields null, no 500
         resp = public_client.get("/api/v1/public/awareness")
         data = resp.json()
-        assert data["obi_mode"] is None
-        assert data["person_present"] is None    # null when Frigate absent (hides indicator)
+        assert data["activity"] == "unknown"
+        assert data["activity_age_seconds"] is None
         assert data["weather"] is None
 
-    def test_flattened_projection_from_awareness_file(self, public_client, state_dir):
+    def test_projection_excludes_live_household_state(self, public_client, state_dir):
         awareness = {
             "ts": "2026-03-13T01:00:00Z",
-            "obi_mode": "calm",
+            "obi_mode": "at-school",
             "time_period": "night",
             "minutes_since_speech": 4.0,
             "frigate": {
                 "person_present": True,
                 "score": 0.74,
-                "event_count": 1,
+                "detections": [{"label": "person", "score": 0.74}],
             },
             "ambient_sound": {"rms": 340, "level": "quiet"},
             "weather": {
@@ -287,12 +286,11 @@ class TestPublicAwareness:
         (state_dir / "awareness.json").write_text(json.dumps(awareness))
         resp = public_client.get("/api/v1/public/awareness")
         data = resp.json()
-        assert data["obi_mode"] == "calm"
-        assert data["person_present"] is True
-        assert abs(data["frigate_score"] - 0.74) < 0.01
-        assert data["ambient_rms"] == 340
-        assert data["ambient_level"] == "quiet"
-        assert data["minutes_since_speech"] == pytest.approx(4.0, abs=0.1)
+        for private_key in (
+            "obi_mode", "person_present", "frigate_score", "detections",
+            "ambient_level", "ambient_rms", "minutes_since_speech",
+        ):
+            assert private_key not in data
         assert data["time_period"] == "night"
         assert data["ts"] == "2026-03-13T01:00:00Z"
 
@@ -309,31 +307,47 @@ class TestPublicAwareness:
         assert abs(data["weather"]["temp_c"] - 14.2) < 0.01
         assert "temp_C" not in data["weather"]
 
-    def test_person_present_null_when_frigate_key_absent(self, public_client, state_dir):
-        # awareness.json with no frigate key → Frigate offline → null hides indicator
-        (state_dir / "awareness.json").write_text(json.dumps({"obi_mode": "absent"}))
+    def test_activity_is_delayed_and_coarse(self, public_client, monkeypatch):
+        from pxh import api as _api
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 901))
+        new_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30))
+        with _api._history_lock:
+            _api._history_buf.clear()
+            _api._history_buf.append({
+                "ts": old_ts, "person_present": False, "ambient_rms": 220,
+            })
+            _api._history_buf.append({
+                "ts": new_ts, "person_present": True, "ambient_rms": 900,
+            })
         data = public_client.get("/api/v1/public/awareness").json()
-        assert data["person_present"] is None
+        assert data["activity"] == "quiet"
+        assert data["activity_age_seconds"] >= _api._PUBLIC_ACTIVITY_DELAY_S
 
-    def test_person_present_null_when_frigate_is_none(self, public_client, state_dir):
-        # awareness.json with frigate: null (Frigate offline) → null hides indicator
-        (state_dir / "awareness.json").write_text(json.dumps({"frigate": None}))
-        data = public_client.get("/api/v1/public/awareness").json()
-        assert data["person_present"] is None
+    def test_delayed_person_presence_maps_to_active(self, public_client):
+        from pxh import api as _api
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 901))
+        with _api._history_lock:
+            _api._history_buf.clear()
+            _api._history_buf.append({
+                "ts": old_ts, "person_present": True, "ambient_rms": 100,
+            })
+        assert public_client.get("/api/v1/public/awareness").json()["activity"] == "active"
 
     def test_no_500_on_json_array_awareness_file(self, public_client, state_dir):
         # awareness.json is a JSON array (corrupted) → 200 with null fields, no 500
         (state_dir / "awareness.json").write_text(json.dumps([{"obi_mode": "calm"}]))
         resp = public_client.get("/api/v1/public/awareness")
         assert resp.status_code == 200
-        assert resp.json()["obi_mode"] is None
+        assert resp.json()["activity"] in ("unknown", "quiet", "active")
 
     def test_no_500_on_non_json_awareness_file(self, public_client, state_dir):
         # awareness.json is garbage bytes → 200 with null fields, no 500
         (state_dir / "awareness.json").write_text("not valid json {{{")
         resp = public_client.get("/api/v1/public/awareness")
         assert resp.status_code == 200
-        assert resp.json()["obi_mode"] is None
+        assert resp.json()["activity"] in ("unknown", "quiet", "active")
 
     def test_no_500_when_weather_is_string(self, public_client, state_dir):
         # weather field is a string not a dict → treated as null, no 500
@@ -346,15 +360,6 @@ class TestPublicAwareness:
         (state_dir / "awareness.json").write_text(json.dumps({"obi_mode": "calm"}))
         data = public_client.get("/api/v1/public/awareness").json()
         assert data["weather"] is None
-
-    def test_nested_null_for_missing_subkeys(self, public_client, state_dir):
-        # ambient_sound present but missing level → null for that subfield
-        awareness = {"ambient_sound": {"rms": 200}}
-        (state_dir / "awareness.json").write_text(json.dumps(awareness))
-        data = public_client.get("/api/v1/public/awareness").json()
-        assert data["ambient_rms"] == 200
-        assert data["ambient_level"] is None
-
 
 class TestPublicHistory:
     def test_returns_200(self, public_client):
@@ -383,19 +388,48 @@ class TestPublicHistory:
         assert len(data) == 1
         assert data[0]["cpu_pct"] == pytest.approx(25.0, abs=0.1)
         assert data[0]["sonar_cm"] == pytest.approx(45.2, abs=0.1)
+        assert "ambient_rms" not in data[0]
 
     def test_maxlen_enforced(self, public_client):
         from pxh import api as _api
         maxlen = _api._history_buf.maxlen
+        now = time.time()
         with _api._history_lock:
             _api._history_buf.clear()
             for i in range(maxlen + 10):
-                _api._history_buf.append({"ts": f"t{i:04}", "cpu_pct": float(i)})
+                ts = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(now - _api._PUBLIC_ACTIVITY_DELAY_S - maxlen + i - 20),
+                )
+                _api._history_buf.append({"ts": ts, "cpu_pct": float(i)})
         # Default limit is 60; request full deque with explicit limit
         resp = public_client.get(f"/api/v1/public/history?limit={maxlen}")
         data = resp.json()
         assert len(data) == maxlen
-        assert data[-1]["ts"] == f"t{maxlen + 9:04}"  # newest
+        assert data[-1]["cpu_pct"] == pytest.approx(maxlen + 9, abs=0.1)
+
+    def test_recent_samples_and_private_inputs_are_excluded(self, public_client):
+        from pxh import api as _api
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 901))
+        new_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30))
+        with _api._history_lock:
+            _api._history_buf.clear()
+            _api._history_buf.extend([
+                {
+                    "ts": old_ts, "cpu_pct": 10, "ambient_rms": 200,
+                    "person_present": False,
+                },
+                {
+                    "ts": new_ts, "cpu_pct": 99, "ambient_rms": 900,
+                    "person_present": True,
+                },
+            ])
+        data = public_client.get("/api/v1/public/history").json()
+        assert len(data) == 1
+        assert data[0]["cpu_pct"] == 10
+        assert "ambient_rms" not in data[0]
+        assert "person_present" not in data[0]
 
     def test_collect_sample_sonar_null_when_stale(self, state_dir, monkeypatch):
         import time as _time
@@ -425,7 +459,7 @@ class TestPublicHistory:
         from pxh import api as _api
         sample = _api._collect_history_sample(state_dir)
         for field in ("ts", "cpu_pct", "cpu_temp_c", "ram_pct", "disk_pct", "battery_pct",
-                      "sonar_cm", "ambient_rms", "weather_temp_c", "wind_kmh", "humidity_pct",
+                      "sonar_cm", "ambient_rms", "person_present", "weather_temp_c", "wind_kmh", "humidity_pct",
                       "tokens_in", "tokens_out", "salience", "mood_val", "wifi_dbm"):
             assert field in sample, f"missing field: {field}"
 

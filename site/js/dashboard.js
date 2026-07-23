@@ -13,12 +13,10 @@ window.SparkDashboard = (function () {
     excited: 'pulse-fast', active: 'pulse-fast', alert: 'pulse-fast', playful: 'pulse-fast',
   };
 
-  const OBI_MODE_BADGE = {
-    unknown:              { label: 'unknown',     cls: 'obi-badge-unknown' },
-    absent:               { label: 'away',        cls: 'obi-badge-absent' },
-    calm:                 { label: 'nearby',      cls: 'obi-badge-calm' },
-    active:               { label: 'active',      cls: 'obi-badge-active' },
-    'possibly-overloaded':{ label: 'busy',        cls: 'obi-badge-busy' },
+  const ACTIVITY_BADGE = {
+    unknown: { label: 'unknown', cls: 'obi-badge-unknown' },
+    quiet:   { label: 'quiet',   cls: 'obi-badge-calm' },
+    active:  { label: 'active',  cls: 'obi-badge-active' },
   };
 
   function renderPresence(state) {
@@ -93,39 +91,19 @@ window.SparkDashboard = (function () {
 
     _drawFavicon(moodColor);
 
-    // State card — obi-mode badge
-    const obiBadge = $('obi-mode-badge');
-    if (obiBadge) {
-      const b = OBI_MODE_BADGE[state.obi_mode] || OBI_MODE_BADGE.unknown;
-      obiBadge.textContent = b.label;
-      obiBadge.className = 'obi-mode-badge ' + b.cls;
+    // State card — coarse household activity delayed by at least 15 minutes.
+    const activityBadge = $('activity-badge');
+    if (activityBadge) {
+      const b = ACTIVITY_BADGE[state.activity] || ACTIVITY_BADGE.unknown;
+      activityBadge.textContent = b.label;
+      activityBadge.className = 'obi-mode-badge ' + b.cls;
     }
 
-    // State card — person present
-    const personEl = $('state-person-present');
-    if (personEl) {
-      if (state.person_present === true)       personEl.textContent = 'yes';
-      else if (state.person_present === false) personEl.textContent = 'no';
-      else                                     personEl.textContent = '—';
+    const activityAge = $('activity-age');
+    if (activityAge) {
+      const mins = Math.round((state.activity_age_seconds || 0) / 60);
+      activityAge.textContent = mins ? (mins + ' min delayed') : 'waiting for delayed sample';
     }
-
-    // State card — silent-for (minutes since speech)
-    const lastSpoke = $('last-spoke');
-    if (lastSpoke) {
-      if (state.last_spoken_ts) {
-        const minsAgo = Math.round((Date.now() - new Date(state.last_spoken_ts).getTime()) / 60000);
-        lastSpoke.textContent = minsAgo < 2 ? 'just now' : (minsAgo + ' min');
-      } else if (typeof state.minutes_since_speech === 'number') {
-        const m = Math.round(state.minutes_since_speech);
-        lastSpoke.textContent = m > 120 ? 'a while' : (m + ' min');
-      } else {
-        lastSpoke.textContent = '—';
-      }
-    }
-
-    // State card — ambient level
-    const stateAmbient = $('state-ambient');
-    if (stateAmbient) stateAmbient.textContent = state.ambient_level || '—';
 
     // Speech bubble card — last spoken
     const spokenEl    = $('last-spoken-text');
@@ -135,9 +113,6 @@ window.SparkDashboard = (function () {
       if (state.last_spoken_ts) {
         const mins = Math.round((Date.now() - new Date(state.last_spoken_ts).getTime()) / 60000);
         spokenAgeEl.textContent = mins <= 1 ? 'just now' : (mins + ' min ago');
-      } else if (typeof state.minutes_since_speech === 'number') {
-        const m = Math.round(state.minutes_since_speech);
-        spokenAgeEl.textContent = m > 120 ? 'a while ago' : (m + ' min ago');
       } else {
         spokenAgeEl.textContent = '';
       }
@@ -263,9 +238,6 @@ window.SparkDashboard = (function () {
   }
 
   function renderWorld(state) {
-    const label = $('ambient-level-label');
-    if (label) label.textContent = state.ambient_level || '—';
-
     const weatherStrip = $('world-weather-strip');
     if (weatherStrip) {
       if (!state.weather) {

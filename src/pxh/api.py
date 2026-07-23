@@ -396,6 +396,62 @@ import collections as _collections
 
 _history_buf: "_collections.deque[Dict[str, Any]]" = _collections.deque(maxlen=2880)
 _history_lock = threading.Lock()
+_PUBLIC_ACTIVITY_DELAY_S = 15 * 60
+_PUBLIC_ACTIVITY_ACTIVE_RMS = 500
+_PRIVATE_HISTORY_FIELDS = frozenset({"ambient_rms", "person_present"})
+
+
+def _history_sample_epoch(sample: Dict[str, Any]) -> Optional[float]:
+    """Return a history sample's UTC epoch, or None when its timestamp is invalid."""
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(sample["ts"]).replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _delayed_public_activity(now: Optional[float] = None) -> tuple[str, Optional[int]]:
+    """Project a delayed, coarse activity signal from private sensor history."""
+    now_epoch = _time.time() if now is None else now
+    cutoff = now_epoch - _PUBLIC_ACTIVITY_DELAY_S
+    with _history_lock:
+        samples = list(_history_buf)
+
+    for sample in reversed(samples):
+        sample_epoch = _history_sample_epoch(sample)
+        if sample_epoch is None or sample_epoch > cutoff:
+            continue
+        person_present = sample.get("person_present")
+        ambient_rms = sample.get("ambient_rms")
+        if person_present is True:
+            activity = "active"
+        elif isinstance(ambient_rms, (int, float)):
+            activity = "active" if ambient_rms >= _PUBLIC_ACTIVITY_ACTIVE_RMS else "quiet"
+        elif person_present is False:
+            activity = "quiet"
+        else:
+            activity = "unknown"
+        return activity, max(0, round(now_epoch - sample_epoch))
+    return "unknown", None
+
+
+def _public_history_projection(limit: int, now: Optional[float] = None) -> list[Dict[str, Any]]:
+    """Return delayed history without household-presence or acoustic measurements."""
+    now_epoch = _time.time() if now is None else now
+    cutoff = now_epoch - _PUBLIC_ACTIVITY_DELAY_S
+    with _history_lock:
+        samples = list(_history_buf)
+
+    projected = []
+    for sample in samples:
+        sample_epoch = _history_sample_epoch(sample)
+        if sample_epoch is None or sample_epoch > cutoff:
+            continue
+        projected.append({
+            key: value for key, value in sample.items()
+            if key not in _PRIVATE_HISTORY_FIELDS
+        })
+    return projected[-limit:]
 
 
 def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, Any]":
@@ -446,13 +502,19 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
         sample["tokens_in"] = None
         sample["tokens_out"] = None
 
-    # Ambient RMS + weather fields from awareness.json (single read)
+    # Private activity inputs + weather fields from awareness.json (single read).
+    # Presence and ambient RMS stay internal to the ring buffer and are removed
+    # by _public_history_projection before any unauthenticated response.
     try:
         aw = json.loads((state_dir / "awareness.json").read_text())
         if not isinstance(aw, dict):
             aw = {}
         ambient = aw.get("ambient_sound") or {}
         sample["ambient_rms"] = ambient.get("rms") if isinstance(ambient, dict) else None
+        frigate = aw.get("frigate") or {}
+        sample["person_present"] = (
+            frigate.get("person_present") if isinstance(frigate, dict) else None
+        )
         weather = aw.get("weather")
         if isinstance(weather, dict):
             tc = weather.get("temp_C")
@@ -467,6 +529,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
             sample["rain_24h_mm"] = None
     except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
         sample["ambient_rms"] = None
+        sample["person_present"] = None
         sample["weather_temp_c"] = None
         sample["wind_kmh"] = None
         sample["humidity_pct"] = None
@@ -781,26 +844,12 @@ async def public_sonar() -> Dict[str, Any]:
 
 @app.get("/api/v1/public/awareness")
 async def public_awareness() -> Dict[str, Any]:
-    """SPARK awareness snapshot: mode, Frigate, ambient, weather, time context. No auth."""
+    """Public-safe weather, time, and delayed coarse household activity."""
     try:
         parsed = json.loads((_public_state_dir() / "awareness.json").read_text())
         awareness = parsed if isinstance(parsed, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
         awareness = {}
-
-    # frigate: absent/None → Frigate offline → person_present=None (hidden in UI)
-    # frigate: dict → Frigate online → use its person_present value
-    raw_frigate = awareness.get("frigate")
-    if isinstance(raw_frigate, dict):
-        person_present: Any = raw_frigate.get("person_present", False)
-        frigate_score: Any = raw_frigate.get("score")
-        detections: Any = raw_frigate.get("detections", [])
-    else:
-        person_present = None
-        frigate_score = None
-        detections = None
-
-    ambient = awareness.get("ambient_sound") or {}
 
     raw_weather = awareness.get("weather")
     if isinstance(raw_weather, dict):
@@ -820,27 +869,14 @@ async def public_awareness() -> Dict[str, Any]:
     sys_stats = awareness.get("system") or {}
     wifi_dbm: Any = sys_stats.get("wifi_dbm")
 
-    # HA presence stripped from public endpoint — occupancy data is sensitive.
-    # Available on authenticated /api/v1/session only.
+    activity, activity_age_seconds = _delayed_public_activity()
 
     return {
-        "obi_mode": awareness.get("obi_mode"),
-        "person_present": person_present,
-        "frigate_score": frigate_score,
-        "detections": detections,
-        "ha_presence": None,
-        "ambient_level": ambient.get("level"),
-        "ambient_rms": ambient.get("rms"),
+        "activity": activity,
+        "activity_age_seconds": activity_age_seconds,
         "weather": weather_out,
-        "minutes_since_speech": awareness.get("minutes_since_speech"),
         "time_period": awareness.get("time_period"),
         "wifi_dbm": wifi_dbm,
-        # HA integration data stripped from public endpoint — exposes Obi's schedule,
-        # meds status, and Adrian's call status.  Available on authenticated /api/v1/session only.
-        "ha_calendar": None,
-        "ha_routines": None,
-        "ha_context": None,
-        "ha_sleep": None,
         "ts": awareness.get("ts"),
     }
 
@@ -858,9 +894,8 @@ async def authenticated_awareness() -> Dict[str, Any]:
 
 @app.get("/api/v1/public/history")
 async def public_history(limit: int = Query(default=60, ge=1, le=2880)) -> list:
-    """Ring buffer of up to 2880 vitals readings (24h). No auth. Default: last 60 (~30 min)."""
-    with _history_lock:
-        return list(_history_buf)[-limit:]
+    """Delayed public history with household activity inputs removed."""
+    return _public_history_projection(limit)
 
 
 @app.get("/api/v1/public/thoughts")

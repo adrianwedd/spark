@@ -146,20 +146,12 @@
       <div class="presence-card presence-card-state">
         <p class="card-eyebrow">State</p>
         <div class="state-obi-row">
-          <span class="state-label">Obi</span>
-          <span id="obi-mode-badge" class="obi-mode-badge"></span>
+          <span class="state-label">Household</span>
+          <span id="activity-badge" class="obi-mode-badge"></span>
         </div>
         <div class="state-stat-row">
-          <span class="state-label">Present</span>
-          <span id="state-person-present" class="state-stat-val">—</span>
-        </div>
-        <div class="state-stat-row">
-          <span class="state-label">Silent for</span>
-          <span id="last-spoke" class="state-stat-val"></span>
-        </div>
-        <div class="state-stat-row">
-          <span class="state-label">Ambient</span>
-          <span id="state-ambient" class="state-stat-val"></span>
+          <span class="state-label">Privacy</span>
+          <span id="activity-age" class="state-stat-val">waiting for delayed sample</span>
         </div>
         <div class="state-stat-row">
           <span class="state-label">Period</span>
@@ -173,11 +165,6 @@
         <div class="proximity-bar-track proximity-bar-track--inline">
           <div id="proximity-bar" class="proximity-bar-fill"></div>
         </div>
-        <div class="state-section-label">Detected</div>
-        <ul id="detections-list" class="detections-list"></ul>
-        <p class="detections-empty" id="detections-empty">Nothing detected</p>
-        <div class="state-section-label" id="ha-presence-label" hidden>Who's home</div>
-        <ul id="ha-presence-list" class="ha-presence-list"></ul>
       </div>
 
       <!-- Last spoken — speech bubble card -->
@@ -202,25 +189,6 @@
     <div class="band band-world" id="band-world">
       <details class="world-details">
         <summary class="world-toggle">Environment ▸</summary>
-
-      <!-- Sound + Noise cards -->
-      <div class="sound-noise-row">
-        <div class="wx-card wx-card-sound">
-          <div class="wx-card-label">Sound level</div>
-          <div class="sound-val-wave-row">
-            <div class="wx-card-val" id="ambient-level-label">—</div>
-            <canvas id="waveform-canvas" height="28"
-                    aria-label="ambient sound level visualisation"></canvas>
-          </div>
-        </div>
-        <div class="wx-card wx-card-noise">
-          <div class="wx-card-header-row">
-            <div class="wx-card-label">Noise level (1h)</div>
-          </div>
-          <canvas class="sparkline-canvas" data-field="ambient_rms" height="40"
-                  aria-label="noise level history"></canvas>
-        </div>
-      </div>
 
       <!-- Weather cards 2×2 -->
       <div class="wx-card-grid" id="world-weather-strip">
@@ -494,10 +462,10 @@
     <pre class="arch">
   GET /api/v1/public/status       mood, last_thought, last_spoken, salience
   GET /api/v1/public/thoughts     recent thoughts, newest-first (limit=N)
-  GET /api/v1/public/awareness    obi_mode, Frigate, ambient, weather, time
+  GET /api/v1/public/awareness    delayed coarse activity, weather, time
   GET /api/v1/public/vitals       cpu, ram, disk, temp, battery, tokens
   GET /api/v1/public/sonar        latest sonar distance + age
-  GET /api/v1/public/history      ring buffer — 2880 samples × 30s ≈ 24 h
+  GET /api/v1/public/history      15-min delayed history; no presence/audio fields
   GET /api/v1/public/services     systemd unit status for all eleven services
   GET /api/v1/public/feed         social posting feed (JSON)
   GET /api/v1/public/race         race telemetry, calibration, live lap data
