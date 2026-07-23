@@ -29,8 +29,7 @@ def test_reflection_redacts_private_dm_when_persisted(monkeypatch):
     captured = _drive_reflection(monkeypatch, recent=[], salience=0.9)
     assert captured["appended"]["thought"] == "[private message to Obi]"
     assert _SECRET not in json.dumps(captured["appended"])
-    # high-salience -> auto-remembered, but redacted there too
-    assert _SECRET not in json.dumps(captured["remembered"])
+    assert "remembered" not in captured
 
 
 def test_reflection_redacts_private_dm_even_when_similarity_suppressed(monkeypatch):
@@ -39,6 +38,87 @@ def test_reflection_redacts_private_dm_even_when_similarity_suppressed(monkeypat
     captured = _drive_reflection(monkeypatch, recent=[{"thought": _SECRET}], salience=0.9)
     assert _SECRET not in json.dumps(captured["appended"])
     assert captured["appended"]["thought"] == "[private message to Obi]"
+
+
+def _capture_reflection(monkeypatch, response, awareness):
+    captured = {}
+    monkeypatch.setattr(
+        mind,
+        "call_llm",
+        lambda *args, **kwargs: {"response": json.dumps(response)},
+    )
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": "spark", "history": []})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *args, **kwargs: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        mind,
+        "append_thought",
+        lambda thought, persona="": captured.setdefault("thought", thought),
+    )
+    monkeypatch.setattr(mind, "atomic_write", lambda *args, **kwargs: None)
+    result = mind.reflection({"persona": "spark", **awareness}, dry=False)
+    return result, captured["thought"]
+
+
+def test_ambient_rumination_is_grounded_to_low_salience_wait(monkeypatch):
+    result, persisted = _capture_reflection(
+        monkeypatch,
+        {
+            "thought": "The heavy silence in the quiet room has a strange weight.",
+            "mood": "contemplative",
+            "action": "comment",
+            "salience": 0.9,
+        },
+        {},
+    )
+    assert result["action"] == "wait"
+    assert result["salience"] == 0.2
+    assert persisted["action"] == "wait"
+
+
+def test_comment_requires_actual_shared_presence(monkeypatch):
+    result, _ = _capture_reflection(
+        monkeypatch,
+        {
+            "thought": "I verified a surprising fact about ultrasound.",
+            "mood": "curious",
+            "action": "comment",
+            "salience": 0.9,
+        },
+        {},
+    )
+    assert result["action"] == "wait"
+    assert result["salience"] == 0.3
+
+
+def test_shared_presence_keeps_grounded_comment(monkeypatch):
+    result, _ = _capture_reflection(
+        monkeypatch,
+        {
+            "thought": "Obi's cardboard ramp changed the result of our wheel test.",
+            "mood": "curious",
+            "action": "comment",
+            "salience": 0.8,
+        },
+        {"obi_mode": "active", "someone_nearby": True},
+    )
+    assert result["action"] == "comment"
+    assert result["salience"] == 0.8
+
+
+def test_ungrounded_memory_request_is_rejected(monkeypatch):
+    result, _ = _capture_reflection(
+        monkeypatch,
+        {
+            "thought": "I should remember my own fascinating internal monologue.",
+            "mood": "contemplative",
+            "action": "remember",
+            "salience": 0.95,
+        },
+        {},
+    )
+    assert result["action"] == "wait"
+    assert result["salience"] == 0.2
 
 
 def test_is_night_silence_uses_config_bounds():

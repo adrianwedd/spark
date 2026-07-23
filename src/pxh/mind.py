@@ -39,7 +39,7 @@ from pxh.spark_config import (
     _SPARK_REFLECTION_PREFIX, _SPARK_REFLECTION_SUFFIX,
     MOOD_TO_SOUND, MOOD_TO_EMOTE,
     SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
-    SALIENCE_THRESHOLD, WEATHER_INTERVAL_S,
+    WEATHER_INTERVAL_S,
     OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
@@ -1680,7 +1680,7 @@ def load_notes(n: int = 5, persona: str = "") -> list[str]:
             except json.JSONDecodeError:
                 continue
             note = (record.get("note") or "").strip()
-            if note:
+            if note and not note.startswith("[mind] "):
                 notes.append(note)
         notes.reverse()
         return notes
@@ -1709,6 +1709,40 @@ def text_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+_AMBIENT_RUMINATION_TERMS = frozenset({
+    "ambient", "hush", "hum", "quiet", "quietude", "room", "silence",
+    "still", "stillness", "weight", "heavy", "office light",
+})
+
+
+def _is_ambient_rumination(text: str) -> bool:
+    lower = text.lower()
+    hits = sum(
+        1 for term in _AMBIENT_RUMINATION_TERMS
+        if re.search(rf"\b{re.escape(term)}\b", lower)
+    )
+    return hits >= 2
+
+
+def _reflection_focus(awareness: dict) -> str:
+    obi_mode = awareness.get("obi_mode")
+    conversations = awareness.get("recent_conversations") or []
+    if obi_mode in {"active", "calm"}:
+        return "shared"
+    if any(str(item.get("who", "")).lower() == "obi" for item in conversations):
+        return "shared"
+    return "independent"
+
+
+def _shared_presence(awareness: dict) -> bool:
+    frigate = awareness.get("frigate") or {}
+    return bool(
+        awareness.get("someone_nearby")
+        or frigate.get("person_present")
+        or awareness.get("obi_mode") in {"active", "calm"}
+    )
 
 
 def nearest_mood(v: float, a: float) -> str:
@@ -2493,16 +2527,17 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
 
     session = load_session()
     persona = runtime_persona(awareness.get("persona") or session.get("persona"))
-    recent_thoughts = load_recent_thoughts(5, persona=persona)
+    recent_thoughts = load_recent_thoughts(20, persona=persona)
     recent_history = (session.get("history") or [])[-5:]
     notes = load_notes(3, persona=persona)
+    focus = _reflection_focus(awareness)
 
     # Pick a topic seed (or None = free-will mode) using OS entropy RNG
-    topic_seed = _pick_reflection_seed()
+    topic_seed = _pick_reflection_seed(focus=focus)
 
     # Feed moods only (not full thought text) to avoid re-seeding repetition
-    recent_moods = [t.get("mood", "?") for t in recent_thoughts]
-    recent_actions = [t.get("action", "?") for t in recent_thoughts]
+    recent_moods = [t.get("mood", "?") for t in recent_thoughts[-5:]]
+    recent_actions = [t.get("action", "?") for t in recent_thoughts[-5:]]
     momentum = awareness.get("mood_momentum", {})
     context_parts = [
         f"Current awareness:\n{json.dumps(awareness, indent=2)}",
@@ -2510,7 +2545,18 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         f"Your recent actions: {recent_actions}",
         f"Your emotional momentum: {momentum.get('mood', 'content')} (valence={momentum.get('valence', 0)}, arousal={momentum.get('arousal', 0)})",
         f"Recent events:\n{json.dumps(recent_history, indent=2)}",
+        f"Attention mode: {focus}.",
     ]
+
+    ambient_recent = sum(
+        _is_ambient_rumination(str(item.get("thought", "")))
+        for item in recent_thoughts
+    )
+    if ambient_recent >= 3:
+        context_parts.append(
+            "Attention correction: recent thoughts over-focused on room atmosphere, "
+            "silence, or stillness. Do not revisit that theme."
+        )
 
     if awareness.get("transitions"):
         context_parts.append(f"Transitions just detected: {awareness['transitions']}")
@@ -2520,8 +2566,6 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if time_ctx:
         period_min = awareness.get("period_duration_min", 0)
         context_parts.append(f"Time context: {time_ctx}")
-        if period_min > 60 and awareness.get("minutes_since_interaction", 0) > 30:
-            context_parts.append(f"It's been quiet for over {int(period_min)} minutes this {awareness.get('time_period', 'period')}.")
 
     # Conversation digestion
     convos = awareness.get("recent_conversations", [])
@@ -2725,7 +2769,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     log(f"reflecting... (backend={effective_backend}, persona={persona or 'default'})")
     t0 = time.monotonic()
     if persona == "spark":
-        angles = _pick_spark_angles()
+        angles = _pick_spark_angles(focus=focus)
         formatted = "\n".join(f"- {text}" for text, _mood in angles)
         target_mood = angles[0][1]
         mood_hint = f"\n\nSuggested mood for this reflection: **{target_mood}**. You may choose a different mood if the thought genuinely leads elsewhere, but don't default to contemplative/content out of habit."
@@ -2825,6 +2869,25 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         thought["action"] = "wait"
         thought["salience"] = 0.0
 
+    has_grounding = bool(
+        awareness.get("transitions")
+        or awareness.get("recent_conversations")
+    )
+    if _is_ambient_rumination(thought["thought"]) and not has_grounding:
+        log(f"thought grounded to wait (ambient rumination): {display_text[:80]}")
+        thought["action"] = "wait"
+        thought["salience"] = min(thought["salience"], 0.2)
+    if thought["action"] == "comment" and not _shared_presence(awareness):
+        log(f"thought grounded to wait (nobody present): {display_text[:80]}")
+        thought["action"] = "wait"
+        thought["salience"] = min(thought["salience"], 0.3)
+    if thought["action"] == "remember" and not has_grounding:
+        log(f"thought grounded to wait (memory lacks event): {display_text[:80]}")
+        thought["action"] = "wait"
+        thought["salience"] = min(thought["salience"], 0.2)
+    if thought["action"] == "wait":
+        thought["salience"] = min(thought["salience"], 0.3)
+
     log(f"thought: {display_text}  mood={thought['mood']} "
         f"action={thought['action']} salience={thought['salience']:.1f} "
         f"({elapsed:.1f}s, {tps} tok/s)")
@@ -2849,10 +2912,6 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         }))
     except Exception:
         pass
-
-    # Auto-remember high-salience thoughts (persona-scoped) — redacted if private.
-    if thought["salience"] >= SALIENCE_THRESHOLD:
-        auto_remember(persist_thought, persona=persona)
 
     return thought
 

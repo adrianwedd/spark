@@ -163,6 +163,20 @@ def test_auto_remember_writes_note_regardless_of_salience(mind_state):
     assert notes_file.exists()
 
 
+def test_load_notes_ignores_legacy_self_awarded_memories(mind_state):
+    notes_file = pxh.mind.notes_file_for_persona("spark")
+    notes_file.write_text(
+        "\n".join([
+            json.dumps({"note": "[mind] The silence feels heavy again."}),
+            json.dumps({"note": "Obi prefers the blue ramp for wheel experiments."}),
+        ]) + "\n"
+    )
+
+    assert pxh.mind.load_notes(5, persona="spark") == [
+        "Obi prefers the blue ramp for wheel experiments."
+    ]
+
+
 # ── fetch_weather tests ──────────────────────────────────────────────
 
 def test_fetch_weather_dry_returns_dict():
