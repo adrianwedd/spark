@@ -944,8 +944,8 @@ def main(argv=None) -> int:
         px.get_grayscale_data.return_value = [400, 410, 405]
     else:
         try:
-            from picarx import Picarx
-            px = Picarx()
+            from pxh.hardware import make_picarx
+            px = make_picarx()
         except Exception as exc:
             print(f"ERROR: cannot init Picarx: {exc}", file=sys.stderr)
             return 1

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
-yield_alive
+yield_alive "$@"
 
 /usr/bin/python3 - "$@" <<'PY'
 """Sweep the camera pan servo and sample ultrasonic distance at each step.
@@ -57,7 +57,7 @@ def main(argv):
         return 0
 
     try:
-        from picarx import Picarx
+        from pxh.hardware import make_picarx
     except Exception as exc:
         log(f"import error: {exc}")
         print(json.dumps({"status": "error", "error": str(exc)}))
@@ -65,7 +65,7 @@ def main(argv):
 
     px = None
     try:
-        px = Picarx()
+        px = make_picarx()
         px.set_cam_tilt_angle(int(args.tilt))
         readings = []
 

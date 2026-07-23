@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
-yield_alive
+yield_alive "$@"
 
 /usr/bin/python3 - "$@" <<'PY'
 """Move the PiCar-X camera pan/tilt servos to a target angle, with easing."""
@@ -71,14 +71,14 @@ def main(argv):
         return 0
 
     try:
-        from picarx import Picarx
+        from pxh.hardware import make_picarx
     except Exception as exc:
         log(f"error importing picarx: {exc}")
         return 1
 
     px = None
     try:
-        px = Picarx()
+        px = make_picarx()
         ease_servos(px, from_pan, from_tilt, to_pan, to_tilt, args.ease)
         log(f"arrived pan={to_pan} tilt={to_tilt}")
         if args.hold > 0:

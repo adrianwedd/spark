@@ -36,26 +36,75 @@ if [[ -d "$PROJECT_ROOT/.venv" && -z "${VIRTUAL_ENV:-}" ]]; then
     source "$PROJECT_ROOT/.venv/bin/activate"
 fi
 
-# Signal px-alive to release its Picarx/GPIO handle so a tool can use servos.
-# Usage: yield_alive  (call before opening Picarx in any tool script)
-yield_alive() {
+# Acquire the single secondary-hardware lease and pause px-alive in-process.
+# The lease stays open in the calling shell and its child until shell exit.
+resume_alive() {
+    if [[ "${PX_GPIO_LEASE_ACTIVE:-0}" != "1" ]]; then
+        return
+    fi
     local pid_file="$LOG_DIR/px-alive.pid"
     if [[ -f "$pid_file" ]]; then
         local pid
         pid=$(<"$pid_file")
         if [[ -d "/proc/$pid" ]]; then
-            kill -USR1 "$pid" 2>/dev/null || true
-            # Poll until px-alive actually exits — sleep 1 is not reliable
-            # because gaze animations can take 2-3s to complete.
+            kill -USR2 "$pid" 2>/dev/null || sudo -n kill -USR2 "$pid" 2>/dev/null || true
+        fi
+    fi
+    if [[ -n "${PX_GPIO_LOCK_FD:-}" ]]; then
+        flock -u "$PX_GPIO_LOCK_FD" 2>/dev/null || true
+        eval "exec ${PX_GPIO_LOCK_FD}>&-"
+        unset PX_GPIO_LOCK_FD
+    fi
+    PX_GPIO_LEASE_ACTIVE=0
+    export PX_GPIO_LEASE_ACTIVE
+}
+
+yield_alive() {
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == "--dry-run" ]]; then
+            return
+        fi
+    done
+    if [[ "${PX_DRY:-0}" == "1" || "${PX_GPIO_LEASE_ACTIVE:-0}" == "1" ]]; then
+        return
+    fi
+    local lock_file="$LOG_DIR/gpio-owner.lock"
+    mkdir -p "$LOG_DIR"
+    exec {PX_GPIO_LOCK_FD}>"$lock_file"
+    if ! flock -w "${PX_GPIO_LOCK_TIMEOUT:-20}" "$PX_GPIO_LOCK_FD"; then
+        echo "GPIO lease timeout: another hardware tool is still running" >&2
+        return 1
+    fi
+    export PX_GPIO_LOCK_FD
+    PX_GPIO_LEASE_ACTIVE=1
+    export PX_GPIO_LEASE_ACTIVE
+    trap resume_alive EXIT
+
+    local pid_file="$LOG_DIR/px-alive.pid"
+    local paused_file="$LOG_DIR/px-alive.paused"
+    if [[ -f "$pid_file" ]]; then
+        local pid
+        pid=$(<"$pid_file")
+        if [[ -d "/proc/$pid" ]]; then
+            if ! kill -USR1 "$pid" 2>/dev/null && ! sudo -n kill -USR1 "$pid" 2>/dev/null; then
+                echo "Unable to pause px-alive PID $pid" >&2
+                resume_alive
+                return 1
+            fi
             local i
-            for i in $(seq 25); do
-                [[ -d "/proc/$pid" ]] || break
+            for i in $(seq 50); do
+                if [[ -f "$paused_file" ]] && [[ "$(<"$paused_file")" == "$pid" ]]; then
+                    return
+                fi
+                if [[ ! -d "/proc/$pid" ]]; then
+                    return
+                fi
                 sleep 0.2
             done
-            # px.close() does NOT release GPIO5 (reset_mcu pin) — only
-            # full process exit does. lgpiod also needs time to reclaim
-            # the pin after client fd closes. 2s is empirically safe.
-            sleep 2.0
+            echo "Timed out waiting for px-alive PID $pid to pause" >&2
+            resume_alive
+            return 1
         fi
     fi
 }

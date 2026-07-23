@@ -116,11 +116,11 @@ Boot
  ├── px-battery-poll.service    (root)   — polls Robot HAT ADC every 30s → state/battery.json; plays rising/falling sweep tones on plug/unplug with voice announcement; escalating warnings + emergency shutdown at 10%
  ├── px-api-server.service      (pi)     — REST API + SPARK web dashboard on port 8420
  ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via Claude, posts to Bluesky + local feed
- ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration (stops px-alive to claim libcamera)
+ ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration
  └── cloudflared.service        (pi)     — Cloudflare Tunnel (spark-api.wedd.au → localhost:8420)
 ```
 
-**`px-alive`** runs as root (GPIO access) and immediately calls `Picarx()`, claiming GPIO5 via `reset_mcu()`. It never releases this handle. All other processes that need servos must signal px-alive with `SIGUSR1` (via the `yield_alive` function in `px-env`) to make it exit cleanly. systemd restarts it after 10 seconds. The PCA9685 PWM chip retains the last servo position between restarts, so the robot head stays still.
+**`px-alive`** is the durable GPIO5 owner. Hardware tools take `logs/gpio-owner.lock`, signal `SIGUSR1`, and wait for `logs/px-alive.paused`. The daemon releases its ultrasonic handle but stays alive; secondary clients use `pxh.hardware.make_picarx()` so they never reclaim/reset GPIO5. The tool's shell trap sends `SIGUSR2` to resume the same daemon process.
 
 **`px-wake-listen`** loads the Vosk grammar model (~40 MB) and sits in a tight capture loop on the USB microphone at 44100 Hz.
 
@@ -248,7 +248,7 @@ print(json.dumps(payload))           # single JSON line to stdout
 PY
 ```
 
-Tools that need GPIO call `yield_alive` first (defined in `px-env` as `kill -USR1 $(cat logs/px-alive.pid) 2>/dev/null; sleep 0.5`).
+Tools that need GPIO call `yield_alive "$@"` first. It serializes secondary clients, pauses `px-alive`, waits for acknowledgement, and automatically resumes it when the tool shell exits. Dry runs never acquire the lease.
 
 **Motion gate**: tools that move the robot check `confirm_motion_allowed` in session before proceeding. If false, they return `{"status": "blocked", "reason": "motion not allowed"}`.
 
@@ -656,9 +656,10 @@ SPARK-specific session fields: `obi_routine`, `obi_step`, `obi_mood`, `obi_strea
 
 The PiCar-X Robot HAT MCU at I2C address `0x14` handles all servos and ADC through `robot_hat`. The `Picarx()` constructor claims GPIO5 and `close()` does not release it.
 
-- **`px-alive`** holds a persistent `Picarx` handle
-- **Tools** call `yield_alive()` (SIGUSR1 to px-alive) before claiming GPIO
-- **systemd** restarts px-alive after 10s (`Restart=always`, `RestartSec=10`)
+- **`px-alive`** remains the durable GPIO5 owner and pauses in-process
+- **Tools** serialize on `gpio-owner.lock`, then wait for the daemon's pause acknowledgement
+- **Secondary clients** use `make_picarx()` with MCU reset disabled
+- **Shell cleanup** sends `SIGUSR2`; normal tool use does not stop or restart the service
 - **`os.getlogin()`** fails under systemd — monkey-patched via `usercustomize.py`
 
 ---
@@ -682,7 +683,7 @@ espeak → WAV pipe → aplay -D robothat
 2. Add to `ALLOWED_TOOLS` and `TOOL_COMMANDS` in `src/pxh/voice_loop.py`
 3. Add `validate_action()` branch to sanitise params into env vars
 4. Add to relevant system prompts in `docs/prompts/`
-5. Add `yield_alive` call if it needs GPIO
+5. Add `yield_alive "$@"` and construct hardware through `pxh.hardware.make_picarx()` if it needs GPIO
 6. Add a dry-run test in `tests/test_tools.py`
 
 Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle errors as `{"status": "error", "error": "..."}`.

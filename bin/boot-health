@@ -8,6 +8,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/px-env"
 
+yield_alive "$@"
+
 LOG_FILE="${LOG_DIR:-${SCRIPT_DIR}/../logs}/boot-health.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -96,8 +98,8 @@ _user = os.environ.get("LOGNAME") or os.environ.get("USER") or "pi"
 os.getlogin = lambda: _user
 
 sys.path.insert(0, "/home/pi/picar-x")
-from picarx import Picarx
-px = Picarx()
+from pxh.hardware import make_picarx
+px = make_picarx()
 px.stop()
 px.set_dir_servo_angle(0)
 px.set_cam_pan_angle(0)

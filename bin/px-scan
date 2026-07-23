@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
-yield_alive
+yield_alive "$@"
 
 /usr/bin/python3 - "$@" <<'PY'
 import argparse
@@ -72,12 +72,12 @@ def main(argv: list[str]) -> int:
     target_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        from picarx import Picarx
+        from pxh.hardware import make_picarx
     except Exception as exc:  # pragma: no cover
         log(f"error importing picarx detail={exc}")
         return 1
 
-    px = Picarx()
+    px = make_picarx()
     return_code = 0
     try:
         for angle in angles:

@@ -1918,9 +1918,8 @@ async def race_action(action: str, request: Request) -> JSONResponse:
             raise HTTPException(status_code=422, detail=exc.errors()) from None
         dry = _resolve_dry(parsed.dry)
 
-        # Launch via bin/px-race so yield_alive runs *before* Picarx() is constructed
-        # (issue #145). The bash launcher sources px-env, sends SIGUSR1 to px-alive,
-        # waits for it to exit + 2s lgpiod settle, then delegates to `python -m pxh.race`.
+        # Launch via bin/px-race so it leases hardware and pauses px-alive
+        # before constructing a secondary Picarx client.
         px_race = str(PROJECT_ROOT / "bin" / "px-race")
         cmd: list[str] = [px_race]
 

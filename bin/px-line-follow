@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+yield_alive "$@"
+
 /usr/bin/python3 - "$@" <<'PY'
 """Line follower: detect coloured track boundaries, steer to inferred centre.
 
@@ -205,8 +207,8 @@ def run(args) -> int:
     px = None
     if not dry:
         try:
-            from picarx import Picarx
-            px = Picarx()
+            from pxh.hardware import make_picarx
+            px = make_picarx()
             # Tilt camera down to see track
             px.set_camera_tilt_angle(args.cam_tilt)
             log(f"picarx ready, camera tilt={args.cam_tilt}°")

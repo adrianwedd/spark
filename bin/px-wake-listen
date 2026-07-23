@@ -15,7 +15,7 @@ Flow:
      a. Pipe utterance to run-voice-loop-claude --max-turns 1.
      b. Flush stale buffer, play soft follow-up chime, listen for reply.
      c. If reply detected within timeout → next turn; else → end conversation.
-  4. Restart px-alive, return to step 1.
+  4. Return to wake detection; px-alive continues independently.
 """
 import argparse
 import datetime as dt
@@ -647,49 +647,6 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     return text
 
 
-def _alive_pid() -> int | None:
-    """Return px-alive PID if running, else None."""
-    try:
-        pid = int(PID_FILE.parent.joinpath("px-alive.pid").read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    # Use /proc to check existence — os.kill(pid, 0) raises PermissionError for
-    # root-owned processes when running as pi, which we must not treat as "dead".
-    return pid if Path(f"/proc/{pid}").exists() else None
-
-
-def _stop_alive() -> int | None:
-    """Send SIGTERM to px-alive so it releases GPIO. Returns PID if killed."""
-    pid = _alive_pid()
-    if pid:
-        log(f"pausing px-alive (pid={pid}) for voice turn")
-        try:
-            # px-alive runs as root; use sudo kill so pi user can signal it
-            r = subprocess.run(["sudo", "-n", "kill", str(pid)], check=False, capture_output=True)
-            if r.returncode != 0:
-                log(f"_stop_alive: sudo kill failed (rc={r.returncode}): {r.stderr.decode(errors='replace').strip()}")
-            time.sleep(2.0)  # wait for Picarx.close() to release GPIO
-        except Exception as exc:
-            log(f"_stop_alive: exception: {exc}")
-    return pid
-
-
-def _restart_alive() -> None:
-    """Restart px-alive in background."""
-    alive_script = PROJECT_ROOT / "bin" / "px-alive"
-    if alive_script.exists():
-        log("restarting px-alive")
-        try:
-            subprocess.Popen(
-                ["sudo", "-n", str(alive_script)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as exc:
-            log(f"_restart_alive: failed to spawn: {exc}")
-
-
-
 def flush_stream(stream, chunks: int = 15) -> None:
     """Discard buffered audio that built up while the robot was speaking."""
     for _ in range(chunks):
@@ -803,7 +760,6 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
         log(f"dry_run: persona {persona_name} with {initial_text!r} ({max_turns} turns max)")
         return
 
-    had_alive = _stop_alive()
     env = os.environ.copy()
     env["PX_DRY"] = "0"
 
@@ -815,55 +771,50 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
     log(f"persona {persona_name}: using Ollama chat tool")
 
     current_text = initial_text
-    try:
-        for turn in range(1, max_turns + 1):
-            log(f"persona {persona_name} turn {turn}/{max_turns}: {current_text!r}")
+    for turn in range(1, max_turns + 1):
+        log(f"persona {persona_name} turn {turn}/{max_turns}: {current_text!r}")
 
-            env["PX_TEXT"] = current_text
-            result = subprocess.run(
+        env["PX_TEXT"] = current_text
+        result = subprocess.run(
+            [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
+        )
+        log(f"persona chat tool rc={result.returncode}")
+
+        if result.returncode != 0:
+            log(f"persona error (rc={result.returncode})")
+            break
+
+        if turn >= max_turns:
+            log("persona conversation: max turns reached")
+            play_chime_timeout(aplay_device)
+            break
+
+        time.sleep(0.4)
+        flush_stream(stream)
+        log("persona conversation: chime — listening")
+        play_chime_listening(aplay_device)
+        flush_stream(stream, chunks=15)
+        log("persona conversation: listening for follow-up...")
+        follow_text = record_followup(stream, model, stt, whisper, sensevoice,
+                                      aplay_device=aplay_device)
+
+        if not follow_text:
+            log("persona conversation: silence — ending")
+            play_chime_timeout(aplay_device)
+            break
+
+        log(f"persona conversation: follow-up: {follow_text!r}")
+
+        if _END_PHRASE_RE.search(follow_text.lower()):
+            log("persona conversation: end phrase — final turn")
+            env["PX_TEXT"] = follow_text
+            subprocess.run(
                 [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
             )
-            log(f"persona chat tool rc={result.returncode}")
+            play_chime_timeout(aplay_device)
+            break
 
-            if result.returncode != 0:
-                log(f"persona error (rc={result.returncode})")
-                break
-
-            if turn >= max_turns:
-                log("persona conversation: max turns reached")
-                play_chime_timeout(aplay_device)
-                break
-
-            time.sleep(0.4)
-            flush_stream(stream)
-            log("persona conversation: chime — listening")
-            play_chime_listening(aplay_device)
-            flush_stream(stream, chunks=15)
-            log("persona conversation: listening for follow-up...")
-            follow_text = record_followup(stream, model, stt, whisper, sensevoice,
-                                          aplay_device=aplay_device)
-
-            if not follow_text:
-                log("persona conversation: silence — ending")
-                play_chime_timeout(aplay_device)
-                break
-
-            log(f"persona conversation: follow-up: {follow_text!r}")
-
-            if _END_PHRASE_RE.search(follow_text.lower()):
-                log("persona conversation: end phrase — final turn")
-                env["PX_TEXT"] = follow_text
-                subprocess.run(
-                    [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
-                )
-                play_chime_timeout(aplay_device)
-                break
-
-            current_text = follow_text
-
-    finally:
-        if had_alive:
-            _restart_alive()
+        current_text = follow_text
 
 
 def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
@@ -876,73 +827,57 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
         log(f"dry_run: conversation with {initial_text!r} ({max_turns} turns max)")
         return
 
-    had_alive = _stop_alive()
     env = os.environ.copy()
     env["PX_DRY"] = "0"
 
     current_text = initial_text
-    try:
-        for turn in range(1, max_turns + 1):
-            log(f"conversation turn {turn}/{max_turns}: {current_text!r}")
-            result = subprocess.run(
+    for turn in range(1, max_turns + 1):
+        log(f"conversation turn {turn}/{max_turns}: {current_text!r}")
+        result = subprocess.run(
+            [voice_cmd, "--max-turns", "3"],
+            input=current_text,
+            text=True,
+            capture_output=False,
+            env=env,
+            check=False,
+        )
+        log(f"voice loop rc={result.returncode}")
+
+        if turn >= max_turns:
+            log("conversation: max turns reached")
+            play_chime_timeout(aplay_device)
+            break
+
+        time.sleep(0.4)
+        flush_stream(stream)
+        log("conversation: chime — listening")
+        play_chime_listening(aplay_device)
+        flush_stream(stream, chunks=15)
+        log("conversation: listening for follow-up...")
+        follow_text = record_followup(stream, model, stt, whisper, sensevoice,
+                                      aplay_device=aplay_device)
+
+        if not follow_text:
+            log("conversation: silence — ending")
+            play_chime_timeout(aplay_device)
+            break
+
+        log(f"conversation: follow-up: {follow_text!r}")
+
+        if _END_PHRASE_RE.search(follow_text.lower()):
+            log("conversation: end phrase — one final turn")
+            subprocess.run(
                 [voice_cmd, "--max-turns", "3"],
-                input=current_text,
+                input=follow_text,
                 text=True,
                 capture_output=False,
                 env=env,
                 check=False,
             )
-            log(f"voice loop rc={result.returncode}")
+            play_chime_timeout(aplay_device)
+            break
 
-            if turn >= max_turns:
-                log("conversation: max turns reached")
-                play_chime_timeout(aplay_device)
-                break
-
-            # Brief drain gap so PulseAudio finishes playing robot's last word
-            time.sleep(0.4)
-
-            # Flush stale audio buffered while robot was speaking
-            flush_stream(stream)
-
-            # Ascending chime: "your turn, I'm listening"
-            log("conversation: chime — listening")
-            play_chime_listening(aplay_device)
-
-            # Flush chime echo from mic buffer before listening
-            flush_stream(stream, chunks=15)
-
-            # Listen for follow-up (patient: 30s onset wait, 3.5s in-speech silence)
-            log("conversation: listening for follow-up...")
-            follow_text = record_followup(stream, model, stt, whisper, sensevoice,
-                                          aplay_device=aplay_device)
-
-            if not follow_text:
-                log("conversation: silence — ending")
-                play_chime_timeout(aplay_device)
-                break
-
-            log(f"conversation: follow-up: {follow_text!r}")
-
-            # Check for end-of-conversation phrases
-            if _END_PHRASE_RE.search(follow_text.lower()):
-                log("conversation: end phrase — one final turn")
-                subprocess.run(
-                    [voice_cmd, "--max-turns", "3"],
-                    input=follow_text,
-                    text=True,
-                    capture_output=False,
-                    env=env,
-                    check=False,
-                )
-                play_chime_timeout(aplay_device)
-                break
-
-            current_text = follow_text
-
-    finally:
-        if had_alive:
-            _restart_alive()
+        current_text = follow_text
 
 
 def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> None:

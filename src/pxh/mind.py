@@ -673,7 +673,7 @@ def read_sonar(dry: bool) -> float | None:
 
     Reads px-alive's live sonar file (updated every 5s, no servo movement).
     Returns None if stale/missing — no fallback to tool-sonar, which would
-    kill px-alive via yield_alive and make the staleness worse.
+    interrupt the hardware owner and make the staleness worse.
     """
     if dry:
         return None
@@ -3156,35 +3156,6 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 log("expression: explore gates failed on re-check")
                 return
 
-            # yield_alive
-            try:
-                import shlex as _shlex
-                subprocess.run(
-                    ["bash", "-c", f"source {_shlex.quote(str(BIN_DIR / 'px-env'))} && yield_alive"],
-                    capture_output=True, text=True, check=False, timeout=15,
-                )
-            except Exception as exc:
-                log(f"expression: yield_alive failed: {exc}")
-
-            # Wait for px-alive to exit
-            alive_pid_file = Path(os.environ.get("LOG_DIR",
-                                  str(PROJECT_ROOT / "logs"))) / "px-alive.pid"
-            waited = 0.0
-            while waited < 5:
-                if not alive_pid_file.exists():
-                    break
-                try:
-                    pid = int(alive_pid_file.read_text().strip())
-                    if not Path(f"/proc/{pid}").is_dir():
-                        break
-                except Exception:
-                    break
-                time.sleep(0.5)
-                waited += 0.5
-            if waited >= 5:
-                log("expression: px-alive still running after 5s — aborting exploration")
-                return
-
             # Update exploration_meta (establishes cooldown)
             meta_path = STATE_DIR / "exploration_meta.json"
             try:
@@ -3249,22 +3220,6 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 append_thought(post_thought, persona=persona)
             except Exception as exc:
                 log(f"expression: post-exploration thought failed: {exc}")
-
-            # Verify px-alive is running
-            time.sleep(2)
-            try:
-                result = subprocess.run(
-                    ["systemctl", "is-active", "px-alive"],
-                    capture_output=True, text=True, check=False, timeout=5,
-                )
-                if result.stdout.strip() != "active":
-                    log("expression: px-alive not running — restarting")
-                    subprocess.run(
-                        ["sudo", "-n", "systemctl", "start", "px-alive"],
-                        capture_output=True, check=False, timeout=10,
-                    )
-            except Exception as exc:
-                log(f"expression: px-alive restart check failed: {exc}")
 
         elif action == "play_sound":
             sound = MOOD_TO_SOUND.get(thought.get("mood", ""), "chime")

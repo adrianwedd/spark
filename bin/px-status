@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+yield_alive "$@"
+
 python - "$@" <<'PY'
 import argparse
 import datetime as dt
@@ -128,14 +130,14 @@ def probe_sensors(args):
             "battery": "skipped (dry-run)",
         }
     try:
-        from picarx import Picarx
+        from pxh.hardware import make_picarx
     except Exception as exc:  # pragma: no cover
         return {
             "error": f"picarx import failed: {exc}",
         }
     px = None
     try:
-        px = Picarx()
+        px = make_picarx()
         distance = px.get_distance()
         grayscale = px.get_grayscale_data()
         battery = read_battery(args.battery_channel, args.samples)

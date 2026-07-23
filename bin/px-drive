@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
-yield_alive
+yield_alive "$@"
 
 /usr/bin/python3 - "$@" <<'PY'
 """Drive the robot forward or backward for a fixed duration with optional steering."""
@@ -56,14 +56,14 @@ def main(argv) -> int:
         return 0
 
     try:
-        from picarx import Picarx
+        from pxh.hardware import make_picarx
     except Exception as exc:
         log(f"import error: {exc}")
         return 1
 
     px = None
     try:
-        px = Picarx()
+        px = make_picarx()
         px.set_dir_servo_angle(steer)
         if args.direction == "forward":
             px.forward(speed)

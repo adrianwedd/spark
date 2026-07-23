@@ -3,5 +3,5 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
-yield_alive
+yield_alive "$@"
 /usr/bin/python3 -m pxh.race "$@"

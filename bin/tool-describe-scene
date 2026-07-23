@@ -160,7 +160,7 @@ def call_claude_vision(image_path: Path) -> str:
 
 
 def _set_exploring(active: bool) -> None:
-    """Write exploring.json so px-alive yields GPIO."""
+    """Record the long-running vision task for operator visibility."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     path = STATE_DIR / "exploring.json"
     data = {"active": active}

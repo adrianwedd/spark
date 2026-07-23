@@ -30,6 +30,7 @@ def api_client(isolated_project, monkeypatch):
     monkeypatch.delenv("PX_ENABLE_ADULT_PERSONAS", raising=False)
 
     from pxh import api
+    monkeypatch.setattr(api, "FORCE_DRY", True)
     api._load_token()
 
     from fastapi.testclient import TestClient
