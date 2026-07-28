@@ -38,7 +38,7 @@ from pxh.spark_config import (
     _pick_spark_angles, _pick_reflection_seed,
     _SPARK_REFLECTION_PREFIX, _SPARK_REFLECTION_SUFFIX,
     MOOD_TO_SOUND, MOOD_TO_EMOTE,
-    SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S,
+    SIMILARITY_THRESHOLD, EXPRESSION_COOLDOWN_S, GREET_ARRIVAL_COOLDOWN_S,
     SALIENCE_THRESHOLD, WEATHER_INTERVAL_S,
     OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
@@ -3429,11 +3429,30 @@ def _consolidation_tick(session: dict, dry: bool) -> None:
         log(f"consolidation error: {exc}")
 
 
+def _should_express(action: str, transitions: list, now: float,
+                    last_expression_mono: float,
+                    last_greet_arrival_mono: float) -> bool:
+    """Layer 3 cooldown gate.
+
+    greet_arrival bypasses the global expression budget when an arrival
+    transition is present this tick — an arrival is the one moment the
+    30-minute budget must not silence SPARK. GREET_ARRIVAL_COOLDOWN_S keeps
+    a flapping tracker from spamming greetings through the bypass, while
+    still allowing separate people arriving minutes apart to each get one.
+    """
+    if action == "greet_arrival" and any(
+            t.split(":", 1)[0] == "person_arrived_home" for t in transitions):
+        if (now - last_greet_arrival_mono) > GREET_ARRIVAL_COOLDOWN_S:
+            return True
+    return (now - last_expression_mono) > EXPRESSION_COOLDOWN_S
+
+
 def mind_loop(args) -> None:
     """Main cognitive loop."""
     prev_awareness: dict = {}
     last_reflection_mono = 0.0
     last_expression_mono = 0.0
+    last_greet_arrival_mono = 0.0
     last_battery_warn_mono = 0.0
     global _consecutive_reflection_failures, _reflection_offline_spoken
     consecutive_critical = 0          # require 2 consecutive critical readings before shutdown
@@ -3551,14 +3570,19 @@ def mind_loop(args) -> None:
                     _reflection_offline_spoken = False
 
             if thought and thought.get("action", "wait") != "wait":
-                # Layer 3: Expression (with cooldown). Only a dispatched action
-                # charges the budget — a gate-suppressed one must not silence
-                # SPARK for the next 30 minutes.
-                if (now - last_expression_mono) > EXPRESSION_COOLDOWN_S:
+                _action = thought["action"]
+                # Layer 3: Expression. Only a dispatched action charges the
+                # budget — a gate-suppressed one must not silence SPARK for
+                # 30 minutes — and greet_arrival may bypass it on a real
+                # arrival (see _should_express).
+                if _should_express(_action, transitions, now,
+                                   last_expression_mono, last_greet_arrival_mono):
                     if expression(thought, args.dry_run, awareness=awareness):
                         last_expression_mono = now
+                        if _action == "greet_arrival":
+                            last_greet_arrival_mono = now
                 else:
-                    log(f"expression suppressed (cooldown): {thought['action']}")
+                    log(f"expression suppressed (cooldown): {_action}")
             else:
                 # Idle thought — apply backoff so we reflect less often when nobody's around
                 if not transitions:

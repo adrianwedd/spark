@@ -303,3 +303,38 @@ def test_greet_arrival_respects_night_silence(monkeypatch):
     assert result is False
     assert calls == []
     assert "greet_arrival" not in mind.NIGHT_ALLOWED_ACTIONS
+
+
+def test_should_express_cooldown_matrix():
+    C = mind.EXPRESSION_COOLDOWN_S
+    A = mind.GREET_ARRIVAL_COOLDOWN_S
+    arrival = ["person_arrived_home:adrian_chipolo"]
+
+    # normal action: pure global-cooldown behavior
+    assert mind._should_express("comment", [], now=C + 1.0,
+                                last_expression_mono=0.0,
+                                last_greet_arrival_mono=0.0) is True
+    assert mind._should_express("comment", arrival, now=C - 1.0,
+                                last_expression_mono=0.0,
+                                last_greet_arrival_mono=0.0) is False
+
+    # greet_arrival + arrival transition bypasses the global cooldown
+    assert mind._should_express("greet_arrival", arrival, now=C - 1.0,
+                                last_expression_mono=0.0,
+                                last_greet_arrival_mono=0.0) is True
+
+    # ...but not within the anti-flap window
+    assert mind._should_express("greet_arrival", arrival, now=A - 1.0,
+                                last_expression_mono=0.0,
+                                last_greet_arrival_mono=0.0) is False
+
+    # greet_arrival WITHOUT an arrival transition gets no bypass
+    assert mind._should_express("greet_arrival", [], now=C - 1.0,
+                                last_expression_mono=0.0,
+                                last_greet_arrival_mono=0.0) is False
+
+
+def test_mind_loop_uses_should_express():
+    src = inspect.getsource(mind.mind_loop)
+    assert "_should_express(" in src
+    assert "last_greet_arrival_mono" in src
