@@ -350,6 +350,9 @@ VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_
                  "set_goal", "update_goal", "complete_goal"}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
+# Deliberately NOT absence-gated: "greet_arrival". Arrivals are the one moment
+# the absence heuristic is guaranteed stale — the person just walked in — so
+# absent/at-school/at-mums must never suppress an arrival greeting.
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
@@ -2981,7 +2984,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     # Calendar-driven mode shifts
     _cal = _aw.get("calendar", {}) if isinstance(_aw, dict) else {}
     _current_event = (_cal.get("current_event") or "").lower()
-    if "decompress" in _current_event and action in ("greet", "comment", "scan", "calendar_check"):
+    if "decompress" in _current_event and action in ("greet", "greet_arrival", "comment", "scan", "calendar_check"):
         log(f"expression: suppressed {action} — after-school decompress (low-demand mode)")
         return False
     if "quiet time" in _current_event:

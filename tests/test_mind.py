@@ -250,3 +250,56 @@ def test_reactive_mechanism_removed():
     src = inspect.getsource(mind.mind_loop)
     assert "reactive" not in src.lower()
     assert "reacted" not in src
+
+
+# ---------------------------------------------------------------------------
+# greet_arrival: SPARK prompt exposure + gating semantics
+# ---------------------------------------------------------------------------
+
+
+def test_spark_prompt_exposes_greet_arrival():
+    from pxh import spark_config
+    suffix = spark_config._SPARK_REFLECTION_SUFFIX
+    # once in the rules bullet, once in the JSON action enumeration
+    assert suffix.count("greet_arrival") >= 2
+    assert "person_arrived_home" in suffix
+
+
+def test_greet_arrival_suppressed_during_decompress(monkeypatch):
+    _quiet_daytime(monkeypatch)
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    aw = {"obi_mode": "active",
+          "calendar": {"current_event": "After School Decompress"},
+          "ha_context": {}}
+    result = mind.expression({"action": "greet_arrival", "thought": "hi Dad"},
+                             dry=True, awareness=aw)
+    assert result is False
+    assert calls == []
+
+
+def test_greet_arrival_not_gated_by_absence_modes(monkeypatch):
+    """Arrivals invalidate the absence heuristic — at-mums/absent must NOT
+    suppress an arrival greeting."""
+    _quiet_daytime(monkeypatch)
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    for mode in ("absent", "at-mums", "at-school"):
+        aw = {"obi_mode": mode, "calendar": {}, "ha_context": {}}
+        result = mind.expression({"action": "greet_arrival", "thought": "hi"},
+                                 dry=True, awareness=aw)
+        assert result is True, mode
+    assert calls == ["greet_arrival"] * 3
+
+
+def test_greet_arrival_respects_night_silence(monkeypatch):
+    _quiet_daytime(monkeypatch)
+    monkeypatch.setattr(mind, "_is_night_silence", lambda h: True)
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    result = mind.expression({"action": "greet_arrival", "thought": "hi"},
+                             dry=True, awareness={"obi_mode": "active",
+                                                  "calendar": {}, "ha_context": {}})
+    assert result is False
+    assert calls == []
+    assert "greet_arrival" not in mind.NIGHT_ALLOWED_ACTIONS
