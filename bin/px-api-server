@@ -53,6 +53,10 @@ if [[ -z "${PX_API_TOKEN:-}" ]]; then
     exit 1
 fi
 
+# Route chat turns through Claude Code (see run-voice-loop-claude) instead of
+# the raw Codex CLI default — matches px-spark/run-voice-loop-claude/px-wake-listen.
+export CODEX_CHAT_CMD="$SCRIPT_DIR/claude-voice-bridge"
+
 echo "Starting PiCar-X API on $HOST:$PORT (dry=${PX_DRY:-0})"
 exec uvicorn pxh.api:app \
     --host "$HOST" \

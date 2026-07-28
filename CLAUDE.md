@@ -107,8 +107,9 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 Three-layer architecture:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session + calendar + Frigate → `state/awareness.json`
 - **Layer 2 — Reflection** (on transition or every 5min idle): SPARK→Claude Haiku; GREMLIN/VIXEN→Ollama. Four-tier fallback: Claude → M5.local → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). Writes to `state/thoughts.jsonl`.
-- **Layer 3 — Expression** (2min cooldown): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. 21 valid actions (wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug) are exempt and run overnight.**
+- **Layer 3 — Expression** (2min cooldown): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. 24 valid actions (wait, greet, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. Thoughts with `action=message_obi` are **redacted** in `thoughts-spark.jsonl` (written as `[private message to Obi]`) so the private DM content never reaches the public `/api/v1/public/thoughts` endpoint.
+- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap (falls back to last-3 notes while empty). Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
 
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
@@ -150,6 +151,7 @@ Watches `state/thoughts-spark.jsonl` (salience ≥0.7 or spoken action), runs Cl
 | `compose` | Haiku | 4h | 2/day |
 | `conversation` | Sonnet | 15min | 4/day |
 | `blog` | Haiku | 30min | 5/day |
+| `consolidate` | Haiku | 20h | 1/day |
 
 Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
 

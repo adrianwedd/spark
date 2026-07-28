@@ -1136,6 +1136,29 @@ def test_sleep_no_token_returns_none():
     assert result is None
 
 
+def test_sleep_404_disables_future_requests():
+    """A 404 from HA sets the entity-missing flag and suppresses all future fetches."""
+    def _raise_404(*args, **kwargs):
+        raise urllib.error.HTTPError("http://ha.test/sensor.sleep", 404, "Not Found", {}, None)
+
+    with _ha_ctx():
+        with patch("urllib.request.urlopen", side_effect=_raise_404):
+            result = _fetch_ha_sleep(dry=False)
+    assert result is None
+    assert pxh.mind._ha_sleep_entity_missing is True
+
+    # Subsequent call is short-circuited — no network access needed
+    result2 = _fetch_ha_sleep(dry=False)
+    assert result2 is None
+
+
+def test_sleep_404_reset_between_tests():
+    """_reset_state() clears the entity-missing flag so tests are isolated."""
+    pxh.mind._ha_sleep_entity_missing = True
+    _reset_state()
+    assert pxh.mind._ha_sleep_entity_missing is False
+
+
 # ── HA context formatting ──────────────────────────────────────────
 
 
@@ -1527,3 +1550,12 @@ def test_reflection_survives_intention_failure(tmp_path, monkeypatch):
         monkeypatch, {"persona": "spark", "time_period": "afternoon"})
     assert ctx  # reflection completed and produced a context
     assert "current intention" not in ctx.lower()
+
+
+def test_spark_prompt_offers_goal_actions_and_explore_injection_still_works():
+    from pxh.spark_config import _SPARK_REFLECTION_SUFFIX
+    from pxh.mind import _inject_explore
+    assert "set_goal, update_goal, complete_goal" in _SPARK_REFLECTION_SUFFIX
+    assert '- "set_goal"' in _SPARK_REFLECTION_SUFFIX
+    patched = _inject_explore(_SPARK_REFLECTION_SUFFIX)
+    assert ", explore" in patched  # regex injection survives the longer enum

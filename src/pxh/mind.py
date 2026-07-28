@@ -968,6 +968,9 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
 
 def _fetch_ha_sleep(dry: bool = False) -> dict | None:
     """Fetch Adrian's sleep data from HA Pixel Watch. Returns None if unavailable."""
+    global _ha_sleep_entity_missing
+    if _ha_sleep_entity_missing:
+        return None
     if dry or not HA_TOKEN:
         if not HA_TOKEN:
             log("ha_sleep: skipped — no PX_HA_TOKEN")
@@ -992,7 +995,14 @@ def _fetch_ha_sleep(dry: bool = False) -> dict | None:
         if HA_DEBUG:
             log(f"ha_sleep: {hours}h ({quality})")
         return {"sleep_hours": hours, "sleep_quality": quality}
-    except (urllib.error.HTTPError, urllib.error.URLError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            _ha_sleep_entity_missing = True
+            log("ha_sleep: sensor.sleep not found (404) — disabling until restart")
+        else:
+            log(f"ha_sleep: error: {type(exc).__name__}: {exc}")
+        return None
+    except (urllib.error.URLError, ValueError, KeyError, json.JSONDecodeError) as exc:
         log(f"ha_sleep: error: {type(exc).__name__}: {exc}")
         return None
     except Exception as exc:
@@ -1752,6 +1762,7 @@ _cached_ha_calendar: list | None = None
 _last_ha_calendar_fetch: float = 0.0
 _cached_ha_sleep: dict | None = None
 _last_ha_sleep_fetch: float = 0.0
+_ha_sleep_entity_missing: bool = False  # set True on 404; sensor.sleep removed from HA 2026-07
 _cached_ha_routines: dict | None = None
 _last_ha_routines_fetch: float = 0.0
 HA_ROUTINES_INTERVAL_S = 300  # 5 min
@@ -1815,7 +1826,10 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
 
     sonar_cm = read_sonar(dry)
     frigate = _fetch_frigate_presence(dry)
-    session = load_session()
+    try:
+        session = load_session()
+    except FileLockTimeout:
+        raise  # propagate — mind_loop catches and skips the tick
     history = session.get("history") or []
     now_hour = dt.datetime.now(HOBART_TZ).hour
     now_mono = time.monotonic()
@@ -2296,6 +2310,7 @@ def _reset_state():
     global _time_period_start_mono, _last_image_cleanup
     global _last_known_findmyhub
     global _ha_offline_until, _host_failure_until
+    global _ha_sleep_entity_missing
 
     _battery_history = []
     _battery_glitch_count = 0
@@ -2308,6 +2323,7 @@ def _reset_state():
     _last_ha_calendar_fetch = 0.0
     _cached_ha_sleep = None
     _last_ha_sleep_fetch = 0.0
+    _ha_sleep_entity_missing = False
     _cached_ha_routines = None
     _last_ha_routines_fetch = 0.0
     _cached_ha_context = None
@@ -3104,7 +3120,10 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     # prompt already produces persona-voiced text — skip Ollama rephrase to
     # avoid double "FUCK YEAH!" or other duplication.
     # For weather_comment, the raw weather data needs rephrasing.
-    session = load_session()
+    try:
+        session = load_session()
+    except FileLockTimeout:
+        session = {}
     persona = (session.get("persona") or "").lower().strip()
     needs_rephrase = action in ("weather_comment",)
     if persona and persona in PERSONA_VOICE_ENV:
@@ -3482,10 +3501,13 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     }
     if outcome:
         history_entry["outcome"] = outcome
-    update_session(
-        fields={"last_action": "px_mind"},
-        history_entry=history_entry,
-    )
+    try:
+        update_session(
+            fields={"last_action": "px_mind"},
+            history_entry=history_entry,
+        )
+    except FileLockTimeout:
+        log("warning: session lock busy — expression history entry dropped")
 
 
 def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
@@ -3547,15 +3569,18 @@ def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
     except Exception as exc:
         log(f"reactive error: {exc}")
 
-    update_session(
-        fields={"last_action": "px_mind"},
-        history_entry={
-            "event": "mind",
-            "mood": awareness.get("mood_momentum", {}).get("mood", ""),
-            "action": f"reactive_{transition}",
-            "thought": text,
-        },
-    )
+    try:
+        update_session(
+            fields={"last_action": "px_mind"},
+            history_entry={
+                "event": "mind",
+                "mood": awareness.get("mood_momentum", {}).get("mood", ""),
+                "action": f"reactive_{transition}",
+                "thought": text,
+            },
+        )
+    except FileLockTimeout:
+        log("warning: session lock busy — reactive history entry dropped")
 
 
 def _consolidation_tick(session: dict, dry: bool) -> None:
@@ -3609,14 +3634,24 @@ def mind_loop(args) -> None:
         now = time.monotonic()
 
         # Pause during active conversations; reset backoff on interaction
-        session = load_session()
+        try:
+            session = load_session()
+        except FileLockTimeout:
+            log("warning: session lock busy — skipping tick")
+            time.sleep(5)
+            continue
         if session.get("listening", False):
             backoff_multiplier = 1.0  # reset when talking
             time.sleep(5)
             continue
 
         # Layer 1: Awareness
-        awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
+        try:
+            awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
+        except FileLockTimeout:
+            log("warning: session lock busy during awareness — skipping tick")
+            time.sleep(5)
+            continue
         prev_awareness = awareness
 
         # Nightly memory consolidation (02:00–06:00 Hobart, once per date, SPARK only)

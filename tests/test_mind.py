@@ -1,6 +1,8 @@
 """Tests for night-silence helper and announce action in pxh.mind."""
 import json
 import subprocess
+from unittest.mock import patch
+from filelock import Timeout as FileLockTimeout
 from pxh import mind
 
 
@@ -140,7 +142,7 @@ def test_inject_explore_reaches_spark_prompt():
     the old string-replace silently stopped matching when message_obi was appended)."""
     from pxh import spark_config
     out = mind._inject_explore(spark_config._SPARK_REFLECTION_SUFFIX)
-    assert 'message_obi, explore"' in out
+    assert 'complete_goal, explore"' in out
 
 
 def test_inject_explore_reaches_generic_prompt():
@@ -156,3 +158,46 @@ def test_inject_explore_injects_exactly_once():
     from pxh import spark_config
     out = mind._inject_explore(spark_config._SPARK_REFLECTION_SUFFIX)
     assert out.count(", explore") == 1
+
+
+# ---------------------------------------------------------------------------
+# Session lock contention — mind_loop must survive FileLockTimeout (#crash)
+# ---------------------------------------------------------------------------
+
+
+def test_awareness_tick_propagates_lock_timeout(monkeypatch):
+    """awareness_tick() re-raises FileLockTimeout so mind_loop can skip the tick."""
+    monkeypatch.setattr(mind, "load_session", lambda: (_ for _ in ()).throw(FileLockTimeout("fake.lock")))
+    monkeypatch.setattr(mind, "read_sonar", lambda dry: None)
+    monkeypatch.setattr(mind, "_fetch_frigate_presence", lambda dry: {})
+    try:
+        mind.awareness_tick({}, dry=True)
+        raised = False
+    except FileLockTimeout:
+        raised = True
+    assert raised, "awareness_tick should propagate FileLockTimeout to its caller"
+
+
+def test_expression_survives_lock_timeout_on_load(monkeypatch, tmp_path):
+    """expression() falls back to empty session when load_session raises FileLockTimeout."""
+    import os
+    monkeypatch.setattr(mind, "load_session", lambda: (_ for _ in ()).throw(FileLockTimeout("fake.lock")))
+    monkeypatch.setattr(mind, "update_session", lambda **kw: None)
+    monkeypatch.setattr(mind, "_run_voice", lambda *a, **kw: None)
+    monkeypatch.setattr(mind, "_last_spoken_text", "")
+    monkeypatch.setenv("PX_DRY", "1")
+    # Should not raise — missing persona falls back to no persona-voice injection
+    thought = {"action": "comment", "thought": "test", "mood": "content", "salience": 0.5}
+    mind.expression(thought, dry=True, awareness={})
+
+
+def test_expression_survives_lock_timeout_on_update(monkeypatch):
+    """expression() logs and continues when update_session raises FileLockTimeout."""
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": "spark"})
+    monkeypatch.setattr(mind, "update_session",
+                        lambda **kw: (_ for _ in ()).throw(FileLockTimeout("fake.lock")))
+    monkeypatch.setattr(mind, "_run_voice", lambda *a, **kw: None)
+    monkeypatch.setattr(mind, "_last_spoken_text", "")
+    monkeypatch.setenv("PX_DRY", "1")
+    thought = {"action": "comment", "thought": "test", "mood": "content", "salience": 0.5}
+    mind.expression(thought, dry=True, awareness={})
