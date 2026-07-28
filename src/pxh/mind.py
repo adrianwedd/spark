@@ -9,7 +9,7 @@ Awareness is enriched with weather (every 10 min), long-term memory,
 topic seeding for variety, and repetition detection to stay dynamic.
 
 Run with: bin/px-mind [--dry-run]
-Requires Ollama running on M5.local (or PX_OLLAMA_HOST).
+Requires Ollama running on M5 (or PX_OLLAMA_HOST).
 """
 from __future__ import annotations
 
@@ -276,7 +276,9 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 # PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
 
 # Ollama config (same host as tool-chat)
-OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
+# "M5" (router DNS via UDR7) not "M5.local" (mDNS) — plain hostname tracks the
+# box across wired/wifi and avoids the mDNS hangs that trip the fallback cascade.
+OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5:11434")
 _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
 OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
@@ -290,7 +292,7 @@ _resolved_models: dict[str, tuple[str, float]] = {}  # host → (model, resolved
 _MODEL_CACHE_TTL = 1800  # 30 min
 
 # Network failure cache: skip DNS+connect for hosts that recently failed.
-# Key is host URL prefix (e.g. "http://M5.local:11434"), value is monotonic
+# Key is host URL prefix (e.g. "http://M5:11434"), value is monotonic
 # deadline after which the host should be retried. Suppresses the mDNS hang
 # (typically 15-20 s) that occurs when .local names are queried on a dead network,
 # since Python's urllib timeout covers the socket but not the DNS lookup.
@@ -2132,7 +2134,7 @@ def call_ollama(prompt: str, system: str,
                 host: str | None = None,
                 model: str | None = None,
                 auth_token: str | None = None) -> dict:
-    """Call Ollama for reflection. host defaults to OLLAMA_HOST (M5.local)."""
+    """Call Ollama for reflection. host defaults to OLLAMA_HOST (M5)."""
     _host  = host  or OLLAMA_HOST
     # Skip hosts that failed recently — avoids the mDNS hang on dead networks
     # (Python's urllib timeout covers the socket but not DNS resolution, which
@@ -2321,7 +2323,7 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
 def call_llm(prompt: str, system: str, persona: str = "") -> dict:
     """Four-tier LLM fallback.
 
-    Tier 1 — Ollama M5.local (LAN):   primary for all personas incl. SPARK (when reachable)
+    Tier 1 — Ollama M5 (LAN):         primary for all personas incl. SPARK (when reachable)
     Tier 2 — Claude Haiku (internet): SPARK fallback when M5 unreachable, or MIND_BACKEND=claude
     Tier 3 — Ollama Cloud (internet): fallback when M5 unreachable and Claude fails
     Tier 4 — Ollama localhost (Pi):   final fallback when all else fails
@@ -2672,7 +2674,9 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         append_thought(thought, persona=persona)
         return thought
 
-    effective_backend = "claude" if (MIND_BACKEND == "claude" or (MIND_BACKEND == "auto" and persona == "spark")) else "ollama"
+    # Tier 1 is Ollama for everyone unless MIND_BACKEND forces claude; the
+    # actual tier that serves is only known after call_llm() (see fallback logs)
+    effective_backend = "claude" if MIND_BACKEND == "claude" else "ollama"
     log(f"reflecting... (backend={effective_backend}, persona={persona or 'default'})")
     t0 = time.monotonic()
     if persona == "spark":
