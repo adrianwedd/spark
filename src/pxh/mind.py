@@ -3041,13 +3041,17 @@ def _tool_outcome(result) -> str:
     return f"failed: {out.get('error', 'unknown error')}"
 
 
-def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
-    """Layer 3: act on a thought."""
+def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
+    """Layer 3: act on a thought.
+
+    Returns True when an action was dispatched (the expression budget
+    should be charged), False when gated/suppressed or action == "wait".
+    """
     global _last_spoken_text, _last_morning_fact_date
 
     action = thought.get("action", "wait")
     if action == "wait":
-        return
+        return False
 
     # Hard night silence: 19:00–07:00 Hobart time — unconditional, no sensor
     # dependencies. Silent cognitive actions are exempt (NIGHT_ALLOWED_ACTIONS).
@@ -3056,7 +3060,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         if action not in NIGHT_ALLOWED_ACTIONS:
             log(f"expression: suppressed {action} — night silence "
                 f"({NIGHT_SILENCE_START_H:02d}:00–{NIGHT_SILENCE_END_H:02d}:00)")
-            return
+            return False
 
     # Gate speech on obi_mode: at night when Obi is absent, suppress non-essential actions
     _aw = awareness or {}
@@ -3069,26 +3073,26 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
     log(f"expression: obi_mode={_obi_mode} hour={_aw.get('hour','?')} action={action}")
     if _obi_mode == "absent" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — obi_mode=absent (night, Obi likely asleep)")
-        return
+        return False
     if _obi_mode == "at-school" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — Obi at school (calendar)")
-        return
+        return False
     if _obi_mode == "at-mums" and action in ABSENT_GATED_ACTIONS:
         log(f"expression: suppressed {action} — Obi at Mum's (calendar)")
-        return
+        return False
 
     # Calendar-driven mode shifts
     _cal = _aw.get("calendar", {}) if isinstance(_aw, dict) else {}
     _current_event = (_cal.get("current_event") or "").lower()
     if "decompress" in _current_event and action in ("greet", "comment", "scan", "calendar_check"):
         log(f"expression: suppressed {action} — after-school decompress (low-demand mode)")
-        return
+        return False
     if "quiet time" in _current_event:
         log(f"expression: suppressed {action} — quiet time (calendar)")
-        return
+        return False
     if "bedtime" in _current_event and action not in ("wait", "remember"):
         log(f"expression: suppressed {action} — bedtime routine (calm mode)")
-        return
+        return False
 
     # Suppress speech when Adrian is on a call or mic is active
     ha_ctx = _aw.get("ha_context") or {}
@@ -3096,7 +3100,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         if action in ("greet", "greet_arrival", "comment", "weather_comment", "play_sound",
                        "time_check", "calendar_check", "photograph"):
             log(f"expression: suppressed {action} — Adrian on call/mic active")
-            return
+            return False
 
     # Gate on charging: suppress servo-related actions when plugged in
     try:
@@ -3106,7 +3110,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         _charging = False
     if _charging and action in CHARGING_GATED_ACTIONS:
         log(f"expression: suppressed {action} — battery charging")
-        return
+        return False
 
     text = thought.get("thought", "")
     env = os.environ.copy()
@@ -3208,7 +3212,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 pass
             if not _can_explore(session, awareness_data):
                 log("expression: explore gates failed on re-check")
-                return
+                return False
 
             # yield_alive
             try:
@@ -3237,7 +3241,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
                 waited += 0.5
             if waited >= 5:
                 log("expression: px-alive still running after 5s — aborting exploration")
-                return
+                return False
 
             # Update exploration_meta (establishes cooldown)
             meta_path = STATE_DIR / "exploration_meta.json"
@@ -3508,6 +3512,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> None:
         )
     except FileLockTimeout:
         log("warning: session lock busy — expression history entry dropped")
+    return True
 
 
 def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
@@ -3734,10 +3739,12 @@ def mind_loop(args) -> None:
                     _reflection_offline_spoken = False
 
             if thought and thought.get("action", "wait") != "wait":
-                # Layer 3: Expression (with cooldown)
+                # Layer 3: Expression (with cooldown). Only a dispatched action
+                # charges the budget — a gate-suppressed one must not silence
+                # SPARK for the next 30 minutes.
                 if (now - last_expression_mono) > EXPRESSION_COOLDOWN_S:
-                    expression(thought, args.dry_run, awareness=awareness)
-                    last_expression_mono = now
+                    if expression(thought, args.dry_run, awareness=awareness):
+                        last_expression_mono = now
                 else:
                     log(f"expression suppressed (cooldown): {thought['action']}")
             else:

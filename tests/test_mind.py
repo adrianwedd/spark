@@ -201,3 +201,39 @@ def test_expression_survives_lock_timeout_on_update(monkeypatch):
     monkeypatch.setenv("PX_DRY", "1")
     thought = {"action": "comment", "thought": "test", "mood": "content", "salience": 0.5}
     mind.expression(thought, dry=True, awareness={})
+
+
+# ---------------------------------------------------------------------------
+# expression() executed/suppressed return contract
+# ---------------------------------------------------------------------------
+
+
+def _quiet_daytime(monkeypatch):
+    """Neutralize gates unrelated to the behavior under test."""
+    monkeypatch.setattr(mind, "_is_night_silence", lambda h: False)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "update_session", lambda **k: None)
+
+
+def test_expression_returns_true_when_dispatched(monkeypatch):
+    _quiet_daytime(monkeypatch)
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    result = mind.expression({"action": "greet", "thought": "hello"}, dry=True, awareness=aw)
+    assert result is True
+    assert calls == ["greet"]
+
+
+def test_expression_returns_false_when_gated(monkeypatch):
+    _quiet_daytime(monkeypatch)
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    aw = {"obi_mode": "absent", "calendar": {}, "ha_context": {}}
+    result = mind.expression({"action": "greet", "thought": "hello"}, dry=True, awareness=aw)
+    assert result is False
+    assert calls == []
+
+
+def test_expression_returns_false_for_wait():
+    assert mind.expression({"action": "wait"}, dry=True, awareness={}) is False
