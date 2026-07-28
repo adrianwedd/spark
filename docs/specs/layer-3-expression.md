@@ -100,9 +100,9 @@ Suppressed when battery is charging (read from `state/battery.json`).
 
 Actions gated: `scan`, `look_at`, `explore`, `emote`, `look_around`, `calendar_check`.
 
-### Gate 5: Global expression cooldown (line 3124)
+### Gate 5: Global expression cooldown
 
-The main loop enforces `EXPRESSION_COOLDOWN_S = 120` seconds (2 minutes) between any two expression calls. This is checked in the main loop *before* calling `expression()`, not inside it.
+The main loop enforces `EXPRESSION_COOLDOWN_S = 1800` seconds (30 minutes) between any two expression calls, via `_should_express()` in `mind.py`. This is checked in the main loop *before* calling `expression()`, not inside it. `greet_arrival` bypasses the global cooldown when a `person_arrived_home` transition was detected this tick, throttled by `GREET_ARRIVAL_COOLDOWN_S` (120 s) so a flapping tracker cannot spam greetings.
 
 ### Summary table
 
@@ -110,6 +110,7 @@ The main loop enforces `EXPRESSION_COOLDOWN_S = 120` seconds (2 minutes) between
 |--------|:---:|:---:|:---:|:---:|:---:|:---:|
 | `wait` | - | - | - | - | - | - |
 | `greet` | Y | Y | Y | Y | Y | - |
+| `greet_arrival` | - | Y | Y | Y | Y | - |
 | `comment` | Y | Y | Y | Y | Y | - |
 | `weather_comment` | Y | - | Y | Y | Y | - |
 | `morning_fact` | Y | - | Y | Y | - | - |
@@ -135,7 +136,7 @@ The main loop enforces `EXPRESSION_COOLDOWN_S = 120` seconds (2 minutes) between
 
 ### Global cooldown
 
-`EXPRESSION_COOLDOWN_S = 120` (defined in `spark_config.py`, line 14). Enforced in the main loop at line 3124 of `mind.py`. Any action (except `wait`) resets the cooldown timer. If an action arrives within 120 seconds of the previous expression, it is logged as "expression suppressed (cooldown)" and discarded.
+`EXPRESSION_COOLDOWN_S = 1800` (defined in `spark_config.py`). Enforced by `_should_express()` in the main loop of `mind.py`. Only an action that actually dispatches charges the cooldown — `expression()` returns `True`/`False` and a gate-suppressed action does not consume the budget. `greet_arrival` bypasses the global cooldown when a `person_arrived_home` transition was detected this tick, throttled by `GREET_ARRIVAL_COOLDOWN_S` (120 s). If any other action arrives within 1800 seconds of the previous expression, it is logged as "expression suppressed (cooldown)" and discarded.
 
 ### Per-action secondary cooldowns
 
