@@ -1,4 +1,5 @@
 """Tests for night-silence helper and announce action in pxh.mind."""
+import inspect
 import json
 import subprocess
 from unittest.mock import patch
@@ -237,3 +238,15 @@ def test_expression_returns_false_when_gated(monkeypatch):
 
 def test_expression_returns_false_for_wait():
     assert mind.expression({"action": "wait"}, dry=True, awareness={}) is False
+
+
+def test_reactive_mechanism_removed():
+    """Tripwire: the template-based reactive path is gone; transitions go
+    through reflection instead."""
+    assert not hasattr(mind, "REACTIVE_TEMPLATES")
+    assert not hasattr(mind, "reactive_response")
+    assert not hasattr(mind, "REACTIVE_COOLDOWN_S")
+    assert not hasattr(mind, "_last_reactive_phrases")
+    src = inspect.getsource(mind.mind_loop)
+    assert "reactive" not in src.lower()
+    assert "reacted" not in src

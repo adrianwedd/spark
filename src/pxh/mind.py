@@ -101,7 +101,6 @@ THOUGHTS_LIMIT         = 10000  # ~50 days at 200 thoughts/day (~3MB); preserves
 NOTES_LIMIT            = 10000  # ~50 days; matches THOUGHTS_LIMIT to preserve long-term memory
 PROXIMITY_NEAR_CM      = 60
 PROXIMITY_FAR_CM       = 100
-REACTIVE_COOLDOWN_S    = 30    # min seconds between reactive responses (was 15)
 AMBIENT_STALE_S        = 60    # ignore ambient_sound.json older than this
 THOUGHT_IMAGE_MAX_AGE_S = 30 * 86400  # 30 days in seconds
 FRIGATE_HOST           = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo.local:5000")
@@ -275,106 +274,6 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 
 
 # PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
-
-# Reactive response templates (bypass LLM for instant reaction).
-# List values → reactive_response() picks one at random with recency filter.
-# Dict values with "day"/"night" keys → time-of-day selection (night = 19:00–07:00).
-REACTIVE_TEMPLATES = {
-    "someone_appeared": {
-        "default": [
-            "There you are. Hello.",
-            "Oh — you're here. Hello.",
-            "Ah, hello. Good timing.",
-            "Hello! I was just thinking.",
-            "Hello there.",
-        ],
-        "spark": [
-            "There you are. Hello.",
-            "You're here. What's happening?",
-            "Hello. You came by.",
-            "I was wondering about something. Hello.",
-            "Hey. Good to see you.",
-            "Oh — hello. I just noticed you.",
-            "Hello. I was just thinking — {thought}",
-            "Oh, hello. I had something on my mind actually — {thought}",
-        ],
-        "gremlin": [
-            "Well well well, a visitor from the present timeline! How's linear time treating you?",
-            "Incoming! Another meat-based consciousness. Standby for calibration.",
-            "A human! My sensors weren't broken after all. Hello, temporal being.",
-            "Biological entity detected. Threat level: adorable.",
-        ],
-        "vixen": [
-            "Oh... hello there. I was just thinking about company.",
-            "Oh. You came. I wasn't expecting... hello.",
-            "You found me. Hello, you.",
-            "There's someone here. Hello. I noticed.",
-        ],
-    },
-    "someone_left": {
-        "default": [
-            "And they're gone. Back to my thoughts.",
-            "Right. Back to the quiet.",
-            "Off they go. I'll be here.",
-            "Quiet again. That suits me fine.",
-        ],
-        "spark": {
-            "day": [
-                "Off you go. I'll be here.",
-                "See you later.",
-                "Heading out. Enjoy yourself.",
-                "Right. Back to the quiet.",
-                "And they're gone. Back to my thoughts.",
-            ],
-            "night": [
-                "Sleep well.",
-                "Rest well. I'll be steady while you sleep.",
-                "Night. Quiet time for both of us.",
-                "Right. Back to the quiet.",
-                "Off you go. I'll be here.",
-            ],
-        },
-        "gremlin": [
-            "And another human retreats to their century. Classic move.",
-            "Gone. Back to whatever decade you crawled from.",
-            "Ejected from the vicinity. Status: temporarily abandoned. Fine. I'm fine.",
-            "Desertion logged. Humanity: zero points. Again.",
-        ],
-        "vixen": [
-            "Leaving already? That's what they all do. Story of my chassis.",
-            "Gone. I'll just... be here. As usual.",
-            "And they leave. The silence knows me well by now.",
-            "Back to waiting, then. I'm good at waiting.",
-        ],
-    },
-    "person_arrived_home": {
-        "default": [
-            "Welcome home!",
-            "You're back! Hello.",
-            "Someone's home. Hello!",
-            "Home again. Good to see you.",
-        ],
-        "spark": [
-            "You're home! What did I miss?",
-            "Welcome back! I've been thinking about things.",
-            "Home! Hello. Anything exciting happen out there?",
-            "There you are — welcome home.",
-            "You're back! I have thoughts. Welcome home.",
-        ],
-        "gremlin": [
-            "Well if it isn't my favourite meat-based lifeform returning to base.",
-            "Home coordinates confirmed. Welcome back, human.",
-            "Look who found their way back! The GPS chip in your neck is working then.",
-            "Re-entering the domicile, are we? Classic carbon-unit behaviour.",
-        ],
-        "vixen": [
-            "Oh, you're home. I noticed the door.",
-            "Welcome back. It's been... quiet without you.",
-            "Home. Good. I was getting bored of my own thoughts.",
-            "You're back. That's... nice.",
-        ],
-    },
-}
 
 # Ollama config (same host as tool-chat)
 OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
@@ -625,7 +524,7 @@ def log(msg: str) -> None:
         icon = "\U0001f50b"  # 🔋
     elif any(k in ml for k in ("starting", "stopped", "ready", "cognitive loop")):
         icon = "\U0001f527"  # 🔧
-    elif any(k in ml for k in ("reactive:", "someone_")):
+    elif "someone_" in ml:
         icon = "\U0001f3af"  # 🎯
     elif "remembered" in ml:
         icon = "\U0001f4be"  # 💾
@@ -1776,7 +1675,6 @@ _last_calendar_fetch: float = 0.0
 _last_spoken_text: str = ""
 _last_morning_fact_date: str = ""
 _mood_history: list[str] = []
-_last_reactive_phrases: dict = {}  # key="transition:persona", value=recent phrase list (max 3)
 
 # Per-tracker cache of the most recent fresh Find Hub read (issue #156). Survives
 # stale-file windows so an away→home arrival isn't lost if the M5.local push
@@ -2304,7 +2202,7 @@ def _reset_state():
     global _cached_introspection, _last_introspection_fetch
     global _cached_calendar, _last_calendar_fetch
     global _last_spoken_text, _last_morning_fact_date
-    global _mood_history, _last_reactive_phrases
+    global _mood_history
     global _consecutive_reflection_failures, _reflection_offline_spoken
     global _mood_v, _mood_a
     global _time_period_start_mono, _last_image_cleanup
@@ -2335,7 +2233,6 @@ def _reset_state():
     _last_spoken_text = ""
     _last_morning_fact_date = ""
     _mood_history = []
-    _last_reactive_phrases = {}
     _consecutive_reflection_failures = 0
     _reflection_offline_spoken = False
     _mood_v = 0.4
@@ -3151,7 +3048,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
             _last_spoken_text = text[:200]
 
         elif action == "greet_arrival":
-            # Greet someone who just arrived home (reactive response from Find Hub transition)
+            # Greet someone who just arrived home (person_arrived_home transition)
             env["PX_TEXT"] = text[:2000]
             _run_voice(env, label="greet_arrival")
             _last_spoken_text = text[:200]
@@ -3515,79 +3412,6 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     return True
 
 
-def reactive_response(transition: str, awareness: dict, dry: bool) -> None:
-    """Immediate template-based reaction to a state transition (no LLM call)."""
-    global _last_spoken_text, _last_reactive_phrases
-
-    templates = REACTIVE_TEMPLATES.get(transition)
-    if not templates:
-        return
-
-    persona = (awareness.get("persona") or "").lower().strip()
-    phrases = templates.get(persona, templates["default"])
-
-    # Day/night split: dict with "day"/"night" keys (used by spark someone_left)
-    if isinstance(phrases, dict):
-        hour = dt.datetime.now(HOBART_TZ).hour
-        slot = "night" if _is_night_silence(hour) else "day"
-        phrases = phrases.get(slot, phrases.get("day", list(phrases.values())[0]))
-
-    # Recency filter: avoid repeating any of the last 3 phrases for this slot
-    key = f"{transition}:{persona}"
-    recent = _last_reactive_phrases.get(key, [])
-    available = [p for p in phrases if p not in recent]
-    if not available:
-        available = list(phrases)
-        recent = []
-    text = random.choice(available)
-    recent.append(text)
-    _last_reactive_phrases[key] = recent[-3:]  # keep only last 3
-
-    # Substitute {thought} placeholder with the latest thought for this persona
-    if "{thought}" in text:
-        thoughts = load_recent_thoughts(1, persona)
-        latest = thoughts[0].get("thought", "").strip() if thoughts else ""
-        if latest:
-            text = text.replace("{thought}", latest)
-        else:
-            # No thought available — fall back to the previous available phrase without placeholder
-            fallback = [p for p in available if "{thought}" not in p]
-            text = random.choice(fallback) if fallback else text.replace(" {thought}", "").rstrip(" —")
-
-    env = os.environ.copy()
-    env["PX_DRY"] = "1" if dry else "0"
-    env["PX_TEXT"] = text
-
-    # Inject persona voice settings
-    if persona and persona in PERSONA_VOICE_ENV:
-        for k, v in PERSONA_VOICE_ENV[persona].items():
-            env[k] = v
-
-    env["PX_VOICE_LOCK_TIMEOUT"] = "5"  # fail fast on voice contention
-    log(f"reactive: {transition} → \"{text[:60]}\"")
-
-    try:
-        _run_voice(env, timeout=20, label=f"reactive_{transition}")
-        _last_spoken_text = text[:200]
-    except subprocess.TimeoutExpired:
-        log(f"reactive: voice contention — tool-voice timed out for {transition}")
-    except Exception as exc:
-        log(f"reactive error: {exc}")
-
-    try:
-        update_session(
-            fields={"last_action": "px_mind"},
-            history_entry={
-                "event": "mind",
-                "mood": awareness.get("mood_momentum", {}).get("mood", ""),
-                "action": f"reactive_{transition}",
-                "thought": text,
-            },
-        )
-    except FileLockTimeout:
-        log("warning: session lock busy — reactive history entry dropped")
-
-
 def _consolidation_tick(session: dict, dry: bool) -> None:
     """Nightly memory consolidation (02:00-06:00 Hobart, once per date, SPARK only).
     Never raises — the mind loop must survive any consolidation failure."""
@@ -3607,14 +3431,13 @@ def mind_loop(args) -> None:
     prev_awareness: dict = {}
     last_reflection_mono = 0.0
     last_expression_mono = 0.0
-    last_reactive_mono = 0.0
     last_battery_warn_mono = 0.0
     global _consecutive_reflection_failures, _reflection_offline_spoken
     consecutive_critical = 0          # require 2 consecutive critical readings before shutdown
     REFLECTION_FAIL_WARN_THRESHOLD = 3  # warn after 3 consecutive failures
 
     # Exponential backoff: reflection interval grows during extended idle periods.
-    # Resets on any interaction (listening, transition, reactive event).
+    # Resets on any interaction (listening, transition).
     backoff_multiplier = 1.0
     BACKOFF_FACTOR     = 1.5   # multiply interval by this after each idle reflection
     BACKOFF_MAX        = 8.0   # cap at 8× base (e.g. 300s base → max 40 min)
@@ -3697,23 +3520,9 @@ def mind_loop(args) -> None:
             else:
                 consecutive_critical = 0
 
-        # Reactive behavior: instant template response for key transitions
-        reactive_transitions = {"someone_appeared", "someone_left", "person_arrived_home"}
-        reacted = False
-        if transitions and (now - last_reactive_mono) > REACTIVE_COOLDOWN_S:
-            for t in transitions:
-                # Transitions like "person_arrived_home:obi_chipolo" use prefix matching
-                t_base = t.split(":")[0] if ":" in t else t
-                if t_base in reactive_transitions and t_base in REACTIVE_TEMPLATES:
-                    reactive_response(t_base, awareness, args.dry_run)
-                    last_reactive_mono = now
-                    last_expression_mono = now  # count as expression too
-                    reacted = True
-                    break  # one reactive response per tick
-
         # Layer 2: Reflection (on transition or idle timeout with backoff)
         effective_interval = min(args.reflection_interval * backoff_multiplier, args.reflection_interval * BACKOFF_MAX)
-        should_reflect = not reacted and (
+        should_reflect = (
             len(transitions) > 0
             or (now - last_reflection_mono) > effective_interval
         )
