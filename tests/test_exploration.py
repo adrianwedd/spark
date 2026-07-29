@@ -12,15 +12,11 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 
 def _load_wander_helpers():
-    """Parse bin/px-wander and extract explore-mode helper functions."""
-    src = (PROJECT_ROOT / "bin" / "px-wander").read_text()
-    start = src.index("<<'PY'\n") + len("<<'PY'\n")
-    end = src.rindex("\nPY\n")
-    py_src = src[start:end]
-    globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-wander")}
-    compiled = compile(py_src, "bin/px-wander", "exec")
-    exec(compiled, globs)  # noqa: S102
-    return globs
+    """Reload pxh.wander so its module-level env-var reads pick up the patched env."""
+    import importlib
+    import pxh.wander as wander_module
+    importlib.reload(wander_module)
+    return vars(wander_module)
 
 
 @pytest.fixture
