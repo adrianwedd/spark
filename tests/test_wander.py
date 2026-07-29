@@ -33,10 +33,6 @@ def test_wander_module_importable_without_picarx():
     assert callable(wander.main)
 
 
-def test_best_direction_ignores_none():
-    assert wander.best_direction({0: None, 25: 40.0, -25: 10.0}) == (25, 40.0)
-
-
 def test_calibrate_cliff_writes_reference(tmp_path):
     px = FakePx(grayscale=[[1000.0, 1100.0, 900.0]])
     cal = wander.calibrate_cliff(px, tmp_path)
@@ -138,3 +134,46 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     # The guard is checked BEFORE the first slice — a wander that starts
     # already at the desk edge must never move at all.
     assert not any(isinstance(c, tuple) and c[0] == "forward" for c in px.calls)
+
+
+def test_probe_turn_picks_clearer_side(monkeypatch):
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*20)
+    # left probe reads 20cm (blocked), arc-back ok, right probe reads 90cm → commit right
+    px._dist = iter([20.0, 40.0, 55.0, 90.0])
+    px.get_distance = lambda: next(px._dist, 90.0)
+    side, clearance = wander.probe_turn(px, _guard(), prefer="left")
+    assert side == "right" and clearance == 90.0
+    assert ("dir", 30) in px.calls and ("dir", -30) in px.calls
+
+
+def test_probe_turn_edge_aborts_probe(monkeypatch):
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[600]*3] * 5)     # cliff on first probe creep
+    px._dist = iter([50.0, 55.0])
+    px.get_distance = lambda: next(px._dist, 55.0)
+    guard = _guard()
+    side, _ = wander.probe_turn(px, guard, prefer="left")
+    assert side == "edge"
+    assert guard.edge_events >= 1
+
+
+def test_probe_turn_first_side_commit_rearcs(monkeypatch):
+    """Both probes < CLEAR_CM, first side best: the chassis must END on the
+    first side's arc, not stranded at the end of the second probe arc."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*30)
+    # left probe 40cm (best), arc-back 50→55, right probe 20cm,
+    # arc-back 50→55, then re-commit left (guarded creep, no sonar read)
+    px._dist = iter([40.0, 50.0, 55.0, 20.0, 50.0, 55.0])
+    px.get_distance = lambda: next(px._dist, 55.0)
+    side, clearance = wander.probe_turn(px, _guard(), prefer="left")
+    assert side == "left" and clearance == 40.0
+    # last non-zero steer is the LEFT re-commit, not the right probe
+    steers = [c for c in px.calls if c[0] == "dir" and c[1] != 0]
+    assert steers[-1] == ("dir", -30)
+
+
+def test_sweep_helpers_are_gone():
+    for name in ("sweep_distances", "_sweep_sonar", "read_dist", "_heading_label", "best_direction"):
+        assert not hasattr(wander, name)

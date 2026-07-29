@@ -33,9 +33,7 @@ FORWARD_SPEED  = 30
 FORWARD_S      = 1.2    # drive this long per step
 TURN_SPEED     = 25
 TURN_S         = 0.7
-
-# Angles to sweep for direction choice (pan servo)
-SWEEP_ANGLES   = [-50, -25, 0, 25, 50]
+PROBE_S        = 0.4
 
 EXPLORE_STEP_TIMEOUT   = 30
 PHOTO_COOLDOWN_S       = 30
@@ -44,7 +42,6 @@ VISION_FAIL_MAX        = 3
 STUCK_THRESHOLD        = 3
 BATTERY_STALE_S        = 60
 FLUSH_INTERVAL         = 10
-TURN_K                 = 1.0
 
 STATE_DIR  = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 BIN_DIR    = PROJECT_ROOT / "bin"
@@ -88,36 +85,6 @@ def log(msg: str) -> None:
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     print(line, file=sys.stderr)
-
-
-def read_dist(px) -> float | None:
-    """Read sonar distance using the existing Picarx handle. Returns cm or None on failure."""
-    try:
-        d = px.get_distance()
-        return float(d) if d and d > 0 else None
-    except Exception:
-        return None
-
-
-def sweep_distances(px) -> dict[int, float | None]:
-    """Sweep camera pan across SWEEP_ANGLES, read sonar at each. Returns {angle: cm|None}."""
-    readings = {}
-    for angle in SWEEP_ANGLES:
-        px.set_cam_pan_angle(angle)
-        time.sleep(0.15)  # settle
-        readings[angle] = read_dist(px)
-        dist_str = f"{readings[angle]:.0f}" if readings[angle] is not None else "None"
-        log(f"  sweep angle={angle:+d}° dist={dist_str}cm")
-    px.set_cam_pan_angle(0)  # return to center
-    return readings
-
-
-def best_direction(readings: dict[int, float | None]) -> tuple[int, float]:
-    """Return (best_angle, best_dist) — angle of maximum clearance. Ignores None readings."""
-    valid = {k: v for k, v in readings.items() if v is not None}
-    if not valid:
-        return (0, 0.0)  # no valid readings — report blocked
-    return max(valid.items(), key=lambda kv: kv[1])
 
 
 def speak(text: str) -> None:
@@ -221,18 +188,6 @@ def _read_sonar(px) -> float | None:
         return None
 
 
-def _sweep_sonar(px) -> dict[int, float | None]:
-    readings = {}
-    for angle in SWEEP_ANGLES:
-        px.set_cam_pan_angle(angle)
-        time.sleep(0.15)
-        readings[angle] = _read_sonar(px)
-        dist_str = f"{readings[angle]:.0f}" if readings[angle] is not None else "None"
-        log(f"  sweep angle={angle:+d}deg dist={dist_str}cm")
-    px.set_cam_pan_angle(0)
-    return readings
-
-
 def _query_frigate() -> list[dict] | None:
     url = f"{FRIGATE_HOST}/api/events?cameras={FRIGATE_CAMERA}&limit=5&min_score=0.5"
     try:
@@ -308,20 +263,6 @@ def _save_exploration_meta(meta: dict) -> bool:
             except Exception:
                 pass
         return False
-
-
-def _heading_label(accumulator: float) -> str:
-    a = ((accumulator + 180) % 360) - 180
-    if a < -135:
-        return "behind-left"
-    elif a < -45:
-        return "left"
-    elif a <= 45:
-        return "ahead"
-    elif a <= 135:
-        return "right"
-    else:
-        return "behind-right"
 
 
 def _extract_landmark(description: str) -> str:
@@ -576,6 +517,56 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
     return "ok"
 
 
+def probe_turn(px, guard: CliffGuard, prefer: str = "left") -> tuple[str, float]:
+    """Physically probe ±30° for the clearer path. Sonar is chassis-fixed, so
+    the only honest way to measure a direction is to point the chassis at it."""
+    order = ["left", "right"] if prefer == "left" else ["right", "left"]
+    best = ("blocked", 0.0)
+    for i, side in enumerate(order):
+        steer = -30 if side == "left" else 30
+        px.set_dir_servo_angle(steer)
+        result = guarded_forward(px, guard, TURN_SPEED, PROBE_S)
+        px.set_dir_servo_angle(0)
+        if result != "ok":
+            return ("edge", 0.0)
+        d = _read_sonar(px) or 0.0
+        log(f"probe {side}: {d:.0f}cm")
+        if d >= CLEAR_CM:
+            return (side, d)          # good enough — commit without probing the other side
+        if d > best[1]:
+            best = (side, d)
+        if i == 0:                     # arc back before trying the other side
+            px.set_dir_servo_angle(-steer)
+            stalled = bounded_reverse(px)
+            px.set_dir_servo_angle(0)
+            if stalled:
+                guard.edge_events += 1
+                return ("edge", 0.0)
+    # Falling out of the loop means the chassis sits at the end of the SECOND
+    # probe arc. If that side won, the label already matches — return as-is.
+    if best[0] == order[1] and best[1] >= OBSTACLE_CM:
+        return best
+    # Otherwise (committing to the first side, or blocked) the honest-label
+    # invariant requires physically recovering: arc back the same way as the
+    # mid-probe recovery, then re-execute the first arc when committing.
+    second_steer = -30 if order[1] == "left" else 30
+    px.set_dir_servo_angle(-second_steer)
+    stalled = bounded_reverse(px)
+    px.set_dir_servo_angle(0)
+    if stalled:
+        guard.edge_events += 1
+        return ("edge", 0.0)
+    if best[1] < OBSTACLE_CM:
+        return ("blocked", best[1])
+    first_steer = -30 if best[0] == "left" else 30
+    px.set_dir_servo_angle(first_steer)
+    result = guarded_forward(px, guard, TURN_SPEED, PROBE_S)
+    px.set_dir_servo_angle(0)
+    if result != "ok":
+        return ("edge", 0.0)
+    return best
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Autonomous wander loop")
     parser.add_argument("--steps",    type=int,   default=int(os.environ.get("PX_WANDER_STEPS", "5")))
@@ -722,7 +713,6 @@ def main(argv: list[str]) -> int:
             observations = []
             steps_completed = 0
             stuck_count = 0
-            turn_accumulator = 0.0
             last_photo_time = 0.0
             last_photo_heading = None
             seen_labels = set()
@@ -802,7 +792,6 @@ def main(argv: list[str]) -> int:
                                 time.sleep(TURN_S)
                                 px.stop()
                                 px.set_dir_servo_angle(0)
-                                turn_accumulator += turn * TURN_K
                             else:
                                 stuck_count = 0
                                 nav_action = "turned"
@@ -812,7 +801,6 @@ def main(argv: list[str]) -> int:
                                 time.sleep(TURN_S)
                                 px.stop()
                                 px.set_dir_servo_angle(0)
-                                turn_accumulator += steer * TURN_K
                         else:
                             stuck_count = 0
                             nav_action = "forward"

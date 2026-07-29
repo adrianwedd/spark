@@ -51,29 +51,6 @@ def wander(tmp_path):
                 os.environ[k] = v
 
 
-# -- Heading estimation --
-
-def test_heading_estimate(wander):
-    hl = wander["_heading_label"]
-    assert hl(0) == "ahead"
-    assert hl(45) == "ahead"
-    assert hl(46) == "right"
-    assert hl(90) == "right"
-    assert hl(135) == "right"
-    assert hl(136) == "behind-right"
-    assert hl(-46) == "left"
-    assert hl(-90) == "left"
-    assert hl(-135) == "left"
-    assert hl(-136) == "behind-left"
-
-
-def test_heading_wraps_at_180(wander):
-    hl = wander["_heading_label"]
-    assert hl(180) == "behind-left"
-    assert hl(-180) == "behind-left"
-    assert hl(360) == "ahead"
-
-
 # -- Exploration log --
 
 def test_exploration_log_nav_entry(wander, tmp_path):
