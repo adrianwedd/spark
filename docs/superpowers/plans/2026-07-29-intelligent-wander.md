@@ -269,6 +269,19 @@ def test_bounded_reverse_stall_detection(monkeypatch):
     px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
     px.get_distance = lambda: next(px._dist, 50.5)
     assert wander.bounded_reverse(px) is True
+
+def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
+    """Cornered case: cliff trip AND stalled escape → 2 edge events, which at
+    EDGE_ABORT_COUNT=2 aborts the wander on the spot. That instant abort is
+    INTENTIONAL — this test pins it so a refactor can't silently change it."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[600]*3] + [[1000]*3]*5)   # first check trips cliff
+    px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
+    px.get_distance = lambda: next(px._dist, 50.5)
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
+    assert guard.edge_events == 2
+    assert guard.edge_events >= wander.EDGE_ABORT_COUNT
 ```
 
 - [ ] **Step 2: Run to verify failure** — `python -m pytest tests/test_wander.py -k "cliff or reverse" -v` → FAIL
@@ -315,6 +328,11 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
         if status != "clear":
             px.stop()
             log(f"cliff guard tripped ({status}) — stop + bounded reverse")
+            # Cliff + stalled escape deliberately counts as TWO edge events:
+            # at EDGE_ABORT_COUNT=2 a single cornered-against-a-cliff moment
+            # aborts the whole wander. That is the intended behavior (no
+            # escape room = the abort case) — do not "fix" the double count
+            # in either direction without a spec change.
             if bounded_reverse(px):
                 guard.edge_events += 1   # stall during escape counts too
             guard.edge_events += 1
@@ -342,6 +360,7 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
 
 **Interfaces:**
 - Produces: `probe_turn(px, guard, prefer: str = "left") -> tuple[str, float]` — returns `("left"|"right", clearance_cm)` on success, `("blocked", best_cm)` if both sides < `OBSTACLE_CM`, `("edge", 0.0)` if the guard/stall tripped.
+- **Post-condition (honest-label invariant):** on a `("left"|"right", …)` return the chassis physically sits at the end of THAT side's arc; on `("blocked", …)` it has arc-backed to ≈ the pre-probe pose. The caller logs `turned_{side}` from this return value, so any exit after the second probe that doesn't commit to the second side must physically recover first (arc back, and re-execute the first arc when committing to the first side). All recovery motion is guard-checked; a trip/stall during recovery returns `("edge", 0.0)`.
 - Deletes: `sweep_distances`, `read_dist`, `_sweep_sonar`, `best_direction`, `_heading_label`, `turn_accumulator` usage, `TURN_K`, `SWEEP_ANGLES`. Single surviving sonar reader: `_read_sonar(px)`.
 - Nav entry schema (both modes, dry and live) becomes: `{"ts", "type": "nav", "explore_id", "action", "sonar_cm": float|None, "steps_from_start", "frigate_labels"}` — no `heading_estimate`, no `sonar_readings` dict.
 
@@ -367,6 +386,21 @@ def test_probe_turn_edge_aborts_probe(monkeypatch):
     side, _ = wander.probe_turn(px, guard, prefer="left")
     assert side == "edge"
     assert guard.edge_events >= 1
+
+def test_probe_turn_first_side_commit_rearcs(monkeypatch):
+    """Both probes < CLEAR_CM, first side best: the chassis must END on the
+    first side's arc, not stranded at the end of the second probe arc."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*30)
+    # left probe 40cm (best), arc-back 50→55, right probe 20cm,
+    # arc-back 50→55, then re-commit left (guarded creep, no sonar read)
+    px._dist = iter([40.0, 50.0, 55.0, 20.0, 50.0, 55.0])
+    px.get_distance = lambda: next(px._dist, 55.0)
+    side, clearance = wander.probe_turn(px, _guard(), prefer="left")
+    assert side == "left" and clearance == 40.0
+    # last non-zero steer is the LEFT re-commit, not the right probe
+    steers = [c for c in px.calls if c[0] == "dir" and c[1] != 0]
+    assert steers[-1] == ("dir", -30)
 
 def test_sweep_helpers_are_gone():
     for name in ("sweep_distances", "_sweep_sonar", "read_dist", "_heading_label"):
@@ -405,8 +439,28 @@ def probe_turn(px, guard: CliffGuard, prefer: str = "left") -> tuple[str, float]
             if stalled:
                 guard.edge_events += 1
                 return ("edge", 0.0)
+    # Falling out of the loop means the chassis sits at the end of the SECOND
+    # probe arc. If that side won, the label already matches — return as-is.
+    if best[0] == order[1] and best[1] >= OBSTACLE_CM:
+        return best
+    # Otherwise (committing to the first side, or blocked) the honest-label
+    # invariant requires physically recovering: arc back the same way as the
+    # mid-probe recovery, then re-execute the first arc when committing.
+    second_steer = -30 if order[1] == "left" else 30
+    px.set_dir_servo_angle(-second_steer)
+    stalled = bounded_reverse(px)
+    px.set_dir_servo_angle(0)
+    if stalled:
+        guard.edge_events += 1
+        return ("edge", 0.0)
     if best[1] < OBSTACLE_CM:
         return ("blocked", best[1])
+    first_steer = -30 if best[0] == "left" else 30
+    px.set_dir_servo_angle(first_steer)
+    result = guarded_forward(px, guard, TURN_SPEED, PROBE_S)
+    px.set_dir_servo_angle(0)
+    if result != "ok":
+        return ("edge", 0.0)
     return best
 ```
 
@@ -681,7 +735,7 @@ def test_mind_dispatch_does_not_write_cooldown(tmp_path, monkeypatch):
 - Produces: autouse fixture patching module-level `LOG_FILE` attributes of already-imported `pxh.mind` / `pxh.wander` to tmp_path. Root cause: `mind.py:56-57` resolves `LOG_FILE` from env **at import time**; direct-call tests (e.g. `tests/test_mind.py` `_drive_reflection`) then write "explore injection: action enum not found", synthetic thoughts, etc. into the real `logs/px-mind.log`.
 
 - [ ] **Step 1: Capture baseline** — `wc -l logs/px-mind.log` (note the number).
-- [ ] **Step 2: Implement**
+- [ ] **Step 2: Implement** (the fixture uses `sys.modules` — `import sys` is already at `tests/conftest.py:1`; confirm it survives)
 
 ```python
 @pytest.fixture(autouse=True)
@@ -773,7 +827,7 @@ VALID_DIRECTIVES = {"continue", "turn_left", "turn_right", "investigate", "photo
 def _extract_json_object(text: str) -> dict | None:
     start = text.find("{")
     depth = 0
-    for i in range(start, len(text)) if start >= 0 else []:
+    for i in (range(start, len(text)) if start >= 0 else []):
         if text[i] == "{": depth += 1
         elif text[i] == "}":
             depth -= 1
@@ -1020,3 +1074,4 @@ def synthesize_narrative(intent: str, observations: list[dict]) -> str | None:
 - **Spec coverage:** §1 safety → Tasks 2,3,5,6,13; §2 sensing → Tasks 4,5; §3 LLM → Tasks 10,11,12; §4 memory → Tasks 7,8; §5 cleanup → Tasks 1,8,9; rollout order preserved (gate flip last). Review note #1 (staleness = warning) → Task 2; note #2 (photo cooldown) → Task 11.
 - **Type consistency:** `CliffGuard.check` returns `"clear"|"cliff"|"fail"` everywhere; `run_explore_step` consumes `state["forced_turn"]` set by Task 11; `get_directive`/`synthesize_narrative` both route through `_call_wander_llm`.
 - **Known risk:** Task 11's test seam requires extracting `run_explore` — the largest mechanical step; do it as a pure extraction first, then add the directive window.
+- **Review round 2 (2026-07-29, folded in):** (1) `probe_turn` honest-label invariant — post-second-probe recovery + first-side re-commit arc, pinned by `test_probe_turn_first_side_commit_rearcs`; (2) cliff+stall double edge-event pinned as intentional instant-abort by `test_guarded_forward_cliff_plus_stall_counts_two_events` + code comment; (3) trivia: conftest `import sys` confirmed present, `_extract_json_object` ternary parenthesized.
