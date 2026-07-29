@@ -49,6 +49,14 @@ except ImportError:
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 BLOG_FILE = STATE_DIR / "blog.json"
 BLOG_LOG = STATE_DIR / "blog_log.jsonl"
@@ -1112,6 +1120,8 @@ def main(argv: list[str]) -> int:
         while not _shutdown.is_set():
             try:
                 count, had_skips = run_once(dry=dry)
+                _health.record_success("px-blog", detail={"generated": count,
+                                                          "skipped": bool(had_skips)})
                 if count:
                     log(f"poll: generated {count} posts")
                 if had_skips and count == 0:
@@ -1124,6 +1134,10 @@ def main(argv: list[str]) -> int:
                     _shutdown.wait(timeout=args.poll_interval)
             except Exception as exc:
                 if _BudgetError and isinstance(exc, _BudgetError):
+                    # Budget exhaustion is the daemon working correctly, not
+                    # failing — refusing to spend is its job. Recording it as a
+                    # failure would show px-blog red every evening.
+                    _health.record_success("px-blog", detail={"throttled": str(exc)[:200]})
                     exc_str = str(exc)
                     import re as _re
                     m = _re.search(r"cooldown \((\d+)s / (\d+)s\)", exc_str)
@@ -1143,6 +1157,7 @@ def main(argv: list[str]) -> int:
                         _shutdown.wait(timeout=sleep_s)
                 else:
                     log(f"poll: CRASHED: {exc}")
+                    _health.record_failure("px-blog", str(exc))
                     _shutdown.wait(timeout=args.poll_interval)
     finally:
         _safe_unlink_pid()

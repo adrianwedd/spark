@@ -26,6 +26,16 @@ PID_FILE = LOG_DIR / "px-frigate-stream.pid"
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "."))
 GO2RTC_BIN = PROJECT_ROOT / "bin" / "go2rtc"
 
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
+# The watch loop polls twice a second; coalesce successes.
+HEALTH_INTERVAL_S = 60
+
 
 def handle_sigint(signum, frame):
     global STOP_REQUESTED
@@ -166,10 +176,15 @@ def main() -> int:
                 break
             if go2rtc_proc.poll() is not None:
                 log_event("frigate-stream", {"status": "go2rtc_exited_unexpectedly"})
+                _health.record_failure("px-frigate-stream", "go2rtc exited unexpectedly")
                 break
             # Restart keepalive if it died (e.g. go2rtc hiccup)
             if keepalive_proc.poll() is not None:
                 keepalive_proc = start_keepalive(args.port, args.stream)
+                _health.record_failure("px-frigate-stream", "keepalive died — restarted")
+            else:
+                _health.record_success("px-frigate-stream",
+                                       min_interval_s=HEALTH_INTERVAL_S)
             time.sleep(0.5)
 
     finally:

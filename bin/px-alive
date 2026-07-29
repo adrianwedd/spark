@@ -62,6 +62,18 @@ FACE_LOST_TIMEOUT    = 3.0    # seconds without face before returning to gaze dr
 # Emotional servo coordination: mood → body language
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
+# The loop ticks twice a second; coalesce successes so health reporting doesn't
+# fsync the SD card 172,800 times a day.
+HEALTH_INTERVAL_S = 60
+
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
 SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
@@ -587,11 +599,14 @@ def idle_loop(args) -> None:
 
             except OSError as exc:
                 log(f"I2C error (will retry in {I2C_BACKOFF_S}s): {exc}")
+                _health.record_failure("px-alive", f"I2C error: {exc}")
                 drop_px(force_reset_on_reacquire=True)  # hard reset MCU on next get_px()
                 i2c_ok_after = time.monotonic() + I2C_BACKOFF_S
                 next_gaze = i2c_ok_after + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
                 next_scan = i2c_ok_after + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
                 next_prox = i2c_ok_after + PROX_CHECK_S
+            else:
+                _health.record_success("px-alive", min_interval_s=HEALTH_INTERVAL_S)
 
             time.sleep(0.5)
     finally:

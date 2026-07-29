@@ -43,6 +43,7 @@ from pxh.spark_config import (
     OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
+from pxh import health as health_mod
 from pxh import intention as intention_mod
 from pxh import memory as spark_memory
 from pxh.state import atomic_write, load_session, rotate_log, update_session
@@ -2031,8 +2032,24 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     # Track reflection backend health in awareness for dashboard visibility
     awareness["reflection_status"] = "offline" if _consecutive_reflection_failures >= 3 else "healthy"
 
+    # Cross-daemon health. Read live from state/health/ so a daemon that died
+    # shows as stale here even though it can no longer report anything itself.
+    try:
+        _health = health_mod.read_health()
+        awareness["health"] = _health
+    except Exception:
+        _health = None
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2))
+    # Publish the aggregate for cheap dashboard reads. px-mind is the only
+    # writer of this file, so no lock is needed; readers that must be correct
+    # when px-mind is down should call health.read_health() instead.
+    if _health is not None:
+        try:
+            atomic_write(STATE_DIR / "health.json", json.dumps(_health, indent=2))
+        except Exception:
+            pass
     if frigate is not None:
         atomic_write(FRIGATE_FILE, json.dumps(frigate, indent=2))
 
@@ -2348,9 +2365,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
         result = call_ollama(prompt, system)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-m5")
             except Exception:
                 pass
+            result["backend"] = "ollama-m5"
             return result
 
         # Tier 2: Claude Haiku — SPARK fallback when M5 is unreachable
@@ -2366,9 +2384,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                 claude_result = {"error": str(exc)}
             if "error" not in claude_result:
                 try:
-                    _log_token_usage(prompt + system, claude_result.get("response", ""))
+                    _log_token_usage(prompt + system, claude_result.get("response", ""), "claude")
                 except Exception:
                     pass
+                claude_result["backend"] = "claude"
                 return claude_result
             log(f"claude failed ({claude_result['error']}), falling back to ollama cloud")
     else:
@@ -2383,17 +2402,19 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
             result = {"error": str(exc)}
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "claude")
             except Exception:
                 pass
+            result["backend"] = "claude"
             return result
         log(f"claude failed ({result['error']}), falling back to ollama")
         result = call_ollama(prompt, system)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-m5")
             except Exception:
                 pass
+            result["backend"] = "ollama-m5"
             return result
 
     # Tier 3: Ollama Cloud (internet fallback)
@@ -2405,9 +2426,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                              auth_token=OLLAMA_CLOUD_KEY)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-cloud")
             except Exception:
                 pass
+            result["backend"] = "ollama-cloud"
             return result
 
     # Tier 4: local Pi Ollama — disabled by default (Pi 4 RAM too small;
@@ -2418,9 +2440,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
         result = call_ollama(prompt, system, host=LOCAL_OLLAMA_HOST, model=LOCAL_MODEL)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-local")
             except Exception:
                 pass
+            result["backend"] = "ollama-local"
             return result
 
     log(f"all tiers failed ({result['error']}), skipping reflection")
@@ -2444,8 +2467,12 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     recent_moods = [t.get("mood", "?") for t in recent_thoughts]
     recent_actions = [t.get("action", "?") for t in recent_thoughts]
     momentum = awareness.get("mood_momentum", {})
+    # The health block is for the dashboard, not the prompt — it would add a few
+    # hundred tokens of ops telemetry to every reflection, and summarize() says
+    # the same thing in one sentence further down.
+    awareness_ctx = {k: v for k, v in awareness.items() if k != "health"}
     context_parts = [
-        f"Current awareness:\n{json.dumps(awareness, indent=2)}",
+        f"Current awareness:\n{json.dumps(awareness_ctx, indent=2)}",
         f"Your recent moods: {recent_moods}",
         f"Your recent actions: {recent_actions}",
         f"Your emotional momentum: {momentum.get('mood', 'content')} (valence={momentum.get('valence', 0)}, arousal={momentum.get('arousal', 0)})",
@@ -2546,6 +2573,18 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if ram_pct >= 90:
         context_parts.append(
             f"RAM is {ram_pct}% used — you feel mentally cluttered and find it hard to think clearly."
+        )
+
+    # Daemon health — SPARK's own faculties. Phrased as interoception rather
+    # than ops telemetry: these are parts of him, not services he administers.
+    try:
+        _health_note = health_mod.summarize(awareness.get("health"))
+    except Exception:
+        _health_note = ""
+    if _health_note:
+        context_parts.append(
+            f"Something in you isn't working right: {_health_note}. "
+            f"You notice it the way a person notices a numb hand — not alarming, but wrong."
         )
 
     # Always report system vitals as plain text so the LLM registers them
@@ -2743,12 +2782,18 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
 
     if "error" in result:
         log(f"reflection failed: {result['error']}")
+        health_mod.record_failure("px-mind-reflection", result["error"])
         return None
 
     raw = result.get("response", "")
     parsed = extract_json(raw)
     if not parsed:
         log(f"reflection: no JSON in response: {raw}")
+        # A tier answered but produced junk — distinct from "all tiers down",
+        # and invisible until now because the caller only sees None either way.
+        health_mod.record_failure(
+            "px-mind-reflection", "no JSON in response",
+            detail={"backend": result.get("backend"), "raw": raw[:200]})
         return None
 
     # Validate and sanitize
@@ -2769,6 +2814,14 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     eval_toks = result.get("eval_count", 0)
     eval_dur = result.get("eval_duration", 0) / 1e9
     tps = round(eval_toks / eval_dur, 1) if eval_dur > 0 else 0
+
+    # Record which tier actually served. `backend=` in the reflection log line
+    # shows the *configured* primary, so this is the only place the real answer
+    # is captured — and it is what makes paid-tier drift visible.
+    thought["backend"] = result.get("backend", "unknown")
+    health_mod.record_success(
+        "px-mind-reflection",
+        detail={"backend": thought["backend"], "elapsed_s": round(elapsed, 1)})
 
     # message_obi thoughts carry private DM content. Capture this BEFORE the
     # similarity suppressor can flip `action` to "wait" — otherwise a near-duplicate
@@ -3500,6 +3553,7 @@ def mind_loop(args) -> None:
             session = load_session()
         except FileLockTimeout:
             log("warning: session lock busy — skipping tick")
+            health_mod.record_failure("px-mind", "session lock busy reading session")
             time.sleep(5)
             continue
         if session.get("listening", False):
@@ -3512,9 +3566,11 @@ def mind_loop(args) -> None:
             awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
         except FileLockTimeout:
             log("warning: session lock busy during awareness — skipping tick")
+            health_mod.record_failure("px-mind", "session lock busy during awareness")
             time.sleep(5)
             continue
         prev_awareness = awareness
+        health_mod.record_success("px-mind", detail={"transitions": transitions})
 
         # Nightly memory consolidation (02:00–06:00 Hobart, once per date, SPARK only)
         _consolidation_tick(session, args.dry_run)

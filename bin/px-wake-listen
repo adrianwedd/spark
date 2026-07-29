@@ -35,6 +35,13 @@ LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
 PID_FILE = Path(os.environ.get("PX_WAKE_PID", LOG_DIR / "px-wake-listen.pid"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
 
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
 VOSK_RATE   = 16000  # Vosk model input rate
@@ -1005,8 +1012,14 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                             "ts": _utc_ts(), "rms": avg_rms, "level": level,
                         }), encoding="utf-8")
                         _tmp.rename(AMBIENT_FILE)
+                        # Reaching here proves the audio stream is being read
+                        # AND state is writable — the two ways this daemon dies
+                        # quietly while its process stays up.
+                        _health.record_success("px-wake-listen",
+                                               detail={"rms": avg_rms, "level": level})
                     except (OSError, TypeError) as exc:
                         log(f"ambient file write failed: {exc}")
+                        _health.record_failure("px-wake-listen", f"ambient write: {exc}")
                     _ambient_rms_sum = 0
                     _ambient_rms_count = 0
                     _ambient_last_write = _now_mono

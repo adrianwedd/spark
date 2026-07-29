@@ -284,12 +284,33 @@ def _verify_token(request: Request) -> None:
 from contextlib import asynccontextmanager
 
 
+async def _health_heartbeat() -> None:
+    """Report px-api-server liveness on a timer.
+
+    The API has no polling loop of its own, so without a heartbeat it would sit
+    permanently "missing" in health.json. A timer rather than per-request
+    reporting: request traffic measures whether anyone is *asking*, not whether
+    the server is well, and an idle night would look identical to a crash.
+    """
+    import asyncio
+    from pxh import health as _health
+
+    while True:
+        _health.record_success("px-api-server")
+        await asyncio.sleep(120)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
+    import asyncio
     _load_token()
     _load_pin_state()
     _start_history_worker()
-    yield
+    _hb = asyncio.create_task(_health_heartbeat())
+    try:
+        yield
+    finally:
+        _hb.cancel()
 
 
 app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
@@ -632,6 +653,22 @@ async def health():
             checks["awareness"] = {"status": "ok", "age_s": round(age_s)}
     else:
         checks["awareness"] = {"status": "missing"}
+
+    # Per-daemon health. Read live rather than from the px-mind snapshot, so a
+    # dead px-mind reports as stale instead of freezing the last good picture.
+    # Status only — last_error can carry paths and exception text, and this
+    # endpoint is unauthenticated.
+    try:
+        from pxh import health as _health
+        daemons = _health.read_health()
+        checks["daemons"] = {
+            "status": daemons["overall"],
+            "components": {k: v["status"] for k, v in daemons["components"].items()},
+        }
+        if daemons["overall"] != "ok" and overall == "ok":
+            overall = "degraded"
+    except Exception:
+        checks["daemons"] = {"status": "unknown"}
 
     status_code = 200 if overall == "ok" else 503
     return JSONResponse(
