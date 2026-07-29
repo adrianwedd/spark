@@ -1,7 +1,19 @@
 """Unit tests for pxh.wander (extracted from bin/px-wander heredoc)."""
 import datetime as dt
 import json
+from pathlib import Path
 from pxh import wander
+
+# NOTE: wander.PROJECT_ROOT is computed at import time from a fallback
+# (Path(__file__).resolve().parent.parent) that resolves to src/, not the
+# repo root, whenever the PROJECT_ROOT env var isn't already set in the
+# process — which is exactly the case for a bare `python -m pytest` (only
+# subprocess envs get PROJECT_ROOT via the isolated_project fixture). That's
+# a pre-existing bug unrelated to this task (bin/px-env always sets the env
+# var in real usage, so it's never hit outside tests) — use our own
+# known-good repo root for subprocess cwd instead of relying on the module
+# attribute.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 class FakePx:
@@ -177,3 +189,44 @@ def test_probe_turn_first_side_commit_rearcs(monkeypatch):
 def test_sweep_helpers_are_gone():
     for name in ("sweep_distances", "_sweep_sonar", "read_dist", "_heading_label", "best_direction"):
         assert not hasattr(wander, name)
+
+
+def test_explore_step_forward_when_clear(monkeypatch):
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*10)
+    px.get_distance = lambda: 120.0
+    state = {"forced_turn": None, "stuck_count": 0, "sensor_fail_streak": 0,
+             "steps_completed": 1, "explore_id": "e-test"}
+    entry = wander.run_explore_step(px, _guard(), state)
+    assert entry["action"] == "forward"
+    assert entry["sonar_cm"] == 120.0
+    assert "heading_estimate" not in entry
+
+
+def test_explore_step_probes_when_blocked(monkeypatch):
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*20)
+    px._dist = iter([15.0, 80.0])            # blocked ahead; left probe clear
+    px.get_distance = lambda: next(px._dist, 80.0)
+    state = {"forced_turn": None, "stuck_count": 0, "sensor_fail_streak": 0,
+             "steps_completed": 1, "explore_id": "e-test"}
+    entry = wander.run_explore_step(px, _guard(), state)
+    assert entry["action"] == "turned_left"
+    assert state["stuck_count"] == 0
+
+
+def test_explore_live_requires_calibration(isolated_project):
+    """Live explore (bypass-sudo, no calibration file) is blocked, rc 2."""
+    from pxh.state import default_state
+    state = default_state()
+    state["confirm_motion_allowed"] = True
+    state["roaming_allowed"] = True
+    isolated_project["session_path"].write_text(json.dumps(state))
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    import subprocess
+    r = subprocess.run(["bin/px-wander", "--mode", "explore", "--duration", "30"],
+                       capture_output=True, text=True, env=env, cwd=str(PROJECT_ROOT))
+    payload = json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload["status"] == "blocked"
+    assert "calibrat" in payload["reason"]
