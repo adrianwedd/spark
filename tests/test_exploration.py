@@ -12,11 +12,16 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 
 def _load_wander_helpers():
-    """Reload pxh.wander so its module-level env-var reads pick up the patched env."""
-    import importlib
-    import pxh.wander as wander_module
-    importlib.reload(wander_module)
-    return vars(wander_module)
+    """Load a private copy of pxh.wander (not registered in sys.modules) so its
+    module-level env-var reads pick up the patched env without mutating the
+    real, cached pxh.wander module used elsewhere in the process."""
+    import importlib.util
+
+    wander_path = PROJECT_ROOT / "src" / "pxh" / "wander.py"
+    spec = importlib.util.spec_from_file_location("pxh_wander_test_copy", wander_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return vars(module)
 
 
 @pytest.fixture
