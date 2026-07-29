@@ -48,6 +48,8 @@ BIN_DIR    = PROJECT_ROOT / "bin"
 
 CLIFF_MARGIN          = 0.65
 CALIBRATION_STALE_S   = 30 * 24 * 3600
+GRAYSCALE_SETTLE_S    = 3.0
+GRAYSCALE_POLL_S      = 0.05
 
 REVERSE_S             = 0.3
 REVERSE_SPEED         = 20
@@ -390,12 +392,55 @@ def _increment_vision_count(meta: dict) -> dict:
     return meta
 
 
-def calibrate_cliff(px, state_dir: Path) -> dict:
+def wait_for_grayscale(px, settle_s: float | None = None,
+                        poll_s: float | None = None) -> list[float] | None:
+    """Block until the grayscale ADC returns a genuine conversion.
+
+    For roughly 0.75s after Picarx() is constructed the robot_hat ADC returns a
+    fixed power-on latch rather than a measurement — observed on this hardware
+    as [2571, 3085, 3599], an exact arithmetic progression (gaps of 514, 514)
+    that three independent physical sensors would never produce. The window is
+    wall-clock based, not read-count based: twelve back-to-back reads all return
+    the latch, while reads spaced 0.25s apart go live on the fourth.
+
+    Reading inside that window fabricates data, and the latch is high enough to
+    clear any sane cliff threshold — so a guard check taken too early reports
+    "clear" while the car sits at the edge of a step, and a calibration taken
+    too early persists a reference ~5x too high.
+
+    Returns the first reading that differs from the initial sample, or None if
+    the ADC never updated within `settle_s`. None means "cannot sense" and
+    callers must fail closed, exactly as CliffGuard.check does.
+
+    settle_s/poll_s read the module attributes at call time (not as captured
+    default args) so tests can shorten them without patching time.sleep.
+    """
+    settle_s = GRAYSCALE_SETTLE_S if settle_s is None else settle_s
+    poll_s   = GRAYSCALE_POLL_S if poll_s is None else poll_s
+    first = safe_grayscale(px, retries=1)
+    deadline = time.monotonic() + settle_s
+    while time.monotonic() < deadline:
+        if poll_s:
+            time.sleep(poll_s)
+        gs = safe_grayscale(px, retries=1)
+        if gs is None:
+            continue
+        if first is None or gs != first:
+            return gs
+    log("grayscale ADC never left its power-on latch — treating as unreadable "
+        "(fail closed)")
+    return None
+
+
+def calibrate_cliff(px, state_dir: Path, settle_s: float | None = None,
+                     poll_s: float | None = None) -> dict:
     """Read the floor's grayscale signature and persist a cliff calibration.
 
-    Raises RuntimeError if the grayscale sensor can't be read.
+    Raises RuntimeError if the grayscale sensor can't be read, including the
+    case where it only ever returns its power-on latch — persisting that would
+    write a fabricated reference, so nothing is written at all.
     """
-    gs = safe_grayscale(px, retries=2)
+    gs = wait_for_grayscale(px, settle_s=settle_s, poll_s=poll_s)
     if gs is None:
         raise RuntimeError("grayscale read failed — cannot calibrate")
     cal = {
@@ -662,6 +707,18 @@ def main(argv: list[str]) -> int:
             log(f"picarx import error: {exc}")
             print(json.dumps({"status": "error", "error": str(exc)}))
             return 1
+
+        # The ADC returns a power-on latch for ~0.75s after Picarx(). That latch
+        # sits far ABOVE any calibrated cliff threshold, so a guard check taken
+        # inside the window returns "clear" on fabricated data — which would
+        # defeat guarded_forward's "never moves at the desk edge" guarantee on
+        # the very first slice. Both loops reach their first guard check well
+        # inside 0.75s, so block here until the sensor is demonstrably live.
+        if wait_for_grayscale(px) is None:
+            log("explore abort: grayscale ADC not live — refusing to move")
+            print(json.dumps({"status": "blocked",
+                "reason": "grayscale sensor not live — cannot guard against cliffs"}))
+            return 2
 
     guard = CliffGuard([0, 0, 0] if dry else cal["cliff_ref"])
 

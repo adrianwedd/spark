@@ -45,19 +45,59 @@ def test_wander_module_importable_without_picarx():
     assert callable(wander.main)
 
 
+# The robot_hat ADC returns a fixed power-on latch for ~0.75s after Picarx() is
+# constructed. Observed on this hardware as [2571, 3085, 3599] — an exact
+# arithmetic progression (gaps of 514, 514), which three independent physical
+# sensors never produce. Tests use the real observed values deliberately.
+ADC_LATCH = [2571.0, 3085.0, 3599.0]
+REAL_FLOOR = [245.0, 493.0, 473.0]
+
+
+def test_wait_for_grayscale_returns_first_live_reading():
+    """The power-on latch is discarded; the first CHANGED reading is returned."""
+    px = FakePx(grayscale=[ADC_LATCH] * 4 + [REAL_FLOOR] * 5)
+    assert wander.wait_for_grayscale(px, settle_s=1.0, poll_s=0.0) == REAL_FLOOR
+
+
+def test_wait_for_grayscale_stuck_adc_fails_closed():
+    """An ADC that never updates yields None — callers must refuse to move."""
+    px = FakePx(grayscale=[ADC_LATCH] * 500)
+    assert wander.wait_for_grayscale(px, settle_s=0.2, poll_s=0.0) is None
+
+
+def test_wait_for_grayscale_unreadable_sensor_fails_closed():
+    px = FakePx(grayscale=[None] * 500)
+    assert wander.wait_for_grayscale(px, settle_s=0.2, poll_s=0.0) is None
+
+
 def test_calibrate_cliff_writes_reference(tmp_path):
-    px = FakePx(grayscale=[[1000.0, 1100.0, 900.0]])
-    cal = wander.calibrate_cliff(px, tmp_path)
+    # Must survive the latch: calibration reference comes from the live reading,
+    # never from the power-on latch that precedes it.
+    px = FakePx(grayscale=[ADC_LATCH] * 2 + [[1000.0, 1100.0, 900.0]] * 3)
+    cal = wander.calibrate_cliff(px, tmp_path, settle_s=1.0, poll_s=0.0)
     assert cal["floor_ref"] == [1000.0, 1100.0, 900.0]
     assert cal["cliff_ref"] == [650.0, 715.0, 585.0]
     on_disk = json.loads((tmp_path / "wander_calibration.json").read_text())
     assert on_disk == cal
 
 
+def test_calibrate_cliff_refuses_to_persist_the_adc_latch(tmp_path):
+    """Regression: calibrating on the latch stores a reference ~5x too high,
+    which grounds the robot — or, with a plausible floor, silently defeats the
+    guard. Refuse to write anything rather than persist fabricated data."""
+    import pytest
+    px = FakePx(grayscale=[ADC_LATCH] * 500)
+    with pytest.raises(RuntimeError):
+        wander.calibrate_cliff(px, tmp_path, settle_s=0.2, poll_s=0.0)
+    assert not (tmp_path / "wander_calibration.json").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_calibrate_cliff_read_failure_raises(tmp_path):
     import pytest
     with pytest.raises(RuntimeError):
-        wander.calibrate_cliff(FakePx(grayscale=[None, None]), tmp_path)
+        wander.calibrate_cliff(FakePx(grayscale=[None, None]), tmp_path,
+                               settle_s=0.2, poll_s=0.0)
 
 
 def test_calibrate_cliff_write_failure_cleans_up_tmp(tmp_path, monkeypatch):
@@ -67,9 +107,9 @@ def test_calibrate_cliff_write_failure_cleans_up_tmp(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     monkeypatch.setattr(wander.os, "replace", _raise_replace)
-    px = FakePx(grayscale=[[1000.0, 1100.0, 900.0]])
+    px = FakePx(grayscale=[ADC_LATCH] * 2 + [[1000.0, 1100.0, 900.0]] * 3)
     with pytest.raises(OSError):
-        wander.calibrate_cliff(px, tmp_path)
+        wander.calibrate_cliff(px, tmp_path, settle_s=1.0, poll_s=0.0)
     assert list(tmp_path.glob("*.tmp")) == []
     assert not (tmp_path / "wander_calibration.json").exists()
 
