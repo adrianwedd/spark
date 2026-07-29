@@ -72,6 +72,11 @@ POLL_INTERVAL = 60
 # single stubborn post (e.g. a weekly Haiku keeps returning title-only)
 # burns a Claude session on every poll cycle forever.
 FAILURE_CAP = 3
+
+# post_ids whose retirement has already been announced this process. Retirement
+# is terminal and persisted in blog_failures.json, so re-logging it on every
+# poll is pure noise; once per process is enough to stay diagnosable.
+_retirement_logged: set = set()
 # How many days back to scan for unwritten daily posts (handles power outages)
 DAILY_CATCHUP_DAYS = 30
 
@@ -269,6 +274,79 @@ def save_blog_failures(data: dict) -> None:
 def is_generation_skipped(post_id: str) -> bool:
     """True if post_id has been given up on (hit the failure cap or was QA-rejected)."""
     return bool(load_blog_failures().get(post_id, {}).get("skipped", False))
+
+
+# A strike means "this post's content cannot be generated" — three of them
+# retire the post permanently. Infrastructure that was merely unreachable at
+# the moment we asked says nothing about the post, so it must not count: three
+# unlucky outages would otherwise retire a perfectly writable day forever.
+#
+# Deliberately narrow. Over-classifying disables the doom-loop breaker that is
+# the entire reason this file tracks failures, so bare HTTP status numbers are
+# NOT listed — a prompt echoed back in an exception message routinely contains
+# "500 words". Every marker here is a phrase that only appears in transport
+# failures.
+_TRANSPORT_ERROR_MARKERS = (
+    "overloaded",
+    "rate_limit",
+    "rate limit",
+    "too many requests",
+    "timed out",
+    "timeout",
+    "connection",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "broken pipe",
+    "econnreset",
+    "econnrefused",
+    "enotfound",
+    "etimedout",
+    "api error 5",
+    "api error 429",
+)
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    """True when exc is infrastructure failing, not the post failing.
+
+    Type first — TimeoutExpired and OSError (whose subclasses cover every
+    socket error the CLI can surface) — then a conservative message scan for
+    transient upstream conditions.
+    """
+    if isinstance(exc, (subprocess.TimeoutExpired, OSError)):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _TRANSPORT_ERROR_MARKERS)
+
+
+class TransportUnavailable(Exception):
+    """The Claude call never got an answer — infrastructure, not content.
+
+    Raised rather than returned as None because callers must tell it apart
+    from every other None generate_post can return. run_once treats a None
+    from a daily as a QA rejection and permanently retires the day in
+    blog.json's "skipped" list, so a single network blip used to cost a day
+    of the blog forever — no strikes required.
+    """
+
+
+# How often a persisting transport failure may be logged, per post type. An
+# outage lasting days must stay diagnosable without writing a line every poll:
+# unthrottled logging here would recreate the 5.5 MB log-growth defect that
+# this phase exists to fix, just from a different branch.
+TRANSPORT_LOG_INTERVAL_S = 600
+_transport_logged_at: dict = {}
+
+
+def _log_transport_throttled(post_type: str, exc: BaseException) -> None:
+    """Log a transport failure at most once per TRANSPORT_LOG_INTERVAL_S per type."""
+    now = time.monotonic()
+    last = _transport_logged_at.get(post_type)
+    if last is not None and (now - last) < TRANSPORT_LOG_INTERVAL_S:
+        return
+    _transport_logged_at[post_type] = now
+    log(f"transport error for {post_type} (no strike recorded, backing off): {exc}")
 
 
 def record_generation_failure(post_id: str, error: str) -> None:
@@ -771,6 +849,12 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         log(f"budget exhausted for {post_type}: {exc}")
         raise  # propagate to main loop so it can sleep until budget resets — not a post failure
     except Exception as exc:
+        if _is_transport_error(exc):
+            # Transport, not content. Raise rather than return None: no strike,
+            # and the caller must not mistake this for a QA rejection and
+            # retire the post.
+            _log_transport_throttled(post_type, exc)
+            raise TransportUnavailable(str(exc)) from exc
         log(f"generation failed for {post_type}: {exc}")
         record_generation_failure(pid, f"generation failed: {exc}")
         return None
@@ -875,9 +959,18 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
         if is_generation_skipped(pid):
             # Gave up on this post_id after repeated failed generations or a
             # QA rejection (state/blog_failures.json) — do not burn another
-            # Claude session retrying it. Logged every cycle (cheap, no
-            # session consumed) rather than tracking a "already logged" flag.
-            log(f"skipping {pid}: exceeded generation failure cap, not retrying")
+            # Claude session retrying it.
+            #
+            # Cheap in Claude sessions is not cheap on an SD card. This branch
+            # previously logged every poll and left had_skips alone, so a
+            # permanently retired post re-announced its retirement every 60s
+            # forever — 5.5 MB of logs/px-blog.log by 2026-07-30. Now the
+            # notice is logged once per post per process, and had_skips lets
+            # the poll loop fall back to SKIP_BACKOFF_S.
+            if pid not in _retirement_logged:
+                _retirement_logged.add(pid)
+                log(f"skipping {pid}: exceeded generation failure cap, not retrying")
+            had_skips = True
             continue
 
         log(f"generating {post_type} post: {pid}")
@@ -898,7 +991,16 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
                 had_skips = True
                 continue
 
-        post = generate_post(post_type, target_date, blog_data, dry=dry)
+        try:
+            post = generate_post(post_type, target_date, blog_data, dry=dry)
+        except TransportUnavailable:
+            # Infrastructure, not this post. Leave it due so the next poll
+            # retries it, and signal had_skips so the loop waits SKIP_BACKOFF_S
+            # rather than hammering an outage every poll_interval. Deliberately
+            # does NOT fall into the branch below, which would retire the day.
+            had_skips = True
+            continue
+
         if post is None:
             had_skips = True
             # QA-rejected daily: mark skipped so catch-up advances to the next
@@ -964,7 +1066,14 @@ def run_backfill(*, dry: bool = False) -> int:
             continue
 
         log(f"backfill: generating {pid}")
-        post = generate_post("daily", target, blog_data, dry=dry)
+        try:
+            post = generate_post("daily", target, blog_data, dry=dry)
+        except TransportUnavailable as exc:
+            # Abort rather than march through every remaining day hitting the
+            # same outage. Nothing is retired; a later backfill resumes here.
+            log(f"backfill: aborting — transport unavailable: {exc}")
+            log(f"backfill complete: {generated} posts generated (stopped early)")
+            return generated
         if post:
             post["source"] = "backfill"
             with _blog_lock(BLOG_FILE):
@@ -1010,7 +1119,12 @@ def run_backfill(*, dry: bool = False) -> int:
                 continue
 
             log(f"backfill: generating {pid}")
-            post = generate_post("weekly", target, blog_data, dry=dry)
+            try:
+                post = generate_post("weekly", target, blog_data, dry=dry)
+            except TransportUnavailable as exc:
+                log(f"backfill: aborting — transport unavailable: {exc}")
+                log(f"backfill complete: {generated} posts generated (stopped early)")
+                return generated
             if post:
                 post["source"] = "backfill"
                 with _blog_lock(BLOG_FILE):
