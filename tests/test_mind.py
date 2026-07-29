@@ -338,3 +338,48 @@ def test_mind_loop_uses_should_express():
     src = inspect.getsource(mind.mind_loop)
     assert "_should_express(" in src
     assert "last_greet_arrival_mono" in src
+
+
+# ---------------------------------------------------------------------------
+# Task 8: px-wander is the single writer of exploration_meta
+# ---------------------------------------------------------------------------
+
+
+def test_mind_dispatch_does_not_write_cooldown(tmp_path, monkeypatch):
+    """expression("explore") must not write exploration_meta.json.
+
+    px-wander's start-of-run write is the single cooldown writer; a second
+    writer in mind.py made the cooldown non-atomic with the run itself.
+    """
+    monkeypatch.setenv("LOG_DIR", str(tmp_path))       # no px-alive.pid -> no 5s wait
+    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(mind, "AWARENESS_FILE", tmp_path / "awareness.json")
+    monkeypatch.setattr(mind, "BATTERY_FILE", tmp_path / "battery.json")
+    monkeypatch.setattr(mind, "_is_night_silence", lambda hour: False)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "_can_explore", lambda session, awareness: True)
+    monkeypatch.setattr(mind, "append_thought", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "time", type("_T", (), {"sleep": staticmethod(lambda s: None)}))
+    monkeypatch.setattr(mind.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, "active", ""))
+
+    launched = []
+
+    class _FakeProc:
+        returncode = 0
+        def communicate(self, timeout=None):
+            return (json.dumps({"status": "ok", "observations": 0}), "")
+
+    def _fake_popen(*a, **k):
+        launched.append((a, k))
+        return _FakeProc()
+
+    monkeypatch.setattr(mind.subprocess, "Popen", _fake_popen)
+
+    mind.expression({"action": "explore", "thought": "time to roam"}, dry=False)
+
+    # the wander subprocess still gets launched...
+    assert len(launched) == 1
+    assert launched[0][1]["env"]["PX_WANDER_MODE"] == "explore"
+    # ...but mind never establishes the cooldown itself
+    assert not (tmp_path / "exploration_meta.json").exists()

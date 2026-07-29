@@ -36,6 +36,7 @@ TURN_S         = 0.7
 PROBE_S        = 0.4
 
 EXPLORE_STEP_TIMEOUT   = 30
+DESCRIBE_SCENE_TIMEOUT = 75
 PHOTO_COOLDOWN_S       = 30
 DAILY_VISION_CAP       = 50
 VISION_FAIL_MAX        = 3
@@ -94,8 +95,14 @@ def log(msg: str) -> None:
 
 
 def speak(text: str) -> None:
-    """Speak text via espeak if available. Non-blocking (fire and forget)."""
-    if not shutil.which("espeak"):
+    """Speak text via espeak if available. Non-blocking (fire and forget).
+
+    Requires aplay as well as espeak: espeak is spawned with a pipe that only
+    aplay drains, and nothing here waits on it. With no reader the pipe fills
+    (~64KB) and espeak blocks on write forever, leaking a stuck process per
+    call — so with no sink we synthesize nothing.
+    """
+    if not (shutil.which("espeak") and shutil.which("aplay")):
         return
     try:
         from robot_hat import enable_speaker
@@ -116,17 +123,14 @@ def speak(text: str) -> None:
             ["espeak", "-v", variant, "-p", pitch, "-s", rate, "--stdout", text],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
-        if shutil.which("aplay"):
-            cmd = ["aplay", "-q"]
-            if device:
-                cmd += ["-D", device]
-            aplay_env = os.environ.copy()
-            aplay_env["PULSE_SERVER"] = "unix:/run/user/1000/pulse/native"
-            ap = subprocess.Popen(cmd, stdin=es.stdout, stderr=subprocess.DEVNULL, env=aplay_env)
-            es.stdout.close()
-            ap.wait()
-        else:
-            es.wait()
+        cmd = ["aplay", "-q"]
+        if device:
+            cmd += ["-D", device]
+        aplay_env = os.environ.copy()
+        aplay_env["PULSE_SERVER"] = "unix:/run/user/1000/pulse/native"
+        # fire-and-forget: never block the drive loop on audio
+        subprocess.Popen(cmd, stdin=es.stdout, stderr=subprocess.DEVNULL, env=aplay_env)
+        es.stdout.close()
     except Exception as exc:
         log(f"speak error: {exc}")
 
@@ -199,8 +203,20 @@ def _read_sonar(px) -> float | None:
         return None
 
 
-def _query_frigate() -> list[dict] | None:
+def _query_frigate(after_epoch: float | None = None) -> list[dict] | None:
+    """Fetch recent Frigate detections for the wander camera.
+
+    `after_epoch` bounds the query to events that *started* after that epoch
+    (Frigate's `after=` takes epoch seconds). Without it the endpoint returns
+    historical events, so a single person detection from hours ago colours
+    every step of a run and fires the "new label" photo trigger spuriously.
+    Truncated (not rounded) so the window never starts after the run did —
+    a late-rounded bound would silently drop detections from the run's first
+    half-second.
+    """
     url = f"{FRIGATE_HOST}/api/events?cameras={FRIGATE_CAMERA}&limit=5&min_score=0.5"
+    if after_epoch is not None:
+        url += f"&after={int(after_epoch)}"
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=4) as resp:
@@ -343,7 +359,7 @@ def _call_describe_scene(dry: bool) -> dict:
         result = subprocess.run(
             [str(BIN_DIR / "tool-describe-scene")],
             capture_output=True, text=True, check=False,
-            env=env, timeout=60,
+            env=env, timeout=DESCRIBE_SCENE_TIMEOUT,
         )
         lines = result.stdout.strip().splitlines()
         if lines:
@@ -855,13 +871,13 @@ def main(argv: list[str]) -> int:
                     # Frigate query (retry every FLUSH_INTERVAL steps after failure)
                     frigate_labels = []
                     if not frigate_available and explore_state["steps_completed"] % FLUSH_INTERVAL == 0:
-                        detections = _query_frigate()
+                        detections = _query_frigate(after_epoch=start_time)
                         if detections is not None:
                             log("explore: Frigate back online")
                             frigate_available = True
                             frigate_labels = [d["label"] for d in detections]
                     elif frigate_available:
-                        detections = _query_frigate()
+                        detections = _query_frigate(after_epoch=start_time)
                         if detections is None:
                             if not frigate_warned:
                                 log("explore: Frigate offline — sonar-only navigation")

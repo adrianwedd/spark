@@ -286,3 +286,109 @@ def test_explore_live_requires_calibration(isolated_project):
     payload = json.loads(r.stdout.strip().splitlines()[-1])
     assert payload["status"] == "blocked"
     assert "calibrat" in payload["reason"]
+
+
+def test_describe_scene_timeout_has_margin_over_claude():
+    """The outer wander timeout must outlive tool-describe-scene's 60s call."""
+    assert wander.DESCRIBE_SCENE_TIMEOUT >= 75
+
+
+# ---------------------------------------------------------------------------
+# Task 8: Frigate freshness + non-blocking speech
+# ---------------------------------------------------------------------------
+
+
+class _FakeFrigateResp:
+    def __init__(self, payload=b"[]"):
+        self._payload = payload
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def read(self): return self._payload
+
+
+def _capture_frigate_url(monkeypatch, **kwargs):
+    seen = {}
+    def fake_urlopen(req, timeout=0):
+        seen["url"] = req.full_url
+        return _FakeFrigateResp()
+    monkeypatch.setattr(wander.urllib.request, "urlopen", fake_urlopen)
+    wander._query_frigate(**kwargs)
+    return seen["url"]
+
+
+def test_query_frigate_passes_after(monkeypatch):
+    """A run-start epoch is forwarded so only events from *this* run come back."""
+    url = _capture_frigate_url(monkeypatch, after_epoch=1753747200.9)
+    assert "after=1753747200" in url
+
+
+def test_query_frigate_after_url_is_well_formed(monkeypatch):
+    """The substring check above would pass on a malformed URL — pin the structure."""
+    import urllib.parse as _up
+    url = _capture_frigate_url(monkeypatch, after_epoch=1753747200.9)
+    assert url.count("?") == 1, f"malformed query string: {url}"
+    parsed = _up.urlparse(url)
+    assert parsed.scheme in ("http", "https")
+    assert parsed.netloc
+    assert parsed.path == "/api/events"
+    q = _up.parse_qs(parsed.query, strict_parsing=True)
+    # truncation, not rounding: 1753747200.9 -> ...200 (never ...201)
+    assert q["after"] == ["1753747200"]
+    # pre-existing params survive
+    assert "cameras" in q and "limit" in q and "min_score" in q
+
+
+def test_query_frigate_omits_after_when_not_given(monkeypatch):
+    """Default stays backwards-compatible: no after= bound at all."""
+    url = _capture_frigate_url(monkeypatch)
+    assert "after" not in url
+
+
+def test_explore_loop_bounds_frigate_by_run_start():
+    """Every _query_frigate call in the explore loop must carry the run start."""
+    import inspect as _inspect
+    import re as _re
+    src = _inspect.getsource(wander.main)
+    calls = _re.findall(r"_query_frigate\(([^)]*)\)", src)
+    assert calls, "no _query_frigate calls found in wander.main"
+    for args in calls:
+        assert "after_epoch=start_time" in args, f"unbounded frigate query: _query_frigate({args})"
+
+
+def test_speak_never_blocks_on_audio(monkeypatch):
+    """speak() is fire-and-forget: the drive loop must not wait on aplay/espeak."""
+    waits = []
+
+    class _FakeStdout:
+        def close(self): pass
+
+    class _FakeProc:
+        def __init__(self, *a, **k):
+            self.stdout = _FakeStdout()
+        def wait(self, *a, **k):
+            waits.append(1)
+            return 0
+
+    monkeypatch.setattr(wander.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(wander.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(wander.subprocess, "Popen", _FakeProc)
+    wander.speak("hello")
+    assert waits == [], "speak() waited on a child process — it must not block the drive loop"
+
+
+def test_speak_spawns_nothing_without_aplay(monkeypatch):
+    """No aplay means no reader for espeak's pipe.
+
+    speak() never waits on its children, so an undrained pipe fills at ~64KB
+    and blocks espeak forever — one stuck process per call. With no sink,
+    nothing may be spawned at all.
+    """
+    spawned = []
+    monkeypatch.setattr(wander.shutil, "which",
+                        lambda name: None if name == "aplay" else f"/usr/bin/{name}")
+    monkeypatch.setattr(wander.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(wander.subprocess, "Popen",
+                        lambda *a, **k: spawned.append(a) or (_ for _ in ()).throw(
+                            AssertionError("speak() spawned espeak with no aplay to drain it")))
+    wander.speak("hello")
+    assert spawned == []

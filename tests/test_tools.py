@@ -263,6 +263,67 @@ def test_tool_describe_scene_dry_run(isolated_project):
     assert len(payload["description"]) > 0
 
 
+def test_describe_scene_root_runs_claude_as_pi(tmp_path, monkeypatch):
+    """Root keeps hardware ownership but crosses to pi for Claude credentials."""
+    ns = _load_tool_heredoc("tool-describe-scene", monkeypatch, tmp_path)
+    monkeypatch.setattr(ns["os"], "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        ns["pwd"], "getpwnam",
+        lambda name: _types.SimpleNamespace(pw_dir=f"/home/{name}"),
+    )
+    monkeypatch.setenv("SUDO_USER", "root")
+
+    command = ns["_claude_command"]("describe this")
+
+    assert command[:5] == ["sudo", "-n", "-u", "pi", "env"]
+    assert "HOME=/home/pi" in command
+    assert command[-7:] == [
+        ns["CLAUDE_BIN"], "-p", "describe this",
+        "--allowedTools", "Read", "--output-format", "text",
+    ]
+    assert ns["CLAUDE_TIMEOUT"] == 60
+
+
+def test_px_wander_calibration_wrapper_self_elevates(isolated_project, tmp_path):
+    """The gate's px-wander calibration command must acquire hardware access."""
+    if __import__("os").geteuid() == 0:
+        pytest.skip("self-elevation is only observable from a non-root test user")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    sudo_log = tmp_path / "sudo-args.txt"
+    fake_sudo = fake_bin / "sudo"
+    fake_sudo.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$PX_TEST_SUDO_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o755)
+
+    env = isolated_project["env"].copy()
+    env["PX_BYPASS_SUDO"] = "0"
+    env["PX_TEST_SUDO_LOG"] = str(sudo_log)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    result = subprocess.run(
+        ["bin/px-wander", "--calibrate-cliff"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, env=env, check=False,
+    )
+
+    assert result.returncode == 0
+    args = sudo_log.read_text(encoding="utf-8").splitlines()
+    assert args[:2] == ["-n", "env"]
+    assert str(PROJECT_ROOT / "bin" / "px-wander") in args
+    assert args[-1] == "--calibrate-cliff"
+
+
+def test_px_wander_calibration_guard_precedes_alive_yield():
+    """The ownership marker must exist before px-alive is asked to exit."""
+    source = (PROJECT_ROOT / "bin" / "px-wander").read_text(encoding="utf-8")
+    guard_call = source.index("set_calibration_guard 1")
+    yield_call = source.index("\nyield_alive\n", guard_call)
+    hardware_launch = source.index("\n/usr/bin/python3 -", yield_call)
+    assert guard_call < yield_call < hardware_launch
+
+
 def test_tool_frigate_events_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -1235,6 +1296,7 @@ def _load_tool_heredoc(name, monkeypatch, tmp_path, extra_env=None):
     pxh.claude_session so main() can run without a live Claude CLI."""
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("PX_DRY", "0")
+    monkeypatch.setenv("PROJECT_ROOT", str(_TOOLS_ROOT))
     for k, v in (extra_env or {}).items():
         monkeypatch.setenv(k, v)
 

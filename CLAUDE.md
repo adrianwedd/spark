@@ -98,6 +98,10 @@ Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not ref
 
 **GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Tools set `state/exploring.json` to prevent restart mid-operation.
 
+**Wander calibration**: Before live wandering on a new floor, place all grayscale sensors over that surface and run `bin/px-wander --calibrate-cliff`. The launcher self-elevates for GPIO access and writes `exploring.json` before yielding `px-alive`; do not replace it with a direct Python invocation. The ADC power-on latch is rejected, so calibration fails closed until live sensor values appear.
+
+**Wander vision credentials**: Wander owns GPIO as root, but `tool-describe-scene` runs only the Claude CLI subprocess as the authenticated `pi` user (`PX_VISION_USER` overrides). Running Claude itself as root returns the fallback description because root has no Claude credentials. Keep wander's outer vision timeout longer than the tool's Claude timeout (currently 75s > 60s); real image reads can take more than 45s.
+
 ### Cognitive Loop (px-mind)
 
 ```bash

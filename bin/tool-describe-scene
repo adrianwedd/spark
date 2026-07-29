@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -94,12 +95,42 @@ def _resume_stream() -> None:
     )
 
 FALLBACK_DESCRIPTION = "I couldn't see anything right now."
-CLAUDE_TIMEOUT = 45
+CLAUDE_TIMEOUT = 60
 
 # claude CLI may not be on PATH when launched from systemd — find it explicitly
 CLAUDE_BIN = (os.environ.get("PX_CLAUDE_BIN")
               or shutil.which("claude")
               or "/home/pi/.local/bin/claude")
+
+
+def _claude_command(prompt: str) -> list[str]:
+    """Build a Claude command in the interactive user's credential context."""
+    command = [
+        CLAUDE_BIN, "-p", prompt,
+        "--allowedTools", "Read",
+        "--output-format", "text",
+    ]
+    if os.geteuid() != 0:
+        return command
+
+    # Wander owns GPIO as root, but Claude's credentials belong to pi. Keep the
+    # hardware process privileged and cross the user boundary only for vision.
+    vision_user = os.environ.get("PX_VISION_USER")
+    if not vision_user:
+        sudo_user = os.environ.get("SUDO_USER")
+        vision_user = sudo_user if sudo_user and sudo_user != "root" else "pi"
+    try:
+        user = pwd.getpwnam(vision_user)
+    except KeyError:
+        return command
+    return [
+        "sudo", "-n", "-u", vision_user,
+        "env",
+        f"HOME={user.pw_dir}",
+        f"USER={vision_user}",
+        f"LOGNAME={vision_user}",
+        *command,
+    ]
 
 
 def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:
@@ -137,11 +168,7 @@ def call_claude_vision(image_path: Path) -> str:
     )
     try:
         result = subprocess.run(
-            [
-                CLAUDE_BIN, "-p", prompt,
-                "--allowedTools", "Read",
-                "--output-format", "text",
-            ],
+            _claude_command(prompt),
             capture_output=True,
             text=True,
             check=False,

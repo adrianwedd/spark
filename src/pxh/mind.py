@@ -3160,17 +3160,12 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
                 log("expression: px-alive still running after 5s — aborting exploration")
                 return False
 
-            # Update exploration_meta (establishes cooldown)
-            meta_path = STATE_DIR / "exploration_meta.json"
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
-            meta["last_explore_ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
-            try:
-                atomic_write(meta_path, json.dumps(meta, indent=2))
-            except Exception:
-                pass
+            # NOTE: the exploration cooldown is established by px-wander itself
+            # (its start-of-run exploration_meta write, right after the
+            # exploring.json handshake) — it is the single writer. Residual:
+            # if the launch below fails outright, no cooldown is recorded and
+            # the next cycle may re-dispatch; those paths are quick-exit and
+            # motionless.
 
             # Run tool-wander in explore mode
             explore_env = env.copy()
