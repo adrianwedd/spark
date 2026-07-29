@@ -92,7 +92,9 @@ def test_exploration_log_observation_entry(wander, tmp_path):
         "steps_from_start": 5,
     }
     write_obs(entry)
-    path = tmp_path / "exploration.jsonl"
+    path = tmp_path / "observations.jsonl"
+    assert path.exists()
+    assert not (tmp_path / "exploration.jsonl").exists()
     lines = path.read_text().strip().splitlines()
     parsed = json.loads(lines[0])
     assert parsed["type"] == "observation"

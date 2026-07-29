@@ -215,6 +215,22 @@ def test_explore_step_probes_when_blocked(monkeypatch):
     assert state["stuck_count"] == 0
 
 
+def test_append_jsonl_capped_trims(tmp_path):
+    p = tmp_path / "observations.jsonl"
+    for batch in range(3):
+        wander.append_jsonl_capped(p, [{"n": batch * 10 + i} for i in range(10)], cap=15)
+    lines = [json.loads(l) for l in p.read_text().strip().splitlines()]
+    assert len(lines) == 15
+    assert lines[-1] == {"n": 29}
+
+
+def test_observation_goes_to_observations_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(wander, "STATE_DIR", tmp_path)
+    wander._write_observation({"type": "observation", "landmark": "a red chair"})
+    assert (tmp_path / "observations.jsonl").exists()
+    assert not (tmp_path / "exploration.jsonl").exists()
+
+
 def test_explore_live_requires_calibration(isolated_project):
     """Live explore (bypass-sudo, no calibration file) is blocked, rc 2."""
     from pxh.state import default_state

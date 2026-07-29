@@ -471,10 +471,10 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
             print(f"[voice-loop] failed to read findmyhub.json: {exc}", file=sys.stderr)
 
     # Inject recent exploration observations
-    exploration_file = state_dir / "exploration.jsonl"
-    if exploration_file.exists():
+    observations_file = state_dir / "observations.jsonl"
+    if observations_file.exists():
         try:
-            lines = tail_lines(exploration_file, n=10)
+            lines = tail_lines(observations_file, n=10)
             recent_obs = []
             for line in lines:
                 try:
@@ -489,7 +489,7 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
                 context_sections.append("Recent exploration landmarks:")
                 context_sections.append(", ".join(recent_obs[-5:]))
         except Exception as exc:
-            print(f"[voice-loop] failed to read exploration.jsonl: {exc}", file=sys.stderr)
+            print(f"[voice-loop] failed to read observations.jsonl: {exc}", file=sys.stderr)
 
     context_block = "\n".join(context_sections)
 

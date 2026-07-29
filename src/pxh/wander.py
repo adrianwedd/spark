@@ -60,6 +60,9 @@ FRIGATE_CAMERA = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
 
 FALLBACK_DESCRIPTION = "I couldn't see anything right now."
 
+OBS_CAP = 1000
+NAV_CAP = 100
+
 
 def log(msg: str) -> None:
     ts = dt.datetime.now().isoformat(timespec="seconds")
@@ -281,10 +284,17 @@ def _extract_landmark(description: str) -> str:
     return " ".join(words[:6])
 
 
-def _flush_nav_entries(entries: list[dict], explore_id: str) -> None:
+def append_jsonl_capped(path: Path, entries: list[dict], cap: int) -> None:
+    """Append entries to a jsonl file, keeping only the last `cap` lines.
+
+    FileLock-guarded (best-effort — falls back to no lock if filelock isn't
+    installed), and the trim+rewrite is atomic via mkstemp + os.replace so a
+    concurrent reader never sees a partially-written file. Any failure during
+    the temp-file write cleans up the temp file before re-raising the log
+    (mirrors _save_exploration_meta / _write_exploring_state / calibrate_cliff).
+    """
     if not entries:
         return
-    path = STATE_DIR / "exploration.jsonl"
     try:
         from filelock import FileLock
         lock = FileLock(str(path) + ".lock", timeout=5)
@@ -293,13 +303,14 @@ def _flush_nav_entries(entries: list[dict], explore_id: str) -> None:
     try:
         _cm = lock if lock else __import__("contextlib").nullcontext()
         with _cm:
+            path.parent.mkdir(parents=True, exist_ok=True)
             existing = []
             if path.exists():
                 existing = [ln for ln in path.read_text(encoding="utf-8").strip().splitlines() if ln.strip()]
             existing.extend(json.dumps(e) for e in entries)
-            if len(existing) > 100:
-                existing = existing[-100:]
-            fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+            if len(existing) > cap:
+                existing = existing[-cap:]
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
             try:
                 with os.fdopen(fd, "w") as f:
                     f.write("\n".join(existing) + "\n")
@@ -310,29 +321,17 @@ def _flush_nav_entries(entries: list[dict], explore_id: str) -> None:
                     os.unlink(tmp)
                 except Exception:
                     pass
+                raise
     except Exception as exc:
-        log(f"flush_nav_entries error: {exc}")
+        log(f"append_jsonl_capped error ({path.name}): {exc}")
+
+
+def _flush_nav_entries(entries: list[dict], explore_id: str) -> None:
+    append_jsonl_capped(STATE_DIR / "exploration.jsonl", entries, NAV_CAP)
 
 
 def _write_observation(entry: dict) -> None:
-    path = STATE_DIR / "exploration.jsonl"
-    try:
-        from filelock import FileLock
-        lock = FileLock(str(path) + ".lock", timeout=5)
-    except ImportError:
-        lock = None
-    try:
-        _cm = lock if lock else __import__("contextlib").nullcontext()
-        with _cm:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry) + "\n")
-            try:
-                os.chmod(str(path), 0o644)
-            except OSError:
-                pass
-    except Exception as exc:
-        log(f"write_observation error: {exc}")
+    append_jsonl_capped(STATE_DIR / "observations.jsonl", [entry], OBS_CAP)
 
 
 def _call_describe_scene(dry: bool) -> dict:

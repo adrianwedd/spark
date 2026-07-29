@@ -1580,3 +1580,16 @@ def test_spark_prompt_offers_goal_actions_and_explore_injection_still_works():
     assert '- "set_goal"' in _SPARK_REFLECTION_SUFFIX
     patched = _inject_explore(_SPARK_REFLECTION_SUFFIX)
     assert ", explore" in patched  # regex injection survives the longer enum
+
+
+def test_awareness_reads_observations_file(tmp_path, monkeypatch):
+    from pxh import mind
+    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
+    obs = {"type": "observation", "landmark": "bookshelf corner",
+           "heading_estimate": "", "interesting": True, "vision_failed": False}
+    (tmp_path / "observations.jsonl").write_text(_json.dumps(obs) + "\n")
+    # nav spam in the OLD file must not shadow observations anymore
+    (tmp_path / "exploration.jsonl").write_text(
+        "\n".join(_json.dumps({"type": "nav", "action": "forward"}) for _ in range(100)) + "\n")
+    recent = mind._recent_exploration_observations()   # extracted helper, see Step 3
+    assert recent and recent[0]["landmark"] == "bookshelf corner"

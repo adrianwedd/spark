@@ -1720,6 +1720,32 @@ def _cleanup_thought_images() -> int:
     return deleted
 
 
+def _recent_exploration_observations(n: int = 20) -> list[dict]:
+    """Read the last `n` lines of state/observations.jsonl and return the
+    non-vision-failed observation entries as compact landmark/heading/interesting
+    dicts. Reads STATE_DIR through the module attribute at call time so tests
+    (and any future STATE_DIR reconfiguration) can monkeypatch it."""
+    recent_obs: list[dict] = []
+    try:
+        obs_file = STATE_DIR / "observations.jsonl"
+        if obs_file.exists():
+            obs_lines = obs_file.read_text(encoding="utf-8").strip().splitlines()
+            for line in obs_lines[-n:]:
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") == "observation" and not entry.get("vision_failed"):
+                        recent_obs.append({
+                            "landmark": entry.get("landmark", ""),
+                            "heading": entry.get("heading_estimate", ""),
+                            "interesting": entry.get("interesting", False),
+                        })
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return recent_obs
+
+
 def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     """Layer 1: gather perception, detect transitions, enrich context."""
     global _cached_weather, _last_weather_fetch, _time_period_start_mono
@@ -1998,26 +2024,9 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         awareness["recent_conversations"] = list(reversed(recent_convos))
 
     # Recent exploration observations
-    try:
-        exp_file = STATE_DIR / "exploration.jsonl"
-        if exp_file.exists():
-            exp_lines = exp_file.read_text(encoding="utf-8").strip().splitlines()
-            recent_obs = []
-            for line in exp_lines[-5:]:
-                try:
-                    entry = json.loads(line)
-                    if entry.get("type") == "observation" and not entry.get("vision_failed"):
-                        recent_obs.append({
-                            "landmark": entry.get("landmark", ""),
-                            "heading": entry.get("heading_estimate", ""),
-                            "interesting": entry.get("interesting", False),
-                        })
-                except json.JSONDecodeError:
-                    continue
-            if recent_obs:
-                awareness["recent_exploration"] = recent_obs
-    except Exception:
-        pass
+    recent_obs = _recent_exploration_observations()
+    if recent_obs:
+        awareness["recent_exploration"] = recent_obs
 
     # Track reflection backend health in awareness for dashboard visibility
     awareness["reflection_status"] = "offline" if _consecutive_reflection_failures >= 3 else "healthy"
@@ -2715,10 +2724,10 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         if mins_idle > 30:
             explore_hints.append("You haven't moved in a while.")
         try:
-            exp_file = STATE_DIR / "exploration.jsonl"
-            if exp_file.exists():
-                exp_lines = exp_file.read_text(encoding="utf-8").strip().splitlines()
-                for line in reversed(exp_lines[-10:]):
+            obs_file = STATE_DIR / "observations.jsonl"
+            if obs_file.exists():
+                obs_lines = obs_file.read_text(encoding="utf-8").strip().splitlines()
+                for line in reversed(obs_lines[-10:]):
                     entry = json.loads(line)
                     if entry.get("type") == "observation" and entry.get("interesting"):
                         lm = entry.get("landmark", "something")
