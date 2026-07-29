@@ -532,6 +532,15 @@ def bounded_reverse(px) -> bool:
     time.sleep(REVERSE_S)
     px.stop()
     after = _read_sonar(px)
+    # An unreadable sonar reading (before or after is None) deliberately
+    # counts as "not stalled" here, even though this looks like it inverts
+    # CliffGuard.check's fail-closed convention. The physical safety
+    # guarantee doesn't come from this accounting — it comes from
+    # guard.check() re-verifying grayscale before every slice, including
+    # the very next one after this reverse. Failing closed here instead
+    # would let routine sonar dropouts (common on soft/angled surfaces)
+    # inflate edge_events and abort otherwise-fine wanders via
+    # EDGE_ABORT_COUNT. Reviewed and intentionally kept as-is.
     if before is not None and after is not None:
         if (after - before) < REVERSE_STALL_CM:
             log(f"reverse stall: clearance {before:.0f}→{after:.0f}cm — edge-event equivalent")

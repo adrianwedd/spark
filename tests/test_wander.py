@@ -135,3 +135,6 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
     assert guard.edge_events == 2
     assert guard.edge_events >= wander.EDGE_ABORT_COUNT
+    # The guard is checked BEFORE the first slice — a wander that starts
+    # already at the desk edge must never move at all.
+    assert not any(isinstance(c, tuple) and c[0] == "forward" for c in px.calls)
