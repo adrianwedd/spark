@@ -20,6 +20,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from pxh.race import safe_grayscale
 from pxh.utils import clamp
 
 LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
@@ -47,6 +48,9 @@ TURN_K                 = 1.0
 
 STATE_DIR  = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 BIN_DIR    = PROJECT_ROOT / "bin"
+
+CLIFF_MARGIN          = 0.65
+CALIBRATION_STALE_S   = 30 * 24 * 3600
 
 FRIGATE_HOST   = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo:5000")
 FRIGATE_CAMERA = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
@@ -435,6 +439,50 @@ def _increment_vision_count(meta: dict) -> dict:
     return meta
 
 
+def calibrate_cliff(px, state_dir: Path) -> dict:
+    """Read the floor's grayscale signature and persist a cliff calibration.
+
+    Raises RuntimeError if the grayscale sensor can't be read.
+    """
+    gs = safe_grayscale(px, retries=2)
+    if gs is None:
+        raise RuntimeError("grayscale read failed — cannot calibrate")
+    cal = {
+        "floor_ref": [float(v) for v in gs],
+        "cliff_ref": [round(float(v) * CLIFF_MARGIN, 1) for v in gs],
+        "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(state_dir), suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cal, f, indent=2)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, str(state_dir / "wander_calibration.json"))
+    log(f"cliff calibration saved: floor={cal['floor_ref']} cliff={cal['cliff_ref']}")
+    return cal
+
+
+def load_cliff_calibration(state_dir: Path) -> dict | None:
+    """Load a persisted cliff calibration. None if missing/corrupt/invalid.
+
+    Staleness is a warning only — a stale calibration is still returned.
+    """
+    path = state_dir / "wander_calibration.json"
+    try:
+        cal = json.loads(path.read_text(encoding="utf-8"))
+        ref = cal["cliff_ref"]
+        if not (isinstance(ref, list) and len(ref) == 3):
+            return None
+        age = (dt.datetime.now(dt.timezone.utc)
+               - dt.datetime.fromisoformat(cal["ts"])).total_seconds()
+        if age > CALIBRATION_STALE_S:
+            log(f"cliff calibration is stale ({age/86400:.0f} days old) — "
+                "consider re-running --calibrate-cliff on the current floor")
+        return cal
+    except Exception:
+        return None
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Autonomous wander loop")
     parser.add_argument("--steps",    type=int,   default=int(os.environ.get("PX_WANDER_STEPS", "5")))
@@ -442,6 +490,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--quiet",    action="store_true", help="Don't speak while wandering")
     parser.add_argument("--mode",     type=str,   default="avoid", choices=["avoid", "explore"])
     parser.add_argument("--duration", type=int,   default=180, help="Explore mode duration in seconds")
+    parser.add_argument("--calibrate-cliff", action="store_true",
+                         help="Read the floor's grayscale signature and persist a cliff calibration")
     args = parser.parse_args(argv)
 
     mode   = args.mode
@@ -449,6 +499,21 @@ def main(argv: list[str]) -> int:
     dry    = args.dry_run
     quiet  = args.quiet or os.environ.get("PX_WANDER_QUIET", "0") != "0"
     duration = int(clamp(args.duration, 30, 300)) if mode == "explore" else 0
+
+    if args.calibrate_cliff:
+        if dry:
+            print(json.dumps({"status": "ok", "dry": True}))
+            return 0
+        try:
+            from picarx import Picarx
+            px = Picarx()
+            cal = calibrate_cliff(px, STATE_DIR)
+            print(json.dumps({"status": "ok", **cal}))
+            return 0
+        except Exception as exc:
+            log(f"calibrate-cliff error: {exc}")
+            print(json.dumps({"status": "error", "error": str(exc)}))
+            return 1
 
     px = None
 
