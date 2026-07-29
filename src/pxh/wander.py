@@ -52,6 +52,11 @@ BIN_DIR    = PROJECT_ROOT / "bin"
 CLIFF_MARGIN          = 0.65
 CALIBRATION_STALE_S   = 30 * 24 * 3600
 
+REVERSE_S             = 0.3
+REVERSE_SPEED         = 20
+REVERSE_STALL_CM      = 2.0
+EDGE_ABORT_COUNT      = 2
+
 FRIGATE_HOST   = os.environ.get("PX_FRIGATE_HOST", "http://pi5-hailo:5000")
 FRIGATE_CAMERA = os.environ.get("PX_FRIGATE_CAMERA", "picar_x")
 
@@ -498,6 +503,68 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         log(f"cliff calibration load failed: {exc}")
         return None
+
+
+class CliffGuard:
+    """Fail-closed cliff detector backed by a calibrated grayscale reference."""
+
+    def __init__(self, cliff_ref: list[float]):
+        self.cliff_ref = [float(v) for v in cliff_ref]
+        self.edge_events = 0
+
+    def check(self, px) -> str:
+        """Return "clear" | "cliff" | "fail". An unreadable sensor ("fail")
+        must be treated identically to "cliff" by callers — fail closed."""
+        gs = safe_grayscale(px, retries=1)
+        if gs is None:
+            log("cliff guard: grayscale read failed — treating as cliff (fail closed)")
+            return "fail"
+        if any(gs[i] <= self.cliff_ref[i] for i in range(3)):
+            return "cliff"
+        return "clear"
+
+
+def bounded_reverse(px) -> bool:
+    """Reverse for up to REVERSE_S at REVERSE_SPEED. Returns True if the
+    escape stalled (forward sonar clearance grew less than REVERSE_STALL_CM)."""
+    before = _read_sonar(px)
+    px.backward(REVERSE_SPEED)
+    time.sleep(REVERSE_S)
+    px.stop()
+    after = _read_sonar(px)
+    if before is not None and after is not None:
+        if (after - before) < REVERSE_STALL_CM:
+            log(f"reverse stall: clearance {before:.0f}→{after:.0f}cm — edge-event equivalent")
+            return True
+    return False
+
+
+def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
+                     slice_s: float = 0.15) -> str:
+    """Drive forward in slices, checking the cliff guard before every slice
+    (including the first — a wander that starts at the desk edge never
+    moves). Returns "ok" | "edge"."""
+    remaining = duration_s
+    while remaining > 0:
+        status = guard.check(px)
+        if status != "clear":
+            px.stop()
+            log(f"cliff guard tripped ({status}) — stop + bounded reverse")
+            # Cliff + stalled escape deliberately counts as TWO edge events:
+            # at EDGE_ABORT_COUNT=2 a single cornered-against-a-cliff moment
+            # aborts the whole wander. That is the intended behavior (no
+            # escape room = the abort case) — do not "fix" the double count
+            # in either direction without a spec change.
+            if bounded_reverse(px):
+                guard.edge_events += 1   # stall during escape counts too
+            guard.edge_events += 1
+            return "edge"
+        px.forward(speed)
+        step = min(slice_s, remaining)
+        time.sleep(step)
+        remaining -= step
+    px.stop()
+    return "ok"
 
 
 def main(argv: list[str]) -> int:

@@ -81,3 +81,57 @@ def test_load_calibration_stale_warns_but_loads(tmp_path, monkeypatch):
     cal = wander.load_cliff_calibration(tmp_path)
     assert cal is not None
     assert any("stale" in w.lower() for w in warnings)
+
+
+def _guard():
+    return wander.CliffGuard([650.0, 650.0, 650.0])
+
+
+def test_cliff_guard_detects_drop():
+    px = FakePx(grayscale=[[1000, 640, 1000]])   # center ≤ ref → cliff
+    assert _guard().check(px) == "cliff"
+
+
+def test_cliff_guard_clear():
+    px = FakePx(grayscale=[[1000, 1000, 1000]])
+    assert _guard().check(px) == "clear"
+
+
+def test_cliff_guard_read_failure_is_fail_closed():
+    px = FakePx(grayscale=[None, None, None])    # retries exhausted
+    assert _guard().check(px) == "fail"
+
+
+def test_guarded_forward_stops_and_reverses_on_cliff(monkeypatch):
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3, [600]*3] + [[1000]*3]*5)
+    px._dist = iter([50.0, 60.0])                # before/after reverse: moved
+    px.get_distance = lambda: next(px._dist, 60.0)
+    guard = _guard()
+    r = wander.guarded_forward(px, guard, speed=30, duration_s=0.5)
+    assert r == "edge"
+    assert guard.edge_events == 1
+    assert "stop" in px.calls
+    assert ("backward", wander.REVERSE_SPEED) in px.calls
+
+
+def test_bounded_reverse_stall_detection(monkeypatch):
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*5)
+    px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
+    px.get_distance = lambda: next(px._dist, 50.5)
+    assert wander.bounded_reverse(px) is True
+
+
+def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
+    """Cornered case: cliff trip AND stalled escape → 2 edge events, which at
+    EDGE_ABORT_COUNT=2 aborts the wander on the spot. That instant abort is
+    INTENTIONAL — this test pins it so a refactor can't silently change it."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[600]*3] + [[1000]*3]*5)   # first check trips cliff
+    px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
+    px.get_distance = lambda: next(px._dist, 50.5)
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
+    assert guard.edge_events == 2
+    assert guard.edge_events >= wander.EDGE_ABORT_COUNT
