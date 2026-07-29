@@ -546,9 +546,17 @@ def _base_awareness(**overrides):
 
 @pytest.fixture
 def explore_state(tmp_path):
-    """Temporarily redirect STATE_DIR so _can_explore reads meta from tmp_path."""
+    """Temporarily redirect STATE_DIR so _can_explore reads meta from tmp_path.
+
+    Also seeds a valid cliff calibration so the gate tests below exercise the
+    condition they name rather than short-circuiting on the calibration gate.
+    """
     old = getattr(pxh.mind, "STATE_DIR", None)
     pxh.mind.STATE_DIR = tmp_path
+    (tmp_path / "wander_calibration.json").write_text(_json.dumps({
+        "floor_ref": [1000, 1000, 1000], "cliff_ref": [650, 650, 650],
+        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }))
     yield tmp_path
     if old is not None:
         pxh.mind.STATE_DIR = old
@@ -608,6 +616,19 @@ def test_can_explore_corrupt_meta_fails_safe(explore_state):
     """Corrupt meta file → blocked (fail-safe)."""
     (explore_state / "exploration_meta.json").write_text("not json")
     assert _can_explore(_base_session(), _base_awareness()) is False
+
+
+def test_can_explore_requires_cliff_calibration(tmp_path, monkeypatch):
+    """Autonomous explore must not arm without a calibrated cliff reference."""
+    monkeypatch.setattr(pxh.mind, "STATE_DIR", tmp_path)
+    session = _base_session()
+    awareness = _base_awareness()
+    assert _can_explore(session, awareness) is False  # no calibration file
+    (tmp_path / "wander_calibration.json").write_text(_json.dumps({
+        "floor_ref": [1000, 1000, 1000], "cliff_ref": [650, 650, 650],
+        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }))
+    assert _can_explore(session, awareness) is True  # no cooldown file yet
 
 
 # ---------------------------------------------------------------------------

@@ -1228,6 +1228,10 @@ def _can_explore(session: dict, awareness: dict) -> bool:
         return False
     if battery["pct"] <= 20:
         return False
+    # Fail closed: autonomous roaming requires a calibrated cliff reference.
+    from pxh.wander import load_cliff_calibration
+    if load_cliff_calibration(STATE_DIR) is None:
+        return False
     meta_path = STATE_DIR / "exploration_meta.json"
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
