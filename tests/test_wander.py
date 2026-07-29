@@ -52,6 +52,20 @@ def test_calibrate_cliff_read_failure_raises(tmp_path):
         wander.calibrate_cliff(FakePx(grayscale=[None, None]), tmp_path)
 
 
+def test_calibrate_cliff_write_failure_cleans_up_tmp(tmp_path, monkeypatch):
+    import pytest
+
+    def _raise_replace(*a, **kw):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wander.os, "replace", _raise_replace)
+    px = FakePx(grayscale=[[1000.0, 1100.0, 900.0]])
+    with pytest.raises(OSError):
+        wander.calibrate_cliff(px, tmp_path)
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert not (tmp_path / "wander_calibration.json").exists()
+
+
 def test_load_calibration_missing_or_corrupt_is_none(tmp_path):
     assert wander.load_cliff_calibration(tmp_path) is None
     (tmp_path / "wander_calibration.json").write_text("{nope")

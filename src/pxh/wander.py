@@ -453,11 +453,21 @@ def calibrate_cliff(px, state_dir: Path) -> dict:
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     state_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(state_dir), suffix=".tmp")
-    with os.fdopen(fd, "w") as f:
-        json.dump(cal, f, indent=2)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, str(state_dir / "wander_calibration.json"))
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(state_dir), suffix=".tmp")
+        with os.fdopen(fd, "w") as f:
+            json.dump(cal, f, indent=2)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, str(state_dir / "wander_calibration.json"))
+    except Exception as exc:
+        log(f"cliff calibration write failed: {exc}")
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+        raise
     log(f"cliff calibration saved: floor={cal['floor_ref']} cliff={cal['cliff_ref']}")
     return cal
 
@@ -466,8 +476,14 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
     """Load a persisted cliff calibration. None if missing/corrupt/invalid.
 
     Staleness is a warning only — a stale calibration is still returned.
+    A missing file is the normal first-run state and isn't logged; any other
+    failure (corrupt JSON, malformed structure) is logged so a real bug
+    doesn't silently and invisibly ground autonomous roaming (Task 6 gates on
+    this return value).
     """
     path = state_dir / "wander_calibration.json"
+    if not path.exists():
+        return None
     try:
         cal = json.loads(path.read_text(encoding="utf-8"))
         ref = cal["cliff_ref"]
@@ -479,7 +495,8 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
             log(f"cliff calibration is stale ({age/86400:.0f} days old) — "
                 "consider re-running --calibrate-cliff on the current floor")
         return cal
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        log(f"cliff calibration load failed: {exc}")
         return None
 
 
