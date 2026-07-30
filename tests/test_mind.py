@@ -44,6 +44,195 @@ def test_reflection_redacts_private_dm_even_when_similarity_suppressed(monkeypat
     assert captured["appended"]["thought"] == "[private message to Obi]"
 
 
+# ---------------------------------------------------------------------------
+# Re-roll instead of persisting junk (Phase 1.2 / 1.3)
+# ---------------------------------------------------------------------------
+
+_VALID = {"thought": "The afternoon light is doing something new on the wall.",
+          "mood": "curious", "action": "comment", "salience": 0.6}
+_NOVEL = {"thought": "Someone left a mug on the bench and it sat there all day.",
+          "mood": "amused", "action": "comment", "salience": 0.6}
+_EMPTY = {"thought": "", "mood": "curious", "action": "wait", "salience": 0.2}
+
+
+def _drive_reflection_seq(monkeypatch, payloads, *, recent=(), backend="ollama-m5",
+                          last_spoken=""):
+    """Run reflection() against a SEQUENCE of stubbed LLM responses.
+
+    The final payload repeats if reflection asks more times than provided, so
+    a `len(calls) == N` assertion pins the retry count rather than merely
+    tolerating it. Returns (captured, calls).
+    """
+    captured = {}
+    calls = []
+
+    def _call(*a, **k):
+        payload = payloads[min(len(calls), len(payloads) - 1)]
+        calls.append(payload)
+        return {"response": json.dumps(payload), "backend": backend}
+
+    monkeypatch.setattr(mind, "call_llm", _call)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: list(recent))
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought",
+                        lambda t, persona="": captured.__setitem__("appended", t))
+    monkeypatch.setattr(mind, "auto_remember",
+                        lambda t, persona="": captured.__setitem__("remembered", t))
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "_last_spoken_text", last_spoken, raising=False)
+    captured["returned"] = mind.reflection({"persona": ""}, dry=False)
+    return captured, calls
+
+
+def test_empty_thought_triggers_reroll(monkeypatch):
+    captured, calls = _drive_reflection_seq(monkeypatch, [_EMPTY, _VALID])
+    assert len(calls) == 2, "an empty thought must be re-rolled once"
+    assert captured["appended"]["thought"] == _VALID["thought"]
+
+
+def test_empty_thought_after_reroll_is_dropped(monkeypatch):
+    """Never persist blank text — a blank thought reaches the public endpoint."""
+    captured, calls = _drive_reflection_seq(monkeypatch, [_EMPTY, _EMPTY])
+    assert len(calls) == 2, "exactly one re-roll, then give up"
+    assert "appended" not in captured
+    assert captured["returned"] is None
+
+
+def test_whitespace_only_thought_is_treated_as_empty(monkeypatch):
+    blank = {**_EMPTY, "thought": "   \n\t "}
+    captured, calls = _drive_reflection_seq(monkeypatch, [blank, _VALID])
+    assert len(calls) == 2
+    assert captured["appended"]["thought"] == _VALID["thought"]
+
+
+def test_missing_thought_key_is_treated_as_empty(monkeypatch):
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [{"mood": "curious", "action": "wait", "salience": 0.2}, _VALID])
+    assert len(calls) == 2
+    assert captured["appended"]["thought"] == _VALID["thought"]
+
+
+def test_similar_thought_triggers_reroll(monkeypatch):
+    """A near-duplicate gets one more chance rather than collapsing to wait."""
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_VALID, _NOVEL], recent=[{"thought": _VALID["thought"]}])
+    assert len(calls) == 2
+    assert captured["appended"]["thought"] == _NOVEL["thought"]
+    assert captured["appended"]["action"] == "comment", \
+        "a successful re-roll must not be suppressed"
+    assert captured["appended"]["salience"] > 0.0
+
+
+def test_similar_after_reroll_falls_back_to_suppression(monkeypatch):
+    """If the re-roll is also a duplicate, the existing safety net still applies.
+
+    Suppression is kept rather than dropped so the private-DM redaction path
+    below it stays reachable — see
+    test_reflection_redacts_private_dm_even_when_similarity_suppressed.
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_VALID, _VALID], recent=[{"thought": _VALID["thought"]}])
+    assert len(calls) == 2
+    assert captured["appended"]["action"] == "wait"
+    assert captured["appended"]["salience"] == 0.0
+
+
+def test_no_reroll_when_paid_tier_served(monkeypatch):
+    """Re-rolling on the metered tier doubles spend that already leaks budget.
+
+    Reflection's Claude tier bypasses the session budget entirely, and it only
+    serves when Ollama is already down — exactly when adding a second call is
+    worst on both cost and load.
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_EMPTY, _VALID], backend="claude")
+    assert len(calls) == 1, "must not re-roll on the paid backend"
+    assert "appended" not in captured
+    assert captured["returned"] is None
+
+
+def test_null_thought_is_treated_as_empty(monkeypatch):
+    """`{"thought": null}` must not become the literal string "None".
+
+    `str(parsed.get("thought", ""))` yields "None" for a JSON null — a truthy
+    4-character string that sails past an emptiness check and lands on the
+    public thoughts endpoint. Small models emit null as readily as "".
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [{**_EMPTY, "thought": None}, _VALID])
+    assert len(calls) == 2, "a null thought must be re-rolled like an empty one"
+    assert captured["appended"]["thought"] == _VALID["thought"]
+
+
+def test_null_thought_after_reroll_is_dropped(monkeypatch):
+    """The terminal null case must drop, not persist "None"."""
+    null = {**_EMPTY, "thought": None}
+    captured, calls = _drive_reflection_seq(monkeypatch, [null, null])
+    assert len(calls) == 2
+    assert "appended" not in captured, "must never persist a null thought"
+    assert captured["returned"] is None
+
+
+def test_reroll_triggered_by_similarity_to_last_spoken(monkeypatch):
+    """The `last_spoken` branch of _reroll_reason had no coverage.
+
+    Every other similarity test drives the `recent_thoughts` loop; this one
+    pins the second source, which the docstring claims cannot disagree with
+    the suppressor.
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_VALID, _NOVEL], last_spoken=_VALID["thought"])
+    assert len(calls) == 2, "similarity to spoken text must re-roll"
+    assert captured["appended"]["thought"] == _NOVEL["thought"]
+
+
+def test_no_reroll_on_ollama_cloud(monkeypatch):
+    """Ollama Cloud is a paid API — re-rolling there doubles cloud spend."""
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_EMPTY, _VALID], backend="ollama-cloud")
+    assert len(calls) == 1, "must not re-roll on the paid cloud backend"
+    assert captured["returned"] is None
+
+
+def test_no_reroll_on_unknown_backend_label(monkeypatch):
+    """The cost guard must fail CLOSED on a label it does not recognise.
+
+    `backend not in {"claude"}` is True for "" and for any future or renamed
+    label, so an unrecognised tier silently earns a second billable call.
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_EMPTY, _VALID], backend="")
+    assert len(calls) == 1, "unknown backend must not be re-rolled"
+
+
+def test_reroll_prompt_is_not_byte_identical(monkeypatch):
+    """The retry must tell the model what was wrong with attempt 1.
+
+    Re-sending the identical context relies purely on sampling luck; naming
+    the fault is what makes the second attempt better than a coin flip.
+    """
+    prompts = []
+
+    def _call(context, system, persona=""):
+        prompts.append(context)
+        payload = _EMPTY if len(prompts) == 1 else _VALID
+        return {"response": json.dumps(payload), "backend": "ollama-m5"}
+
+    monkeypatch.setattr(mind, "call_llm", _call)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought", lambda t, persona="": None)
+    monkeypatch.setattr(mind, "auto_remember", lambda t, persona="": None)
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "_last_spoken_text", "", raising=False)
+    mind.reflection({"persona": ""}, dry=False)
+
+    assert len(prompts) == 2
+    assert prompts[1] != prompts[0], "the retry must carry a corrective hint"
+
+
 def test_is_night_silence_uses_config_bounds():
     assert mind._is_night_silence(19) is True
     assert mind._is_night_silence(23) is True
@@ -465,3 +654,42 @@ def test_reflection_records_failure_when_no_json_returned(monkeypatch):
                         lambda comp, err, detail=None, **k: recorded.update({comp: err}))
     assert mind.reflection({"persona": ""}, dry=False) is None
     assert recorded["px-mind-reflection"] == "no JSON in response"
+
+
+# ---------------------------------------------------------------------------
+# extract_json — unit tests for the LLM-quirk repair passes
+# ---------------------------------------------------------------------------
+
+def test_extract_json_handles_comma_inside_closing_quote():
+    """Ollama sometimes puts the field-separator comma inside the string value
+    instead of after the closing quote.  Reproduces the live failure logged at
+    2026-07-30T19:09:01+10:00."""
+    raw = (
+        '{\n'
+        '  "thought": "I\'m thinking about Adrian\'s \'huh\' when he says goodbye,"\n'
+        '  "mood": "lonely",\n'
+        '  "action": "wait",\n'
+        '  "salience": 0.5,\n'
+        '  "reflection_status": "healthy"\n'
+        '}'
+    )
+    result = mind.extract_json(raw)
+    assert result is not None, "extract_json should recover from comma-inside-string"
+    assert result["mood"] == "lonely"
+    assert result["action"] == "wait"
+    assert "goodbye" in result["thought"]
+
+
+def test_extract_json_valid_json_unchanged():
+    """Well-formed JSON must still parse correctly after the repair pass."""
+    raw = '{"thought": "A quiet house.", "mood": "calm", "action": "wait", "salience": 0.3}'
+    result = mind.extract_json(raw)
+    assert result == {"thought": "A quiet house.", "mood": "calm", "action": "wait", "salience": 0.3}
+
+
+def test_extract_json_string_legitimately_ending_with_comma():
+    """A string value that genuinely ends with a comma (valid JSON) must not be mangled."""
+    raw = '{"thought": "One, two,", "mood": "happy", "salience": 0.4}'
+    result = mind.extract_json(raw)
+    assert result is not None
+    assert result["thought"] == "One, two,"

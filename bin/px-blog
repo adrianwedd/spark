@@ -336,17 +336,30 @@ class TransportUnavailable(Exception):
 # unthrottled logging here would recreate the 5.5 MB log-growth defect that
 # this phase exists to fix, just from a different branch.
 TRANSPORT_LOG_INTERVAL_S = 600
-_transport_logged_at: dict = {}
+
+# Steady-state conditions (an outage, a permanently retired post) repeat every
+# poll by definition. Liveness is health.json's job now — record_success runs
+# every loop — so these lines only need to stay diagnosable, not prove the
+# daemon is breathing.
+STUCK_LOG_INTERVAL_S = 3600
+_throttled_logged_at: dict = {}
+
+
+def _log_throttled(key: str, message: str, interval_s: float) -> None:
+    """Log `message` at most once per `interval_s` for a given `key`."""
+    now = time.monotonic()
+    last = _throttled_logged_at.get(key)
+    if last is not None and (now - last) < interval_s:
+        return
+    _throttled_logged_at[key] = now
+    log(message)
 
 
 def _log_transport_throttled(post_type: str, exc: BaseException) -> None:
     """Log a transport failure at most once per TRANSPORT_LOG_INTERVAL_S per type."""
-    now = time.monotonic()
-    last = _transport_logged_at.get(post_type)
-    if last is not None and (now - last) < TRANSPORT_LOG_INTERVAL_S:
-        return
-    _transport_logged_at[post_type] = now
-    log(f"transport error for {post_type} (no strike recorded, backing off): {exc}")
+    _log_throttled(f"transport:{post_type}",
+                   f"transport error for {post_type} (no strike recorded, backing off): {exc}",
+                   TRANSPORT_LOG_INTERVAL_S)
 
 
 def record_generation_failure(post_id: str, error: str) -> None:
@@ -1242,7 +1255,13 @@ def main(argv: list[str]) -> int:
                     # All due posts were skipped (missing children / insufficient
                     # thoughts).  Back off for 1 hour instead of retrying every
                     # poll interval — the source material won't appear in 60 s.
-                    log(f"poll: all due posts skipped (missing source material) — backing off {SKIP_BACKOFF_S}s")
+                    # Throttled: a retired post keeps this branch true forever,
+                    # so at one line per poll it leaks ~288 lines/day into the
+                    # log for a state that will not change without a human.
+                    _log_throttled(
+                        "poll_backoff",
+                        f"poll: all due posts skipped — backing off {SKIP_BACKOFF_S}s",
+                        STUCK_LOG_INTERVAL_S)
                     _shutdown.wait(timeout=SKIP_BACKOFF_S)
                 else:
                     _shutdown.wait(timeout=args.poll_interval)

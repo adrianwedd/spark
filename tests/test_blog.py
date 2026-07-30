@@ -1017,6 +1017,51 @@ class TestRetiredPostBackoff:
         notices = [m for m in logged if pid in m and "not retrying" in m]
         assert len(notices) == 1, f"expected 1 retirement notice, got {len(notices)}: {notices}"
 
+    def test_log_throttled_suppresses_repeats_within_interval(self, blog_mod):
+        """A steady-state condition repeats every poll; the log must not."""
+        ns, _, _ = blog_mod
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        for _ in range(10):
+            ns["_log_throttled"]("stuck", "still stuck", 3600)
+
+        assert len(logged) == 1
+
+    def test_log_throttled_keys_are_independent(self, blog_mod):
+        """Throttling one condition must not silence a different one."""
+        ns, _, _ = blog_mod
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        ns["_log_throttled"]("a", "condition a", 3600)
+        ns["_log_throttled"]("b", "condition b", 3600)
+        ns["_log_throttled"]("a", "condition a", 3600)
+
+        assert logged == ["condition a", "condition b"]
+
+    def test_log_throttled_logs_again_once_interval_elapses(self, blog_mod):
+        """The line must stay diagnosable, not be suppressed forever."""
+        ns, _, _ = blog_mod
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        for _ in range(3):
+            ns["_log_throttled"]("c", "recurring", 0)
+
+        assert len(logged) == 3
+
+    def test_poll_backoff_line_is_throttled(self, blog_mod):
+        """Pins the call site, not just the helper.
+
+        A retired post keeps the backoff branch true forever, so an unthrottled
+        line there leaks ~288 lines/day for a state no poll will change.
+        """
+        script = _BLOG_SCRIPT.read_text(encoding="utf-8")
+        assert 'log(f"poll: all due posts skipped' not in script, \
+            "the poll backoff line must go through _log_throttled"
+        assert '"poll_backoff"' in script
+
 
 class TestBackfillRespectsFailureCap:
     def test_backfill_skips_capped_post_without_claude_call(self, blog_mod):

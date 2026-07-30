@@ -2135,12 +2135,14 @@ def _safe_float(value: object, default: float) -> float:
 
 
 def extract_json(text: str) -> dict | None:
-    """Extract last JSON object from text (handles markdown fences, prose, unescaped newlines)."""
+    """Extract last JSON object from text (handles markdown fences, prose, unescaped newlines, misplaced commas)."""
     # Small models often put literal newlines inside JSON strings — fix them
     import re
     cleaned = re.sub(r'(?<=: ")(.*?)(?=")', lambda m: m.group(0).replace('\n', ' '), text, flags=re.DOTALL)
-    # Also try the original text
-    for attempt in (cleaned, text):
+    # Small models sometimes put the field-separator comma INSIDE the closing
+    # quote of a string value: value," \n "key" → value", \n "key"
+    repaired = re.sub(r',"(\s+")', r'",\1', cleaned)
+    for attempt in (cleaned, repaired, text):
         decoder = json.JSONDecoder()
         pos = 0
         last_obj = None
@@ -2448,6 +2450,65 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
 
     log(f"all tiers failed ({result['error']}), skipping reflection")
     return result
+
+
+def _reroll_reason(parsed: dict, recent_thoughts: list, last_spoken: str = "") -> str | None:
+    """Why this reflection is not worth persisting, or None if it is.
+
+    "empty"   — no thought text at all. Small models periodically return JSON
+                with the key missing, blank, or explicitly null; persisting it
+                puts an empty record on the public thoughts endpoint and into
+                the blog gatherer, where it reads as SPARK having thought
+                nothing.
+    "similar" — a near-duplicate of something just thought or just said.
+
+    Checks the same two sources as the suppressor further down (recent thoughts
+    AND last spoken text) so the two cannot disagree about what counts as a
+    duplicate.
+
+    JSON null is checked BEFORE str(): `str(None)` is the truthy 4-character
+    string "None", which would sail past an emptiness test and reach the public
+    endpoint as a thought reading "None". Small models emit null as readily as
+    "", so this is a real shape, not a theoretical one.
+    """
+    raw_text = parsed.get("thought")
+    text = "" if raw_text is None else str(raw_text).strip()
+    if not text:
+        return "empty"
+    for prev in recent_thoughts:
+        if text_similarity(text, prev.get("thought", "")) > SIMILARITY_THRESHOLD:
+            return "similar"
+    if last_spoken and text_similarity(text, last_spoken) > SIMILARITY_THRESHOLD:
+        return "similar"
+    return None
+
+
+# Reflection's Claude tier bypasses the session budget entirely, and it only
+# serves when Ollama is already unreachable. Re-rolling there would double
+# unbudgeted spend at exactly the moment the system is degraded, so the retry
+# is free-tier only.
+#
+# Deliberately a FREE allowlist rather than a metered denylist: the guard is a
+# spend guard, so an unrecognised label must cost nothing. A denylist fails
+# OPEN — `"" not in {"claude"}` is True, so a missing backend key, a renamed
+# tier, or a future paid backend all silently earn a second billable call.
+# Ollama Cloud is paid too (OLLAMA_CLOUD_API_KEY), so it is not free.
+_FREE_BACKENDS = {"ollama-m5", "ollama-local"}
+
+
+def _reroll_allowed(backend: str) -> bool:
+    """True only for backends known to cost nothing. Fails closed."""
+    return backend in _FREE_BACKENDS
+
+
+# Appended to the retry prompt so attempt 2 knows what was wrong with attempt 1.
+_REROLL_HINTS = {
+    "empty": "Your previous response contained no thought text. "
+             "Return valid JSON with a concrete, specific thought.",
+    "similar": "Your previous response repeated something you just thought or "
+               "said. Notice something different this time — a detail you have "
+               "not mentioned before.",
+}
 
 
 def reflection(awareness: dict, dry: bool) -> dict | None:
@@ -2777,29 +2838,71 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if explore_hints:
         context = context + "\n\nExploration hints: " + " ".join(explore_hints)
 
-    result = call_llm(context, system_prompt, persona=persona)
+    # Up to two attempts. A model that returns a blank thought, or repeats
+    # something it just said, has produced nothing worth a cycle — asking once
+    # more is cheaper than persisting junk or collapsing to "wait". Metered
+    # backends get one attempt only (see _reroll_allowed).
+    #
+    # The retry names the fault rather than re-sending the identical prompt.
+    # TEMPERATURE is 1.3 so a bare re-ask would already resample differently,
+    # but sampling luck is not a correction: telling the model its last answer
+    # was blank, or that it just said this, is what makes attempt 2 better than
+    # a coin flip.
+    parsed = None
+    result = None
+    reroll_reason = None
+    attempt_context = context
+    for attempt in (1, 2):
+        result = call_llm(attempt_context, system_prompt, persona=persona)
+
+        if "error" in result:
+            log(f"reflection failed: {result['error']}")
+            health_mod.record_failure("px-mind-reflection", result["error"])
+            return None
+
+        raw = result.get("response", "")
+        parsed = extract_json(raw)
+        if not parsed:
+            log(f"reflection: no JSON in response: {raw}")
+            # A tier answered but produced junk — distinct from "all tiers down",
+            # and invisible until now because the caller only sees None either way.
+            health_mod.record_failure(
+                "px-mind-reflection", "no JSON in response",
+                detail={"backend": result.get("backend"), "raw": raw[:200]})
+            return None
+
+        reroll_reason = _reroll_reason(parsed, recent_thoughts, _last_spoken_text)
+        if reroll_reason is None:
+            break
+        if attempt == 2:
+            break
+        if not _reroll_allowed(result.get("backend", "")):
+            log(f"reflection: not re-rolling ({reroll_reason}) — "
+                f"backend={result.get('backend')} is metered")
+            break
+        log(f"reflection: re-rolling ({reroll_reason})")
+        attempt_context = context + "\n\n" + _REROLL_HINTS[reroll_reason]
+
     elapsed = time.monotonic() - t0
 
-    if "error" in result:
-        log(f"reflection failed: {result['error']}")
-        health_mod.record_failure("px-mind-reflection", result["error"])
-        return None
-
-    raw = result.get("response", "")
-    parsed = extract_json(raw)
-    if not parsed:
-        log(f"reflection: no JSON in response: {raw}")
-        # A tier answered but produced junk — distinct from "all tiers down",
-        # and invisible until now because the caller only sees None either way.
+    # Never persist blank text. Unlike a duplicate — which still records that
+    # the mind ran and had nothing new — an empty thought carries no
+    # information at all, and reaches the public thoughts endpoint as a hole.
+    if reroll_reason == "empty":
+        log("reflection: dropped — model returned no thought text")
         health_mod.record_failure(
-            "px-mind-reflection", "no JSON in response",
-            detail={"backend": result.get("backend"), "raw": raw[:200]})
+            "px-mind-reflection", "empty thought",
+            detail={"backend": result.get("backend")})
         return None
 
     # Validate and sanitize
     thought = {
         "ts": utc_timestamp(),
-        "thought": str(parsed.get("thought", "")),
+        # Stripped, and null-safe, so this agrees with _reroll_reason above:
+        # it compares stripped text, the suppressor below compares this value,
+        # and the docstring's "the two cannot disagree" only holds if both
+        # normalise identically. `str(None)` would also land "None" here.
+        "thought": "" if parsed.get("thought") is None else str(parsed.get("thought")).strip(),
         "mood": parsed.get("mood") if parsed.get("mood") in VALID_MOODS else _SYS_RNG.choice(sorted(VALID_MOODS)),
         "action": parsed.get("action", "wait") if parsed.get("action") in VALID_ACTIONS else "wait",
         "salience": max(0.0, min(1.0, _safe_float(parsed.get("salience", 0.5), 0.5))),
