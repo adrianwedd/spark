@@ -325,7 +325,9 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 # Run in parallel via run_in_background; synthesise results
 
 hermes -z "QA prompt" 2>&1
-agy --print --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark "QA prompt" 2>&1
+# agy: the prompt is the VALUE of --print, not a positional arg. Passed
+# positionally it is silently ignored and agy just replies "How can I help?".
+agy --print "$(cat prompt.md)" --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark --print-timeout 15m 2>&1
 gemini -p "QA prompt" 2>&1
 echo "QA prompt" | codex exec --full-auto - 2>&1
 ```
