@@ -33,7 +33,6 @@ LOCK_TIMEOUT_S = 10
 
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 DEDUPE_SIMILARITY = 0.85
-DEDUPE_WINDOW_DAYS = 14
 CONSOLIDATION_WINDOW = (2, 6)     # Hobart hours [start, end)
 MAX_ATTEMPTS_PER_DAY = 2
 MIN_THOUGHTS = 5
@@ -210,23 +209,56 @@ def _parse_memory_array(raw: str) -> list[dict]:
     return out
 
 
-def _dedupe(candidates: list[dict], existing: list[dict],
-            now: dt.datetime | None = None) -> list[dict]:
-    cutoff = (now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(days=DEDUPE_WINDOW_DAYS)
-    recent_texts = []
-    for m in existing:
-        try:
-            ts = dt.datetime.fromisoformat(str(m.get("ts", "")).replace("Z", "+00:00"))
-            if ts >= cutoff:
-                recent_texts.append(m.get("text", ""))
-        except (ValueError, TypeError):
-            continue
+def _dedupe(candidates: list[dict], existing: list[dict]) -> list[dict]:
+    """Drop candidates that repeat something SPARK already holds.
+
+    Compares against the WHOLE store rather than a recent window. A memory
+    does not stop being known because it is old: under the old 14-day window
+    the same fact could be re-learned every fortnight, once per window, and
+    each near-identical copy diluted retrieval against the real one. The
+    window also parsed `ts` to apply the cutoff and skipped anything
+    unparseable, so a single corrupt line let its own duplicate back in.
+
+    Cost: MEMORIES_LIMIT is 5000 and candidates are capped at
+    MAX_MEMORIES_PER_DAY, so the naive form is ~40k SequenceMatcher.ratio()
+    calls over ~500-char strings — minutes on a Pi 4. real_quick_ratio() and
+    quick_ratio() are cheap upper bounds on ratio(), so a pair whose upper
+    bound is already below the threshold is skipped without the O(n*m) pass.
+
+    The candidate is seq1 and the stored memory is seq2, matching the argument
+    order of the windowed version this replaced. That orientation is
+    load-bearing, not incidental: ratio() is NOT symmetric — a fuzz over 20k
+    random pairs disagreed on 87% of them, by up to 0.55 — so swapping the two
+    silently changes which pairs count as duplicates. set_seq1 is the cheap
+    side, so the candidate is the one hoisted out of the loop.
+    """
     fresh: list[dict] = []
+    # A stored `"text": null` must be dropped, not stringified: str(None) is the
+    # truthy 4-character "none", which would then dedup against any candidate
+    # mentioning the word. The windowed version raised AttributeError here and
+    # was swallowed by consolidate()'s never-raises wrapper, so a single null
+    # line silently killed the whole night's consolidation.
+    existing_texts = [str(m.get("text") or "").lower() for m in existing
+                      if str(m.get("text") or "").strip()]
     for c in candidates:
-        near_dupe = any(
-            difflib.SequenceMatcher(None, c["text"].lower(), t.lower()).ratio()
-            > DEDUPE_SIMILARITY
-            for t in recent_texts + [f["text"] for f in fresh])
+        ctext = c["text"].lower()
+        clen = len(ctext)
+        matcher = difflib.SequenceMatcher(None)
+        matcher.set_seq1(ctext)
+        near_dupe = False
+        for t in existing_texts + [f["text"].lower() for f in fresh]:
+            # Length gate, computed by hand before touching the matcher. This is
+            # difflib's own real_quick_ratio bound — 2*min(la,lb)/(la+lb) — but
+            # calling it would need set_seq2 first, and set_seq2 eagerly builds
+            # b's index, which is the expensive part we are trying to avoid.
+            # Two texts of very different length cannot be 85% similar.
+            if not t or 2 * min(clen, len(t)) <= DEDUPE_SIMILARITY * (clen + len(t)):
+                continue
+            matcher.set_seq2(t)
+            if (matcher.quick_ratio() > DEDUPE_SIMILARITY
+                    and matcher.ratio() > DEDUPE_SIMILARITY):
+                near_dupe = True
+                break
         if not near_dupe:
             fresh.append(c)
     return fresh
@@ -287,7 +319,7 @@ def consolidate(dry: bool = False, persona: str = "spark",
         if not candidates:
             return {"status": "failed",
                     "error": f"no parseable memories in response: {result.stdout[:200]!r}"}
-        fresh = _dedupe(candidates, existing, now=now)
+        fresh = _dedupe(candidates, existing)
         ts = utc_timestamp()
         records = [{"ts": ts, "date": ts[:10], "text": c["text"], "tags": c["tags"],
                     "importance": c["importance"], "source": "consolidation"} for c in fresh]

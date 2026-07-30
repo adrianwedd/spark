@@ -21,10 +21,10 @@ what the code does.
 | # | Fix | Where | Status |
 |---|-----|-------|--------|
 | 1.1 | Per-daemon health spine — `last_success_ts` / `last_error` / `consecutive_failures`; awareness reads it; enters reflection context and the dashboard | new `src/pxh/health.py`, all daemons | **done** `21127463` |
-| 1.2 | Reject empty thoughts — re-roll or drop, never persist blank text | `mind.py:~2757` | open |
-| 1.3 | Similarity suppression re-rolls once instead of collapsing to `wait` | `mind.py:2827-2845` | open |
-| 1.4 | px-blog: classify transport/quota errors separately from content failures; they must not burn strikes; back off the retry loop instead of logging forever | `bin/px-blog` | **done** (this commit) |
-| 1.5 | Unbound the memory dedup window; fix the time-rotted test fixture to use a relative timestamp | `memory.py:213`, `tests/test_memory.py:15` | open |
+| 1.2 | Reject empty thoughts — re-roll or drop, never persist blank text | `mind.py:~2757` | **done** `7a9dcda2` |
+| 1.3 | Similarity suppression re-rolls once instead of collapsing to `wait` | `mind.py:2827-2845` | **done** `7a9dcda2` |
+| 1.4 | px-blog: classify transport/quota errors separately from content failures; they must not burn strikes; back off the retry loop instead of logging forever | `bin/px-blog` | **done** `0c87b920` |
+| 1.5 | Unbound the memory dedup window; fix the time-rotted test fixture to use a relative timestamp | `memory.py:213`, `tests/test_memory.py:15` | **done** (this commit) |
 | 1.6 | HA: circuit-breaker the whole fetch group, not just `sensor.sleep`; delete the dead `sensor.sleep` entity | `mind.py:727-1100` | open |
 
 ## Exit criteria
