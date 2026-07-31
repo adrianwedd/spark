@@ -142,9 +142,26 @@ which is false in the stable case and sends a reader down the wrong path:
 - stable, non-signature, plausible reading for the full window → its own message
   naming the value, fail closed
 
-If the second message never fires in a month of live wandering, drop the change
-requirement then, with evidence. If it does fire, the false-reject is caught
-before it strands the robot unattended.
+#### Exit condition (this is a decision rule, not "we'll see")
+
+Keeping the change requirement is a deliberate, instrumented trade, not an
+unfortunate residual. Anyone who hits the stable-reading log line and "fixes" it
+by dropping the requirement is deleting the only hardware-agnostic defence in the
+stack without knowing that is what they are doing.
+
+Drop the change requirement only when **all** of these hold:
+
+1. At least 30 days of live wandering have elapsed since this design shipped.
+2. The stable-non-signature log line has fired zero times in that period.
+3. There were at least 20 distinct wander sessions across at least two floor
+   surfaces (the failure is floor-dependent — a single carpet is not evidence
+   about hardwood).
+
+If the line fires even once, the false-reject is real: keep defence 2 and
+revisit the settle duration instead.
+
+If it fires *often*, that is the signal to drop the requirement early — but only
+together with a replacement generic check, never on its own.
 
 ## Part 2 — stale cliff calibration
 
@@ -249,11 +266,16 @@ Tracked separately, deliberately not in this design:
 - interpreter pinning — reduced to fixing the misleading CLAUDE.md sentence
   ("bin scripts run under `/usr/bin/python3` (not venv)" is true only of the
   explicit-GPIO scripts), adding a test for the invariant that already holds, and
-  deciding `bin/tts-glados-server` deliberately. Any such test must assert
-  "sources px-env before invoking python", not "always runs the project venv" —
-  the activate at `px-env:34-37` is guarded by `-z "${VIRTUAL_ENV:-}"`, so a
-  developer with another venv active gets a different interpreter (under systemd
-  `VIRTUAL_ENV` is unset, so it is deterministic there).
+  deciding `bin/tts-glados-server` deliberately.
+
+  **This constraint must be copied into that work item, not left here.** Any
+  interpreter test must assert "sources px-env before invoking python", not
+  "always runs the project venv" — the activate at `px-env:34-37` is guarded by
+  `-z "${VIRTUAL_ENV:-}"`, so a developer with another venv already active gets a
+  different interpreter. Under systemd `VIRTUAL_ENV` is unset, so it is
+  deterministic there. A test asserting the stronger claim passes in CI and
+  misleads exactly the reader it was written to protect. The reasoning is
+  recorded here; the constraint belongs where the test gets written.
 - `bin/px-voice-test:15` enables the speaker amp via venv `python3 -c "from
   robot_hat import enable_speaker"` with `2>/dev/null || true`. If the Pi venv
   cannot see system site-packages this silently no-ops and the amp never enables.
