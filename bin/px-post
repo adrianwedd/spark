@@ -282,8 +282,17 @@ _PRIVATE_PATTERNS_RE = _re.compile(r'\b(?:' + '|'.join([
 ]) + r')\b', _re.IGNORECASE)
 
 
+# A redacted message_obi thought reaches the queue as this exact string (see
+# mind.py). The safety-net QA prompt honestly answers YES to it — nothing in
+# the text is unsafe — so qualification must drop it instead: publishing even
+# the placeholder publicly timestamps a private DM.
+OBI_DM_PLACEHOLDER = "[private message to Obi]"
+
+
 def _contains_private_content(text: str) -> bool:
     """Return True if text contains private/medical content that shouldn't be published."""
+    if text.strip() == OBI_DM_PLACEHOLDER:
+        return True
     return bool(_PRIVATE_PATTERNS_RE.search(text))
 
 

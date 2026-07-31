@@ -132,6 +132,21 @@ def test_suppressed_expression_qualifies():
     assert qualifies(entry) is True
 
 
+def test_obi_dm_placeholder_never_qualifies():
+    """A redacted message_obi reaches the queue as the literal placeholder.
+
+    Under the safety-net QA prompt, YES is the honest verdict for that string
+    (it contains nothing unsafe), so the gate no longer filters it —
+    qualification must. Publishing even the placeholder publicly timestamps a
+    private DM to a child, which the redaction design exists to prevent.
+    """
+    for action, salience in (("message_obi", 0.9), ("comment", 0.3)):
+        entry = {"thought": "[private message to Obi]",
+                 "salience": salience, "action": action}
+        assert qualifies(entry) is False
+        assert _POST["qualifies_social"](entry) is False
+
+
 def test_malformed_thought_entry():
     """Missing required fields returns False."""
     entry = {"random": "data"}
