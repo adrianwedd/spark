@@ -73,7 +73,7 @@ No plumbing from `Picarx()` construction is needed: both call sites construct
 measuring from construction.
 
 `LATCH_SETTLE_MIN_S` must be a **module attribute read at call time**, following
-the existing `settle_s`/`poll_s` pattern (`wander.py:433-434`) rather than a
+the existing `settle_s`/`poll_s` pattern (`wander.py:434-435`) rather than a
 captured default arg. `tests/test_wander.py` has 18 call references across 34
 tests; a hardcoded 1.5s sleep would add ~30s to that file alone.
 
@@ -130,8 +130,13 @@ that floor — a floor-dependent hard outage. If a shape test beyond the exact
 constant is wanted later, restrict it to the observed gap `d=514`.
 
 Defence 3 is hardware-specific by construction. A different robot_hat revision
-may latch at a different value, at which point it silently stops firing. This is
-why defence 2 is retained rather than replaced.
+may latch at a different value, at which point it silently stops firing. The same
+is true of environmental drift on *this* hardware: if the latch is
+`[2571, 3085, 3600]` on a cold day, exact equality stops matching. Both are
+acceptable precisely because defence 3 is not load-bearing — defences 1 and 2
+carry the design — but it means defence 3 must never be treated as the reason the
+others can be relaxed. This is also why defence 2 is retained rather than
+replaced.
 
 #### Defence 3 must also live in `CliffGuard.check`
 
@@ -168,6 +173,16 @@ keep it rests on **observability asymmetry**, not on which failure is likelier:
 
 Defence 2 is also the only hardware-agnostic check in the stack; defences 1 and 3
 are both calibrated to this specific robot.
+
+**The strongest argument for keeping it is not about the latch at all.** The
+change requirement is the only defence that catches a sensor stuck at *any*
+value. Defence 1 is a timer and defence 3 matches one specific constant, so an
+ADC that fails returning a plausible constant — `[400, 400, 400]`, or all zeros —
+passes both and is caught only by the comparison. Dropping the change requirement
+therefore does not merely trade Attack C for a rarer latch case; it removes
+stuck-sensor detection from the design entirely, and nothing else here replaces
+it. Any future decision to drop it must name what detects a stuck sensor instead
+(variance over time, not a first-reading comparison).
 
 Because Attack C has never been measured, the two `None` paths must be
 distinguishable in the log — today both emit "never left its power-on latch",
@@ -255,9 +270,17 @@ self-elevates (`bin/px-wander:20-27`) and writes root-owned 0644
 its return value. Revalidation consumes that reading instead of taking its own:
 one I2C read, and it is guaranteed to be the post-settle one.
 
-Note `px.set_cliff_reference(cal["cliff_ref"])` runs at `wander.py:731`, before
-the settle. That ordering is unchanged; revalidation happens after, and refusal
-returns before any motion.
+Note `px.set_cliff_reference(cal["cliff_ref"])` runs at `wander.py:729`, before
+the settle — i.e. picarx's internal cliff reference is configured from a
+calibration that has not yet been revalidated. Verified harmless rather than
+assumed: `set_cliff_reference` is called exactly once in `wander.py:729` and
+`px.get_cliff_status` is never called anywhere in the module, so the guard path
+does not consult it. `CliffGuard.check` performs its own `safe_grayscale` read
+and compares against its own `cliff_ref` (`wander.py:533-539`).
+
+The ordering is therefore unchanged. If a future change starts using picarx's
+built-in cliff status, this ordering becomes wrong and must move after
+revalidation.
 
 ### Tolerance band, asymmetric
 
@@ -304,9 +327,44 @@ while a void reads near zero. So:
    move the robot, then retry.
 3. All three near zero → sensors are over a drop or not over a surface at all →
    move the robot, then retry. **Never** recalibrate.
+4. **Anything else** — e.g. one channel 30% above `floor_ref` while the other two
+   sit within tolerance, which is neither a shared drift nor a below-`cliff_ref`
+   edge. Refuse, name the channel and the value, and advise recalibration *after*
+   confirming the robot is on a normal surface. A catch-all is mandatory: a
+   three-case rule with an unhandled fourth shape either crashes or silently
+   falls through to "proceed", and "proceed" here means driving on a reference
+   that just failed its own check.
 
-All three must produce different reasons in both the log and the
+All four must produce different reasons in both the log and the
 `status: blocked` JSON.
+
+### Revalidation must not fail on a single noisy sample
+
+A single spike on one channel is normal ADC behaviour, and revalidation that
+grounds the robot on one sample converts routine noise into a refusal to move —
+the same class of failure as Attack C, in the part of the design added to
+*prevent* a silent wrong answer.
+
+Take N samples (N=5 is enough) and use the per-channel median, or require the
+failure to persist across consecutive samples. A genuine surface change and a
+genuine edge both persist; a spike does not.
+
+### `load_cliff_calibration` must validate `floor_ref`
+
+The loader today validates only `cliff_ref`:
+`isinstance(ref, list) and len(ref) == 3` (`wander.py:508-510`). `floor_ref` is
+written by `calibrate_cliff` (`wander.py:471`) but never checked on load.
+
+Revalidation reads `cal["floor_ref"]`, and that access sits in `main()` —
+*outside* the loader's `try/except`. On a calibration file that predates
+`floor_ref`, or one hand-edited, that is an uncaught `KeyError`: a traceback with
+no JSON status at all, which is strictly worse than failing closed. This design
+introduces that path, so it must close it.
+
+Extend the loader's validation to `floor_ref` (present, list, length 3, numeric)
+and return `None` if it fails — which `main()` already handles as "not
+calibrated → blocked" (`wander.py:717-720`). Revalidation then never sees a
+malformed calibration.
 
 ### The abort message when parked at an edge is currently wrong
 
@@ -364,6 +422,15 @@ Part 2:
   "move the robot" reason
 - revalidation never writes `wander_calibration.json` (assert mtime unchanged)
 - fresh calibration → revalidation does not run
+- stale + all three near zero → blocked, "move the robot" reason, **not**
+  "recalibrate"
+- stale + one channel high and outside the band, others within → blocked via the
+  catch-all, naming the channel
+- a single-sample spike on one channel does **not** fail revalidation (median /
+  persistence)
+- calibration missing `floor_ref` → `load_cliff_calibration` returns `None` and
+  `main()` blocks with the not-calibrated reason; no traceback, JSON always
+  emitted
 
 ## Out of scope
 
