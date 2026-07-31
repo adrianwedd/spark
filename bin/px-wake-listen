@@ -682,18 +682,26 @@ def _stop_alive() -> int | None:
 
 
 def _restart_alive() -> None:
-    """Restart px-alive in background."""
-    alive_script = PROJECT_ROOT / "bin" / "px-alive"
-    if alive_script.exists():
-        log("restarting px-alive")
-        try:
-            subprocess.Popen(
-                ["sudo", "-n", str(alive_script)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as exc:
-            log(f"_restart_alive: failed to spawn: {exc}")
+    """Hand px-alive back to systemd after a voice turn.
+
+    Must go through systemctl, never spawn bin/px-alive directly. A directly
+    spawned instance is a child of *this* process, writes px-alive.pid and takes
+    the GPIO handle; the systemd unit (Restart=always) then starts, trips
+    px-alive's single-instance guard, and exits — looping forever while
+    `systemctl is-active` reports a misleading `activating`. It would also drop
+    the unit's --no-face flag. pi holds NOPASSWD sudo for exactly this verb.
+    """
+    log("restarting px-alive")
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "systemctl", "restart", "px-alive"],
+            capture_output=True, check=False, timeout=15,
+        )
+        if r.returncode != 0:
+            log(f"_restart_alive: systemctl restart failed (rc={r.returncode}): "
+                f"{r.stderr.decode(errors='replace').strip()}")
+    except Exception as exc:
+        log(f"_restart_alive: failed to restart: {exc}")
 
 
 
