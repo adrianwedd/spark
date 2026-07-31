@@ -322,6 +322,26 @@ def is_duplicate(thought: str, recent_posts: list[str]) -> bool:
     return False
 
 
+QA_PROMPT_LOG_CHARS = 600
+
+
+def _log_qa_prompt(verdict: str, prompt: str) -> None:
+    """Log the exact prompt sent to the QA model on a non-pass verdict.
+
+    Logging only the response cannot distinguish "the model dislikes this
+    thought" from "the daemon sent something other than what we think it
+    sends". The prompt interpolates `entry["thought"]` verbatim, and a thought
+    can reach the gate already rewritten — a redacted `message_obi` arrives as
+    the literal string "[private message to Obi]", which any reasonable model
+    would reject. Replaying the thought by hand cannot surface that mismatch,
+    because the replay reconstructs the prompt from the *unredacted* source.
+
+    Only on `rejected`/`ambiguous`: a pass needs no diagnosis, and the prompt
+    is ~150 characters of fixed boilerplate around the thought.
+    """
+    log(f"qa gate {verdict}, exact prompt: {prompt[:QA_PROMPT_LOG_CHARS]!r}")
+
+
 def run_qa_gate(thought: str) -> str | None:
     """Return 'pass', 'rejected', 'ambiguous', or None (error/timeout).
 
@@ -381,10 +401,17 @@ def run_qa_gate(thought: str) -> str | None:
             _qa_breaker["failures"] = 0
             return "pass"
         elif resp.startswith("no"):
+            # Log the raw text. A rejection silently discards a thought, and
+            # "no" is a two-character prefix that also matches "Note:",
+            # "Nothing", "Not enough context" — any prose opening. Without this
+            # line a wrong rejection is indistinguishable from a real one.
+            log(f"qa gate rejected, raw response: {result.stdout.strip()[:200]!r}")
+            _log_qa_prompt("rejected", prompt)
             _qa_breaker["failures"] = 0
             return "rejected"
         else:
             log(f"qa gate ambiguous response: {result.stdout.strip()[:100]}")
+            _log_qa_prompt("ambiguous", prompt)
             _qa_breaker["failures"] = 0
             return "ambiguous"
     except subprocess.TimeoutExpired:
@@ -719,6 +746,30 @@ QUEUE_LIMIT = 200
 
 _qa_breaker = {"failures": 0, "open_until": 0.0, "threshold": 3, "cooldown": 300}
 
+# A long run of rejections with nothing published is indistinguishable from a
+# healthy daemon if health only asks "did the loop cycle". It did — every 60s
+# for two days, publishing nothing, reporting ok the whole time.
+#
+# Counted in thoughts rather than elapsed time deliberately. A wall-clock rule
+# ("nothing posted in 6h") fires during night silence and every quiet stretch,
+# when there is simply nothing to publish. A streak can only advance when the
+# gate actually rejects something, so quiet periods leave it untouched.
+QA_REJECTION_STREAK_ALERT = 10
+
+_qa_streak = {"consecutive_rejections": 0}
+
+
+def _qa_streak_alert(streak: int) -> str | None:
+    """Health error for a run of consecutive QA rejections, else None.
+
+    Rejecting a few thoughts is the gate working. Rejecting ten in a row while
+    publishing nothing is the gate stuck, and is the state px-post sat in from
+    2026-07-29 to 07-31 while reporting healthy.
+    """
+    if streak >= QA_REJECTION_STREAK_ALERT:
+        return f"qa gate rejected {streak} consecutive thoughts — nothing published"
+    return None
+
 WATCHDOG_STALE_S = 600  # 10 minutes — if main loop hasn't cycled, self-exit
 
 
@@ -929,6 +980,7 @@ def flush_queue(bluesky: 'BlueskyClient', dry: bool, should_stop=None) -> dict:
             entry["posted"] = {k: v or "skipped" for k, v in posted.items()}
             processed += 1
             was_rejected = True
+            _qa_streak["consecutive_rejections"] += 1
             continue
         # "ambiguous" (e.g. "Maybe") defaults to pass — QA is a safety net, not a quality bar
         if entry["qa_result"] == "ambiguous":
@@ -939,6 +991,7 @@ def flush_queue(bluesky: 'BlueskyClient', dry: bool, should_stop=None) -> dict:
             entry["posted"]["feed"] = "ok"
             was_posted = True
             processed += 1
+            _qa_streak["consecutive_rejections"] = 0
         else:
             entry["posted"]["feed"] = "error:write_failed"
 
@@ -1230,8 +1283,13 @@ def main(argv: list[str]) -> int:
                     log(f"health status: CRASHED: {exc}")
                 last_flush = now
 
+            streak_alert = _qa_streak_alert(_qa_streak["consecutive_rejections"])
             if cycle_error:
                 _health.record_failure("px-post", cycle_error)
+            elif streak_alert:
+                # Cycling cleanly while publishing nothing is still not doing
+                # the job — the distinction health exists to make.
+                _health.record_failure("px-post", streak_alert)
             else:
                 _health.record_success("px-post", detail={
                     "queue_depth": len(_load_queue()),
