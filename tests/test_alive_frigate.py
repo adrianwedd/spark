@@ -1,11 +1,11 @@
 """Tests for px-alive directional gaze toward Frigate-detected person."""
 from __future__ import annotations
 import datetime as dt
-import os
 import sys
 import types
 from pathlib import Path
 
+from _harness import daemon_load_env
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -24,23 +24,14 @@ def _load_alive_helpers():
     stubs_state.load_session = lambda: {}
     sys.modules["pxh.state"] = stubs_state  # explicit, not overwritten by loop
 
-    env_patch = {
-        "PROJECT_ROOT": str(PROJECT_ROOT),
-        "LOG_DIR": str(PROJECT_ROOT / "logs"),
-        "PX_STATE_DIR": str(PROJECT_ROOT / "state"),
-    }
-    old_env = {k: os.environ.get(k) for k in env_patch}
-    for k, v in env_patch.items():
-        os.environ[k] = v
-
     globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-alive")}
     try:
-        exec(compile(py_src, "bin/px-alive", "exec"), globs)  # noqa: S102
+        # STATE_DIR is frozen here for the session — see tests/_harness.py.
+        with daemon_load_env():
+            exec(compile(py_src, "bin/px-alive", "exec"), globs)  # noqa: S102
     finally:
         for k, old_mod in saved.items():
             sys.modules.pop(k, None) if old_mod is None else sys.modules.update({k: old_mod})
-        for k, old_v in old_env.items():
-            os.environ.pop(k, None) if old_v is None else os.environ.update({k: old_v})
     return globs
 
 

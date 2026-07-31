@@ -13,6 +13,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from _harness import daemon_load_env
+
 _SYS_RNG = _test_random.SystemRandom()
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -27,24 +29,12 @@ def _load_post_helpers():
     end = src.rindex("\nPY\n")
     py_src = src[start:end]
 
-    env_patch = {
-        "PROJECT_ROOT": str(PROJECT_ROOT),
-        "LOG_DIR": str(PROJECT_ROOT / "logs"),
-        "PX_STATE_DIR": str(PROJECT_ROOT / "state"),
-    }
-    old_env = {k: os.environ.get(k) for k in env_patch}
-    for k, v in env_patch.items():
-        os.environ[k] = v
-
     globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-post")}
-    try:
+    # The constants this exec computes (QUEUE_FILE, FEED_FILE, CURSOR_FILE,
+    # STATUS_FILE) are frozen for the whole session — see tests/_harness.py.
+    # They must never resolve into the live state/ tree.
+    with daemon_load_env():
         exec(compile(py_src, "bin/px-post", "exec"), globs)  # noqa: S102
-    finally:
-        for k, old_v in old_env.items():
-            if old_v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = old_v
 
     return globs
 
