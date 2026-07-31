@@ -101,6 +101,24 @@ short on a cold boot or different hardware. Closes Attacks A and B on its own.
 Residual: an ADC alternating on all three channels simultaneously — the
 irreducible limit of any change-detector.
 
+Residual it does **not** close: a tear *within* a single channel's read. If the
+ADC goes live between the two 8-bit halves of one channel's 16-bit transaction,
+that channel returns a hybrid (latched MSB + live LSB) which differs from its
+latched baseline, as do the two fully-live channels that follow — so `all()`
+passes on a partly fabricated vector, and the hybrid reads high. Only defence 1
+closes this. Whether robot_hat reads channels this way is unverified (the read
+path is only inspectable on the Pi), which is a further reason the settle, not
+the comparison, is the primary defence.
+
+**Defence 2 widens Attack C.** `all(g != f ...)` is strictly stricter than
+`gs != first`: the old rule accepted a floor where *any* channel showed LSB
+noise, the new one needs all three. The change being shipped therefore increases
+the false-reject rate that the exit condition below is instrumented to measure,
+and the measurement baseline starts *after* that increase. This is not an
+argument against defence 2 — it is still the right call — but a first firing is
+evidence that this change tightened the rule, not evidence that the floor
+changed. The exit condition's ladder is built accordingly.
+
 ### Defence 3 — exact signature rejection
 
 Never accept a reading equal to the recorded latch `[2571, 3085, 3599]`, at any
@@ -114,6 +132,23 @@ constant is wanted later, restrict it to the observed gap `d=514`.
 Defence 3 is hardware-specific by construction. A different robot_hat revision
 may latch at a different value, at which point it silently stops firing. This is
 why defence 2 is retained rather than replaced.
+
+#### Defence 3 must also live in `CliffGuard.check`
+
+The startup framing of this whole design hid a hole in the driving loop. The
+per-slice guard does not call `wait_for_grayscale` — it calls
+`CliffGuard.check`, which tests only
+`any(gs[i] <= self.cliff_ref[i] for i in range(3))` (`wander.py:537`) and
+otherwise returns `"clear"` (`wander.py:539`). The latch reads *high*, so if the
+ADC re-latches mid-wander (I2C reset, brownout, a HAT power glitch) the guard
+returns "clear" on fabricated data and the robot keeps driving.
+
+`CliffGuard.check` must reject the exact signature and return `"fail"`, which
+callers already treat identically to "cliff" (contract documented at
+`wander.py:531-532`; the existing `"fail"` return is at `wander.py:534-536`).
+This is
+independent of everything else in part 1 and is the only change here that
+protects a wander already in motion.
 
 ### Retained
 
@@ -157,11 +192,35 @@ Drop the change requirement only when **all** of these hold:
    surfaces (the failure is floor-dependent — a single carpet is not evidence
    about hardwood).
 
-If the line fires even once, the false-reject is real: keep defence 2 and
-revisit the settle duration instead.
+A firing is *not* a reason to revisit the settle duration. Attack C is a live
+sensor on a quiet floor; no settle length makes a floor noisier. The ladder is:
 
-If it fires *often*, that is the signal to drop the requirement early — but only
-together with a replacement generic check, never on its own.
+- **Fires once** → step defence 2 down from `all(g != f ...)` to the whole-list
+  `gs != first`. Defences 1 and 3 already close Attacks A and B; defence 2's
+  marginal value is only for hardware whose latch window exceeds
+  `LATCH_SETTLE_MIN_S` or whose latch value differs from the recorded one.
+  Stepping down keeps a generic check at half the strictness rather than
+  trading it for nothing.
+- **Fires often** → drop the change requirement early, but only together with a
+  replacement generic check, never on its own.
+- **Zero firings** across the three conditions above → drop it, as written.
+
+#### Measure the noise floor before implementing
+
+The whole "keep it and measure" argument rests on an unmeasured premise: that
+consecutive grayscale reads on a stationary robot over a uniform floor usually
+differ. If they do, defence 2 costs nothing and the 30-day instrument is right.
+If they frequently do not, this design ships a robot that refuses to move, and a
+30-day exit condition is a slow substitute for a fast answer.
+
+This is a one-command experiment on the Pi, and it should be run **before** the
+implementation plan, not after shipping: sample the grayscale ~50 times on a
+stationary robot over a uniform floor (after the latch has expired) and count how
+often consecutive readings are identical, per-channel and all-three.
+
+- Consecutive reads essentially always differ → proceed exactly as designed.
+- Identical reads common → do not ship defence 2 as an acceptance requirement;
+  reopen the drop-the-change-requirement decision with the data in hand.
 
 ## Part 2 — stale cliff calibration
 
@@ -229,8 +288,49 @@ persisting a low `floor_ref` → a low `cliff_ref` → a permanently *less* sens
 guard, via a documented procedure followed properly. That is a worse outcome than
 the stale calibration this change exists to catch.
 
-The cases are distinguishable by the pattern above, and must produce different
-reasons in both the log and the `status: blocked` JSON.
+A third case fits neither pattern and is the most dangerous of the three: the
+robot parked square to a drop with **all three** sensors over the void. All three
+read near zero — which matches "all three drifted together" exactly, and would
+therefore be told to recalibrate, over the void, producing the near-zero
+`floor_ref` this section exists to prevent.
+
+Pattern alone cannot separate that from a surface change. The rule needs an
+absolute test as well: a changed surface still reads a *plausible floor value*,
+while a void reads near zero. So:
+
+1. All three within a plausible floor range but away from `floor_ref` → surface
+   changed → recalibrate.
+2. One or two below `cliff_ref`, others near `floor_ref` → parked at an edge →
+   move the robot, then retry.
+3. All three near zero → sensors are over a drop or not over a surface at all →
+   move the robot, then retry. **Never** recalibrate.
+
+All three must produce different reasons in both the log and the
+`status: blocked` JSON.
+
+### The abort message when parked at an edge is currently wrong
+
+If the robot is parked at an edge, the sensors read the void consistently, so
+`wait_for_grayscale` sees no change, returns `None`, and `main()` aborts at
+`wander.py:741-745` with "grayscale sensor not live — cannot guard against
+cliffs". Revalidation never runs, and the message names a sensor fault when the
+truth is a parked position. This is the same root cause as Attack C and is closed
+by the same split messages — the stable-reading path must name the value it saw,
+so a human reading the log can tell "sensor stuck" from "I am sitting over a
+drop".
+
+### Residual: this protects "parked on", not "drives onto"
+
+The motivating case is a calibration taken on hardwood and used on carpet 31 days
+later. Revalidation samples one spot, once, at wander start — so if the robot
+starts on hardwood and *drives onto* the carpet, revalidation passed and nothing
+rechecks.
+
+What part 2 actually closes is "parked on a different surface than it was
+calibrated on". That is strictly better than a warning and worth shipping, but
+the motivating case is only partly closed. Mid-wander recalibration is a much
+larger design and is deliberately out of scope; the residual is named here so the
+document is not read as closing it.
 
 ## Testing
 
@@ -242,7 +342,15 @@ pattern and shortened module attributes (no real sleeps):
 - alternating latch → not accepted
 - exact signature never accepted, at any position in the script
 - `[700, 700, 700]` (d=0 AP) **is** accepted — guards against re-introducing a
-  general AP test
+  general AP test. The script must supply a *distinct* preceding baseline, e.g.
+  `[[700, 701, 702]] + [[700, 700, 700]] * 3`. Written as `[[700,700,700]] * N`
+  the test goes green via the change requirement without ever exercising AP
+  handling — a vacuous regression guard. (`FakePx` pops scripted values per
+  call, tests/test_wander.py:19-31.)
+- a torn read where one channel's own bytes straddle the transition — document
+  as untestable at this layer if `FakePx` cannot express it; defence 1 is what
+  covers it
+- `CliffGuard.check` returns `"fail"`, not `"clear"`, on the exact signature
 - stable non-signature floor → `None` with the *stable* log message, not the
   latch one
 - both 5a9aea30 regressions still pass
@@ -262,7 +370,8 @@ Part 2:
 Tracked separately, deliberately not in this design:
 
 - `post_exists` list branch in `bin/px-blog` (dormant; `run_once` re-checks with
-  the dict form at `px-blog:969-970`)
+  the dict form before generating at `px-blog:993`, and again at write time
+  under the lock at `px-blog:1057` and `px-blog:1118`)
 - interpreter pinning — reduced to fixing the misleading CLAUDE.md sentence
   ("bin scripts run under `/usr/bin/python3` (not venv)" is true only of the
   explicit-GPIO scripts), adding a test for the invariant that already holds, and
@@ -276,7 +385,18 @@ Tracked separately, deliberately not in this design:
   deterministic there. A test asserting the stronger claim passes in CI and
   misleads exactly the reader it was written to protect. The reasoning is
   recorded here; the constraint belongs where the test gets written.
-- `bin/px-voice-test:15` enables the speaker amp via venv `python3 -c "from
-  robot_hat import enable_speaker"` with `2>/dev/null || true`. If the Pi venv
-  cannot see system site-packages this silently no-ops and the amp never enables.
-  Unverified; check on the Pi with `.venv/bin/python3 -c "import robot_hat"`.
+- `bin/px-voice-test:15` — **confirmed broken on the Pi**, one-line fix. It
+  enables the speaker amp via `python3 -c "from robot_hat import
+  enable_speaker"`, but `px-voice-test:7` sources px-env, so that `python3`
+  resolves to the venv, which has no `robot_hat`; `2>/dev/null || true` swallows
+  the `ModuleNotFoundError`. The MAX98357A never gets its GPIO 20 toggle, which
+  per CLAUDE.md is exactly the failure where `aplay` exits 0 and nothing plays.
+  Cost is bounded — `px-voice-test` is a diagnostic tool, so it reports silence
+  as success while someone debugs audio. Fix: pin `/usr/bin/python3` on that
+  line.
+
+  Provenance: verified on the Pi by the picar session (venv `python3` →
+  `ModuleNotFoundError`, `/usr/bin/python3` → import succeeds); not reproducible
+  from the m5 clone, where `picarx`/`robot_hat` are absent. This is also a live
+  instance of PATH-resolved `python3` actually biting, which raises the priority
+  of the interpreter item above.
