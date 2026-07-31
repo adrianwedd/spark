@@ -1140,15 +1140,22 @@ class TestRetiredPostsStopBeingDue:
         now = dt.datetime.now(HOBART_TZ)
         weeklies = [_make_weekly_post(now - dt.timedelta(days=i * 7)) for i in range(3)]
         blog_data = {"posts": weeklies, "skipped": []}
-        pid = ns["id_for_post"]("monthly", now)
 
-        due, _ = ns["is_due"]("monthly", blog_data)
+        due, target = ns["is_due"]("monthly", blog_data)
         assert due, "precondition: monthly is due while weekly children exist"
 
-        for _ in range(3):
-            ns["record_generation_failure"](pid, "qa_rejected")
-
-        due, _ = ns["is_due"]("monthly", blog_data)
+        # The due target is calendar-dependent: before the 1st's scheduled hour
+        # the due monthly is last month's catch-up, not this month's, and the
+        # weeklies can span both months. Retire whichever pid is_due reports —
+        # at most the two reachable targets (current month + catch-up) — and
+        # require the due set to drain.
+        for _ in range(2):
+            pid = ns["id_for_post"]("monthly", target)
+            for _ in range(3):
+                ns["record_generation_failure"](pid, "qa_rejected")
+            due, target = ns["is_due"]("monthly", blog_data)
+            if not due:
+                break
         assert not due, "a retired monthly must not stay permanently due"
 
 
