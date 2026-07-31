@@ -281,6 +281,31 @@ def test_frigate_presence_low_score():
     assert result.get("person_present") is False
 
 
+def test_frigate_carries_sub_label_through():
+    """Frigate's recognised name rides on sub_label. Nothing consumes it yet;
+    this pins the data path so named greetings stay a phrasing change."""
+    ev = _make_frigate_event(camera="picar_x")
+    ev["sub_label"] = "Obi"
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([ev])):
+        result = _fetch_frigate_presence(dry=False)
+    cam = result["cameras"]["picar_x"]
+    assert cam["people"] == ["Obi"]
+    assert cam["detections"][0]["sub_labels"] == ["Obi"]
+
+
+def test_frigate_sub_label_list_form_and_absence():
+    """Frigate has sent sub_label as [name, score] as well as a bare string,
+    and sends nothing at all when recognition is off."""
+    named = _make_frigate_event(camera="picar_x")
+    named["sub_label"] = ["Adrian", 0.91]
+    anon = _make_frigate_event(camera="picamera")   # no sub_label key
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([named, anon])):
+        result = _fetch_frigate_presence(dry=False)
+    assert result["cameras"]["picar_x"]["people"] == ["Adrian"]
+    assert result["cameras"]["picamera"]["people"] == []
+    assert result["cameras"]["picamera"]["person"] is True
+
+
 def test_frigate_presence_multi_camera():
     """Multiple cameras each with person events → rooms_with_people populated."""
     events = [

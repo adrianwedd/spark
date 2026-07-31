@@ -83,6 +83,27 @@ FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
 MOOD_CHECK_S = 10    # how often to read mood file
 SPARK_GREET_COOLDOWN_S = 120   # minimum seconds between SPARK proximity greetings
 
+# Greeting phrasing and its confirmation policy live in spark_config so SPARK
+# can evolve them (px-alive itself is off the evolve whitelist). spark_config
+# is stdlib-only, so it imports cleanly under the system python3 this script
+# runs on; the fallbacks keep px-alive working if src/ isn't on PYTHONPATH.
+try:
+    from pxh.spark_config import (
+        GREET_CONFIRM_CAMERAS,
+        GREET_FRIGATE_STALE_S,
+        PROXIMITY_GREETINGS,
+    )
+except Exception:  # noqa: BLE001 — deliberately broad; see below
+    # Not just ImportError. spark_config is the primary target of SPARK's own
+    # self-evolution PRs, and this daemon holds the GPIO handle — a bad edit
+    # there must degrade to stock greetings, never take the robot's servos
+    # offline. It is also imported under /usr/bin/python3, which is 3.9 on a
+    # dev Mac and 3.11 on the Pi, so a 3.10-only annotation raises TypeError
+    # at import rather than ImportError.
+    PROXIMITY_GREETINGS = ["Hey. I'm here.", "Hello there.", "Hi. Good to see you.", "Hey."]
+    GREET_CONFIRM_CAMERAS = ["picar_x", "picamera"]
+    GREET_FRIGATE_STALE_S = 120
+
 MOOD_BEHAVIOR = {
     "excited":       {"gaze_min": 5,  "gaze_max": 12, "tilt_bias": 10},
     "playful":       {"gaze_min": 6,  "gaze_max": 15, "tilt_bias": 5},
@@ -199,16 +220,45 @@ def read_session_persona() -> str:
 
 import subprocess as _subprocess
 
+def _person_confirmed(presence: dict | None, now_utc=None) -> bool:
+    """True when a camera that can see the robot recently detected a person.
+
+    Sonar only reports a distance, so the proximity react fires at furniture as
+    readily as at people. This is the veto that stops SPARK greeting a chair
+    leg. It deliberately does not consult the outdoor cameras: someone in the
+    driveway says nothing about what is standing in front of the robot.
+
+    Treated as a veto rather than a trigger, so a false negative costs a missed
+    greeting, not a wrong one. That matters because the Frigate snapshot is
+    built from a 90 s *event* window — a motionless person can age out of it
+    while still present. The greeting is provoked by an approach, though, and
+    approaching is motion, so the person who triggered it has almost always
+    just generated a fresh event.
+    """
+    if not isinstance(presence, dict):
+        return False
+    ts = presence.get("ts")
+    if not ts:
+        return False
+    try:
+        now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
+        if (now_utc - dt.datetime.fromisoformat(ts)).total_seconds() > GREET_FRIGATE_STALE_S:
+            return False
+    except (TypeError, ValueError):
+        return False
+    cameras = presence.get("cameras")
+    if not isinstance(cameras, dict):
+        return False
+    return any(
+        isinstance(cameras.get(cam), dict) and cameras[cam].get("person")
+        for cam in GREET_CONFIRM_CAMERAS
+    )
+
+
 def spark_greet(dry: bool) -> None:
     """Speak a soft SPARK proximity greeting via tool-voice."""
     import random as _random
-    greetings = [
-        "Hey. I'm here.",
-        "Hello there.",
-        "Hi. Good to see you.",
-        "Hey.",
-    ]
-    text = _random.choice(greetings)
+    text = _random.choice(PROXIMITY_GREETINGS)
     tool_voice = PROJECT_ROOT / "bin" / "tool-voice"
     env = os.environ.copy()
     env["PX_TEXT"] = text
@@ -511,11 +561,16 @@ def idle_loop(args) -> None:
                             prox_near_since = None
                             prox_last_react = now
                             next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
-                            # SPARK greeting — speak only when SPARK persona active + cooldown ok
+                            # SPARK greeting — SPARK persona + cooldown + a camera
+                            # that can see the robot actually saw a person. Head
+                            # movement above stays unconditional; only speech is gated.
                             if (read_session_persona() == "spark"
                                     and now - spark_last_greet >= SPARK_GREET_COOLDOWN_S):
-                                spark_greet(args.dry_run)
-                                spark_last_greet = now
+                                if _person_confirmed(_fp):
+                                    spark_greet(args.dry_run)
+                                    spark_last_greet = now
+                                else:
+                                    log("greet suppressed: no camera confirmation of a person")
                     else:
                         prox_near_since = None
                     prox_was_close = is_close

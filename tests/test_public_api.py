@@ -246,6 +246,32 @@ class TestPublicAwareness:
                     "minutes_since_speech", "time_period", "wifi_dbm", "ts"):
             assert key in data, f"missing key: {key}"
 
+    def test_recognised_names_never_reach_public_awareness(self, public_client, state_dir):
+        """Frigate face recognition puts real names in awareness["frigate"]["cameras"].
+        The endpoint whitelists fields and must never pass that block through —
+        it is unauthenticated, so a leak here publishes who is home to anyone."""
+        awareness = {
+            "frigate": {
+                "person_present": True,
+                "score": 0.9,
+                "detections": [{"label": "person", "score": 0.9, "count": 1}],
+                "cameras": {
+                    "picar_x": {
+                        "person": True,
+                        "room": "SPARK's view",
+                        "people": ["Obi"],
+                        "detections": [{"label": "person", "score": 0.9,
+                                        "count": 1, "sub_labels": ["Obi"]}],
+                    },
+                },
+            },
+        }
+        (state_dir / "awareness.json").write_text(json.dumps(awareness))
+        resp = public_client.get("/api/v1/public/awareness")
+        assert resp.status_code == 200
+        assert "Obi" not in json.dumps(resp.json())
+        assert resp.json()["person_present"] is True   # presence still reported
+
     def test_wifi_dbm_read_from_system_stats(self, public_client, state_dir):
         awareness = {"system": {"wifi_dbm": -62, "wifi_quality_pct": 76, "cpu_pct": 20.0}}
         (state_dir / "awareness.json").write_text(json.dumps(awareness))

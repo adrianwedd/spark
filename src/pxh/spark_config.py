@@ -4,6 +4,9 @@ This file is the primary target for SPARK's self-evolution system.
 SPARK can propose changes to this file via the 'evolve' action,
 which creates a PR for human review.
 """
+from __future__ import annotations   # px-alive imports this under /usr/bin/python3,
+                                     # which is 3.9 on macOS and 3.11 on the Pi. Without
+                                     # this, `str | None` below is a runtime TypeError on 3.9.
 import os
 import random
 
@@ -16,6 +19,27 @@ EXPRESSION_COOLDOWN_S  = 1800  # min 30 min between spontaneous speech (was 2 mi
 GREET_ARRIVAL_COOLDOWN_S = 120   # anti-flap for arrival greetings that bypass the expression budget
 WEATHER_INTERVAL_S     = 1800  # refresh weather every 30 min (BOM updates half-hourly)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
+
+# ── Proximity greeting (px-alive) ──────────────────────────────────
+# What SPARK says when something comes close enough to trigger the proximity
+# react. Deliberately short and low-key — this fires unprompted, at whatever
+# walked up, so it wants to read as noticing rather than demanding attention.
+PROXIMITY_GREETINGS = [
+    "Hey. I'm here.",
+    "Hello there.",
+    "Hi. Good to see you.",
+    "Hey.",
+]
+# Cameras whose person detections may confirm a proximity greeting. Sonar can't
+# tell a person from a chair leg, so a Frigate person sighting is required
+# before SPARK speaks. Only cameras that can see where the robot is belong
+# here — driveway/garden say nothing about what is in front of it indoors.
+GREET_CONFIRM_CAMERAS = ["picar_x", "picamera"]
+# Staleness bound for that confirmation. Much tighter than px-alive's
+# FRIGATE_STALE_S (300 s), which exists to aim the head — a stale answer there
+# just means a slightly wrong angle, whereas here it means talking to a room
+# someone left minutes ago.
+GREET_FRIGATE_STALE_S = 120
 
 # Obi-chat backoff: SPARK-initiated messages to Obi via the dashboard
 OBI_CHAT_BASE_BACKOFF_S = 600    # 10 min before a nudge when awaiting reply

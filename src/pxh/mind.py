@@ -670,18 +670,34 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
             score = round(max(e.get("data", {}).get("score", 0),
                               e.get("data", {}).get("top_score", 0)), 3)
             if label not in by_label:
-                by_label[label] = {"score": score, "count": 0}
+                by_label[label] = {"score": score, "count": 0, "sub_labels": set()}
             else:
                 by_label[label]["score"] = max(by_label[label]["score"], score)
             by_label[label]["count"] += 1
+            # Frigate attaches the recognised name (face recognition, licence
+            # plate) as sub_label. Nothing reads it yet — carrying it through now
+            # means named greetings become a phrasing change later rather than a
+            # change to how presence is fetched.
+            sub = e.get("sub_label")
+            if isinstance(sub, list):        # Frigate may send [name, score]
+                sub = sub[0] if sub else None
+            if isinstance(sub, str) and sub.strip():
+                by_label[label]["sub_labels"].add(sub.strip())
 
         dets = sorted(
-            [{"label": k, "score": v["score"], "count": v["count"]} for k, v in by_label.items()],
+            [{"label": k, "score": v["score"], "count": v["count"],
+              "sub_labels": sorted(v["sub_labels"])} for k, v in by_label.items()],
             key=lambda d: d["score"], reverse=True,
         )
         has_person = "person" in by_label
         room = FRIGATE_CAMERA_ROOMS.get(cam_name, cam_name)
-        cameras[cam_name] = {"person": has_person, "detections": dets, "room": room}
+        cameras[cam_name] = {
+            "person": has_person,
+            "detections": dets,
+            "room": room,
+            # Recognised people on this camera, or [] when recognition is off.
+            "people": sorted(by_label.get("person", {}).get("sub_labels", ())),
+        }
         if has_person:
             rooms_with_people.append(room)
 

@@ -1,5 +1,6 @@
 """Tests for px-alive directional gaze toward Frigate-detected person."""
 from __future__ import annotations
+import datetime as dt
 import os
 import sys
 import types
@@ -95,3 +96,79 @@ def test_pan_non_numeric_x_center():
 def test_frigate_stale_s_constant():
     # Staleness threshold should be defined
     assert FRIGATE_STALE_S > 0
+
+
+# ---------------------------------------------------------------------------
+# _person_confirmed — the veto that stops SPARK greeting furniture
+# ---------------------------------------------------------------------------
+
+_person_confirmed = _ALIVE["_person_confirmed"]
+GREET_FRIGATE_STALE_S = _ALIVE["GREET_FRIGATE_STALE_S"]
+GREET_CONFIRM_CAMERAS = _ALIVE["GREET_CONFIRM_CAMERAS"]
+
+
+def _presence(cameras, age_s=0.0):
+    ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s)
+    return {"ts": ts.isoformat(), "cameras": cameras}
+
+
+def test_greet_confirmed_by_robot_camera():
+    assert _person_confirmed(_presence({"picar_x": {"person": True}})) is True
+
+
+def test_greet_confirmed_by_indoor_camera():
+    """Robot's own head may be turned away — the indoor camera still confirms."""
+    assert _person_confirmed(
+        _presence({"picar_x": {"person": False}, "picamera": {"person": True}})
+    ) is True
+
+
+def test_greet_not_confirmed_by_outdoor_camera_only():
+    """Someone in the driveway says nothing about what's in front of the robot."""
+    assert _person_confirmed(
+        _presence({"driveway_camera": {"person": True}, "garden_camera": {"person": True}})
+    ) is False
+
+
+def test_greet_not_confirmed_without_person():
+    """The chair-leg case: sonar fired, no camera saw anyone."""
+    assert _person_confirmed(
+        _presence({"picar_x": {"person": False}, "picamera": {"person": False}})
+    ) is False
+
+
+def test_greet_not_confirmed_when_stale():
+    """Past the window, a person sighting means a room someone already left."""
+    stale = _presence({"picar_x": {"person": True}}, age_s=GREET_FRIGATE_STALE_S + 30)
+    assert _person_confirmed(stale) is False
+
+
+def test_greet_stale_bound_is_tighter_than_pan_bound():
+    """Aiming the head tolerates stale data; speaking does not."""
+    assert GREET_FRIGATE_STALE_S < FRIGATE_STALE_S
+
+
+def test_greet_confirmation_survives_malformed_input():
+    """px-alive must never die on a bad state file — every branch returns False."""
+    for bad in (None, [1, 2, 3], "person", {}, {"ts": "not-a-timestamp"},
+                {"ts": None, "cameras": {}},
+                _presence("cameras-not-a-dict"),
+                _presence({"picar_x": "not-a-dict"})):
+        assert _person_confirmed(bad) is False
+
+
+def test_greet_confirm_cameras_are_indoor_only():
+    assert "driveway_camera" not in GREET_CONFIRM_CAMERAS
+    assert "garden_camera" not in GREET_CONFIRM_CAMERAS
+
+
+def test_alive_fallbacks_match_spark_config():
+    """_load_alive_helpers() stubs out pxh, so the constants under test above
+    are px-alive's ImportError fallbacks. Pin them to spark_config — otherwise
+    SPARK evolves the config and the values px-alive actually uses on a stripped
+    PYTHONPATH drift away silently."""
+    from pxh import spark_config
+
+    assert _ALIVE["PROXIMITY_GREETINGS"] == spark_config.PROXIMITY_GREETINGS
+    assert GREET_CONFIRM_CAMERAS == spark_config.GREET_CONFIRM_CAMERAS
+    assert GREET_FRIGATE_STALE_S == spark_config.GREET_FRIGATE_STALE_S
