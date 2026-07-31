@@ -984,25 +984,30 @@ class TestRetiredPostBackoff:
         assert ns["is_generation_skipped"](pid) is True
         return pid
 
-    def test_retired_post_sets_had_skips(self, blog_mod):
-        """had_skips drives the loop's long backoff; a retired post must set it.
+    def test_retired_post_leaves_the_due_set(self, blog_mod):
+        """A retired post stops being due; is_due advances past it.
 
-        Without this the poll loop re-enumerates a permanently dead post every
-        poll_interval (60s) forever.
+        Supersedes the earlier contract, where retirement only short-circuited
+        generation. The post stayed due, so every poll re-enumerated it, set
+        had_skips, and the loop backed off SKIP_BACKOFF_S — forever. Backing off
+        was a narrower symptom of the same defect that grew px-blog.log to
+        5.4 MB: the loop had nothing to wait for, because a retired post is
+        never going to become writable.
         """
         ns, state_dir, _ = blog_mod
-        self._due_capped_daily(ns, state_dir)
+        pid = self._due_capped_daily(ns, state_dir)
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
-            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
-                _count, had_skips = ns["run_once"](dry=False)
+        due, target = ns["is_due"]("daily", ns["load_blog"]())
+        if due:
+            assert ns["id_for_post"]("daily", target) != pid, \
+                "is_due must advance past a retired post, not re-offer it"
 
-        assert had_skips is True
+    def test_retired_post_never_narrates_its_retirement(self, blog_mod):
+        """Zero retirement notices — the skip branch is unreachable via is_due.
 
-    def test_retired_post_logs_skip_once_not_every_cycle(self, blog_mod):
-        """The retirement notice is logged once per post, not once per poll.
-
-        This is the defect that grew logs/px-blog.log to 5.5 MB.
+        The previous fix throttled this message to once per post per process.
+        Removing the cause removes the message entirely; the branch is retained
+        in run_scheduled_posts only as defence for callers that bypass is_due.
         """
         ns, state_dir, _ = blog_mod
         pid = self._due_capped_daily(ns, state_dir)
@@ -1015,7 +1020,26 @@ class TestRetiredPostBackoff:
                     ns["run_once"](dry=False)
 
         notices = [m for m in logged if pid in m and "not retrying" in m]
-        assert len(notices) == 1, f"expected 1 retirement notice, got {len(notices)}: {notices}"
+        assert notices == [], f"retired post still narrated itself: {notices}"
+
+    def test_missing_source_material_still_backs_off(self, blog_mod):
+        """The had_skips backoff must survive for causes that can still resolve.
+
+        Only the retired case is removed. A daily whose thoughts are missing may
+        get thoughts later, so it must still set had_skips and slow the loop.
+        """
+        ns, state_dir, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        existing = [_make_daily_post(now - dt.timedelta(days=d))
+                    for d in range(2, ns["DAILY_CATCHUP_DAYS"] + 1)]
+        _write_blog_with_posts(state_dir, existing)
+        # No thoughts written at all — source material genuinely absent.
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                _count, had_skips = ns["run_once"](dry=False)
+
+        assert had_skips is True
 
     def test_log_throttled_suppresses_repeats_within_interval(self, blog_mod):
         """A steady-state condition repeats every poll; the log must not."""
@@ -1061,6 +1085,71 @@ class TestRetiredPostBackoff:
         assert 'log(f"poll: all due posts skipped' not in script, \
             "the poll backoff line must go through _log_throttled"
         assert '"poll_backoff"' in script
+
+
+class TestRetiredPostsStopBeingDue:
+    """A retired post must leave the due set, not just the generation path.
+
+    Retirement is recorded in state/blog_failures.json, but is_due() only ever
+    consulted state/blog.json. A retired post therefore stayed due forever:
+    run_scheduled_posts() skipped it, set had_skips, and the poll loop backed
+    off SKIP_BACKOFF_S — every 5 minutes, indefinitely. Live symptom was 1940
+    identical log lines and a 5.4 MB px-blog.log.
+    """
+
+    def _week_with_dailies(self):
+        """Blog data whose only children sit in the week ending last Sunday."""
+        now = dt.datetime.now(HOBART_TZ)
+        last_sunday = now - dt.timedelta(days=(now.weekday() + 1) % 7)
+        posts = [_make_daily_post(last_sunday - dt.timedelta(days=i)) for i in range(7)]
+        return last_sunday, {"posts": posts, "skipped": []}
+
+    def test_retired_weekly_is_not_due(self, blog_mod):
+        ns, _, _ = blog_mod
+        last_sunday, blog_data = self._week_with_dailies()
+        pid = ns["id_for_post"]("weekly", last_sunday)
+
+        due, _ = ns["is_due"]("weekly", blog_data)
+        assert due, "precondition: weekly is due while children exist and it is unwritten"
+
+        for _ in range(3):
+            ns["record_generation_failure"](pid, "empty body")
+        assert ns["is_generation_skipped"](pid) is True
+
+        due, _ = ns["is_due"]("weekly", blog_data)
+        assert not due, "a retired weekly must not stay permanently due"
+
+    def test_skipped_list_suppresses_aggregate(self, blog_mod):
+        """is_due must read blog.json's skipped list for aggregates too.
+
+        The aggregate branches passed the posts *list* to post_exists(), which
+        takes a legacy branch that ignores `skipped` entirely — so a skip record
+        for a weekly/monthly/yearly was structurally unreachable.
+        """
+        ns, _, _ = blog_mod
+        last_sunday, blog_data = self._week_with_dailies()
+        pid = ns["id_for_post"]("weekly", last_sunday)
+
+        blog_data["skipped"].append(pid)
+
+        due, _ = ns["is_due"]("weekly", blog_data)
+        assert not due, "a weekly in blog.json['skipped'] must not be due"
+
+    def test_retired_monthly_is_not_due(self, blog_mod):
+        ns, _, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        weeklies = [_make_weekly_post(now - dt.timedelta(days=i * 7)) for i in range(3)]
+        blog_data = {"posts": weeklies, "skipped": []}
+        pid = ns["id_for_post"]("monthly", now)
+
+        due, _ = ns["is_due"]("monthly", blog_data)
+        assert due, "precondition: monthly is due while weekly children exist"
+
+        for _ in range(3):
+            ns["record_generation_failure"](pid, "qa_rejected")
+
+        due, _ = ns["is_due"]("monthly", blog_data)
+        assert not due, "a retired monthly must not stay permanently due"
 
 
 class TestBackfillRespectsFailureCap:

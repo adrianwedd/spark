@@ -276,6 +276,27 @@ def is_generation_skipped(post_id: str) -> bool:
     return bool(load_blog_failures().get(post_id, {}).get("skipped", False))
 
 
+def _post_settled(blog_data: dict, post_id: str, failures: dict | None = None) -> bool:
+    """True if nothing is left to do for *post_id*: published, skipped, or retired.
+
+    This — not post_exists() — is the question is_due() needs answered.
+    Retirement lives in state/blog_failures.json while is_due() only ever read
+    state/blog.json, so a retired post stayed due forever: run_scheduled_posts()
+    skipped it, set had_skips, and the poll loop backed off SKIP_BACKOFF_S on
+    every cycle for good. Three retired aggregates produced 1940 identical log
+    lines and a 5.4 MB px-blog.log before this was found.
+
+    *failures* is the already-loaded blog_failures dict. is_due()'s daily branch
+    scans a candidate per day, and re-reading the file inside that loop would
+    turn one poll into DAILY_CATCHUP_DAYS SD-card reads.
+    """
+    if post_exists(blog_data, post_id):
+        return True
+    if failures is None:
+        failures = load_blog_failures()
+    return bool(failures.get(post_id, {}).get("skipped", False))
+
+
 # A strike means "this post's content cannot be generated" — three of them
 # retire the post permanently. Infrastructure that was merely unreachable at
 # the moment we asked says nothing about the post, so it must not count: three
@@ -453,6 +474,9 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
     AND no post exists yet. Returns (due, target_date)."""
     now = dt.datetime.now(HOBART_TZ)
     sched = SCHEDULE[post_type]
+    # Read once and thread through: every branch below asks _post_settled at
+    # least twice, and the daily branch asks once per candidate day.
+    failures = load_blog_failures()
 
     if post_type == "daily":
         # Scan forward from the day after the last written/skipped daily post.
@@ -494,7 +518,7 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
             if candidate_date == today and now < target_time:
                 break
             pid = id_for_post("daily", candidate)
-            if not post_exists(blog_data, pid):
+            if not _post_settled(blog_data, pid, failures):
                 return True, candidate
             candidate_date += dt.timedelta(days=1)
         return False, None
@@ -509,12 +533,12 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
         target = last_sunday.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
         if now >= target:
             pid = id_for_post("weekly", last_sunday)
-            if not post_exists(posts, pid) and gather_children("weekly", last_sunday, posts):
+            if not _post_settled(blog_data, pid, failures) and gather_children("weekly", last_sunday, posts):
                 return True, last_sunday
         # Catch-up: previous Sunday
         prev_sunday = last_sunday - dt.timedelta(days=7)
         pid_prev = id_for_post("weekly", prev_sunday)
-        if not post_exists(posts, pid_prev) and gather_children("weekly", prev_sunday, posts):
+        if not _post_settled(blog_data, pid_prev, failures) and gather_children("weekly", prev_sunday, posts):
             return True, prev_sunday
         return False, None
 
@@ -524,13 +548,13 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
         target = now.replace(day=1, hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
         if now >= target:
             pid = id_for_post("monthly", now)
-            if not post_exists(posts, pid) and gather_children("monthly", now, posts):
+            if not _post_settled(blog_data, pid, failures) and gather_children("monthly", now, posts):
                 return True, now
         # Catch-up: previous month
         first_of_month = now.replace(day=1)
         prev_month = first_of_month - dt.timedelta(days=1)
         pid_prev = id_for_post("monthly", prev_month)
-        if not post_exists(posts, pid_prev) and gather_children("monthly", prev_month, posts):
+        if not _post_settled(blog_data, pid_prev, failures) and gather_children("monthly", prev_month, posts):
             return True, prev_month
         return False, None
 
@@ -540,12 +564,12 @@ def is_due(post_type: str, blog_data: dict) -> tuple[bool, dt.datetime | None]:
         target = now.replace(month=1, day=1, hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
         if now >= target:
             pid = id_for_post("yearly", now)
-            if not post_exists(posts, pid) and gather_children("yearly", now, posts):
+            if not _post_settled(blog_data, pid, failures) and gather_children("yearly", now, posts):
                 return True, now
         # Catch-up: previous year
         prev_year = now.replace(year=now.year - 1, month=1, day=1)
         pid_prev = id_for_post("yearly", prev_year)
-        if not post_exists(posts, pid_prev) and gather_children("yearly", prev_year, posts):
+        if not _post_settled(blog_data, pid_prev, failures) and gather_children("yearly", prev_year, posts):
             return True, prev_year
         return False, None
 
