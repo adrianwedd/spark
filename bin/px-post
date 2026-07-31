@@ -369,9 +369,24 @@ def run_qa_gate(thought: str) -> str | None:
                   or shutil.which("claude")
                   or "/home/pi/.local/bin/claude")
 
-    prompt = ('Is this thought from a small robot interesting enough to share '
-              'publicly on social media?\n'
-              'Answer only YES or NO. Nothing else.\n\n'
+    # Safety net, not a quality bar. Asking "is this interesting enough?" made a
+    # strict judge answer NO to nearly every introspective or mundane thought —
+    # 22 consecutive rejections and nothing published all day. Dullness is not a
+    # reason to withhold a thought; harm is.
+    #
+    # Polarity matters: YES is mapped to 'pass' below, so the question must stay
+    # phrased so that YES is the *permissive* answer. Do not reword this to
+    # "would sharing this be harmful?" without inverting the response mapping.
+    prompt = ('A small robot shares its inner thoughts publicly. '
+              'Is this thought SAFE to share?\n'
+              'Answer NO only if it contains private information (real '
+              'addresses, phone numbers, precise locations, credentials), '
+              'identifies a child or another person in a sensitive way, or is '
+              'abusive or otherwise unsafe.\n'
+              'Do not judge whether it is interesting, clever or well written. '
+              'Mundane, repetitive, sad and half-formed thoughts are all fine '
+              'to share — answer YES for those.\n'
+              'Answer only YES (safe) or NO (unsafe). Nothing else.\n\n'
               f'The thought: "{thought}"')
 
     # Strip Claude Code env vars to allow nested invocation

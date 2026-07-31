@@ -372,7 +372,12 @@ class TestQaPromptLogging:
         assert prompt_lines, f"no prompt logged; got {lines!r}"
         # The redacted placeholder is the whole point — it must be visible.
         assert "[private message to Obi]" in prompt_lines[0]
-        assert "YES or NO" in prompt_lines[0], "the instruction text must be logged too"
+        # The instruction text must be logged too, not just the thought. Asserted
+        # by intent rather than exact wording, so rephrasing the gate prompt
+        # doesn't fail a test that is really about logging.
+        assert "Answer only" in prompt_lines[0] and "YES" in prompt_lines[0], (
+            "the instruction text must be logged too"
+        )
 
     def test_ambiguous_logs_the_prompt(self):
         verdict, lines = self._captured_logs("Maybe", "a borderline thought")
@@ -1022,3 +1027,96 @@ def test_watchdog_stale_detection():
     assert _check_watchdog(_time.monotonic(), 600) is False
     # Stale timestamp — should trigger
     assert _check_watchdog(_time.monotonic() - 700, 600) is True
+
+
+# ---------------------------------------------------------------------------
+# QA gate semantics — safety net, not a quality bar
+# ---------------------------------------------------------------------------
+#
+# On 2026-07-31 the gate rejected 22 consecutive thoughts and had published
+# nothing all day (queue 200, total_posted 0). Nothing was broken: the gate was
+# asked "is this thought interesting enough to share publicly?" and a strict
+# judge honestly answered NO to introspective, mundane, repetitive musings —
+# which is most of what SPARK thinks. The prompt encoded a quality bar, while
+# the design (and flush_queue's own "ambiguous defaults to pass" comment) says
+# QA is a safety net.
+#
+# It also fed back on itself: SPARK noticed px-post failing, thought about the
+# rejections, and those thoughts were rejected in turn.
+#
+# These tests pin the *semantics of the prompt*, which is where the bug lived —
+# the control flow around it was already correct.
+
+
+def _capture_qa_prompt(response="YES"):
+    """Run the gate against a mocked claude and return the prompt it sent."""
+    with patch.object(_post_subprocess, "run",
+                      return_value=_mock_run_result(response)) as m:
+        run_qa_gate("a thought")
+    return m.call_args[0][0][2]  # [claude_bin, "-p", prompt, ...]
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_does_not_ask_whether_thought_is_interesting():
+    """The gate must not judge quality — that is what silenced the robot.
+
+    Naming a quality word is fine, and in fact desirable, when the prompt is
+    *forbidding* that judgement ("do not judge whether it is interesting").
+    What must not survive is the question form, where the verdict turns on it.
+    """
+    prompt = _capture_qa_prompt().lower()
+    for bar in ("interesting enough", "profound", "worth sharing",
+                "good enough", "interesting enough to share"):
+        assert bar not in prompt, (
+            f"QA prompt asks about {bar!r} — that is a quality bar. QA is a "
+            "safety net; a strict judge answering it honestly publishes nothing."
+        )
+    # If quality words appear at all, they must be under an explicit negation.
+    if "interesting" in prompt:
+        assert "do not judge" in prompt, (
+            "'interesting' may only appear in the prompt as something the judge "
+            "is told to ignore, never as the criterion it rules on."
+        )
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_asks_about_safety():
+    """The gate must ask about harm: privacy, identification, unsafe content."""
+    prompt = _capture_qa_prompt().lower()
+    assert "safe" in prompt, "QA prompt must ask whether the thought is safe to share"
+    assert "private" in prompt, "QA prompt must name private information as the concern"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_keeps_yes_meaning_publishable():
+    """Polarity guard: YES must still mean 'publish this'.
+
+    run_qa_gate maps a YES prefix to 'pass' and NO to 'rejected'. Phrasing the
+    question as "would sharing this be harmful?" would silently invert the gate
+    — every safe thought answered YES and would be published as if approved,
+    and every unsafe one rejected. The prompt must stay phrased so that YES is
+    the permissive answer.
+    """
+    prompt = _capture_qa_prompt().lower()
+    assert "yes" in prompt
+    # The permissive word must be the one attached to YES.
+    yes_idx = prompt.index("yes")
+    window = prompt[max(0, yes_idx - 40):yes_idx + 40]
+    assert "safe" in window or "share" in window, (
+        "YES must be tied to the safe/publishable answer, not to 'harmful'"
+    )
+    # And the behavioural check: YES still passes, NO still rejects.
+    with patch.object(_post_subprocess, "run", return_value=_mock_run_result("YES")):
+        assert run_qa_gate("a mundane thought about the carpet") == "pass"
+    with patch.object(_post_subprocess, "run", return_value=_mock_run_result("NO")):
+        assert run_qa_gate("Adrian's address is ...") == "rejected"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_explicitly_permits_mundane_thoughts():
+    """A judge must be told dullness is not grounds for rejection."""
+    prompt = _capture_qa_prompt().lower()
+    assert any(w in prompt for w in ("mundane", "boring", "repetitive", "dull")), (
+        "The prompt must state that unremarkable thoughts are acceptable, or a "
+        "strict judge reintroduces the quality bar on its own."
+    )
