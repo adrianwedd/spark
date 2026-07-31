@@ -19,7 +19,7 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (716 tests)
+python -m pytest                          # full suite (1000+ tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
 python -m pytest -m "not live"           # skip hardware tests
@@ -113,7 +113,7 @@ Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every
 
 Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not refactor to create/destroy per-action (`reset_mcu` leaks GPIO5 and `close()` doesn't release it).
 
-**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Tools set `state/exploring.json` to prevent restart mid-operation.
+**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 15s (`RestartSec=15`). Tools set `state/exploring.json` to prevent restart mid-operation — px-alive ignores the file once its mtime is >60s old, so long operations must refresh it (px-wake-listen runs a 20s refresher thread for the whole voice turn). Wake-listen's `_stop_alive` kills px-alive by pid *deliberately* — an explicit `systemctl stop` would disarm Restart=always and lose the dead-man's-switch recovery; the exploring.json guard is what keeps the armed auto-restart from retaking GPIO mid-turn.
 
 **Wander calibration**: Before live wandering on a new floor, place all grayscale sensors over that surface and run `bin/px-wander --calibrate-cliff`. The launcher self-elevates for GPIO access and writes `exploring.json` before yielding `px-alive`; do not replace it with a direct Python invocation. The ADC power-on latch is rejected, so calibration fails closed until live sensor values appear.
 
@@ -262,17 +262,17 @@ See `src/pxh/api.py` for full endpoint list.
 
 | Service | Script | User | Restart |
 |---|---|---|---|
-| `px-alive` | `bin/px-alive` | root | always, 10s (StartLimitIntervalSec=0) |
+| `px-alive` | `bin/px-alive` | root | always, 15s (StartLimitIntervalSec=0) |
 | `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10s |
-| `px-battery-poll` | `bin/px-battery-poll` | root | always, 10s |
+| `px-battery-poll` | `bin/px-battery-poll` | root | always, 30s |
 | `px-mind` | `bin/px-mind` | pi | always, 10s |
 | `px-post` | `bin/px-post` | pi | always, 30s |
-| `px-api-server` | `bin/px-api-server` | pi | always, 2s |
-| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10s |
+| `px-api-server` | `bin/px-api-server` | pi | always, 5s |
+| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 15s |
 | `px-evolve` | `bin/px-evolve` | pi | on-failure, 30s |
 | `px-blog` | `bin/px-blog` | pi | on-failure, 30s |
 | `px-tts-glados` | GLaDOS TTS :7861 | pi | always, 10s |
-| `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 10s |
+| `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 5s |
 
 ## Safety Model
 
