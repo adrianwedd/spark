@@ -61,7 +61,9 @@ def _drive_reflection_seq(monkeypatch, payloads, *, recent=(), backend="ollama-m
 
     The final payload repeats if reflection asks more times than provided, so
     a `len(calls) == N` assertion pins the retry count rather than merely
-    tolerating it. Returns (captured, calls).
+    tolerating it. A payload given as a plain `str` is returned as the raw
+    response verbatim — that is how the no-JSON cases are driven, since a dict
+    payload can only ever produce well-formed JSON. Returns (captured, calls).
     """
     captured = {}
     calls = []
@@ -69,7 +71,8 @@ def _drive_reflection_seq(monkeypatch, payloads, *, recent=(), backend="ollama-m
     def _call(*a, **k):
         payload = payloads[min(len(calls), len(payloads) - 1)]
         calls.append(payload)
-        return {"response": json.dumps(payload), "backend": backend}
+        raw = payload if isinstance(payload, str) else json.dumps(payload)
+        return {"response": raw, "backend": backend}
 
     monkeypatch.setattr(mind, "call_llm", _call)
     monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
@@ -231,6 +234,108 @@ def test_reroll_prompt_is_not_byte_identical(monkeypatch):
 
     assert len(prompts) == 2
     assert prompts[1] != prompts[0], "the retry must carry a corrective hint"
+
+
+# ---------------------------------------------------------------------------
+# Re-roll on a malformed (no-JSON) response
+#
+# This is the failure the live logs actually show — "reflection: no JSON in
+# response" — and it was the one shape the re-roll did not cover: the first
+# malformed answer returned None and burned the whole cycle.
+# ---------------------------------------------------------------------------
+
+_PROSE = "Sure! Here's a thought for you: the light is nice today."
+
+
+def _capture_health(monkeypatch):
+    """Record every px-mind-reflection failure so double-counting is visible."""
+    failures = []
+    monkeypatch.setattr(
+        mind.health_mod, "record_failure",
+        lambda component, reason, **k: failures.append((component, reason)))
+    monkeypatch.setattr(mind.health_mod, "record_success", lambda *a, **k: None)
+    return failures
+
+
+def test_no_json_triggers_reroll(monkeypatch):
+    """A malformed response gets the same second chance as an empty one."""
+    captured, calls = _drive_reflection_seq(monkeypatch, [_PROSE, _VALID])
+    assert len(calls) == 2, "a response with no JSON must be re-rolled once"
+    assert captured["appended"]["thought"] == _VALID["thought"]
+
+
+def test_no_json_after_reroll_is_dropped(monkeypatch):
+    captured, calls = _drive_reflection_seq(monkeypatch, [_PROSE, _PROSE])
+    assert len(calls) == 2, "exactly one re-roll, then give up"
+    assert "appended" not in captured
+    assert captured["returned"] is None
+
+
+def test_no_json_records_one_failure_per_cycle(monkeypatch):
+    """Two malformed attempts are one failed cycle, not two.
+
+    Health escalates to `failing` at 3 consecutive failures, so counting both
+    attempts of a single cycle would trip the alarm in half the real time.
+    """
+    failures = _capture_health(monkeypatch)
+    _drive_reflection_seq(monkeypatch, [_PROSE, _PROSE])
+    reflection_failures = [f for f in failures if f[0] == "px-mind-reflection"]
+    assert len(reflection_failures) == 1, reflection_failures
+    assert reflection_failures[0][1] == "no JSON in response"
+
+
+def test_no_reroll_on_no_json_when_paid_tier_served(monkeypatch):
+    """The cost guard applies to malformed responses too."""
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_PROSE, _VALID], backend="claude")
+    assert len(calls) == 1, "must not re-roll on the paid backend"
+    assert captured["returned"] is None
+
+
+def test_no_json_on_retry_keeps_the_first_parse(monkeypatch):
+    """A malformed attempt 2 must not throw away a usable attempt 1.
+
+    Attempt 1 here is merely *similar* — still a real thought that records the
+    mind ran. Dropping the cycle because the retry came back as prose would be
+    strictly worse than the suppression path that already exists for it.
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_VALID, _PROSE], recent=[{"thought": _VALID["thought"]}])
+    assert len(calls) == 2
+    assert captured["returned"] is not None
+    assert captured["appended"]["thought"] == _VALID["thought"]
+    assert captured["appended"]["action"] == "wait", "still suppressed as a duplicate"
+
+
+def test_no_json_reroll_prompt_carries_a_hint(monkeypatch):
+    """The retry must name the fault — here, that the output was not JSON."""
+    prompts = []
+
+    def _call(context, system, persona=""):
+        prompts.append(context)
+        if len(prompts) == 1:
+            return {"response": _PROSE, "backend": "ollama-m5"}
+        return {"response": json.dumps(_VALID), "backend": "ollama-m5"}
+
+    monkeypatch.setattr(mind, "call_llm", _call)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought", lambda t, persona="": None)
+    monkeypatch.setattr(mind, "auto_remember", lambda t, persona="": None)
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "_last_spoken_text", "", raising=False)
+    mind.reflection({"persona": ""}, dry=False)
+
+    assert len(prompts) == 2
+    assert prompts[1] != prompts[0]
+    assert "JSON" in prompts[1][len(prompts[0]):], \
+        "the hint must actually mention the JSON requirement"
+
+
+def test_every_reroll_reason_has_a_hint():
+    """A reason without a hint is a KeyError on the retry path, not a re-roll."""
+    assert set(mind._REROLL_HINTS) >= {"empty", "similar", "no_json"}
 
 
 def test_is_night_silence_uses_config_bounds():

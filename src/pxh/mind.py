@@ -2508,6 +2508,10 @@ _REROLL_HINTS = {
     "similar": "Your previous response repeated something you just thought or "
                "said. Notice something different this time — a detail you have "
                "not mentioned before.",
+    "no_json": "Your previous response was not valid JSON. Reply with a single "
+               "JSON object and nothing else — no preamble, no explanation, no "
+               "code fence. It must have the keys: thought, mood, action, "
+               "salience.",
 }
 
 
@@ -2850,6 +2854,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     # a coin flip.
     parsed = None
     result = None
+    raw = ""
     reroll_reason = None
     attempt_context = context
     for attempt in (1, 2):
@@ -2861,19 +2866,23 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
             return None
 
         raw = result.get("response", "")
-        parsed = extract_json(raw)
-        if not parsed:
+        candidate = extract_json(raw)
+        if candidate:
+            parsed = candidate
+            reroll_reason = _reroll_reason(parsed, recent_thoughts, _last_spoken_text)
+            if reroll_reason is None:
+                break
+        else:
+            # A tier answered but produced junk — distinct from "all tiers down".
+            # This is the most common single reflection failure in the live logs,
+            # and it re-rolls for the same reason empty and similar do: a model
+            # that opened with prose usually complies once told so.
             log(f"reflection: no JSON in response: {raw}")
-            # A tier answered but produced junk — distinct from "all tiers down",
-            # and invisible until now because the caller only sees None either way.
-            health_mod.record_failure(
-                "px-mind-reflection", "no JSON in response",
-                detail={"backend": result.get("backend"), "raw": raw[:200]})
-            return None
-
-        reroll_reason = _reroll_reason(parsed, recent_thoughts, _last_spoken_text)
-        if reroll_reason is None:
-            break
+            # Only claim the re-roll reason if there is no earlier parse to keep.
+            # A malformed attempt 2 must not discard a merely-similar attempt 1,
+            # which still carries a real thought and its own handling below.
+            if parsed is None:
+                reroll_reason = "no_json"
         if attempt == 2:
             break
         if not _reroll_allowed(result.get("backend", "")):
@@ -2884,6 +2893,15 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         attempt_context = context + "\n\n" + _REROLL_HINTS[reroll_reason]
 
     elapsed = time.monotonic() - t0
+
+    # Both attempts came back malformed. Reported once per cycle, not once per
+    # attempt: health escalates to `failing` at 3 consecutive failures, and
+    # counting each attempt would trip that in half the real elapsed time.
+    if parsed is None:
+        health_mod.record_failure(
+            "px-mind-reflection", "no JSON in response",
+            detail={"backend": result.get("backend"), "raw": raw[:200]})
+        return None
 
     # Never persist blank text. Unlike a duplicate — which still records that
     # the mind ran and had nothing new — an empty thought carries no
