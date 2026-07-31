@@ -613,6 +613,13 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     """
     if dry:
         return None
+    # Skip a host that recently failed. FRIGATE_TIMEOUT_S bounds the socket but
+    # not DNS resolution, so an unreachable host costs a 15-20 s resolver hang
+    # on every tick of a 60 s loop — the same trap call_ollama and the HA block
+    # already guard against. Shares _host_failure_until with them.
+    _now_mono = time.monotonic()
+    if _host_failure_until.get(FRIGATE_HOST, 0) > _now_mono:
+        return None
     since = time.time() - FRIGATE_WINDOW_S
     # Fetch events from ALL cameras in one call (no camera= filter)
     url = (
@@ -623,7 +630,15 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=FRIGATE_TIMEOUT_S) as resp:
             events = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        # Reachability failure — back off. HTTPError subclasses URLError but
+        # means the host answered, so it doesn't earn a backoff.
+        if not isinstance(exc, urllib.error.HTTPError):
+            _host_failure_until[FRIGATE_HOST] = _now_mono + _HOST_FAILURE_BACKOFF_S
+            log(f"frigate: unreachable — skipping for {_HOST_FAILURE_BACKOFF_S}s: {exc}")
+        return None
     except Exception:
+        # Malformed response from a host that answered — no backoff.
         return None
 
     if not isinstance(events, list):

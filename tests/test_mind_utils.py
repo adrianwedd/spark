@@ -213,6 +213,48 @@ def test_frigate_presence_network_error():
     assert result is None
 
 
+def test_frigate_unreachable_sets_backoff_and_skips_next_call():
+    """An unreachable host is skipped for the backoff window without a second
+    connect attempt. FRIGATE_TIMEOUT_S bounds the socket but not DNS, so a
+    retry every tick costs a 15-20 s resolver hang on a 60 s loop."""
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("fail")):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert pxh.mind._host_failure_until.get(pxh.mind.FRIGATE_HOST, 0) > _time.monotonic()
+
+    # Host is now "up", but the backoff must suppress the call entirely.
+    opener = MagicMock(side_effect=_mock_urlopen_fn([_make_frigate_event()]))
+    with patch("urllib.request.urlopen", opener):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert opener.call_count == 0
+
+    # Once the window lapses, the next call goes out normally.
+    pxh.mind._host_failure_until[pxh.mind.FRIGATE_HOST] = _time.monotonic() - 1
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([_make_frigate_event()])):
+        assert _fetch_frigate_presence(dry=False).get("person_present") is True
+
+
+def test_frigate_malformed_response_does_not_set_backoff():
+    """A host that answers with garbage is reachable — it must not be backed
+    off, or one bad payload blinds SPARK's cameras for the whole window."""
+    def _bad_body(*args, **kwargs):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=MagicMock(return_value=None, read=MagicMock(return_value=b"not json")))
+        cm.__exit__ = MagicMock(return_value=False)
+        return cm
+
+    with patch("urllib.request.urlopen", side_effect=_bad_body):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert pxh.mind.FRIGATE_HOST not in pxh.mind._host_failure_until
+
+
+def test_frigate_http_error_does_not_set_backoff():
+    """HTTPError subclasses URLError but means the host replied — no backoff."""
+    err = urllib.error.HTTPError("http://x/api/events", 500, "boom", {}, None)
+    with patch("urllib.request.urlopen", side_effect=err):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert pxh.mind.FRIGATE_HOST not in pxh.mind._host_failure_until
+
+
 def test_frigate_presence_empty_events():
     """Empty event list → no person detected."""
     with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
