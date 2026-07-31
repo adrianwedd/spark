@@ -70,6 +70,26 @@ def test_wait_for_grayscale_unreadable_sensor_fails_closed():
     assert wander.wait_for_grayscale(px, settle_s=0.2, poll_s=0.0) is None
 
 
+def test_wait_for_grayscale_failed_baseline_does_not_accept_the_latch():
+    """Regression: if the BASELINE read fails, the next successful read is the
+    latch — and with nothing to compare it against it was returned as live.
+    An I2C error is most likely right after Picarx(), i.e. precisely when the
+    latch is up, so this is the reachable path to a fabricated 'live' reading.
+
+    Two Nones, not one: safe_grayscale(retries=1) absorbs a single OSError and
+    returns the following reading, so only a both-attempts failure yields the
+    None baseline this regression needs."""
+    px = FakePx(grayscale=[None, None] + [ADC_LATCH] * 500)
+    assert wander.wait_for_grayscale(px, settle_s=0.2, poll_s=0.0) is None
+
+
+def test_wait_for_grayscale_failed_baseline_still_returns_a_real_change():
+    """The rebaselining must not cost us a genuine reading: once a real floor
+    value appears after the latch, it is still returned."""
+    px = FakePx(grayscale=[None, None] + [ADC_LATCH] * 3 + [REAL_FLOOR] * 5)
+    assert wander.wait_for_grayscale(px, settle_s=1.0, poll_s=0.0) == REAL_FLOOR
+
+
 def test_calibrate_cliff_writes_reference(tmp_path):
     # Must survive the latch: calibration reference comes from the live reading,
     # never from the power-on latch that precedes it.

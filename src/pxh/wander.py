@@ -441,7 +441,15 @@ def wait_for_grayscale(px, settle_s: float | None = None,
         gs = safe_grayscale(px, retries=1)
         if gs is None:
             continue
-        if first is None or gs != first:
+        if first is None:
+            # The baseline read itself failed (an I2C error is most likely
+            # right after Picarx(), which is exactly when the latch is up).
+            # Adopt this reading as the baseline and keep waiting for a
+            # CHANGE — returning it here would hand back the very latch this
+            # function exists to reject, with no sample to compare against.
+            first = gs
+            continue
+        if gs != first:
             return gs
     log("grayscale ADC never left its power-on latch — treating as unreadable "
         "(fail closed)")
