@@ -25,6 +25,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -34,6 +35,7 @@ LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
 PID_FILE = Path(os.environ.get("PX_WAKE_PID", LOG_DIR / "px-wake-listen.pid"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
 try:
     from pxh import health as _health
@@ -654,6 +656,62 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     return text
 
 
+# px-alive treats exploring.json as stale once its mtime is >60s old, and a
+# single voice turn can block far longer than that (the Claude CLI alone is
+# routinely 15-80s), so a refresher thread re-writes the file while a turn runs.
+_EXPLORING_REFRESH_S = 20
+_exploring_stop = threading.Event()
+_exploring_thread: threading.Thread | None = None
+
+
+def _set_exploring(active: bool) -> None:
+    """Write state/exploring.json so a systemd-respawned px-alive yields GPIO.
+
+    _stop_alive kills px-alive by pid, which leaves the unit's Restart=always
+    armed: systemd retries every 15s for the whole voice turn. Each retry reads
+    this file and exits cleanly while it is fresh; without it, the respawn
+    retakes GPIO mid-turn. Same contract as px-wander and tool-announce.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        data: dict = {"active": active}
+        if active:
+            data["pid"] = os.getpid()
+            data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, str(STATE_DIR / "exploring.json"))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        log(f"_set_exploring: {exc}")
+
+
+def _start_exploring_refresh() -> None:
+    global _exploring_thread
+    _exploring_stop.clear()
+
+    def _refresh() -> None:
+        while not _exploring_stop.wait(_EXPLORING_REFRESH_S):
+            _set_exploring(True)
+
+    _exploring_thread = threading.Thread(
+        target=_refresh, daemon=True, name="exploring-refresh")
+    _exploring_thread.start()
+
+
+def _stop_exploring_refresh() -> None:
+    _exploring_stop.set()
+    if _exploring_thread is not None:
+        _exploring_thread.join(timeout=2)
+
+
 def _alive_pid() -> int | None:
     """Return px-alive PID if running, else None."""
     try:
@@ -666,7 +724,18 @@ def _alive_pid() -> int | None:
 
 
 def _stop_alive() -> int | None:
-    """Send SIGTERM to px-alive so it releases GPIO. Returns PID if killed."""
+    """Send SIGTERM to px-alive so it releases GPIO. Returns PID if killed.
+
+    Deliberately a pid-kill, not an explicit systemd stop: stopping the unit
+    administratively disarms Restart=always, so if this process died mid-turn
+    px-alive would stay down forever. The kill keeps the auto-restart armed as a dead-man's
+    switch, and the exploring.json guard makes its ~15s retries exit cleanly
+    instead of retaking GPIO. The guard goes up before the pid lookup so it
+    also covers the window where px-alive is between respawns (no live pid,
+    but a restart timer already ticking).
+    """
+    _set_exploring(True)
+    _start_exploring_refresh()
     pid = _alive_pid()
     if pid:
         log(f"pausing px-alive (pid={pid}) for voice turn")
@@ -681,7 +750,7 @@ def _stop_alive() -> int | None:
     return pid
 
 
-def _restart_alive() -> None:
+def _restart_alive(had_alive: int | None = 1) -> None:
     """Hand px-alive back to systemd after a voice turn.
 
     Must go through systemctl, never spawn bin/px-alive directly. A directly
@@ -689,16 +758,29 @@ def _restart_alive() -> None:
     the GPIO handle; the systemd unit (Restart=always) then starts, trips
     px-alive's single-instance guard, and exits — looping forever while
     `systemctl is-active` reports a misleading `activating`. It would also drop
-    the unit's --no-face flag. pi holds NOPASSWD sudo for exactly this verb.
+    the unit's --no-face flag.
+
+    The verb is `start`, matching mind.py and the sudoers grant precedent: it
+    cancels the unit's restart-backoff timer and runs now, but is a no-op if a
+    retry already brought px-alive back — `restart` would bounce a healthy
+    instance every turn.
+
+    Called unconditionally from the voice-turn `finally` (even when px-alive
+    wasn't running at turn start) so the exploring guard always comes down;
+    the systemctl call itself is skipped when there was nothing to hand back.
     """
+    _stop_exploring_refresh()
+    _set_exploring(False)
+    if not had_alive:
+        return
     log("restarting px-alive")
     try:
         r = subprocess.run(
-            ["sudo", "-n", "systemctl", "restart", "px-alive"],
+            ["sudo", "-n", "systemctl", "start", "px-alive"],
             capture_output=True, check=False, timeout=15,
         )
         if r.returncode != 0:
-            log(f"_restart_alive: systemctl restart failed (rc={r.returncode}): "
+            log(f"_restart_alive: systemctl start failed (rc={r.returncode}): "
                 f"{r.stderr.decode(errors='replace').strip()}")
     except Exception as exc:
         log(f"_restart_alive: failed to restart: {exc}")
@@ -877,8 +959,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             current_text = follow_text
 
     finally:
-        if had_alive:
-            _restart_alive()
+        _restart_alive(had_alive)
 
 
 def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
@@ -956,8 +1037,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
             current_text = follow_text
 
     finally:
-        if had_alive:
-            _restart_alive()
+        _restart_alive(had_alive)
 
 
 def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> None:

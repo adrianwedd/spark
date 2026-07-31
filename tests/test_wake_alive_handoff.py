@@ -15,6 +15,11 @@ px-mind already does this correctly (`sudo -n systemctl start px-alive`), and
 sudoers grants pi NOPASSWD on start/stop/restart of px-alive specifically, so
 delegating to systemd is both the supported and the already-established path.
 
+Killing px-alive by pid arms Restart=always: systemd retries every 15s for the
+whole voice turn. The exploring.json guard (same contract as px-wander and
+tool-announce) makes each retry exit cleanly instead of retaking GPIO mid-turn,
+and a refresher thread keeps the file inside px-alive's 60s staleness window.
+
 bin/px-wake-listen runs its Python as a heredoc and cannot be imported, so these
 assert against the source text.
 """
@@ -48,7 +53,7 @@ def test_restart_alive_delegates_to_systemctl(restart_alive_body):
 
 def test_restart_alive_does_not_spawn_px_alive_directly(restart_alive_body):
     """No path may exec bin/px-alive itself — that is what created the squatter."""
-    assert 'BIN_DIR' not in restart_alive_body and '"bin"' not in restart_alive_body, (
+    assert '"bin"' not in restart_alive_body, (
         "_restart_alive must not build a path to bin/px-alive and run it; "
         "let systemd own the process lifecycle."
     )
@@ -58,17 +63,69 @@ def test_restart_alive_does_not_spawn_px_alive_directly(restart_alive_body):
     )
 
 
-def test_stop_alive_still_signals_by_pid(restart_alive_body):
-    """Stopping stays a SIGTERM to the pid: it must not disable the unit.
+def test_restart_alive_uses_start_not_restart():
+    """The sudoers-verified verb is `start` (mind.py precedent), and it is the
+    right one: after the pid-kill the unit sits in auto-restart, so `start`
+    cancels the backoff timer and runs now, while staying a no-op if a retry
+    already brought px-alive back. `restart` would bounce a healthy instance."""
+    src = SCRIPT.read_text()
+    start = src.index("def _restart_alive(")
+    rest = src[start:]
+    end = re.search(r"\n(?=def )", rest)
+    body = rest[: end.start()] if end else rest
+    assert '"start"' in body and '"restart"' not in body
 
-    `systemctl stop` would be wrong here — Restart=always means systemd brings
-    px-alive straight back, defeating the GPIO yield the voice turn needs.
+
+def test_stop_alive_still_signals_by_pid():
+    """Stopping stays a SIGTERM to the pid, keeping Restart=always armed.
+
+    Not because `systemctl stop` would respawn px-alive — an explicit stop
+    disarms Restart=always and the unit stays down. Precisely because of that:
+    pid-kill keeps systemd's auto-restart armed as a dead-man's switch, so if
+    px-wake-listen crashes mid-turn, px-alive recovers on its own within ~15s
+    instead of staying dead forever. The exploring.json guard is what makes
+    those mid-turn retries exit cleanly rather than retake GPIO.
     """
     src = SCRIPT.read_text()
     start = src.index("def _stop_alive(")
     body = src[start : src.index("def _restart_alive(")]
     assert "kill" in body, "_stop_alive must signal px-alive by pid to yield GPIO"
     assert "systemctl" not in body, (
-        "_stop_alive must not use systemctl stop; Restart=always would "
-        "immediately respawn px-alive and it would retake the GPIO handle."
+        "_stop_alive must not systemctl stop the unit; an explicit stop disarms "
+        "Restart=always, losing the dead-man's-switch recovery if wake-listen "
+        "dies mid-turn."
+    )
+
+
+def test_stop_alive_raises_exploring_guard():
+    """The pid-kill arms a 15s systemd respawn; exploring.json is what stops
+    that respawn retaking GPIO mid-turn (px-alive exits cleanly while the file
+    is fresh — same contract px-wander and tool-announce rely on)."""
+    src = SCRIPT.read_text()
+    start = src.index("def _stop_alive(")
+    body = src[start : src.index("def _restart_alive(")]
+    assert "_set_exploring(True)" in body, (
+        "_stop_alive must write exploring.json before yielding GPIO, or the "
+        "systemd auto-restart retakes it ~15s into the voice turn."
+    )
+
+
+def test_restart_alive_clears_exploring_guard(restart_alive_body):
+    """The guard must drop before systemd is asked to start px-alive, or the
+    fresh instance reads it and exits cleanly — recreating the outage."""
+    assert "_set_exploring(False)" in restart_alive_body
+
+
+def test_exploring_refresh_beats_staleness_window():
+    """px-alive ignores exploring.json older than 60s. A single voice turn can
+    block >60s (Claude CLI cold start alone is 15–80s), so a refresher must
+    rewrite the file on an interval well inside that window."""
+    src = SCRIPT.read_text()
+    m = re.search(r"_EXPLORING_REFRESH_S\s*=\s*(\d+)", src)
+    assert m, "px-wake-listen must define _EXPLORING_REFRESH_S"
+    assert int(m.group(1)) <= 30, (
+        "refresh interval must sit well inside px-alive's 60s staleness window"
+    )
+    assert "_exploring_stop.wait(_EXPLORING_REFRESH_S)" in src, (
+        "a refresher thread must re-write exploring.json while the turn runs"
     )
