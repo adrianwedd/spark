@@ -220,22 +220,56 @@ sensor on a quiet floor; no settle length makes a floor noisier. The ladder is:
   replacement generic check, never on its own.
 - **Zero firings** across the three conditions above → drop it, as written.
 
-#### Measure the noise floor before implementing
+#### Measured 2026-07-31 — gate passed, proceed as designed
 
-The whole "keep it and measure" argument rests on an unmeasured premise: that
-consecutive grayscale reads on a stationary robot over a uniform floor usually
-differ. If they do, defence 2 costs nothing and the 30-day instrument is right.
-If they frequently do not, this design ships a robot that refuses to move, and a
-30-day exit condition is a slow substitute for a fast answer.
+Run on the live robot (`pi@192.168.0.236`), reading ADC `A0/A1/A2` directly so
+no Picarx handle was taken from px-alive. 50 samples at 50ms, 5 discarded as
+warm-up:
 
-This is a one-command experiment on the Pi, and it should be run **before** the
-implementation plan, not after shipping: sample the grayscale ~50 times on a
-stationary robot over a uniform floor (after the latch has expired) and count how
-often consecutive readings are identical, per-channel and all-three.
+```
+transitions: 49
+identical consecutive (all three channels): 0
+identical consecutive per channel A0/A1/A2:  [12, 12, 6]
+distinct vectors: 40    min/max: [(220,225), (383,393), (209,216)]
+```
 
-- Consecutive reads essentially always differ → proceed exactly as designed.
-- Identical reads common → do not ship defence 2 as an acceptance requirement;
-  reopen the drop-the-change-requirement decision with the data in hand.
+Individual channels repeat 12–25% of the time, but all three never repeated
+together in 49 transitions. Per transition the chance all three differ is ~50%;
+across a 3s window at `GRAYSCALE_POLL_S` (~60 samples) the probability of never
+accepting is negligible. **Defence 2 ships as specified.**
+
+Caveat: one floor, one lighting condition, one session. The per-channel repeat
+rates are high enough that a quieter surface could raise the all-three rate, so
+the exit condition below remains the instrument for floors not yet measured.
+
+#### Read path verified 2026-07-31 — Attack A is real
+
+`Grayscale_Module.read()` is `[self.pins[i].read() for i in range(3)]`
+(`robot_hat/modules.py:329`), and each `ADC.read()` issues its own
+`write([chn, 0, 0])` then `read(2)` (`robot_hat/adc.py:47-49`). Three separate
+I2C transactions per grayscale read, as this design assumed — the attack is not
+hypothetical and defence 2 is not dead code.
+
+The same source narrows the within-channel tear noted under defence 2: MSB and
+LSB come from a *single* `super().read(2)`, one transaction, not two 8-bit
+reads. A tear would have to occur inside one bus read. Keep the note, downgrade
+the concern.
+
+#### The measurement procedure, for other floors
+
+To repeat the measurement on a new surface (this is what the exit condition asks
+for), read the ADC channels directly rather than via Picarx — it needs no GPIO
+and does not disturb px-alive:
+
+```python
+from robot_hat import ADC
+pins = [ADC(p) for p in ("A0", "A1", "A2")]   # picarx.py:38 grayscale_pins
+```
+
+Sample ~50 times at 50ms after discarding a few warm-up reads, and count
+consecutive identical readings per channel and across all three. All-three
+identical is the number that matters: it is the rate at which defence 2 would
+falsely refuse.
 
 ## Part 2 — stale cliff calibration
 
