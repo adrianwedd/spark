@@ -444,11 +444,11 @@ def test_dispatch_announce_disabled_is_noop(monkeypatch):
     calls = []
     monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", False)
     monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
-    mind._dispatch_announce("hello")
+    assert mind._dispatch_announce("hello") is False
     assert calls == []
 
 
-def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch):
+def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch, tmp_path):
     calls = []
 
     class _FakePopen:
@@ -457,17 +457,49 @@ def test_dispatch_announce_enabled_fires_popen_nonblocking(monkeypatch):
 
     monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
     monkeypatch.setattr(mind.subprocess, "Popen", _FakePopen)
-    mind._dispatch_announce("hello", private=True)
+    monkeypatch.setattr(mind, "_ANNOUNCE_META_FILE", tmp_path / "announce_meta.json")
+    assert mind._dispatch_announce("hello", private=True) is True
     assert len(calls) == 1
     _, kwargs = calls[0]
     assert kwargs["env"]["PX_ANNOUNCE_TEXT"] == "hello"
     assert kwargs["env"]["PX_ANNOUNCE_PRIVATE"] == "1"
+    assert kwargs["env"]["PX_DRY"] == "0"
+
+
+def test_dispatch_announce_dry_propagates_and_skips_meta(monkeypatch, tmp_path):
+    """A --dry-run px-mind must never fire a real cast nor consume the live cap."""
+    calls = []
+    meta = tmp_path / "announce_meta.json"
+    monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
+    monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(mind, "_ANNOUNCE_META_FILE", meta)
+    assert mind._dispatch_announce("hello", dry=True) is True
+    assert calls[0][1]["env"]["PX_DRY"] == "1"
+    assert not meta.exists()
+
+
+def test_dispatch_announce_popen_failure_does_not_consume_cap(monkeypatch, tmp_path):
+    """A failed launch must not buy an hour of silence."""
+    meta = tmp_path / "announce_meta.json"
+    monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
+    monkeypatch.setattr(mind, "_ANNOUNCE_META_FILE", meta)
+
+    def _boom(*a, **k):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(mind.subprocess, "Popen", _boom)
+    assert mind._dispatch_announce("hello") is False
+    assert not meta.exists()
+    calls = []
+    monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+    assert mind._dispatch_announce("retry") is True
+    assert len(calls) == 1
 
 
 def test_emit_message_obi_fires_private_announce(monkeypatch):
     fired = []
     monkeypatch.setattr(mind, "_dispatch_announce",
-                        lambda text, private=False: fired.append((text, private)))
+                        lambda text, private=False, dry=False: fired.append((text, private)))
     # Stub the obi-chat IO so the helper reaches the "write entry" path (not suppressed).
     monkeypatch.setattr(mind, "_read_obi_chat_timestamps", lambda: (0.0, 0.0))
     monkeypatch.setattr(mind, "_read_obi_chat_meta", lambda: {})
@@ -481,7 +513,7 @@ def test_emit_message_obi_fires_private_announce(monkeypatch):
 def test_emit_message_obi_suppressed_no_announce(monkeypatch):
     fired = []
     monkeypatch.setattr(mind, "_dispatch_announce",
-                        lambda text, private=False: fired.append((text, private)))
+                        lambda text, private=False, dry=False: fired.append((text, private)))
     # last_spark_ts > last_obi_ts and recent -> awaiting reply within backoff -> suppressed.
     import time as _t
     now = _t.time()
@@ -930,32 +962,81 @@ def test_announce_is_absent_gated():
     assert "announce" in mind.ABSENT_GATED_ACTIONS
 
 
-def test_dispatch_announce_interval_gate(monkeypatch):
+def test_dispatch_announce_interval_gate(monkeypatch, tmp_path):
     """Public announces are capped to one per ANNOUNCE_MIN_INTERVAL_S."""
     calls = []
     monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
     monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
-    monkeypatch.setattr(mind, "_last_announce_mono", None)
-    now = {"t": 50.0}  # small value: fresh-boot monotonic must not suppress the first announce
-    monkeypatch.setattr(mind.time, "monotonic", lambda: now["t"])
-    mind._dispatch_announce("first")
-    mind._dispatch_announce("too soon")
+    monkeypatch.setattr(mind, "_ANNOUNCE_META_FILE", tmp_path / "announce_meta.json")
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(mind.time, "time", lambda: now["t"])
+    assert mind._dispatch_announce("first") is True
+    assert mind._dispatch_announce("too soon") is False
     assert len(calls) == 1
     now["t"] += mind.spark_config.ANNOUNCE_MIN_INTERVAL_S + 1
-    mind._dispatch_announce("later")
+    assert mind._dispatch_announce("later") is True
     assert len(calls) == 2
 
 
-def test_dispatch_announce_private_bypasses_interval(monkeypatch):
+def test_dispatch_announce_interval_survives_restart(monkeypatch, tmp_path):
+    """The hourly cap is persisted — a px-mind restart must not reset it."""
+    calls = []
+    meta = tmp_path / "announce_meta.json"
+    monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
+    monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(mind, "_ANNOUNCE_META_FILE", meta)
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(mind.time, "time", lambda: now["t"])
+    assert mind._dispatch_announce("before restart") is True
+    # "restart": state lives only in the meta file, so a fresh call within the
+    # window must still be suppressed purely from what's on disk.
+    now["t"] += 60
+    assert mind._dispatch_announce("after restart") is False
+    assert len(calls) == 1
+
+
+def test_dispatch_announce_private_bypasses_interval(monkeypatch, tmp_path):
     """message_obi private audio is never throttled by the ambient announce cap."""
     calls = []
     monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
     monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
-    monkeypatch.setattr(mind, "_last_announce_mono", None)
-    now = {"t": 50.0}
-    monkeypatch.setattr(mind.time, "monotonic", lambda: now["t"])
+    monkeypatch.setattr(mind, "_ANNOUNCE_META_FILE", tmp_path / "announce_meta.json")
+    now = {"t": 1_000_000.0}
+    monkeypatch.setattr(mind.time, "time", lambda: now["t"])
     mind._dispatch_announce("public")
-    mind._dispatch_announce("dm for obi", private=True)   # inside interval, still fires
+    assert mind._dispatch_announce("dm for obi", private=True) is True   # inside interval, still fires
     assert len(calls) == 2
-    mind._dispatch_announce("dm again", private=True)     # private never charges the gate
+    assert mind._dispatch_announce("dm again", private=True) is True     # private never charges the gate
     assert len(calls) == 3
+
+
+def test_announce_is_call_gated():
+    """The loudest action must never fire while Adrian is on a call."""
+    assert "announce" in mind.CALL_GATED_ACTIONS
+
+
+def test_expression_announce_suppressed_on_call(monkeypatch):
+    _quiet_daytime(monkeypatch)
+    fired = []
+    monkeypatch.setattr(mind, "_dispatch_announce",
+                        lambda text, private=False, dry=False: fired.append(text) or True)
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {"adrian_on_call": True}}
+    result = mind.expression({"action": "announce", "thought": "hi house"}, dry=True, awareness=aw)
+    assert result is False
+    assert fired == []
+
+
+def test_expression_announce_charges_budget_only_on_dispatch(monkeypatch):
+    """A cap-suppressed announce made no sound — it must not buy 30 min of silence."""
+    _quiet_daytime(monkeypatch)
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    monkeypatch.setattr(mind, "_dispatch_announce", lambda text, private=False, dry=False: False)
+    assert mind.expression({"action": "announce", "thought": "hello"}, dry=True, awareness=aw) is False
+    monkeypatch.setattr(mind, "_dispatch_announce", lambda text, private=False, dry=False: True)
+    assert mind.expression({"action": "announce", "thought": "hello"}, dry=True, awareness=aw) is True
+
+
+def test_expression_announce_empty_text_not_charged(monkeypatch):
+    _quiet_daytime(monkeypatch)
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    assert mind.expression({"action": "announce", "thought": ""}, dry=True, awareness=aw) is False

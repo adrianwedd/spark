@@ -164,25 +164,38 @@ def _is_night_silence(hour: int) -> bool:
     return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
 
 
-_last_announce_mono: float | None = None  # None (not 0.0): monotonic ~= uptime, so 0.0 would mute the first post-boot hour
+_ANNOUNCE_META_FILE = STATE_DIR / "announce_meta.json"  # persisted cap: a px-mind restart must not reset the 1/hour limit
 
 
-def _dispatch_announce(text: str, private: bool = False) -> None:
-    """Fire bin/tool-announce off the critical path (non-blocking). No-op if disabled."""
-    global _last_announce_mono
+def _read_last_announce_ts() -> float | None:
+    try:
+        val = json.loads(_ANNOUNCE_META_FILE.read_text(encoding="utf-8")).get("last_public_ts")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _dispatch_announce(text: str, private: bool = False, dry: bool = False) -> bool:
+    """Fire bin/tool-announce off the critical path (non-blocking).
+
+    Returns True only when the tool was actually dispatched — a suppressed or
+    failed announce made no sound, and the caller must not charge the
+    expression budget for it. The hourly cap is consumed only after a
+    successful launch, and never under dry (dry must not mutate live state).
+    """
     if not spark_config.ANNOUNCE_ENABLED:
-        return
+        return False
     if not text or not text.strip():
-        return
+        return False
+    now_ts = time.time()
     if not private:
-        now_mono = time.monotonic()
-        if (_last_announce_mono is not None
-                and now_mono - _last_announce_mono < spark_config.ANNOUNCE_MIN_INTERVAL_S):
+        last_ts = _read_last_announce_ts()
+        if last_ts is not None and now_ts - last_ts < spark_config.ANNOUNCE_MIN_INTERVAL_S:
             log("expression: announce suppressed (interval cap)")
-            return
-        _last_announce_mono = now_mono
+            return False
     env = os.environ.copy()
     env["PX_ANNOUNCE_TEXT"] = text.strip()[:spark_config.ANNOUNCE_MAX_CHARS]
+    env["PX_DRY"] = "1" if dry else "0"
     if private:
         env["PX_ANNOUNCE_PRIVATE"] = "1"
     try:
@@ -191,6 +204,13 @@ def _dispatch_announce(text: str, private: bool = False) -> None:
         log("expression: announce dispatched (non-blocking)")
     except Exception as e:
         log(f"expression: announce dispatch failed: {e}")
+        return False
+    if not private and not dry:
+        try:
+            atomic_write(_ANNOUNCE_META_FILE, json.dumps({"last_public_ts": now_ts}))
+        except Exception as e:
+            log(f"expression: announce meta write failed: {e}")
+    return True
 
 
 def _daytime_action_hint(hour_override: int | None = None) -> str:
@@ -371,6 +391,12 @@ ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
                         "blog_essay", "message_obi", "announce"}
+
+# Actions too disruptive to fire while Adrian is on a call or the mic is hot.
+# announce is the loudest thing SPARK can do — it stays at the top of this list.
+CALL_GATED_ACTIONS = {"greet", "greet_arrival", "comment", "weather_comment",
+                      "play_sound", "time_check", "calendar_check", "photograph",
+                      "announce"}
 
 # Actions permitted during night silence and absence: silent cognitive work
 # (no audio, no servo motion) is exactly what idle hours are for.
@@ -3216,7 +3242,7 @@ def _write_obi_chat_meta(meta: dict) -> None:
         log(f"obi_chat: failed to write meta: {exc}")
 
 
-def _emit_message_obi(text: str) -> None:
+def _emit_message_obi(text: str, dry: bool = False) -> None:
     """Write a message_obi nudge (with exponential backoff) and announce it to Obi."""
     if not text:
         log("expression: message_obi has no text — skipping")
@@ -3247,7 +3273,7 @@ def _emit_message_obi(text: str) -> None:
     entry = {"id": msg_id, "ts": utc_timestamp(), "role": "spark", "text": text[:500]}
     _append_obi_chat(entry)
     _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
-    _dispatch_announce(text, private=True)               # Obi HEARS the DM in the data voice
+    _dispatch_announce(text, private=True, dry=dry)      # Obi HEARS the DM in the data voice
     log(f"expression: message_obi written (id={msg_id})")
 
 
@@ -3322,8 +3348,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     # Suppress speech when Adrian is on a call or mic is active
     ha_ctx = _aw.get("ha_context") or {}
     if ha_ctx.get("adrian_on_call") or ha_ctx.get("adrian_mic_active"):
-        if action in ("greet", "greet_arrival", "comment", "weather_comment", "play_sound",
-                       "time_check", "calendar_check", "photograph"):
+        if action in CALL_GATED_ACTIONS:
             log(f"expression: suppressed {action} — Adrian on call/mic active")
             return False
 
@@ -3685,13 +3710,14 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
                 log(f"expression: self_debug error: {exc}")
 
         elif action == "message_obi":
-            _emit_message_obi(text)
+            _emit_message_obi(text, dry=dry)
 
         elif action == "announce":
             if not text:
                 log("expression: announce has no text — skipping")
-            else:
-                _dispatch_announce(text)
+                return False
+            if not _dispatch_announce(text, dry=dry):
+                return False    # suppressed/failed: no sound, don't charge the budget
 
         elif action in ("set_goal", "update_goal", "complete_goal"):
             # In-process state writes — no subprocess, no audio, night-safe.
