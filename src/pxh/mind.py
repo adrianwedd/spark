@@ -2599,6 +2599,13 @@ def _reroll_allowed(backend: str) -> bool:
     return backend in _FREE_BACKENDS
 
 
+# How bad each re-roll verdict is. The retry loop holds the best attempt seen
+# so far and a later attempt replaces it only if STRICTLY better — otherwise a
+# blank attempt 2 overwrites a merely-similar attempt 1 and drops the cycle,
+# when the suppression path would have persisted a real (if duplicate) thought.
+# Live trace 2026-08-01T11:30: re-rolling (similar) → "empty thought" failure.
+_REROLL_RANK = {None: 0, "similar": 1, "empty": 2, "no_json": 3}
+
 # Appended to the retry prompt so attempt 2 knows what was wrong with attempt 1.
 _REROLL_HINTS = {
     "empty": "Your previous response contained no thought text. "
@@ -2954,6 +2961,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     result = None
     raw = ""
     reroll_reason = None
+    # Sentinel: worse than every real verdict, so attempt 1 is always adopted.
+    held_rank = max(_REROLL_RANK.values()) + 1
     attempt_context = context
     for attempt in (1, 2):
         result = call_llm(attempt_context, system_prompt, persona=persona)
@@ -2966,21 +2975,25 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         raw = result.get("response", "")
         candidate = extract_json(raw)
         if candidate:
-            parsed = candidate
-            reroll_reason = _reroll_reason(parsed, recent_thoughts, _last_spoken_text)
-            if reroll_reason is None:
-                break
+            cand_reason = _reroll_reason(candidate, recent_thoughts, _last_spoken_text)
         else:
             # A tier answered but produced junk — distinct from "all tiers down".
             # This is the most common single reflection failure in the live logs,
             # and it re-rolls for the same reason empty and similar do: a model
             # that opened with prose usually complies once told so.
             log(f"reflection: no JSON in response: {raw}")
-            # Only claim the re-roll reason if there is no earlier parse to keep.
-            # A malformed attempt 2 must not discard a merely-similar attempt 1,
-            # which still carries a real thought and its own handling below.
-            if parsed is None:
-                reroll_reason = "no_json"
+            cand_reason = "no_json"
+        # A retry replaces the held attempt only if strictly better (see
+        # _REROLL_RANK). This is one rule where two ad-hoc guards used to be:
+        # it keeps a similar attempt 1 over a blank or malformed attempt 2,
+        # and still lets a real-but-duplicate retry replace a blank attempt 1.
+        if _REROLL_RANK[cand_reason] < held_rank:
+            held_rank = _REROLL_RANK[cand_reason]
+            reroll_reason = cand_reason
+            if candidate:
+                parsed = candidate
+        if reroll_reason is None:
+            break
         if attempt == 2:
             break
         if not _reroll_allowed(result.get("backend", "")):

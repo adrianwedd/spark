@@ -307,6 +307,45 @@ def test_no_json_on_retry_keeps_the_first_parse(monkeypatch):
     assert captured["appended"]["action"] == "wait", "still suppressed as a duplicate"
 
 
+def test_empty_on_retry_keeps_the_first_parse(monkeypatch):
+    """A blank attempt 2 must not throw away a usable attempt 1.
+
+    Same contract as the no-JSON case above: attempt 1 is merely *similar* —
+    a real thought that records the mind ran, persisted via the suppression
+    path. Live trace 2026-08-01T11:30: re-rolling (similar) → dropped as
+    "empty thought", because the blank retry overwrote the held parse.
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_VALID, _EMPTY], recent=[{"thought": _VALID["thought"]}])
+    assert len(calls) == 2
+    assert captured["returned"] is not None
+    assert captured["appended"]["thought"] == _VALID["thought"]
+    assert captured["appended"]["action"] == "wait", "still suppressed as a duplicate"
+
+
+def test_empty_on_retry_of_similar_records_no_failure(monkeypatch):
+    """Keeping attempt 1 means the cycle succeeded — no health failure."""
+    failures = _capture_health(monkeypatch)
+    _drive_reflection_seq(
+        monkeypatch, [_VALID, _EMPTY], recent=[{"thought": _VALID["thought"]}])
+    assert [f for f in failures if f[0] == "px-mind-reflection"] == []
+
+
+def test_similar_retry_replaces_an_empty_first_attempt(monkeypatch):
+    """The retry IS adopted when it is strictly better than what is held.
+
+    empty → similar is an improvement: a real (if duplicate) thought beats a
+    blank one, so the suppression path persists it instead of the cycle
+    dropping as "empty thought".
+    """
+    captured, calls = _drive_reflection_seq(
+        monkeypatch, [_EMPTY, _VALID], recent=[{"thought": _VALID["thought"]}])
+    assert len(calls) == 2
+    assert captured["returned"] is not None
+    assert captured["appended"]["thought"] == _VALID["thought"]
+    assert captured["appended"]["action"] == "wait"
+
+
 def test_no_json_reroll_prompt_carries_a_hint(monkeypatch):
     """The retry must name the fault — here, that the output was not JSON."""
     prompts = []
