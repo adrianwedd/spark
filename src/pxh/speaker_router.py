@@ -9,8 +9,16 @@ Resolution order (spec §Architecture-1):
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
+import time
+import urllib.request
+from pathlib import Path
 
 from pxh import spark_config
+
+STATE_DIR = Path(os.environ.get("PROJECT_ROOT", ".")) / "state"
+LAST_HEARD_PATH = STATE_DIR / "last_heard.json"
 
 
 def _last_heard_entity(last_heard: dict | None, now_ts: float) -> str | None:
@@ -58,3 +66,47 @@ def choose_target(last_heard: dict | None, available: set[str] | None,
         if _ok(candidate):
             return candidate
     return None
+
+
+def read_last_heard(path: Path | None = None) -> dict | None:
+    p = path or LAST_HEARD_PATH
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _get_state(entity: str, ha_base: str, ha_token: str, timeout: float) -> str | None:
+    req = urllib.request.Request(
+        f"{ha_base}/api/states/{entity}",
+        headers={"Authorization": f"Bearer {ha_token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read()).get("state")
+    except Exception:
+        return None
+
+
+def fetch_available(entities: list[str], ha_base: str, ha_token: str,
+                    timeout: float = 2.0) -> set[str] | None:
+    # Parallel: sequential 3s-timeout requests over ~6 entities is an ~18s
+    # worst case before the route even starts. Concurrent, the floor is one
+    # timeout (~2s).
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, len(entities))) as pool:
+        states = list(pool.map(
+            lambda e: _get_state(e, ha_base, ha_token, timeout), entities))
+    got = dict(zip(entities, states))
+    if all(v is None for v in got.values()):
+        return None                       # HA unreachable — caller skips the filter
+    return {e for e, s in got.items() if s not in (None, "unavailable", "unknown")}
+
+
+def resolve_speaker() -> str | None:
+    """One-call resolution for tool-voice: state + config + live availability."""
+    candidates = list(dict.fromkeys(
+        list(spark_config.SPEAKER_ROOMS.values()) + list(spark_config.ANNOUNCE_ALLOWED_TARGETS)))
+    available = fetch_available(candidates, spark_config.HA_BASE_URL,
+                                os.environ.get("PX_HA_TOKEN", ""))
+    return choose_target(read_last_heard(), available, time.time())

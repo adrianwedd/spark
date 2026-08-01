@@ -69,3 +69,46 @@ def test_room_not_in_allowlist_never_routes(monkeypatch):
     now = 1_000_000.0
     lh = {"room": "garage", "ts": _iso(now, 60)}
     assert choose_target(lh, {"media_player.rogue", OFFICE, SHED, LIVING}, now) == OFFICE
+
+
+import json
+import time
+
+import pxh.speaker_router as sr
+
+
+def test_read_last_heard_missing_and_malformed(tmp_path):
+    assert sr.read_last_heard(tmp_path / "nope.json") is None
+    bad = tmp_path / "last_heard.json"
+    bad.write_text("{not json")
+    assert sr.read_last_heard(bad) is None
+
+
+def test_read_last_heard_roundtrip(tmp_path):
+    p = tmp_path / "last_heard.json"
+    p.write_text(json.dumps({"room": "office", "ts": "2026-08-01T04:00:00+00:00"}))
+    assert sr.read_last_heard(p) == {"room": "office", "ts": "2026-08-01T04:00:00+00:00"}
+
+
+def test_fetch_available_filters_unavailable(monkeypatch):
+    states = {"media_player.a": "idle", "media_player.b": "unavailable",
+              "media_player.c": "playing"}
+    monkeypatch.setattr(sr, "_get_state", lambda e, base, tok, timeout: states.get(e))
+    got = sr.fetch_available(list(states), "http://ha", "tok")
+    assert got == {"media_player.a", "media_player.c"}
+
+
+def test_fetch_available_all_errors_returns_none(monkeypatch):
+    monkeypatch.setattr(sr, "_get_state", lambda e, base, tok, timeout: None)
+    assert sr.fetch_available(["media_player.a"], "http://ha", "tok") is None
+
+
+def test_resolve_speaker_end_to_end(tmp_path, monkeypatch):
+    from pxh import spark_config
+    p = tmp_path / "last_heard.json"
+    now_iso = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc).isoformat()
+    p.write_text(json.dumps({"room": "living", "ts": now_iso}))
+    monkeypatch.setattr(sr, "LAST_HEARD_PATH", p)
+    monkeypatch.setattr(sr, "fetch_available", lambda *a, **k: None)  # HA unreachable path
+    assert sr.resolve_speaker() == "media_player.nest_hub_max"
