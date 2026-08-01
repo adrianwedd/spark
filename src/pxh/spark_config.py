@@ -59,9 +59,9 @@ ANNOUNCE_ENABLED         = True   # G1+G2 passed 2026-08-01: relay live on M5, W
 ANNOUNCE_RELAY_URL       = "http://192.168.0.100:7862"   # IP, not M5.local (Nest mDNS) — MUST be a DHCP reservation for M5; if M5's lease changes, the entire announce pipeline breaks silently
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
-ANNOUNCE_DEFAULT_TARGETS = ["media_player.googlehome1094"]   # Office Mini — Adrian's default room (both it and nest_hub_max cast-verified 2026-08-01)
-ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.googlehome1094",
-                            "media_player.laura_s_room_speaker"]  # nest_mini dropped: entity is dead in HA
+ANNOUNCE_DEFAULT_TARGETS = ["media_player.office_mini"]   # Office Mini — Adrian's default room (both it and nest_hub_max cast-verified 2026-08-01)
+ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.office_mini",
+                            "media_player.shed_mini"]  # nest_mini dropped: entity is dead in HA
 ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/wav")
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
 ANNOUNCE_MIN_INTERVAL_S  = 3600   # ambient announces: max one audible interruption/hour (message_obi private audio exempt)
@@ -70,8 +70,8 @@ ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
 # --- Speaker routing (Nest-first speech; see docs/superpowers/specs/2026-07-31-nest-speaker-routing-design.md)
 SPEAKER_ROOMS = {                       # keys MUST match HA area names, lowercased (verified at deploy — Task 7).
                                         # Multi-word HA areas keep their spaces: "Living Room" → key "living room".
-    "office": "media_player.googlehome1094",        # "Office Mini"
-    "shed":   "media_player.laura_s_room_speaker",  # "Shed Mini"
+    "office": "media_player.office_mini",        # "Office Mini"
+    "shed":   "media_player.shed_mini",  # "Shed Mini"
     "living room": "media_player.nest_hub_max",   # HA area is "Living Room" — multi-word keys keep the space
 }
 SPEAKER_DEFAULT_ROOM = "office"

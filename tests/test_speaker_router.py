@@ -3,8 +3,8 @@ import datetime as dt
 from pxh import spark_config
 from pxh.speaker_router import choose_target
 
-OFFICE = "media_player.googlehome1094"
-SHED = "media_player.laura_s_room_speaker"
+OFFICE = "media_player.office_mini"
+SHED = "media_player.shed_mini"
 LIVING = "media_player.nest_hub_max"
 
 

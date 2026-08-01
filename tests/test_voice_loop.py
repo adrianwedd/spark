@@ -110,7 +110,7 @@ def test_validate_announce_rejects_all_bad_targets():
 def test_validate_announce_single_target_from_allowed_list():
     # Multiple ALLOWED targets -> v1 takes exactly one (single-target).
     _, env = validate_action({"tool": "tool_announce", "params": {
-        "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.googlehome1094"]}})
+        "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.office_mini"]}})
     assert env["PX_ANNOUNCE_TARGETS"] == "media_player.nest_hub_max"
 
 

@@ -1219,7 +1219,7 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     payload = parse_json(stdout)
     assert payload["status"] == "ok"
     assert payload["audio_url"].endswith("/audio/abc123.wav")
-    assert payload["targets"] == ["media_player.googlehome1094"]
+    assert payload["targets"] == ["media_player.office_mini"]
     paths = [p for (_, p, _) in _StubHandler.captured]
     assert any(p.endswith("/announce") for p in paths)
     assert any("/api/services/media_player/play_media" in p for p in paths)
@@ -1335,7 +1335,7 @@ def test_tool_announce_resolves_single_target_from_multiple(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
     env["PX_ANNOUNCE_TEXT"] = "hi"
-    env["PX_ANNOUNCE_TARGETS"] = "media_player.nest_hub_max,media_player.googlehome1094"
+    env["PX_ANNOUNCE_TARGETS"] = "media_player.nest_hub_max,media_player.office_mini"
     payload = parse_json(run_tool(["bin/tool-announce"], env))
     assert payload["status"] == "dry"
     assert len(payload["targets"]) == 1
