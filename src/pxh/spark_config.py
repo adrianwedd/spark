@@ -67,6 +67,15 @@ ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log s
 ANNOUNCE_MIN_INTERVAL_S  = 3600   # ambient announces: max one audible interruption/hour (message_obi private audio exempt)
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
 ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
+# --- Speaker routing (Nest-first speech; see docs/superpowers/specs/2026-07-31-nest-speaker-routing-design.md)
+SPEAKER_ROOMS = {                       # keys MUST match HA area names, lowercased (verified at deploy — Task 7).
+                                        # Multi-word HA areas keep their spaces: "Living Room" → key "living room".
+    "office": "media_player.googlehome1094",        # "Office Mini"
+    "shed":   "media_player.laura_s_room_speaker",  # "Shed Mini"
+    "living": "media_player.nest_hub_max",
+}
+SPEAKER_DEFAULT_ROOM = "office"
+SPEAKER_STICKY_S = 1800     # last-heard older than this = Adrian probably moved; stale-as-absent
 HA_BASE_URL              = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")  # single PX_HA_HOST source of truth for the Pi→HA host (mind.HA_HOST aliases this). Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
 
 # Night silence bounds (Hobart time), applied via ZoneInfo("Australia/Hobart").
