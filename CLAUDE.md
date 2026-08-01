@@ -225,6 +225,12 @@ SPARK speaks through the Nest Mini/Hub Max via a two-hop chain: `bin/tool-announ
 
 **Private audio (`message_obi`):** Uses the relay's `priv/` namespace with a 3-minute TTL (vs. 7-day for public audio). The DM text itself is still redacted from `thoughts-spark.jsonl` as `[private message to Obi]`; only the audio is ephemeral on-relay.
 
+### Speaker Routing (tool-voice → nearest Nest)
+
+`bin/tool-voice` is the routing chokepoint for SPARK speech (persona empty or `spark` only — GREMLIN/VIXEN always speak onboard). Resolution (`src/pxh/speaker_router.py`): fresh `state/last_heard.json` room (< `SPEAKER_STICKY_S`, 30 min) → `SPEAKER_DEFAULT_ROOM` (office) → first available `ANNOUNCE_ALLOWED_TARGETS` entry → onboard fallback. Every routed entity must be in `ANNOUNCE_ALLOWED_TARGETS`. `last_heard.json` is written by `POST /api/v1/public/chat` when the HA conversation component sends the satellite's `area` — accepted only from RFC1918/loopback client IPs (`_area_trusted`; tunnel traffic carries a public CF-Connecting-IP and is rejected). `SPEAKER_ROOMS` keys are lowercased HA area names, spaces kept (`"living room"`).
+
+**Suppression never falls back:** a night-suppressed announce, or any *failed* route attempt during the night window, must not reach the onboard speaker (`PX_VOICE_URGENT=1` bypasses — battery warnings at night are deliberate). **`PX_VOICE_NO_ROUTE=1` skips routing entirely** and is set by everything interactive or urgent: `voice_loop.execute_tool` (unconditionally — the human is at the robot, and tool-announce's `yield_alive` must never fire from voice-loop tools), px-alive `spark_greet` (a routed greeting would SIGUSR1-kill px-alive via its own grandchild), px-battery-poll, and `bin/tool-time`. Only mind.py's `_run_voice` path routes, with `timeout=SPEAKER_ROUTE_TIMEOUT_S+15` (90+15s; measured routed speech is ~14s). **Cap semantics (deliberate):** `ANNOUNCE_MIN_INTERVAL_S` (1/hour) governs the `announce` action only; routed greet/comment/weather speech is governed by the 30-min expression cooldown instead — it replaces onboard speech at the same cadence on the speaker nearest Adrian, it does not add interruptions.
+
 ### Site (spark.wedd.au)
 
 Static site on Cloudflare Pages (auto-deploys from `master`, `site/` dir).

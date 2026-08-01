@@ -62,6 +62,15 @@ G1 and G2 are unrun because there has been nothing to run them against.
   conversational reply. Since all speech now routes to Nest, if warm synth is not
   ≲2s the voice-loop path needs a short fail-fast timeout and will drop to
   onboard often.
+  - **MEASURED 2026-08-01 (deploy gate):** same short text end-to-end via
+    `bin/tool-announce`: cold 11.6s, cache-hit 9.8s — the synth delta is
+    ~1.7s; the floor is the yield_alive preamble + cast + the 2.2s
+    volume-restore sleep. Novel-sentence routed speech via `bin/tool-voice`:
+    **14.3s** wall. Over the 10s conversational-comfort bar, but the
+    voice-loop path never routes anyway (`PX_VOICE_NO_ROUTE=1` in
+    `execute_tool` — the human is at the robot), so only autonomous speech
+    pays it. `SPEAKER_ROUTE_TIMEOUT_S=90` has ~6× headroom; no tuning
+    needed.
 
 ## Architecture
 

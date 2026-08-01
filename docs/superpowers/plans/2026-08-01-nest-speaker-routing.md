@@ -415,11 +415,16 @@ def test_public_chat_without_area_still_works(client):
 # module level, near _get_client_ip (import ipaddress at the top):
 def _area_trusted(ip: str) -> bool:
     """Routing hints only from the LAN — the HA component posts directly;
-    tunnel traffic resolves to a public CF-Connecting-IP and is rejected."""
+    tunnel traffic resolves to a public CF-Connecting-IP and is rejected.
+
+    NOTE: implemented as explicit RFC1918 + loopback membership, NOT
+    ipaddress.is_private — is_private also returns True for RFC 5737
+    TEST-NET blocks (e.g. 203.0.113.7), which this gate must reject."""
     try:
-        return ipaddress.ip_address(ip).is_private
+        addr = ipaddress.ip_address(ip)
     except ValueError:
         return False
+    return addr.is_loopback or any(addr in net for net in _RFC1918_NETWORKS)
 
 # PublicChatRequest — add field:
     area: Optional[str] = Field(None, max_length=100)
