@@ -103,10 +103,15 @@ def main() -> int:
         """Same env-overridable bounds as tool-announce (PX_NIGHT_SILENCE_*)."""
         from zoneinfo import ZoneInfo
         import datetime as _dt
-        start = int(os.environ.get("PX_NIGHT_SILENCE_START_H",
-                                   spark_config.NIGHT_SILENCE_START_H))
-        end = int(os.environ.get("PX_NIGHT_SILENCE_END_H",
-                                 spark_config.NIGHT_SILENCE_END_H))
+
+        def _int_env(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, default))
+            except ValueError:
+                return default
+
+        start = _int_env("PX_NIGHT_SILENCE_START_H", spark_config.NIGHT_SILENCE_START_H)
+        end = _int_env("PX_NIGHT_SILENCE_END_H", spark_config.NIGHT_SILENCE_END_H)
         hour = _dt.datetime.now(ZoneInfo("Australia/Hobart")).hour
         return hour >= start or hour < end
 
@@ -356,5 +361,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException as e:   # never raises — always emit a JSON error line
+        print(json.dumps({"status": "error", "error": f"tool-voice crashed: {e}"}))
+        raise SystemExit(0)
 PY

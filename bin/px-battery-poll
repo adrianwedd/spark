@@ -109,6 +109,11 @@ def speak(text: str) -> None:
     """Speak text via tool-voice (handles speaker enable + persona voice)."""
     env = os.environ.copy()
     env["PX_TEXT"] = text
+    # Battery state changes are urgent onboard alerts: never route to a Nest
+    # (routing would be killed by the 20s timeout before any speech), and
+    # bypass night silence so plug/unplug is still heard overnight.
+    env["PX_VOICE_NO_ROUTE"] = "1"
+    env["PX_VOICE_URGENT"] = "1"
     try:
         subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                        capture_output=True, check=False, timeout=20)

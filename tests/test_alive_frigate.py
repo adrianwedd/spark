@@ -229,3 +229,28 @@ def test_greet_suppress_detail_is_informative():
     assert "picar_x" in detail and "400s" in detail
     assert "picamera: never" in detail
     assert _ALIVE["_greet_suppress_detail"](None) == "no presence snapshot"
+
+
+def test_spark_greet_env_never_routes():
+    """spark_greet's tool-voice env must carry PX_VOICE_NO_ROUTE=1.
+
+    Routing would spawn tool-announce, whose yield_alive SIGUSR1-kills
+    px-alive (its own grandparent) mid-greeting; the 8s subprocess timeout
+    would also kill a route attempt before any speech could land.
+    """
+    captured = {}
+
+    def _fake_run(args, env=None, **kwargs):
+        captured["env"] = env
+        class _Result:
+            returncode = 0
+        return _Result()
+
+    orig_run = _ALIVE["_subprocess"].run
+    _ALIVE["_subprocess"].run = _fake_run
+    try:
+        _ALIVE["spark_greet"](dry=True)
+    finally:
+        _ALIVE["_subprocess"].run = orig_run
+
+    assert captured.get("env", {}).get("PX_VOICE_NO_ROUTE") == "1"

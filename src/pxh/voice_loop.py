@@ -884,7 +884,8 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
     # summary below, or transitively via another tool's own subprocess
     # call). A 90s Nest route attempt here would also blow the voice-loop
     # watchdog's 30s stale-heartbeat SIGTERM. Set unconditionally, once,
-    # before any per-tool overrides so no tool can be routed by mistake.
+    # after the env_overrides loop above so no per-tool override (from the
+    # model or elsewhere) can clobber it and re-enable routing by mistake.
     env["PX_VOICE_NO_ROUTE"] = "1"
     # Inject persona voice settings if a persona is active in session
     session_persona = load_session().get("persona") or ""

@@ -314,6 +314,10 @@ def spark_greet(dry: bool) -> None:
     env["PX_VOICE_VARIANT"] = "en+m3"
     env["PX_VOICE_PITCH"] = "58"
     env["PX_VOICE_RATE"] = "120"
+    # Onboard only: routing would spawn tool-announce, whose yield_alive
+    # SIGUSR1-kills px-alive (its own grandparent) mid-greeting, and the
+    # 8s timeout below would kill the route before any speech anyway.
+    env["PX_VOICE_NO_ROUTE"] = "1"
     if dry:
         env["PX_DRY"] = "1"
     try:

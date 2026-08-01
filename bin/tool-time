@@ -51,9 +51,12 @@ def main() -> int:
     payload = {"status": "ok", "dry": dry_mode, "spoken": text}
 
     if not dry_mode:
+        # time_check is interactive-adjacent robot speech; px-mind gives
+        # this tool only 15s, so a Nest route attempt (up to ~90s budget)
+        # would be killed by the caller's timeout before any speech.
         result = subprocess.run(
             [str(PROJECT_ROOT / "bin/tool-voice")],
-            env={**os.environ, "PX_TEXT": text},
+            env={**os.environ, "PX_TEXT": text, "PX_VOICE_NO_ROUTE": "1"},
             capture_output=True, text=True, check=False,
         )
         payload["voice_rc"] = result.returncode
