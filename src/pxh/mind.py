@@ -164,12 +164,23 @@ def _is_night_silence(hour: int) -> bool:
     return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
 
 
+_last_announce_mono: float | None = None  # None (not 0.0): monotonic ~= uptime, so 0.0 would mute the first post-boot hour
+
+
 def _dispatch_announce(text: str, private: bool = False) -> None:
     """Fire bin/tool-announce off the critical path (non-blocking). No-op if disabled."""
+    global _last_announce_mono
     if not spark_config.ANNOUNCE_ENABLED:
         return
     if not text or not text.strip():
         return
+    if not private:
+        now_mono = time.monotonic()
+        if (_last_announce_mono is not None
+                and now_mono - _last_announce_mono < spark_config.ANNOUNCE_MIN_INTERVAL_S):
+            log("expression: announce suppressed (interval cap)")
+            return
+        _last_announce_mono = now_mono
     env = os.environ.copy()
     env["PX_ANNOUNCE_TEXT"] = text.strip()[:spark_config.ANNOUNCE_MAX_CHARS]
     if private:
@@ -359,7 +370,7 @@ CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", 
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
-                        "blog_essay", "message_obi"}
+                        "blog_essay", "message_obi", "announce"}
 
 # Actions permitted during night silence and absence: silent cognitive work
 # (no audio, no servo motion) is exactly what idle hours are for.

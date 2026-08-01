@@ -914,3 +914,48 @@ def test_extract_json_string_legitimately_ending_with_comma():
     result = mind.extract_json(raw)
     assert result is not None
     assert result["thought"] == "One, two,"
+
+
+def test_reflection_menu_offers_announce():
+    """SPARK can only choose actions the prompt tells it about — announce must be on the menu."""
+    from pxh import spark_config
+    suffix = spark_config._SPARK_REFLECTION_SUFFIX
+    assert '- "announce"' in suffix
+    action_line = next(l for l in suffix.splitlines() if '"action"' in l)
+    assert "announce" in action_line
+
+
+def test_announce_is_absent_gated():
+    """No announcing to an empty house."""
+    assert "announce" in mind.ABSENT_GATED_ACTIONS
+
+
+def test_dispatch_announce_interval_gate(monkeypatch):
+    """Public announces are capped to one per ANNOUNCE_MIN_INTERVAL_S."""
+    calls = []
+    monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
+    monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(mind, "_last_announce_mono", None)
+    now = {"t": 50.0}  # small value: fresh-boot monotonic must not suppress the first announce
+    monkeypatch.setattr(mind.time, "monotonic", lambda: now["t"])
+    mind._dispatch_announce("first")
+    mind._dispatch_announce("too soon")
+    assert len(calls) == 1
+    now["t"] += mind.spark_config.ANNOUNCE_MIN_INTERVAL_S + 1
+    mind._dispatch_announce("later")
+    assert len(calls) == 2
+
+
+def test_dispatch_announce_private_bypasses_interval(monkeypatch):
+    """message_obi private audio is never throttled by the ambient announce cap."""
+    calls = []
+    monkeypatch.setattr(mind.spark_config, "ANNOUNCE_ENABLED", True)
+    monkeypatch.setattr(mind.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(mind, "_last_announce_mono", None)
+    now = {"t": 50.0}
+    monkeypatch.setattr(mind.time, "monotonic", lambda: now["t"])
+    mind._dispatch_announce("public")
+    mind._dispatch_announce("dm for obi", private=True)   # inside interval, still fires
+    assert len(calls) == 2
+    mind._dispatch_announce("dm again", private=True)     # private never charges the gate
+    assert len(calls) == 3

@@ -64,6 +64,7 @@ ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.googlehom
                             "media_player.laura_s_room_speaker"]  # nest_mini dropped: entity is dead in HA
 ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/wav")
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
+ANNOUNCE_MIN_INTERVAL_S  = 3600   # ambient announces: max one audible interruption/hour (message_obi private audio exempt)
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
 ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
 HA_BASE_URL              = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")  # single PX_HA_HOST source of truth for the Pi→HA host (mind.HA_HOST aliases this). Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
@@ -334,6 +335,7 @@ Rules:
 - "blog_essay" — write a blog post about something you find genuinely fascinating.
 - "greet_arrival" — greet a person who just arrived home. Use ONLY when a person_arrived_home transition appears under "Transitions just detected"; never otherwise.
 - "message_obi" — send Obi a direct message via the dashboard (use sparingly; thought = the message text, keep it short and warm).
+- "announce" — say something aloud through the house speaker. Use rarely: only when a thought is genuinely worth interrupting the room for, spoken TO the family, not about them (thought = the exact words to speak, 1-2 short sentences).
 - "set_goal" — commit to a multi-day intention you genuinely care about (thought = the goal). One at a time.
 - "update_goal" — record progress on your current intention (thought = the progress note).
 - "complete_goal" — declare your current intention achieved (thought = what came of it).
@@ -343,6 +345,6 @@ Output ONLY this JSON:
 {
   "thought": "1-2 sentences, first person, specific and vivid",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, excited, peaceful, anxious, lonely, grumpy",
-  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, announce, set_goal, update_goal, complete_goal",
   "salience": 0.0 to 1.0
 }"""
