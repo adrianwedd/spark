@@ -118,6 +118,17 @@ def test_audio_fresh_private_file_served(client):
     assert r.content[:4] == b"RIFF"
 
 
+def test_audio_answers_head(client):
+    # Chromecast preflights with HEAD; 405 makes the Nest load the cast and
+    # then never start playing.
+    body = client.post("/announce", json={"text": "head check"}, headers=AUTH).json()
+    name = body["audio_url"].rsplit("/", 1)[-1]
+    r = client.head(f"/audio/{name}")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/wav"
+    assert r.content == b""
+
+
 def test_startup_runs_janitor(monkeypatch):
     from announce_relay import app as appmod
     calls = []

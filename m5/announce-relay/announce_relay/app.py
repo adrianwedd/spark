@@ -103,7 +103,9 @@ def health():
     return {"status": "ok", "afterwords": synth.ping(), "cache_files": n}
 
 
-@app.get("/audio/{name}")
+# GET+HEAD: Chromecast preflights the URL with HEAD before playing; a 405 there
+# makes the cast load and then never start (observed on Nest Hub Max / Mini).
+@app.api_route("/audio/{name}", methods=["GET", "HEAD"])
 def audio(name: str):
     if not _AUDIO_RE.match(name):
         raise HTTPException(404, "not found")

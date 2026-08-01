@@ -49,8 +49,12 @@ def synthesize(text: str, voice: str) -> bytes:
 
 def ping() -> bool:
     """Best-effort liveness probe for /health."""
+    # urlopen raises HTTPError on 4xx, so a bare probe of "/" reported a
+    # perfectly healthy afterwords (404 on root) as down.
     try:
-        with urllib.request.urlopen(config.AFTERWORDS_URL, timeout=2) as resp:
+        with urllib.request.urlopen(config.AFTERWORDS_URL + "/health", timeout=2) as resp:
             return resp.status < 500
+    except urllib.error.HTTPError as e:
+        return e.code < 500
     except Exception:
         return False
