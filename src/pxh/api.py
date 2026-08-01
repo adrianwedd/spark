@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from . import spark_config
 from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
@@ -158,6 +160,29 @@ def _get_client_ip(request: "Request") -> str:
     return peer
 
 
+_RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _area_trusted(ip: str) -> bool:
+    """Routing hints only from the LAN — the HA component posts directly;
+    tunnel traffic resolves to a public CF-Connecting-IP and is rejected.
+
+    Deliberately narrower than ipaddress.is_private (RFC1918 + loopback only):
+    is_private also covers non-globally-routable ranges like the RFC 5737
+    documentation/TEST-NET blocks, which are not LAN addresses and must not
+    be trusted.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or any(addr in net for net in _RFC1918_NETWORKS)
+
+
 def _strip_control_chars(s: str) -> str:
     """Strip ASCII control characters (0x00–0x1F except \\t and \\n)."""
     return _re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', s)
@@ -183,6 +208,7 @@ class ChatHistoryItem(BaseModel):
 class PublicChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
+    area: Optional[str] = Field(None, max_length=100)
 
     @field_validator("message")
     @classmethod
@@ -1394,6 +1420,18 @@ async def public_chat(req: PublicChatRequest, request: Request):
             status_code=429,
             content={"error": "I'm still here — just need a moment before we keep going."},
         )
+
+    if req.area and _area_trusted(client_ip):
+        _room = _sanitize_chat_text(req.area).strip().lower()
+        if _room in spark_config.SPEAKER_ROOMS:
+            try:
+                from datetime import datetime, timezone
+                atomic_write(
+                    _public_state_dir() / "last_heard.json",
+                    json.dumps({"room": _room,
+                                "ts": datetime.now(timezone.utc).isoformat()}))
+            except OSError:
+                pass  # routing hint is best-effort; chat must never fail on it
 
     # Use XML-style role tags with a namespace prefix that user content cannot
     # replicate — bracket-only tags like [USER]: are trivially injected.
