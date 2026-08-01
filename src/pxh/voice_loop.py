@@ -602,6 +602,10 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if len(text) > 2000:
             text = text[:2000]
         sanitized["PX_TEXT"] = text
+        # The human is standing at the robot — onboard is the right speaker
+        # anyway, and a 90s Nest route attempt would blow past the 30s
+        # watchdog stale-heartbeat SIGTERM (see PX_WATCHDOG_STALE_SECONDS).
+        sanitized["PX_VOICE_NO_ROUTE"] = "1"
     elif tool == "tool_look":
         pan  = int(clamp(_num(params.get("pan",  0), "pan"), -90, 90))
         tilt = int(clamp(_num(params.get("tilt", 0), "tilt"), -35, 65))

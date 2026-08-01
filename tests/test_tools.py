@@ -1,9 +1,15 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# Portable "discard input, exit 0" player for tool-voice fallback tests — the
+# brief specifies /bin/true, which is the Linux/Pi path; macOS keeps it under
+# /usr/bin/true, so resolve via PATH rather than hardcoding one or the other.
+_TRUE_BIN = shutil.which("true") or "/bin/true"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1393,3 +1399,107 @@ def test_tool_compose_writes_note_record(tmp_path, monkeypatch, capsys):
     # and a note summary lands in notes
     note_rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
     assert note_rec.get("note", "").startswith("Composed: the wind in the eucalyptus")
+
+
+# ---------------------------------------------------------------------------
+# tool-voice: Nest speaker routing (Task 6, nest-speaker-routing plan)
+# ---------------------------------------------------------------------------
+
+def test_tool_voice_routes_spark_speech_to_nest(isolated_project):
+    """With a working relay stub and a routed target, tool-voice casts instead of espeak."""
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+    assert payload["route"] == "nest"
+    assert payload["status"] == "ok"
+    assert any("/announce" in p for (_, p, _) in _StubHandler.captured)
+
+
+def test_tool_voice_falls_back_onboard_when_relay_dead(isolated_project):
+    """Route attempted + failed (dead relay) during daytime: falls back onboard.
+
+    PX_DRY=0 so the route is actually attempted against a dead port; espeak's
+    output is discarded via PX_VOICE_PLAYER=/bin/true so no audio is spawned
+    in CI (see task brief's "Note on the dry-run test" resolution).
+    """
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_PLAYER": _TRUE_BIN,
+                "PX_ANNOUNCE_RELAY_URL": "http://127.0.0.1:1",   # dead port
+                "PX_HA_HOST": "http://127.0.0.1:1",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["route"] == "onboard"
+    assert payload["status"] == "ok"
+
+
+def test_tool_voice_night_suppression_does_not_fall_back(isolated_project):
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "0", "PX_NIGHT_SILENCE_END_H": "24"})  # always night
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+
+
+def test_tool_voice_gremlin_never_routes_to_nest(isolated_project):
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "1", "PX_TEXT": "hello", "PX_PERSONA": "gremlin",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1"})
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload.get("route", "onboard") == "onboard"
+
+
+def test_tool_voice_no_route_env_skips_nest(isolated_project):
+    """PX_VOICE_NO_ROUTE=1 (voice loop, urgent mind callers) goes straight onboard."""
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://{srv.server_address[0]}:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "1", "PX_TEXT": "hello", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_NO_ROUTE": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+    assert payload.get("route", "onboard") == "onboard"
+    assert not any("/announce" in p for (_, p, _) in _StubHandler.captured)
+
+
+def test_tool_voice_dead_relay_at_night_stays_silent(isolated_project):
+    """Route attempted + failed (dead relay) during night: the onboard fallback
+    must NOT sidestep the night gate that lives inside tool-announce."""
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_PLAYER": _TRUE_BIN,
+                "PX_ANNOUNCE_RELAY_URL": "http://127.0.0.1:1",   # dead port
+                "PX_HA_HOST": "http://127.0.0.1:1",
+                "PX_NIGHT_SILENCE_START_H": "0", "PX_NIGHT_SILENCE_END_H": "24"})  # always night
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"

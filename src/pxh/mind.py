@@ -1575,8 +1575,12 @@ def battery_emergency_shutdown(pct: int, dry: bool) -> None:
 
     _play_alarm_beeps(6, device)
 
-    # Short timeout (5s) — battery is critical, don't let TTS delay shutdown
+    # Short timeout (5s) — battery is critical, don't let TTS delay shutdown.
+    # NO_ROUTE + URGENT: a 90s Nest cast attempt must never delay shutdown,
+    # and the alert must still speak onboard even during night silence.
     env["PX_TEXT"] = f"Battery critical! Only {pct} percent remaining! Shutting down now!"
+    env["PX_VOICE_NO_ROUTE"] = "1"
+    env["PX_VOICE_URGENT"] = "1"
     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                    capture_output=True, check=False, timeout=5)
 
@@ -1604,6 +1608,10 @@ def battery_warn_comment(pct: int, dry: bool) -> None:
     else:
         msg = f"Heads up — my battery is at {pct} percent. I might need charging soon."
     env["PX_TEXT"] = msg[:2000]
+    # NO_ROUTE + URGENT: alerts must not spend 90s casting to a Nest, and
+    # must keep speaking onboard at night as today.
+    env["PX_VOICE_NO_ROUTE"] = "1"
+    env["PX_VOICE_URGENT"] = "1"
     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                    capture_output=True, check=False, timeout=20)
     log(f"battery warning spoken: {pct}%")
@@ -3159,7 +3167,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     return thought
 
 
-def _run_voice(env: dict, *, timeout: int = 30, label: str = "") -> subprocess.CompletedProcess:
+def _run_voice(env: dict, *, timeout: int = spark_config.SPEAKER_ROUTE_TIMEOUT_S + 15,
+               label: str = "") -> subprocess.CompletedProcess:
     """Run tool-voice and log voice-lock contention if detected."""
     voice_env = dict(env)
     voice_env.setdefault("PX_VOICE_LOCK_TIMEOUT", "10")  # fast-fail for autonomous speech
@@ -3916,6 +3925,10 @@ def mind_loop(args) -> None:
                     env = os.environ.copy()
                     env["PX_DRY"] = "1" if args.dry_run else "0"
                     env["PX_TEXT"] = "My thinking is offline — all reflection backends are unreachable."
+                    # NO_ROUTE + URGENT: this alert must not spend 90s casting
+                    # to a Nest, and must still speak onboard at night.
+                    env["PX_VOICE_NO_ROUTE"] = "1"
+                    env["PX_VOICE_URGENT"] = "1"
                     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                                    capture_output=True, check=False, timeout=20)
             else:

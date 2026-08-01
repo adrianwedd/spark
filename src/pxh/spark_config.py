@@ -76,6 +76,7 @@ SPEAKER_ROOMS = {                       # keys MUST match HA area names, lowerca
 }
 SPEAKER_DEFAULT_ROOM = "office"
 SPEAKER_STICKY_S = 1800     # last-heard older than this = Adrian probably moved; stale-as-absent
+SPEAKER_ROUTE_TIMEOUT_S = 90   # tool-voice cap on one announce attempt (cold synth ~33s + cast + restore sleep); revisit after P3
 HA_BASE_URL              = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")  # single PX_HA_HOST source of truth for the Pi→HA host (mind.HA_HOST aliases this). Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
 
 # Night silence bounds (Hobart time), applied via ZoneInfo("Australia/Hobart").

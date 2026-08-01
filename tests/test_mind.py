@@ -1040,3 +1040,51 @@ def test_expression_announce_empty_text_not_charged(monkeypatch):
     _quiet_daytime(monkeypatch)
     aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
     assert mind.expression({"action": "announce", "thought": ""}, dry=True, awareness=aw) is False
+
+
+# ---------------------------------------------------------------------------
+# Speaker-routing timeout/urgent wiring (Task 6, nest-speaker-routing plan)
+# ---------------------------------------------------------------------------
+
+def test_run_voice_default_timeout_covers_route_attempt():
+    """The greet/comment/weather path is where routing SHOULD happen — its
+    default timeout must exceed SPEAKER_ROUTE_TIMEOUT_S (a 30s cap would kill
+    a routed cast mid-synth)."""
+    from pxh import spark_config
+    default_timeout = inspect.signature(mind._run_voice).parameters["timeout"].default
+    assert default_timeout >= spark_config.SPEAKER_ROUTE_TIMEOUT_S
+    assert default_timeout == spark_config.SPEAKER_ROUTE_TIMEOUT_S + 15
+
+
+def test_battery_warn_env_carries_no_route_and_urgent(monkeypatch):
+    """Battery warnings must not spend 90s casting to a Nest, and must keep
+    speaking onboard at night — both flags are required."""
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "_play_alarm_beeps", lambda *a, **k: None)
+    captured = {}
+
+    def _fake_run(cmd, env=None, **kw):
+        captured["env"] = env
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(mind.subprocess, "run", _fake_run)
+    mind.battery_warn_comment(15, dry=False)
+    assert captured["env"]["PX_VOICE_NO_ROUTE"] == "1"
+    assert captured["env"]["PX_VOICE_URGENT"] == "1"
+
+
+def test_battery_emergency_env_carries_no_route_and_urgent(monkeypatch):
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "read_battery", lambda: None)
+    monkeypatch.setattr(mind, "_play_alarm_beeps", lambda *a, **k: None)
+    captured = {}
+
+    def _fake_run(cmd, env=None, **kw):
+        if env is not None:
+            captured["env"] = env
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(mind.subprocess, "run", _fake_run)
+    mind.battery_emergency_shutdown(5, dry=True)
+    assert captured["env"]["PX_VOICE_NO_ROUTE"] == "1"
+    assert captured["env"]["PX_VOICE_URGENT"] == "1"
