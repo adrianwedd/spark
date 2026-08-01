@@ -146,6 +146,35 @@ def log(msg: str) -> None:
         pass
 
 
+def enable_speaker_amp(timeout_s: float = 3.0) -> None:
+    """Enable the MAX98357A amp (GPIO 20) so aplay output is audible.
+
+    robot_hat lives in system site-packages, not the venv, so the direct
+    import only succeeds under /usr/bin/python3 — ModuleNotFoundError is the
+    expected path here, not a failure worth logging. Fall back to a system
+    python subprocess; best-effort either way.
+    """
+    try:
+        from robot_hat import enable_speaker
+        enable_speaker()
+        return
+    except ModuleNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"enable_speaker (direct) failed: {exc}")
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-c",
+             "from robot_hat import enable_speaker; enable_speaker()"],
+            capture_output=True, timeout=timeout_s,
+        )
+        if proc.returncode != 0:
+            err = proc.stderr.decode(errors="replace").strip().splitlines()
+            log(f"enable_speaker (subprocess) failed: {err[-1] if err else 'unknown'}")
+    except Exception as exc:
+        log(f"enable_speaker (subprocess) failed: {exc}")
+
+
 def rms(data: bytes) -> float:
     """Compute RMS amplitude of 16-bit PCM chunk."""
     count = len(data) // 2
@@ -192,18 +221,7 @@ def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000
     Segments are separated by gap_s seconds of silence.
     10ms linear fade-in/out on each segment to prevent clicks.
     """
-    try:
-        from robot_hat import enable_speaker
-        enable_speaker()
-    except Exception:
-        try:
-            subprocess.run(
-                ["/usr/bin/python3", "-c",
-                 "from robot_hat import enable_speaker; enable_speaker()"],
-                capture_output=True, timeout=3,
-            )
-        except Exception:
-            pass  # amp enable is best-effort; audio may still work via PulseAudio
+    enable_speaker_amp()
     try:
         import math, wave as wv, tempfile
         all_samples: list[int] = []
@@ -1133,18 +1151,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                 if any(p in text for p in all_wake_phrases if p != "[unk]") and len(text.strip().split()) >= 2:
                     log(f"wake word detected: {text!r}")
                     # Pre-enable speaker amp so it's warm before chime audio arrives
-                    try:
-                        from robot_hat import enable_speaker
-                        enable_speaker()
-                    except Exception:
-                        try:
-                            subprocess.run(
-                                ["/usr/bin/python3", "-c",
-                                 "from robot_hat import enable_speaker; enable_speaker()"],
-                                capture_output=True, timeout=3,
-                            )
-                        except Exception:
-                            pass
+                    enable_speaker_amp()
                     # Chime in background while we start recording
                     threading.Thread(target=play_chime, args=(args.aplay_device,), daemon=True).start()
                     # Periodic heartbeat: soft tick every 5s so user knows we're listening/thinking
@@ -1276,20 +1283,8 @@ def main(argv) -> int:
     log(f"starting pid={os.getpid()} dry={args.dry_run}")
 
     # Enable speaker amp once at startup — GPIO 20 stays high for the process lifetime.
-    # robot_hat is in system site-packages (not venv), so use system python fallback.
-    try:
-        from robot_hat import enable_speaker
-        enable_speaker()
-    except Exception as exc:
-        log(f"enable_speaker (direct) failed: {exc}")
-        try:
-            subprocess.run(
-                ["/usr/bin/python3", "-c",
-                 "from robot_hat import enable_speaker; enable_speaker()"],
-                capture_output=True, timeout=3,
-            )
-        except Exception as exc2:
-            log(f"enable_speaker (subprocess) failed: {exc2}")
+    # Startup races other services for GPIO/I2C, so allow a longer subprocess timeout.
+    enable_speaker_amp(timeout_s=10.0)
     log(f"personas available: {', '.join(persona_names)} (say name after wake word)")
 
     def _shutdown(sig, _frame):

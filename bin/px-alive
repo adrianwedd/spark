@@ -346,14 +346,19 @@ def do_ease(from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration: 
 I2C_BACKOFF_S = 30     # seconds to wait after an I2C failure before retrying
 
 
+_face_detection_started = False   # camera_close() on a never-started camera re-raises the init error
+
+
 def start_face_detection(retries: int = 2) -> bool:
     """Start Vilib camera + face detection. Returns True if successful."""
+    global _face_detection_started
     for attempt in range(retries + 1):
         try:
             from vilib import Vilib
             Vilib.camera_start(vflip=False, hflip=False)
             Vilib.face_detect_switch(True)
             log("face detection started (Vilib)")
+            _face_detection_started = True
             return True
         except Exception as exc:
             log(f"face detection attempt {attempt+1} failed: {exc}")
@@ -370,12 +375,19 @@ def start_face_detection(retries: int = 2) -> bool:
 
 
 def stop_face_detection() -> None:
-    """Stop Vilib camera."""
+    """Stop Vilib camera. No-op when the camera never started (e.g. held by
+    px-frigate-stream's rpicam-vid) — closing then would re-raise the init
+    error and delay the SIGUSR1 GPIO yield."""
+    global _face_detection_started
+    if not _face_detection_started:
+        return
     try:
         from vilib import Vilib
         Vilib.camera_close()
     except Exception as exc:
         log(f"stop_face_detection cleanup failed: {exc}")
+    finally:
+        _face_detection_started = False
 
 
 def get_face() -> tuple[int, int] | None:
