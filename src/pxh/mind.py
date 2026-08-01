@@ -367,6 +367,13 @@ NIGHT_ALLOWED_ACTIONS = {"wait", "remember", "research", "compose",
                          "introspect", "self_debug",
                          "set_goal", "update_goal", "complete_goal"}
 
+# The expression cooldown is a SPEECH budget; these actions produce no audio,
+# so they neither wait for it nor charge it. Derived from the night-silence
+# set rather than hand-maintained: anything vetted as safe at 3am (no audio,
+# no motion) is by the same token not small talk worth throttling. Live case:
+# a salience-1.0 self_debug queued behind the 30-min cooldown at 13:29.
+SILENT_ACTIONS = NIGHT_ALLOWED_ACTIONS - {"wait"}
+
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
     "excited":       ( 0.8,  0.9),
@@ -2757,11 +2764,16 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
             f"You notice it the way a person notices a numb hand — not alarming, but wrong."
         )
 
-    # Always report system vitals as plain text so the LLM registers them
+    # Always report system vitals as plain text so the LLM registers them.
+    # No temperature numeral here: a bare "66°C" adjacent to household prose
+    # gets re-bound to the nearest concrete noun (live 2026-08-01: the office
+    # lamp "burning at 66°C", auto-remembered twice, publishable at that
+    # salience). The >=70/>=80 branches above phrase temperature as a bodily
+    # symptom explicitly bound to "CPU", which is the only safe shape for it.
     cpu_pct = sys_stats.get("cpu_pct")
     if cpu_pct is not None:
         context_parts.append(
-            f"Your system vitals: CPU {cpu_pct}%, RAM {ram_pct}%, temperature {cpu_temp}°C."
+            f"Your system vitals: CPU {cpu_pct}%, RAM {ram_pct}%."
         )
 
     # Obi's current mode
@@ -3731,12 +3743,18 @@ def _should_express(action: str, transitions: list, now: float,
                     last_greet_arrival_mono: float) -> bool:
     """Layer 3 cooldown gate.
 
+    Silent cognitive actions (SILENT_ACTIONS) bypass the gate entirely — the
+    budget throttles speech, and they make none. Their spend is guarded where
+    it exists (claude_session cooldowns/quotas for self_debug etc.).
+
     greet_arrival bypasses the global expression budget when an arrival
     transition is present this tick — an arrival is the one moment the
     30-minute budget must not silence SPARK. GREET_ARRIVAL_COOLDOWN_S keeps
     a flapping tracker from spamming greetings through the bypass, while
     still allowing separate people arriving minutes apart to each get one.
     """
+    if action in SILENT_ACTIONS:
+        return True
     if action == "greet_arrival" and any(
             t.split(":", 1)[0] == "person_arrived_home" for t in transitions):
         if (now - last_greet_arrival_mono) > GREET_ARRIVAL_COOLDOWN_S:
@@ -3878,7 +3896,10 @@ def mind_loop(args) -> None:
                 if _should_express(_action, transitions, now,
                                    last_expression_mono, last_greet_arrival_mono):
                     if expression(thought, args.dry_run, awareness=awareness):
-                        last_expression_mono = now
+                        # Silent actions don't charge the speech budget — a
+                        # remember or self_debug must not buy 30 min of silence.
+                        if _action not in SILENT_ACTIONS:
+                            last_expression_mono = now
                         if _action == "greet_arrival":
                             last_greet_arrival_mono = now
                 else:

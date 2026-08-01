@@ -377,6 +377,56 @@ def test_every_reroll_reason_has_a_hint():
     assert set(mind._REROLL_HINTS) >= {"empty", "similar", "no_json"}
 
 
+def _reflection_prompt(monkeypatch, awareness):
+    """Run reflection() against a stubbed LLM and return the prompt it was sent."""
+    prompts = []
+
+    def _call(context, system, persona=""):
+        prompts.append(context)
+        return {"response": json.dumps(_VALID), "backend": "ollama-m5"}
+
+    monkeypatch.setattr(mind, "call_llm", _call)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought", lambda t, persona="": None)
+    monkeypatch.setattr(mind, "auto_remember", lambda t, persona="": None)
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "_last_spoken_text", "", raising=False)
+    mind.reflection(awareness, dry=False)
+    return prompts[0]
+
+
+def test_vitals_line_carries_no_temperature_numeral(monkeypatch):
+    """The always-on vitals line must not hand the model a bare temperature.
+
+    Confabulation mechanism seen live 2026-08-01: 'temperature 66°C' lands
+    adjacent to 'Office light is on' in the joined prompt, and the model
+    re-binds the numeral to the lamp — then auto-remembers the false fact.
+    A quantity the model is never handed cannot be misattributed.
+    """
+    ctx = _reflection_prompt(monkeypatch, {
+        "persona": "",
+        "system": {"cpu_pct": 19, "ram_pct": 55, "cpu_temp_c": 66.4,
+                   "disk_pct": 55},
+    })
+    vitals = [l for l in ctx.splitlines() if "Your system vitals" in l]
+    assert vitals, "the vitals line itself must survive"
+    assert "°C" not in vitals[0]
+    assert "66" not in vitals[0]
+
+
+def test_temperature_symptom_branches_survive(monkeypatch):
+    """C1 drops only the unconditional numeral — the >=70/>=80 branches
+    phrase temperature as a bodily symptom bound to 'CPU' and stay."""
+    ctx = _reflection_prompt(monkeypatch, {
+        "persona": "",
+        "system": {"cpu_pct": 19, "ram_pct": 55, "cpu_temp_c": 84.0,
+                   "disk_pct": 55},
+    })
+    assert "YOUR CPU TEMPERATURE IS 84.0°C" in ctx
+
+
 def test_is_night_silence_uses_config_bounds():
     assert mind._is_night_silence(19) is True
     assert mind._is_night_silence(23) is True
@@ -671,6 +721,33 @@ def test_mind_loop_uses_should_express():
     src = inspect.getsource(mind.mind_loop)
     assert "_should_express(" in src
     assert "last_greet_arrival_mono" in src
+
+
+def test_silent_actions_bypass_expression_cooldown():
+    """The expression budget is a SPEECH budget. Silent cognitive actions
+    (the night-allowed set) produce no audio, so queueing them behind small
+    talk gates nothing worth gating — live case: a salience-1.0 self_debug
+    suppressed by the 30-min cooldown at 13:29."""
+    C = mind.EXPRESSION_COOLDOWN_S
+    for action in ("self_debug", "remember", "introspect", "set_goal"):
+        assert mind._should_express(action, [], now=C - 1.0,
+                                    last_expression_mono=0.0,
+                                    last_greet_arrival_mono=0.0) is True, action
+    # spoken actions still wait out the cooldown
+    assert mind._should_express("comment", [], now=C - 1.0,
+                                last_expression_mono=0.0,
+                                last_greet_arrival_mono=0.0) is False
+
+
+def test_silent_actions_is_night_set_minus_wait():
+    """One vetted no-audio-no-motion list, not two drifting ones."""
+    assert mind.SILENT_ACTIONS == mind.NIGHT_ALLOWED_ACTIONS - {"wait"}
+
+
+def test_silent_actions_do_not_charge_the_speech_budget():
+    """A silent dispatch must not push back the next spoken expression."""
+    src = inspect.getsource(mind.mind_loop)
+    assert "SILENT_ACTIONS" in src
 
 
 # ---------------------------------------------------------------------------
