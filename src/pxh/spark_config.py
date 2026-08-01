@@ -47,13 +47,13 @@ OBI_CHAT_MAX_BACKOFF_S  = 14400  # 4 h cap
 OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
 
 # --- Announce pipeline (data-voice over Google Nest) ----------------------
-ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
+ANNOUNCE_ENABLED         = True   # G1+G2 passed 2026-08-01: relay live on M5, WAV plays natively on Mini + Hub Max (needed UniFi ZBF policies 10002/10003 — IoT VLAN 20 → .100:7862 and .200:8123)
 ANNOUNCE_RELAY_URL       = "http://192.168.0.100:7862"   # IP, not M5.local (Nest mDNS) — MUST be a DHCP reservation for M5; if M5's lease changes, the entire announce pipeline breaks silently
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
-ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
-ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.nest_mini",
-                            "media_player.googlehome1094"]
+ANNOUNCE_DEFAULT_TARGETS = ["media_player.googlehome1094"]   # Office Mini — Adrian's default room (both it and nest_hub_max cast-verified 2026-08-01)
+ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.googlehome1094",
+                            "media_player.laura_s_room_speaker"]  # nest_mini dropped: entity is dead in HA
 ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/wav")
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
