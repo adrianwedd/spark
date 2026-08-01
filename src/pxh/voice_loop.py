@@ -878,6 +878,14 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
     # else: leave PX_DRY as inherited from the operator's environment
     for key, value in env_overrides.items():
         env[key] = value
+    # Everything launched via execute_tool is interactive — the human is at
+    # the robot, so onboard is the right speaker regardless of which tool
+    # this is or how it reaches tool-voice (directly, like the weather
+    # summary below, or transitively via another tool's own subprocess
+    # call). A 90s Nest route attempt here would also blow the voice-loop
+    # watchdog's 30s stale-heartbeat SIGTERM. Set unconditionally, once,
+    # before any per-tool overrides so no tool can be routed by mistake.
+    env["PX_VOICE_NO_ROUTE"] = "1"
     # Inject persona voice settings if a persona is active in session
     session_persona = load_session().get("persona") or ""
     if session_persona and session_persona in PERSONA_VOICE_ENV:

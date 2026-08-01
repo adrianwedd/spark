@@ -112,3 +112,51 @@ def test_validate_announce_single_target_from_allowed_list():
     _, env = validate_action({"tool": "tool_announce", "params": {
         "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.googlehome1094"]}})
     assert env["PX_ANNOUNCE_TARGETS"] == "media_player.nest_hub_max"
+
+
+# ---------------------------------------------------------------------------
+# execute_tool: PX_VOICE_NO_ROUTE is an execute_tool-level invariant (Task 6
+# review fix) — every tool launched by the voice loop is interactive (human
+# at the robot), so nothing it runs, directly or transitively, may route
+# speech to a Nest. Covers both the weather-summary tool_voice call that
+# bypasses validate_action (voice_loop.py ~1056) and secondary tools
+# (tool-checkin, tool-timer, tool-story, ...) that shell to tool-voice on
+# their own with os.environ.copy().
+# ---------------------------------------------------------------------------
+
+def test_execute_tool_always_sets_no_route(monkeypatch):
+    import subprocess as _subprocess
+    from pxh import voice_loop as _vl
+
+    captured = {}
+
+    def _fake_run(cmd, capture_output, text, check, env, timeout):
+        captured["env"] = env
+        return _subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(_vl.subprocess, "run", _fake_run)
+    monkeypatch.setattr(_vl, "load_session", lambda: {"persona": "spark"})
+    monkeypatch.setattr(_vl, "_last_tool_execution", 0.0)
+
+    _vl.execute_tool("tool_voice", {"PX_TEXT": "hi"}, dry_mode=True)
+    assert captured["env"]["PX_VOICE_NO_ROUTE"] == "1"
+
+
+def test_execute_tool_no_route_survives_persona_injection(monkeypatch):
+    """A persona-active session (PERSONA_VOICE_ENV injection happens after
+    the NO_ROUTE write) must not clobber PX_VOICE_NO_ROUTE back off."""
+    import subprocess as _subprocess
+    from pxh import voice_loop as _vl
+
+    captured = {}
+
+    def _fake_run(cmd, capture_output, text, check, env, timeout):
+        captured["env"] = env
+        return _subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(_vl.subprocess, "run", _fake_run)
+    monkeypatch.setattr(_vl, "load_session", lambda: {"persona": "gremlin"})
+    monkeypatch.setattr(_vl, "_last_tool_execution", 0.0)
+
+    _vl.execute_tool("tool_voice", {"PX_TEXT": "hi"}, dry_mode=True)
+    assert captured["env"]["PX_VOICE_NO_ROUTE"] == "1"

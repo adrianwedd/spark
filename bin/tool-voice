@@ -68,9 +68,17 @@ def main() -> int:
         return 1
 
     # If a persona is active, reroute through the persona voice wrapper
-    # which rephrases text via Ollama before speaking
+    # which rephrases text via Ollama before speaking. "spark" is never in
+    # the wrapper's REPHRASE_PROMPTS (it's GREMLIN/VIXEN only), so spark
+    # speech must always take the direct path below — that's where the
+    # routing/night-suppression logic lives, and a spark call that took the
+    # wrapper detour could blow the outer 45s subprocess timeout once the
+    # inner call may spend up to 90s routing (uncaught TimeoutExpired kills
+    # tool-voice with no JSON emitted), and would also discard the inner
+    # payload's route/status (a night-suppressed inner call would be
+    # reported as spoken).
     persona = os.environ.get("PX_PERSONA", "")
-    if persona and not os.environ.get("_PX_VOICE_PERSONA_DONE"):
+    if persona and persona != "spark" and not os.environ.get("_PX_VOICE_PERSONA_DONE"):
         persona_wrapper = Path(os.environ.get("PROJECT_ROOT", ".")) / "bin" / "tool-voice-persona"
         if persona_wrapper.exists():
             env = os.environ.copy()
@@ -257,7 +265,7 @@ def main() -> int:
                         payload["tts_aplay_error"] = play_res.stderr[-512:].decode("latin1", errors="ignore")
                         # Don't set status=error — fall through to espeak fallback
             except _FileLockTimeout:
-                payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
+                payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text, "route": "onboard"}
                 log_event("voice", payload)
                 print(json.dumps(payload))
                 return 1
@@ -328,12 +336,12 @@ def main() -> int:
                     if result.returncode != 0:
                         payload["status"] = "error"
         except _FileLockTimeout:
-            payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
+            payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text, "route": "onboard"}
             log_event("voice", payload)
             print(json.dumps(payload))
             return 1
         except Exception as exc:
-            payload = {"status": "error", "error": f"playback error: {exc}", "dry": dry_mode, "text": text}
+            payload = {"status": "error", "error": f"playback error: {exc}", "dry": dry_mode, "text": text, "route": "onboard"}
             log_event("voice", payload)
             print(json.dumps(payload))
             return 1
