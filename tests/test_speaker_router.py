@@ -108,7 +108,7 @@ def test_resolve_speaker_end_to_end(tmp_path, monkeypatch):
     p = tmp_path / "last_heard.json"
     now_iso = __import__("datetime").datetime.now(
         __import__("datetime").timezone.utc).isoformat()
-    p.write_text(json.dumps({"room": "living", "ts": now_iso}))
+    p.write_text(json.dumps({"room": "living room", "ts": now_iso}))
     monkeypatch.setattr(sr, "LAST_HEARD_PATH", p)
     monkeypatch.setattr(sr, "fetch_available", lambda *a, **k: None)  # HA unreachable path
     assert sr.resolve_speaker() == "media_player.nest_hub_max"

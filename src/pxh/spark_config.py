@@ -72,7 +72,7 @@ SPEAKER_ROOMS = {                       # keys MUST match HA area names, lowerca
                                         # Multi-word HA areas keep their spaces: "Living Room" → key "living room".
     "office": "media_player.googlehome1094",        # "Office Mini"
     "shed":   "media_player.laura_s_room_speaker",  # "Shed Mini"
-    "living": "media_player.nest_hub_max",
+    "living room": "media_player.nest_hub_max",   # HA area is "Living Room" — multi-word keys keep the space
 }
 SPEAKER_DEFAULT_ROOM = "office"
 SPEAKER_STICKY_S = 1800     # last-heard older than this = Adrian probably moved; stale-as-absent
