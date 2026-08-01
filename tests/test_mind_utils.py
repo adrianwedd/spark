@@ -1660,3 +1660,159 @@ def test_awareness_reads_observations_file(tmp_path, monkeypatch):
         "\n".join(_json.dumps({"type": "nav", "action": "forward"}) for _ in range(100)) + "\n")
     recent = mind._recent_exploration_observations()   # extracted helper, see Step 3
     assert recent and recent[0]["landmark"] == "bookshelf corner"
+
+
+# ---------------------------------------------------------------------------
+# Find Hub feed health (surfaces silent auth breakage — 2026-08-01)
+# ---------------------------------------------------------------------------
+
+
+def _write_findmyhub(tmp_path, monkeypatch, trackers, ts=None):
+    from pxh import mind
+    path = tmp_path / "findmyhub.json"
+    path.write_text(_json.dumps({"ts": ts or _time.time(), "trackers": trackers}))
+    monkeypatch.setattr(mind, "FINDMYHUB_FILE", path)
+    return path
+
+
+def test_findmyhub_health_ok_on_valid_trackers(tmp_path, monkeypatch):
+    from pxh import health, mind
+    now = _time.time()
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"lat": -43.13567, "lon": 147.11840, "accuracy_m": 10, "ts": now},
+    })
+    result = mind._read_findmyhub()
+    assert "obi" in result
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "ok"
+
+
+def test_findmyhub_health_fails_when_all_trackers_error(tmp_path, monkeypatch):
+    """The BadAuthentication signature: fresh file, valid JSON, every tracker
+    carries an error key. Must surface as a health failure, not silence."""
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"error": "'Auth'"},
+        "adrian": {"error": "'Auth'"},
+    })
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "degraded"
+    assert "Auth" in rec["last_error"]
+    # Three consecutive bad reads → failing.
+    mind._read_findmyhub()
+    mind._read_findmyhub()
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "failing"
+
+
+def test_findmyhub_health_recovers_after_auth_fixed(tmp_path, monkeypatch):
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {"obi": {"error": "'Auth'"}})
+    mind._read_findmyhub()
+    now = _time.time()
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"lat": -43.13567, "lon": 147.11840, "ts": now},
+    })
+    mind._read_findmyhub()
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "ok"
+
+
+def test_findmyhub_health_semantic_only_is_ok(tmp_path, monkeypatch):
+    """Semantic (address-only) locations are a healthy feed, not a failure."""
+    from pxh import health, mind
+    now = _time.time()
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"semantic": True, "address": "school", "ts": now},
+    })
+    mind._read_findmyhub()
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "ok"
+
+
+def test_findmyhub_health_empty_trackers_is_failure(tmp_path, monkeypatch):
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {})
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "degraded"
+
+
+def test_findmyhub_health_stale_file_writes_nothing(tmp_path, monkeypatch):
+    """A stale file means the *push* stopped — the record must be allowed to
+    age into 'stale' on its own, not be refreshed as success or failure."""
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {"obi": {"error": "x"}},
+                     ts=_time.time() - 10_000)
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "missing"  # nothing ever recorded
+
+
+def test_findmyhub_health_missing_file_writes_nothing(tmp_path, monkeypatch):
+    from pxh import health, mind
+    monkeypatch.setattr(mind, "FINDMYHUB_FILE", tmp_path / "nope.json")
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "missing"
+
+
+def test_findmyhub_health_corrupt_json_is_failure(tmp_path, monkeypatch):
+    from pxh import health, mind
+    path = tmp_path / "findmyhub.json"
+    path.write_text("{not json")
+    monkeypatch.setattr(mind, "FINDMYHUB_FILE", path)
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "degraded"
+    assert "read error" in rec["last_error"]
+
+
+# ---------------------------------------------------------------------------
+# Frigate last_person_ts carry-through (greet recency, 2026-08-01)
+# ---------------------------------------------------------------------------
+
+
+def test_frigate_snapshot_carries_last_person_ts(monkeypatch, tmp_path):
+    from pxh import mind
+    monkeypatch.setattr(mind, "FRIGATE_FILE", tmp_path / "frigate_presence.json")
+    mind._last_person_seen.clear()
+    mind._host_failure_until.clear()
+    events = [_make_frigate_event(score=0.8, camera="picar_x")]
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn(events)):
+        r1 = _fetch_frigate_presence(dry=False)
+    ts1 = r1["cameras"]["picar_x"]["last_person_ts"]
+    assert ts1
+    # Person goes still → no events — the sighting timestamp is carried forward.
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
+        r2 = _fetch_frigate_presence(dry=False)
+    assert r2["cameras"]["picar_x"]["person"] is False
+    assert r2["cameras"]["picar_x"]["last_person_ts"] == ts1
+
+
+def test_frigate_last_person_ts_absent_when_never_seen(monkeypatch, tmp_path):
+    from pxh import mind
+    monkeypatch.setattr(mind, "FRIGATE_FILE", tmp_path / "frigate_presence.json")
+    mind._last_person_seen.clear()
+    mind._host_failure_until.clear()
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
+        r = _fetch_frigate_presence(dry=False)
+    assert "last_person_ts" not in r["cameras"]["picar_x"]
+
+
+def test_frigate_last_person_ts_seeds_from_snapshot_file(monkeypatch, tmp_path):
+    """px-mind restarts must not forget a recent sighting: the in-memory cache
+    seeds from the previous snapshot file on first fetch."""
+    from pxh import mind
+    snap = tmp_path / "frigate_presence.json"
+    snap.write_text(_json.dumps({
+        "cameras": {"picar_x": {"person": True, "last_person_ts": "2026-08-01T03:00:00+00:00"}},
+    }))
+    monkeypatch.setattr(mind, "FRIGATE_FILE", snap)
+    mind._last_person_seen.clear()
+    monkeypatch.setattr(mind, "_last_person_seen_seeded", False)
+    mind._host_failure_until.clear()
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
+        r = _fetch_frigate_presence(dry=False)
+    assert r["cameras"]["picar_x"]["last_person_ts"] == "2026-08-01T03:00:00+00:00"

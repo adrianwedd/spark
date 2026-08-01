@@ -91,6 +91,7 @@ try:
     from pxh.spark_config import (
         GREET_CONFIRM_CAMERAS,
         GREET_FRIGATE_STALE_S,
+        GREET_PERSON_RECENCY_S,
         PROXIMITY_GREETINGS,
     )
 except Exception:  # noqa: BLE001 — deliberately broad; see below
@@ -103,6 +104,7 @@ except Exception:  # noqa: BLE001 — deliberately broad; see below
     PROXIMITY_GREETINGS = ["Hey. I'm here.", "Hello there.", "Hi. Good to see you.", "Hey."]
     GREET_CONFIRM_CAMERAS = ["picar_x", "picamera"]
     GREET_FRIGATE_STALE_S = 120
+    GREET_PERSON_RECENCY_S = 300
 
 MOOD_BEHAVIOR = {
     "excited":       {"gaze_min": 5,  "gaze_max": 12, "tilt_bias": 10},
@@ -229,30 +231,76 @@ def _person_confirmed(presence: dict | None, now_utc=None) -> bool:
     driveway says nothing about what is standing in front of the robot.
 
     Treated as a veto rather than a trigger, so a false negative costs a missed
-    greeting, not a wrong one. That matters because the Frigate snapshot is
-    built from a 90 s *event* window — a motionless person can age out of it
-    while still present. The greeting is provoked by an approach, though, and
-    approaching is motion, so the person who triggered it has almost always
-    just generated a fresh event.
+    greeting, not a wrong one. Two signals confirm:
+
+    1. Live: a confirm camera reports a person and the snapshot is within
+       GREET_FRIGATE_STALE_S.
+    2. Recent: cameras.*.last_person_ts (carried by px-mind across event
+       windows) is within GREET_PERSON_RECENCY_S. Covers the person who
+       approached, sat down, and aged out of Frigate's 90 s event window
+       while still there — the sonar approach supplies the "someone is here
+       now" half, the camera only vouches it's a human, not a chair leg.
+       The sighting timestamp is absolute, so it stands even when the
+       snapshot itself has gone stale.
     """
     if not isinstance(presence, dict):
         return False
-    ts = presence.get("ts")
-    if not ts:
-        return False
-    try:
-        now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
-        if (now_utc - dt.datetime.fromisoformat(ts)).total_seconds() > GREET_FRIGATE_STALE_S:
-            return False
-    except (TypeError, ValueError):
-        return False
+    now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
     cameras = presence.get("cameras")
     if not isinstance(cameras, dict):
         return False
-    return any(
+    ts = presence.get("ts")
+    try:
+        fresh = bool(ts) and (
+            now_utc - dt.datetime.fromisoformat(ts)
+        ).total_seconds() <= GREET_FRIGATE_STALE_S
+    except (TypeError, ValueError):
+        fresh = False
+    if fresh and any(
         isinstance(cameras.get(cam), dict) and cameras[cam].get("person")
         for cam in GREET_CONFIRM_CAMERAS
-    )
+    ):
+        return True
+    for cam in GREET_CONFIRM_CAMERAS:
+        info = cameras.get(cam)
+        if not isinstance(info, dict):
+            continue
+        last_seen = info.get("last_person_ts")
+        if not last_seen:
+            continue
+        try:
+            if (now_utc - dt.datetime.fromisoformat(last_seen)).total_seconds() <= GREET_PERSON_RECENCY_S:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _greet_suppress_detail(presence: dict | None, now_utc=None) -> str:
+    """One-line WHY for a suppressed greeting — snapshot age plus the last
+    person sighting per confirm camera. Today's log line ("no camera
+    confirmation") forced a manual dig through px-mind logs to tell a stale
+    snapshot from an empty room."""
+    if not isinstance(presence, dict):
+        return "no presence snapshot"
+    now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
+    bits = []
+    try:
+        age = (now_utc - dt.datetime.fromisoformat(presence["ts"])).total_seconds()
+        bits.append(f"snapshot {age:.0f}s old")
+    except (KeyError, TypeError, ValueError):
+        bits.append("snapshot ts invalid")
+    cameras = presence.get("cameras")
+    cameras = cameras if isinstance(cameras, dict) else {}
+    for cam in GREET_CONFIRM_CAMERAS:
+        info = cameras.get(cam)
+        last_seen = info.get("last_person_ts") if isinstance(info, dict) else None
+        try:
+            ago = (now_utc - dt.datetime.fromisoformat(last_seen)).total_seconds()
+            bits.append(f"{cam}: last person {ago:.0f}s ago")
+        except (TypeError, ValueError):
+            bits.append(f"{cam}: never")
+    return ", ".join(bits)
 
 
 def spark_greet(dry: bool) -> None:
@@ -437,7 +485,10 @@ def idle_loop(args) -> None:
     prox_last_react: float = 0.0     # monotonic time of last proximity react (cooldown guard)
     spark_last_greet: float = 0.0    # monotonic time of last SPARK greeting
     i2c_ok_after: float = 0.0  # monotonic time after which I2C retries are allowed
-    face_tracking = not args.no_face
+    # Opt-in since px-frigate-stream holds the camera permanently: the old
+    # default-on start burned ~10s of retries and logged failures on every
+    # boot for a capability that cannot work while Frigate streams.
+    face_tracking = args.face and not args.no_face
     face_active = False
     face_last_seen: float = 0.0  # monotonic time of last face detection
 
@@ -582,7 +633,7 @@ def idle_loop(args) -> None:
                                     spark_greet(args.dry_run)
                                     spark_last_greet = now
                                 else:
-                                    log("greet suppressed: no camera confirmation of a person")
+                                    log(f"greet suppressed: no camera confirmation of a person ({_greet_suppress_detail(_fp)})")
                     else:
                         prox_near_since = None
                     prox_was_close = is_close
@@ -693,8 +744,11 @@ def main(argv) -> int:
                         help="Proximity threshold in cm to trigger reaction")
     parser.add_argument("--no-prox",    action="store_true",
                         help="Disable proximity sensing")
+    parser.add_argument("--face",       action="store_true",
+                        help="Enable Vilib face tracking (needs exclusive camera — "
+                             "stop px-frigate-stream first, it holds it permanently)")
     parser.add_argument("--no-face",    action="store_true",
-                        help="Disable camera face tracking")
+                        help="Deprecated no-op: face tracking is opt-in via --face")
     parser.add_argument("--dry-run",    action="store_true",
                         help="Log planned actions without moving servos")
     args = parser.parse_args(argv)
@@ -781,8 +835,7 @@ def main(argv) -> int:
         log(f"fatal: {exc}")
         return 1
     finally:
-        if not args.no_face:
-            stop_face_detection()
+        stop_face_detection()  # no-op unless the camera actually started
         _safe_unlink_pid()
         log("stopped")
     return 0

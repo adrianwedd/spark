@@ -40,6 +40,14 @@ GREET_CONFIRM_CAMERAS = ["picar_x", "picamera"]
 # just means a slightly wrong angle, whereas here it means talking to a room
 # someone left minutes ago.
 GREET_FRIGATE_STALE_S = 120
+# A person who approached and then stood still ages out of Frigate's 90 s
+# event window while still present (seen 2026-08-01: sonar 13 cm, greet
+# suppressed, person at the desk the whole time). px-mind carries the last
+# person sighting per camera as cameras.*.last_person_ts; a sighting within
+# this window confirms the greet — the sonar approach is the "someone is here
+# now" evidence, the camera only vouches that a human (not a chair leg) has
+# been around recently.
+GREET_PERSON_RECENCY_S = 300
 
 # Obi-chat backoff: SPARK-initiated messages to Obi via the dashboard
 OBI_CHAT_BASE_BACKOFF_S = 600    # 10 min before a nudge when awaiting reply

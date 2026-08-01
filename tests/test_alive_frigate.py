@@ -163,3 +163,69 @@ def test_alive_fallbacks_match_spark_config():
     assert _ALIVE["PROXIMITY_GREETINGS"] == spark_config.PROXIMITY_GREETINGS
     assert GREET_CONFIRM_CAMERAS == spark_config.GREET_CONFIRM_CAMERAS
     assert GREET_FRIGATE_STALE_S == spark_config.GREET_FRIGATE_STALE_S
+
+
+# ---------------------------------------------------------------------------
+# Recency-based confirmation (2026-08-01): a person who approached and then
+# stood still ages out of Frigate's 90s event window while still present.
+# px-mind now carries cameras.*.last_person_ts; a sighting within
+# GREET_PERSON_RECENCY_S confirms the greet even when person=False right now.
+# ---------------------------------------------------------------------------
+
+GREET_PERSON_RECENCY_S = _ALIVE["GREET_PERSON_RECENCY_S"]
+
+
+def _iso_ago(seconds):
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)).isoformat()
+
+
+def test_greet_confirmed_by_recent_sighting():
+    """Person seen 60s ago, no live event now → still confirmed."""
+    assert _person_confirmed(_presence({
+        "picar_x": {"person": False, "last_person_ts": _iso_ago(60)},
+    })) is True
+
+
+def test_greet_recency_expired_not_confirmed():
+    assert _person_confirmed(_presence({
+        "picar_x": {"person": False,
+                    "last_person_ts": _iso_ago(GREET_PERSON_RECENCY_S + 30)},
+    })) is False
+
+
+def test_greet_recency_survives_stale_snapshot():
+    """last_person_ts carries its own timestamp — a snapshot past the live
+    staleness bound can still confirm via a recent absolute sighting."""
+    assert _person_confirmed(_presence(
+        {"picar_x": {"person": True, "last_person_ts": _iso_ago(100)}},
+        age_s=GREET_FRIGATE_STALE_S + 60,
+    )) is True
+
+
+def test_greet_recency_outdoor_camera_does_not_confirm():
+    assert _person_confirmed(_presence({
+        "driveway_camera": {"person": False, "last_person_ts": _iso_ago(10)},
+    })) is False
+
+
+def test_greet_recency_malformed_ts_not_confirmed():
+    assert _person_confirmed(_presence({
+        "picar_x": {"person": False, "last_person_ts": "garbage"},
+    })) is False
+
+
+def test_greet_recency_bound_pinned_to_spark_config():
+    from pxh import spark_config
+    assert GREET_PERSON_RECENCY_S == spark_config.GREET_PERSON_RECENCY_S
+
+
+def test_greet_suppress_detail_is_informative():
+    """The suppression log line must say WHY: snapshot age + last sightings."""
+    detail = _ALIVE["_greet_suppress_detail"](_presence({
+        "picar_x": {"person": False, "last_person_ts": _iso_ago(400)},
+        "picamera": {"person": False},
+    }, age_s=30))
+    assert "snapshot 30s" in detail
+    assert "picar_x" in detail and "400s" in detail
+    assert "picamera: never" in detail
+    assert _ALIVE["_greet_suppress_detail"](None) == "no presence snapshot"

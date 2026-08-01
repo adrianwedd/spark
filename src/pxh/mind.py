@@ -596,6 +596,30 @@ def read_sonar(dry: bool) -> float | None:
     return None
 
 
+# Last person sighting per camera (UTC ISO), carried into the frigate
+# snapshot as cameras.*.last_person_ts so px-alive's greet confirmation can
+# accept "seen recently" when a still person has aged out of the 90 s event
+# window. Seeded once per process from the previous snapshot file so a
+# px-mind restart doesn't forget a sighting.
+_last_person_seen: dict[str, str] = {}
+_last_person_seen_seeded = False
+
+
+def _seed_last_person_seen() -> None:
+    global _last_person_seen_seeded
+    if _last_person_seen_seeded:
+        return
+    _last_person_seen_seeded = True
+    try:
+        data = json.loads(FRIGATE_FILE.read_text(encoding="utf-8"))
+        for cam, info in (data.get("cameras") or {}).items():
+            ts = info.get("last_person_ts") if isinstance(info, dict) else None
+            if ts:
+                _last_person_seen.setdefault(cam, ts)
+    except Exception:
+        pass
+
+
 def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     """Query Frigate for recent detections across ALL configured cameras.
 
@@ -700,6 +724,15 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
         }
         if has_person:
             rooms_with_people.append(room)
+
+    _seed_last_person_seen()
+    now_iso = utc_timestamp()
+    for cam_name, info in cameras.items():
+        if info["person"]:
+            _last_person_seen[cam_name] = now_iso
+        last_seen = _last_person_seen.get(cam_name)
+        if last_seen:
+            info["last_person_ts"] = last_seen
 
     # ── Global aggregation (backward compat) ──
     all_by_label: dict = {}
@@ -849,6 +882,37 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
         return None
 
 
+def _record_findmyhub_health(trackers: dict, enriched: dict) -> None:
+    """Record feed health for a *fresh* findmyhub read.
+
+    The dangerous failure mode is silent: a fresh file of valid JSON whose
+    trackers all carry error payloads (seen 2026-08-01 when Google revoked
+    the cached AAS token — every tracker read {"error": "'Auth'"} for a day
+    with nothing flagging it). That shape records a failure; a mix of good
+    and errored trackers is still a working feed. Stale/missing files are
+    deliberately NOT recorded here — the health record ages into "stale" on
+    its own, which correctly points at the push pipeline rather than the feed.
+    """
+    errored = [
+        name for name, raw in trackers.items()
+        if isinstance(raw, dict) and "error" in raw
+    ]
+    if trackers and len(errored) < len(trackers):
+        health_mod.record_success(
+            "findmyhub",
+            detail={"trackers": len(trackers), "errored": len(errored),
+                    "enriched": len(enriched)},
+            min_interval_s=240,
+        )
+    elif trackers:
+        sample = trackers[errored[0]].get("error", "")
+        health_mod.record_failure(
+            "findmyhub", f"all {len(errored)} trackers error: {sample}"
+        )
+    else:
+        health_mod.record_failure("findmyhub", "feed has no trackers")
+
+
 def _read_findmyhub() -> dict:
     """Read state/findmyhub.json (written by M5.local cron via GoogleFindMyTools).
 
@@ -865,13 +929,16 @@ def _read_findmyhub() -> dict:
             log(f"findmyhub: file stale ({file_age_s:.0f}s old), ignoring")
             return {}
         result = {}
-        for name, raw in data.get("trackers", {}).items():
+        trackers = data.get("trackers", {})
+        for name, raw in trackers.items():
             enriched = _enrich_tracker(raw, name)
             if enriched:
                 result[name] = enriched
+        _record_findmyhub_health(trackers, result)
         return result
     except Exception as exc:
         log(f"findmyhub: read error: {exc}")
+        health_mod.record_failure("findmyhub", f"read error: {exc}")
         return {}
 
 
