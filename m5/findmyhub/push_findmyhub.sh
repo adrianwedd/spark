@@ -18,7 +18,9 @@
 
 set -o pipefail
 
-PI=pi@192.168.0.27
+# eth0 reservation first, wlan0 reservation as fallback — the Pi may be on
+# either link (ethernet gets unplugged when the car roams).
+PI_ADDRS=(pi@192.168.0.27 pi@192.168.0.236)
 DEST=/home/pi/picar-x-hacking/state/findmyhub.json
 TOOLS_DIR="$HOME/GoogleFindMyTools"
 LOG="$TOOLS_DIR/push_findmyhub.log"
@@ -35,6 +37,11 @@ if ! printf '%s' "$out" | /usr/bin/python3 -c 'import json,sys; json.load(sys.st
     exit 1
 fi
 
-printf '%s' "$out" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$PI" \
-    "cat > $DEST.tmp && mv $DEST.tmp $DEST" \
-    || echo "$(date -Iseconds) push to Pi failed" >>"$LOG"
+for PI in "${PI_ADDRS[@]}"; do
+    if printf '%s' "$out" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$PI" \
+        "cat > $DEST.tmp && mv $DEST.tmp $DEST"; then
+        exit 0
+    fi
+done
+echo "$(date -Iseconds) push to Pi failed on all addresses" >>"$LOG"
+exit 1
