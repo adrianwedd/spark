@@ -1154,6 +1154,8 @@ import threading
 
 class _StubHandler(http.server.BaseHTTPRequestHandler):
     captured = []  # class-level capture: list of (method, path, body)
+    get_state = {"state": "idle"}  # configurable HA state response for GET /api/states/<entity>
+    announce_duration = 1.2  # configurable duration_s for the /announce response
 
     def log_message(self, *a):  # silence
         pass
@@ -1169,7 +1171,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         # HA state lookups: /api/states/<entity>
         _StubHandler.captured.append(("GET", self.path, None))
-        self._send(200, {"state": "idle"})
+        self._send(200, _StubHandler.get_state)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1177,8 +1179,9 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         _StubHandler.captured.append(("POST", self.path, body))
         if self.path.endswith("/announce"):
             self._send(200, {"audio_url": "http://192.168.0.100:7862/audio/abc123.wav",
-                             "voice": "data", "cached": False, "duration_s": 1.2})
-        else:  # HA play_media
+                             "voice": "data", "cached": False,
+                             "duration_s": _StubHandler.announce_duration})
+        else:  # HA play_media / volume_set / etc.
             self._send(200, [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])
 
 
@@ -1214,6 +1217,57 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     paths = [p for (_, p, _) in _StubHandler.captured]
     assert any(p.endswith("/announce") for p in paths)
     assert any("/api/services/media_player/play_media" in p for p in paths)
+
+
+def test_tool_announce_restores_volume_and_playback(isolated_project):
+    _StubHandler.captured = []
+    _StubHandler.get_state = {"state": "playing",
+                              "attributes": {"volume_level": 0.4, "app_name": "Spotify"}}
+    _StubHandler.announce_duration = 1.2
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_ANNOUNCE_TEXT": "Dinner", "PX_BYPASS_SUDO": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+        _StubHandler.get_state = {"state": "idle"}
+    assert payload["status"] == "ok"
+    posts = [(p, b) for (m, p, b) in _StubHandler.captured if m == "POST"]
+    vol = [b for (p, b) in posts if p.endswith("/media_player/volume_set")]
+    play = [b for (p, b) in posts if p.endswith("/media_player/media_play")]
+    assert vol and vol[0]["volume_level"] == 0.4
+    assert not play   # media_play would replay the announcement, never issue it
+
+
+def test_tool_announce_restores_volume_on_bad_duration(isolated_project):
+    _StubHandler.captured = []
+    _StubHandler.get_state = {"state": "playing",
+                              "attributes": {"volume_level": 0.6, "app_name": "Spotify"}}
+    _StubHandler.announce_duration = "garbage"
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_ANNOUNCE_TEXT": "Dinner", "PX_BYPASS_SUDO": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+        _StubHandler.get_state = {"state": "idle"}
+        _StubHandler.announce_duration = 1.2
+    assert payload["status"] == "ok"
+    posts = [(p, b) for (m, p, b) in _StubHandler.captured if m == "POST"]
+    vol = [b for (p, b) in posts if p.endswith("/media_player/volume_set")]
+    play = [b for (p, b) in posts if p.endswith("/media_player/media_play")]
+    assert vol and vol[0]["volume_level"] == 0.6
+    assert not play
 
 
 def _run_announce_against_stub(isolated_project, text, *, private):

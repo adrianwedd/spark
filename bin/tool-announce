@@ -19,6 +19,7 @@ import http.client
 import json
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -120,14 +121,28 @@ def _post_json(url: str, body: dict, headers: dict, connect_to: int, read_to: in
         conn.close()
 
 
-def _ha_state(entity_id: str, ha_base: str, ha_token: str) -> str | None:
+def _ha_state_full(entity_id: str, ha_base: str, ha_token: str) -> dict | None:
+    """Full state object (state + attributes) — None on any error."""
     url = f"{ha_base}/api/states/{entity_id}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {ha_token}"})
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read().decode("utf-8")).get("state")
+            return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return None
+
+
+def _ha_state(entity_id: str, ha_base: str, ha_token: str) -> str | None:
+    return (_ha_state_full(entity_id, ha_base, ha_token) or {}).get("state")
+
+
+def _ha_service(service: str, body: dict, ha_base: str, ha_token: str) -> None:
+    """POST /api/services/media_player/<service>; best-effort, never raises."""
+    try:
+        _post_json(f"{ha_base}/api/services/media_player/{service}", body,
+                   {"Authorization": f"Bearer {ha_token}"}, 5, 10)
+    except Exception:
+        pass
 
 
 def _ha_cast(entity_id: str, audio_url: str, ha_base: str, ha_token: str) -> bool:
@@ -192,17 +207,41 @@ def main() -> int:
 
         # 2) cast to each resolved target (single in v1); skip unavailable
         cast_ok = []
+        snapshots: dict[str, dict] = {}
         for entity in targets:
-            state = _ha_state(entity, cfg.HA_BASE_URL, ha_token)
+            full = _ha_state_full(entity, cfg.HA_BASE_URL, ha_token) or {}
+            state = full.get("state")
             if state == "unavailable":
                 continue  # skip + log via payload below
             if state == "playing":
                 pass  # destructive to current playback (documented v1 behavior)
+            snapshots[entity] = full
             try:
                 if _ha_cast(entity, audio_url, cfg.HA_BASE_URL, ha_token):
                     cast_ok.append(entity)
             except Exception:
                 pass  # best-effort per target
+
+        # Volume restore (spec §Interrupt-and-restore, narrowed): volume only —
+        # play_media replaced the queue, so media_play would replay the
+        # announcement, not resume the original app. Skipped when nothing cast.
+        # duration_s is an external field: clamp it, and restore in a finally
+        # so a malformed value or an interrupt can't strand the speaker loud.
+        if cast_ok:
+            try:
+                try:
+                    _dur = float(result.get("duration_s") or 0)
+                except (TypeError, ValueError):
+                    _dur = 0.0
+                time.sleep(min(max(_dur, 0.0), 30.0) + 1.0)
+            finally:
+                for entity in cast_ok:
+                    snap = snapshots.get(entity) or {}
+                    vol = (snap.get("attributes") or {}).get("volume_level")
+                    if isinstance(vol, (int, float)):
+                        _ha_service("volume_set",
+                                    {"entity_id": entity, "volume_level": vol},
+                                    cfg.HA_BASE_URL, ha_token)
 
         payload = {
             "status": "ok" if cast_ok else "error",
