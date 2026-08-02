@@ -79,6 +79,12 @@ bin/run-wake [--wake-word "hey robot"] [--dry-run]
 
 STT priority chain: SenseVoice (primary, ~5s) → faster-whisper (best AU accent) → sherpa-onnx Zipformer → Vosk (wake word grammar only). Models gitignored, must be downloaded separately.
 
+**Capture is `arecord`, never PyAudio** (`src/pxh/mic_stream.py`). PortAudio's ALSA backend sits in a permanent overrun-recovery loop on the C-Media USB mic: opened at 44100 Hz it delivers ~29,900 samples/sec, and since the listener must pass `exception_on_overflow=False`, ~32% of every utterance is silently spliced out. There is no clipping, no zero-run and no envelope anomaly, so **every offline metric on the recorded WAV looks clean** — only listening reveals it. Do not reintroduce PyAudio.
+
+`ArecordStream` mirrors `pyaudio.Stream.read/start_stream/close`, so call sites are unchanged. A reader thread drains the pipe into a bounded deque; this is load-bearing, not decoration — the listener stops reading for seconds at a time (STT, then the LLM call) and a 64 KB pipe holds only ~0.37 s, so without it arecord would block and overrun its own ALSA buffer, rebuilding the original bug. Drops are counted and logged (`dropped_chunks`), never silent. A wedged mic surfaces as `OSError` after `read_timeout_s` so systemd restarts the daemon instead of hanging.
+
+**Regression test:** `bin/px-mic-check` — chirp-train loopback through SPARK's own speaker. Healthy: 18/18 chirps, ≤3 ms deviation, 0 drops. The broken PyAudio path scored 13/18 with the timeline compressed by seconds. Needs the mic free (`systemctl stop px-wake-listen` first).
+
 **Whisper anti-hallucination**: `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`. Post-filters: non-ASCII dominant, phantom phrases, repetitive text → reject.
 
 **Critical:** `bpe_model` kwarg is **not** supported by the installed sherpa-onnx — do not add it to `load_stt_model()`.

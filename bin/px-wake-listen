@@ -44,6 +44,13 @@ except ImportError:                                   # pxh not on PYTHONPATH
         record_success = staticmethod(lambda *a, **k: None)
         record_failure = staticmethod(lambda *a, **k: None)
 
+# Capture backend. No fallback shim on purpose: without this the daemon has no
+# working microphone, and the PyAudio path it replaced failed *silently*.
+from pxh.mic_stream import (                          # noqa: E402
+    ArecordStream as _ArecordStream,
+    resolve_arecord_device as _resolve_arecord_device,
+)
+
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
 VOSK_RATE   = 16000  # Vosk model input rate
@@ -184,31 +191,26 @@ def rms(data: bytes) -> float:
     return (sum(s * s for s in shorts) / count) ** 0.5
 
 
-def find_input_device(pa, preferred_name: str = "") -> int:
-    """Return PyAudio device index for the best available input.
+def open_mic_stream(preferred_name: str = ""):
+    """Open the microphone via an arecord subprocess.
 
-    Search order:
-      1. Direct match on preferred_name substring (e.g. 'USB')
-      2. 'pulse' device (PulseAudio — routes USB mic when ALSA direct unavailable)
-      3. First device with input channels
+    Capture does NOT go through PyAudio: PortAudio's ALSA backend sits in a
+    permanent overrun-recovery loop on this C-Media USB mic and silently
+    discards ~32% of every utterance (see src/pxh/mic_stream.py for the full
+    diagnosis and the chirp-loopback evidence). arecord on the same device is
+    clean.
     """
-    best = None
-    pulse_idx = None
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if info["maxInputChannels"] < 1:
-            continue
-        name_lower = info["name"].lower()
-        if preferred_name and preferred_name.lower() in name_lower:
-            return i
-        if name_lower == "pulse":
-            pulse_idx = i
-        if best is None:
-            best = i
-    result = pulse_idx if pulse_idx is not None else best
-    if result is None:
-        raise RuntimeError("No input audio device found")
-    return result
+    device = _resolve_arecord_device(preferred_name or "USB")
+    log(f"mic capture: arecord device {device} @ {MIC_RATE} Hz")
+    stream = _ArecordStream(
+        device=device,
+        rate=MIC_RATE,
+        channels=CHANNELS,
+        chunk_frames=CHUNK,
+        log=log,
+    )
+    stream.start_stream()
+    return stream
 
 
 def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000,
@@ -827,7 +829,18 @@ def _restart_alive(had_alive: int | None = 1) -> None:
 
 
 def flush_stream(stream, chunks: int = 15) -> None:
-    """Discard buffered audio that built up while the robot was speaking."""
+    """Discard buffered audio that built up while the robot was speaking.
+
+    ArecordStream can drop exactly the backlog, which is tighter than the old
+    fixed 15-chunk read: a user replying the instant the chime ends is no
+    longer clipped. `chunks` is the fallback path's budget only.
+    """
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        dropped = flush()
+        if dropped:
+            log(f"flushed {dropped} buffered chunks ({dropped * CHUNK / MIC_RATE:.1f}s)")
+        return
     for _ in range(chunks):
         try:
             stream.read(CHUNK, exception_on_overflow=False)
@@ -1109,13 +1122,9 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
         _restart_alive(had_alive)
 
 
-def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> None:
+def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
     """Main listen loop: wake-word detect → conversation → return to listening."""
     import vosk
-    import pyaudio
-
-    device_idx = find_input_device(pa, args.mic)
-    log(f"using mic device idx={device_idx} ({pa.get_device_info_by_index(device_idx)['name']})")
 
     # Grammar recognizer for wake word (fast, low-CPU)
     wake_phrase = args.wake_word.lower().strip()
@@ -1127,15 +1136,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
     resample_state = None  # resampler state for wake recognizer
 
-    stream = pa.open(
-        format=pyaudio.paInt16,
-        channels=CHANNELS,
-        rate=MIC_RATE,
-        input=True,
-        input_device_index=device_idx,
-        frames_per_buffer=CHUNK,
-    )
-    stream.start_stream()
+    stream = open_mic_stream(args.mic)
     persona_names = [k.split()[-1] for k in PERSONA_WAKE]
     log(f"listening for wake word: '{wake_phrase}' or 'hey spark' / 'hey vixen' / 'hey gremlin'")
 
@@ -1290,7 +1291,6 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                     log(f"listening for wake word: '{wake_phrase}' (also: hey spark, hey vixen, hey gremlin)")
 
     finally:
-        stream.stop_stream()
         stream.close()
 
 
@@ -1307,7 +1307,7 @@ def main(argv) -> int:
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL,
                         help="Path to faster-whisper model snapshot dir (fallback STT, best AU accent support)")
     parser.add_argument("--mic",           default="USB",
-                        help="Substring to match in mic device name (default: USB)")
+                        help="Substring to match in the `arecord -l` card description (default: USB)")
     parser.add_argument("--aplay-device",  default="",
                         help="ALSA device for chime output (default: system default)")
     parser.add_argument("--voice-cmd",     default=DEFAULT_VOICE_CMD,
@@ -1359,7 +1359,6 @@ def main(argv) -> int:
 
     try:
         import vosk
-        import pyaudio
     except ImportError as exc:
         log(f"missing dependency: {exc}")
         return 1
@@ -1406,21 +1405,8 @@ def main(argv) -> int:
     backend = "sensevoice" if sensevoice else ("faster-whisper" if whisper else ("sherpa-onnx" if stt else "vosk"))
     log(f"STT backend: {backend}")
 
-    # PyAudio init spams ALSA warnings to stderr — suppress at the fd level
-    import ctypes
     try:
-        _libc = ctypes.CDLL("libc.so.6")
-        _devnull = os.open(os.devnull, os.O_WRONLY)
-        _saved_stderr = os.dup(2)
-        os.dup2(_devnull, 2)
-        os.close(_devnull)
-        pa = pyaudio.PyAudio()
-        os.dup2(_saved_stderr, 2)
-        os.close(_saved_stderr)
-    except (OSError, AttributeError):
-        pa = pyaudio.PyAudio()  # fallback without stderr suppression
-    try:
-        listen_loop(pa, model, args, stt, whisper, sensevoice)
+        listen_loop(model, args, stt, whisper, sensevoice)
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -1429,7 +1415,6 @@ def main(argv) -> int:
         traceback.print_exc()
         return 1
     finally:
-        pa.terminate()
         PID_FILE.unlink(missing_ok=True)
         log("stopped")
 
