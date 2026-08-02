@@ -1098,9 +1098,18 @@ class TestRetiredPostsStopBeingDue:
     """
 
     def _week_with_dailies(self):
-        """Blog data whose only children sit in the week ending last Sunday."""
+        """Blog data whose only children sit in a fully-elapsed reporting week.
+
+        The Sunday must be one whose 22:30 target has already passed. Run on a
+        Sunday before 22:30 the current week is not yet due, is_due() falls
+        through to the previous-Sunday catch-up branch, and children built for
+        the current week are invisible to it — the precondition fails for a
+        calendar reason, not a code one.
+        """
         now = dt.datetime.now(HOBART_TZ)
         last_sunday = now - dt.timedelta(days=(now.weekday() + 1) % 7)
+        if last_sunday.replace(hour=22, minute=30, second=0, microsecond=0) > now:
+            last_sunday -= dt.timedelta(days=7)
         posts = [_make_daily_post(last_sunday - dt.timedelta(days=i)) for i in range(7)]
         return last_sunday, {"posts": posts, "skipped": []}
 
