@@ -74,6 +74,10 @@ state/obi_chat.jsonl
 state/obi_chat_meta.json
 state/exploration.jsonl
 state/exploration_meta.json
+state/last_heard.json
+state/announce_meta.json
+state/wake-debug/
+state/notes-*.jsonl.bak-*
 photos/
 .env
 # Rotation backups (.env.bak-YYYYMMDD-rotate), .env.local, and anything else
