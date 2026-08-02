@@ -853,12 +853,42 @@ def record_utterance(stream, max_s: float, silence_s: float) -> bytes:
     return b"".join(captured)
 
 
+def _debug_dump_wav(audio_bytes: bytes) -> None:
+    """When PX_WAKE_DEBUG_WAV=1, save the raw 44.1k capture to state/wake-debug/
+    and log peak/RMS so clipping vs. low-level can be diagnosed offline.
+    Keeps the 10 most recent dumps."""
+    if os.environ.get("PX_WAKE_DEBUG_WAV") != "1":
+        return
+    try:
+        import array
+        samples = array.array("h", audio_bytes)
+        peak = max(abs(s) for s in samples) if samples else 0
+        clipped = sum(1 for s in samples if abs(s) >= 32700)
+        level = rms(audio_bytes)
+        dbg_dir = STATE_DIR / "wake-debug"
+        dbg_dir.mkdir(parents=True, exist_ok=True)
+        ts = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        path = dbg_dir / f"utt-{ts}.wav"
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(MIC_RATE)
+            wf.writeframes(audio_bytes)
+        log(f"debug wav: {path.name} peak={peak} clipped={clipped}/{len(samples)} rms={level:.0f}")
+        old = sorted(dbg_dir.glob("utt-*.wav"))[:-10]
+        for p in old:
+            p.unlink(missing_ok=True)
+    except Exception as exc:
+        log(f"debug wav dump failed: {exc}")
+
+
 def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice=None) -> str:
     """Transcribe audio using the best available backend: sensevoice > whisper > sherpa > vosk.
 
     If the primary backend returns empty (hallucination filtered), falls through
     to the next backend instead of returning empty.
     """
+    _debug_dump_wav(audio_bytes)
     if sensevoice is not None:
         result = transcribe_sensevoice(sensevoice, audio_bytes)
         if result.strip():
