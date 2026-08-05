@@ -308,9 +308,11 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 # PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
 
 # Ollama config (same host as tool-chat)
-# "M5" (router DNS via UDR7) not "M5.local" (mDNS) — plain hostname tracks the
-# box across wired/wifi and avoids the mDNS hangs that trip the fallback cascade.
-OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5:11434")
+# "M5.local" (mDNS), not "M5" — the UDR7 stopped serving the bare hostname
+# entirely (getent rc=2 from the Pi, verified 2026-08-05), which silently sent
+# every SPARK reflection to paid Claude Haiku for two days. mDNS tracks the box
+# across IP moves; if it flakes, the fallback cascade is the designed behaviour.
+OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
 _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
 OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
