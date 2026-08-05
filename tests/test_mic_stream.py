@@ -188,6 +188,80 @@ def test_slow_consumer_drops_oldest_and_counts_it():
         stream.close()
 
 
+def test_idle_drops_are_classified_benign_and_logged_quietly():
+    """Backlog discarded outside a capture is expected, not audio loss.
+
+    Every voice turn stops reading for seconds (STT, LLM, SPARK speaking) and
+    overflows the ring. Counting that as loss is what saturated the counter.
+    """
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    logs = []
+    stream = ArecordStream(chunk_frames=chunk_frames, buffer_s=0.01,
+                           log=logs.append,
+                           command=_pcm_command(200, chunk_bytes))
+    try:
+        stream.start_stream()
+        deadline = time.monotonic() + 5
+        while stream.dropped_chunks == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert stream.dropped_idle > 0
+        assert stream.dropped_active == 0, "no capture was declared"
+        assert any("while idle" in m for m in logs)
+        assert not any("DURING CAPTURE" in m for m in logs)
+    finally:
+        stream.close()
+
+
+def test_drops_inside_a_declared_capture_are_reported_as_lost_audio():
+    """Inside capturing(), an overflow means speech was clipped — log loudly."""
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    logs = []
+    stream = ArecordStream(chunk_frames=chunk_frames, buffer_s=0.01,
+                           log=logs.append,
+                           command=_pcm_command(200, chunk_bytes))
+    try:
+        stream.start_stream()
+        with stream.capturing():
+            deadline = time.monotonic() + 5
+            while stream.dropped_active == 0 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert stream.dropped_active > 0
+        assert any("DURING CAPTURE" in m for m in logs)
+    finally:
+        stream.close()
+
+
+def test_capturing_is_reentrant_and_resets_after_the_block():
+    stream = ArecordStream(chunk_frames=64, command=[sys.executable, "-c", "pass"])
+    try:
+        assert stream._capturing == 0
+        with stream.capturing():
+            with stream.capturing():
+                assert stream._capturing == 2
+            assert stream._capturing == 1
+        assert stream._capturing == 0
+    finally:
+        stream.close()
+
+
+def test_total_drop_count_still_sums_both_classes():
+    """dropped_chunks stays the back-compat total px-mic-check reports on."""
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    stream = ArecordStream(chunk_frames=chunk_frames, buffer_s=0.01,
+                           command=_pcm_command(200, chunk_bytes))
+    try:
+        stream.start_stream()
+        deadline = time.monotonic() + 5
+        while stream.dropped_chunks == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert stream.dropped_chunks == stream.dropped_active + stream.dropped_idle
+    finally:
+        stream.close()
+
+
 def test_flush_discards_backlog_and_returns_count():
     chunk_frames = 64
     chunk_bytes = chunk_frames * 2

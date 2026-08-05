@@ -33,6 +33,7 @@ The ``read(frames, exception_on_overflow=...)`` signature deliberately mirrors
 
 from __future__ import annotations
 
+import contextlib
 import re
 import subprocess
 import threading
@@ -44,6 +45,19 @@ DEFAULT_CHANNELS = 1
 DEFAULT_CHUNK_FRAMES = 2048
 DEFAULT_BUFFER_S = 10.0
 DEFAULT_READ_TIMEOUT_S = 5.0
+
+# A drop is only audio *loss* if the listener meant to be recording at the
+# time. It deliberately stops reading for seconds during STT and the LLM call,
+# and again while SPARK speaks; the ring overflowing then discards audio nobody
+# wanted, and `flush()` would have thrown it away regardless. Counting those
+# the same as a mid-utterance drop is what let `dropped_chunks` climb into the
+# hundreds of thousands while capture was in fact healthy — saturating the one
+# signal that was supposed to make dropped audio visible.
+#
+# The stream cannot infer intent: because a blocked reader drains the deque,
+# an overflow *always* means nobody was inside read(). Only the caller knows
+# whether that gap was a planned pause or a stall in the middle of an
+# utterance, so it declares it via `capturing()`.
 
 _CARD_RE = re.compile(
     r"^card (?P<card>\d+): (?P<short>\S+) \[(?P<long>[^\]]*)\], "
@@ -132,9 +146,13 @@ class ArecordStream:
         self._closing = False
         self._dead = False
         self._dead_reason = ""
-        self.dropped_chunks = 0
+        self.dropped_chunks = 0      # total, kept for back-compat
+        self.dropped_active = 0      # dropped mid-capture — real audio loss
+        self.dropped_idle = 0        # dropped while nobody was reading — benign
         self.restarts = 0
         self._last_drop_log = 0.0
+        self._last_idle_drop_log = 0.0
+        self._capturing = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -194,7 +212,12 @@ class ArecordStream:
                         return
                     if len(self._buf) == self._buf.maxlen:
                         self.dropped_chunks += 1
-                        self._maybe_log_drop()
+                        active = self._capturing > 0
+                        if active:
+                            self.dropped_active += 1
+                        else:
+                            self.dropped_idle += 1
+                        self._maybe_log_drop(active)
                     self._buf.append(data)
                     self._cond.notify_all()
         except (OSError, ValueError):
@@ -247,13 +270,28 @@ class ArecordStream:
                 self._cond.notify_all()
             self._log(self._dead_reason)
 
-    def _maybe_log_drop(self) -> None:
+    def _maybe_log_drop(self, active: bool) -> None:
+        """Log drops, loudly for real loss and rarely for benign backlog.
+
+        Mid-capture drops mean an utterance was clipped and warrant the same
+        5s cadence as before. Idle backlog is expected every voice turn, so it
+        logs once a minute at most — frequently enough to spot a consumer that
+        has genuinely wedged, quietly enough that it no longer drowns out the
+        case this counter exists to surface.
+        """
         now = time.monotonic()
-        if now - self._last_drop_log >= 5.0:
-            self._last_drop_log = now
+        if active:
+            if now - self._last_drop_log >= 5.0:
+                self._last_drop_log = now
+                self._log(
+                    f"arecord ring buffer full DURING CAPTURE — dropped "
+                    f"{self.dropped_active} chunks mid-utterance (audio lost)"
+                )
+        elif now - self._last_idle_drop_log >= 60.0:
+            self._last_idle_drop_log = now
             self._log(
-                f"arecord ring buffer full — dropped {self.dropped_chunks} chunks "
-                f"(consumer too slow)"
+                f"arecord backlog dropped while idle — {self.dropped_idle} "
+                f"chunks (expected during STT/LLM/speech; no capture affected)"
             )
 
     # -- reading -----------------------------------------------------------
@@ -301,6 +339,23 @@ class ArecordStream:
                 have += len(chunk)
 
         return b"".join(parts)
+
+    @contextlib.contextmanager
+    def capturing(self):
+        """Mark a region where dropped audio is real loss, not backlog.
+
+        Wrap utterance recording in this. Inside it, a ring overflow means the
+        capture loop stalled long enough to lose speech and is logged loudly;
+        outside it, an overflow is the expected backlog from a planned pause
+        and is logged quietly. Re-entrant, so nested capture helpers are safe.
+        """
+        with self._cond:
+            self._capturing += 1
+        try:
+            yield self
+        finally:
+            with self._cond:
+                self._capturing -= 1
 
     def flush(self) -> int:
         """Discard everything buffered right now; return chunks dropped.

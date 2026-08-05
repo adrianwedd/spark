@@ -18,6 +18,7 @@ Flow:
   4. Restart px-alive, return to step 1.
 """
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -854,15 +855,21 @@ def record_utterance(stream, max_s: float, silence_s: float) -> bytes:
     silence_frames = 0
     silence_limit = int(silence_s * MIC_RATE / CHUNK)
     max_frames = int(max_s * MIC_RATE / CHUNK)
-    for _ in range(max_frames):
-        chunk = stream.read(CHUNK, exception_on_overflow=False)
-        captured.append(chunk)
-        if rms(chunk) < RMS_SILENCE:
-            silence_frames += 1
-            if silence_frames >= silence_limit:
-                break
-        else:
-            silence_frames = 0
+    # Declare the capture so a ring overflow here is reported as lost speech
+    # rather than folded in with the benign backlog every STT/LLM pause
+    # produces. Older stream objects (and the PyAudio-shaped test doubles)
+    # have no capturing(), so degrade to a plain no-op context.
+    mark = getattr(stream, "capturing", None)
+    with (mark() if callable(mark) else contextlib.nullcontext()):
+        for _ in range(max_frames):
+            chunk = stream.read(CHUNK, exception_on_overflow=False)
+            captured.append(chunk)
+            if rms(chunk) < RMS_SILENCE:
+                silence_frames += 1
+                if silence_frames >= silence_limit:
+                    break
+            else:
+                silence_frames = 0
     return b"".join(captured)
 
 

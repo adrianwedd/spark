@@ -517,6 +517,33 @@ def run_codex(command_spec: str, prompt: str, timeout: Optional[float] = None) -
         return 1, "", f"run_codex timed out after {timeout}s"
 
 
+def backend_label(command_spec: str) -> str:
+    """Name the LLM tier behind ``CODEX_CHAT_CMD`` for token accounting.
+
+    The three launchers all drive the same supervisor loop and differ only in
+    the chat command they export, so the command string is the only place the
+    tier is recorded. Without this every voice-loop call landed in the
+    ``unknown`` bucket of ``state/token_usage.json``, which mixes paid Claude
+    with free Ollama and cannot answer "what am I spending".
+
+    Labels match the tiers ``mind.call_llm`` already reports, so both writers
+    accumulate into the same ``by_backend`` keys.
+    """
+    spec = (command_spec or "").lower()
+    if "claude" in spec:
+        return "claude"
+    if "ollama" in spec:
+        # bin/codex-ollama defaults to 127.0.0.1; OLLAMA_HOST redirects it to
+        # M5. Which host answered decides whether the call was free-and-local
+        # or free-but-remote, so read the same env var the bridge reads rather
+        # than assuming the M5 tier.
+        host = os.environ.get("OLLAMA_HOST", "").lower()
+        return "ollama-m5" if "m5" in host else "ollama-local"
+    if "codex" in spec:
+        return "codex"
+    return "unknown"
+
+
 def extract_action(text: str) -> Optional[Dict[str, Any]]:
     # Fast path: scan lines in reverse for a single-line JSON object
     for line in reversed(text.strip().splitlines()):
@@ -974,7 +1001,7 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         if rc == 0 and stdout.strip():
             try:
                 from .token_log import log_usage
-                log_usage(prompt, stdout)
+                log_usage(prompt, stdout, backend_label(args.codex_cmd))
             except Exception:
                 print("[voice-loop] token logging failed", file=sys.stderr)
 

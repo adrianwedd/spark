@@ -160,3 +160,39 @@ def test_execute_tool_no_route_survives_persona_injection(monkeypatch):
 
     _vl.execute_tool("tool_voice", {"PX_TEXT": "hi"}, dry_mode=True)
     assert captured["env"]["PX_VOICE_NO_ROUTE"] == "1"
+
+
+# --- token accounting --------------------------------------------------------
+
+
+def test_backend_label_names_each_launcher_tier(monkeypatch):
+    """Every voice-loop call used to land in the `unknown` bucket, which mixes
+    paid Claude with free Ollama and so cannot answer "what am I spending"."""
+    from pxh.voice_loop import backend_label
+
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    assert backend_label("/home/pi/picar-x-hacking/bin/claude-voice-bridge") == "claude"
+    assert backend_label("codex exec --full-auto -") == "codex"
+    assert backend_label("") == "unknown"
+
+
+def test_backend_label_routes_codex_ollama_by_host(monkeypatch):
+    """bin/codex-ollama matches both 'codex' and 'ollama'; the ollama branch
+    must win, and OLLAMA_HOST decides local vs M5."""
+    from pxh.voice_loop import backend_label
+
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    assert backend_label("/home/pi/picar-x-hacking/bin/codex-ollama") == "ollama-local"
+
+    monkeypatch.setenv("OLLAMA_HOST", "http://M5:11434")
+    assert backend_label("/home/pi/picar-x-hacking/bin/codex-ollama") == "ollama-m5"
+
+
+def test_backend_labels_match_the_tiers_mind_already_reports():
+    """Both writers accumulate into the same by_backend keys, or the split is
+    useless: mind.call_llm tags its calls with these exact strings."""
+    from pxh.voice_loop import backend_label
+
+    known = {"claude", "ollama-m5", "ollama-local", "ollama-cloud", "codex", "unknown"}
+    for spec in ("claude-voice-bridge", "codex-ollama", "codex exec", ""):
+        assert backend_label(spec) in known
