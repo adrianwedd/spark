@@ -224,6 +224,38 @@ def test_guarded_forward_stops_and_reverses_on_cliff(monkeypatch):
     assert ("backward", wander.REVERSE_SPEED) in px.calls
 
 
+def test_guarded_forward_single_low_confirm_is_not_enough(monkeypatch):
+    """One low stationary read does not confirm a cliff — it must persist.
+
+    Live run 8 (2026-08-06) aborted on a stationary confirm of 257/79/79 taken
+    on floor that read 718/540 in motion moments earlier and measured 400-900
+    on the probe minutes later. A settle-ladder sweep (px-guard-probe, 36
+    post-stop reads from 0s to 1.6s) found the dips scattered across every
+    rung, ~3% of reads, rather than concentrated at short delays: waiting
+    longer does not make a single read trustworthy, so the guard requires the
+    low reading to repeat instead.
+    """
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    # in-motion trip, one low confirm, then clear for the rest
+    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*3 + [[1000]*3]*100)
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "ok"
+    assert guard.edge_events == 0
+    assert ("backward", wander.REVERSE_SPEED) not in px.calls
+
+
+def test_guarded_forward_persistent_low_still_trips(monkeypatch):
+    """A real cliff holds the sensor low across every confirm read — the
+    persistence requirement must not disarm the guard it protects."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[600]*3] * (3 * (1 + wander.GUARD_CONFIRM_READS) + 20))
+    px._dist = iter([50.0, 60.0])
+    px.get_distance = lambda: next(px._dist, 60.0)
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
+    assert guard.edge_events >= 1
+
+
 def test_bounded_reverse_stall_detection(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
     px = FakePx(grayscale=[[1000]*3]*5)
@@ -237,7 +269,11 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     EDGE_ABORT_COUNT=2 aborts the wander on the spot. That instant abort is
     INTENTIONAL — this test pins it so a refactor can't silently change it."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[600]*3]*6 + [[1000]*3]*20)   # first check + confirm trip cliff
+    # first check + every confirm read trips: GUARD_SAMPLES per check, and the
+    # confirm only stands when the low reading persists across all of them
+    px = FakePx(grayscale=[[600]*3] * (wander.GUARD_SAMPLES
+                                       * (1 + wander.GUARD_CONFIRM_READS))
+                + [[1000]*3]*20)
     px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
     px.get_distance = lambda: next(px._dist, 50.5)
     guard = _guard()

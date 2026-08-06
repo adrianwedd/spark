@@ -579,12 +579,21 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
 # the sensor low across every sample, so a per-channel median still trips.
 GUARD_SAMPLES = 3
 GUARD_SAMPLE_GAP_S = 0.01
-# Settle before the stationary confirm read after a driving trip. Motor noise
-# at FORWARD_SPEED=30 is dense enough that even medians dip below threshold
-# (measured 2026-08-06: 16 of 56 in-motion median checks tripped), but reads
-# taken after px.stop() are always at floor level — so a trip is confirmed or
-# dismissed stationary, where the sensor is trustworthy.
+# Settle between the stationary confirm reads taken after a driving trip.
+# Motor noise at FORWARD_SPEED=30 is dense enough that even medians dip below
+# threshold (measured 2026-08-06: 16 of 56 in-motion median checks tripped),
+# so a trip is confirmed or dismissed with the wheels stopped.
+#
+# One stationary read is not enough on its own. Run 8 aborted on a confirm of
+# 257/79/79 taken on floor reading 718/540 in motion moments earlier and
+# 400-900 on the probe minutes later. A settle ladder from 0s to 1.6s
+# (bin/px-guard-probe, 36 post-stop reads) put the dips at ~3% of reads
+# scattered across every rung — not concentrated at short delays — so a longer
+# wait buys nothing and only repetition separates a transient from a drop.
 GUARD_CONFIRM_SETTLE_S = 0.05
+# A real cliff holds the sensor low indefinitely; a transient does not survive
+# being asked three times.
+GUARD_CONFIRM_READS = 3
 
 
 class CliffGuard:
@@ -675,14 +684,20 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
             # safety reaction and is unconditional; whether to reverse/abort
             # is decided by a stationary re-read, which noise cannot reach.
             # A real cliff keeps the sensor low with the wheels stopped.
-            time.sleep(GUARD_CONFIRM_SETTLE_S)
-            status = guard.check(px)
+            confirms = []
+            for _ in range(GUARD_CONFIRM_READS):
+                time.sleep(GUARD_CONFIRM_SETTLE_S)
+                status = guard.check(px)
+                confirms.append(guard.describe_last())
+                if status == "clear":
+                    break
             if status == "clear":
                 log("cliff guard: in-motion trip dismissed by stationary re-read "
-                    f"(motor noise) — in-motion {in_motion}, stationary {guard.describe_last()}")
+                    f"(transient) — in-motion {in_motion}, stationary "
+                    + "; ".join(confirms))
                 continue
             log(f"cliff guard tripped ({status}) — stop + bounded reverse "
-                f"— in-motion {in_motion}, stationary {guard.describe_last()}")
+                f"— in-motion {in_motion}, stationary " + "; ".join(confirms))
             # Cliff + stalled escape deliberately counts as TWO edge events:
             # at EDGE_ABORT_COUNT=2 a single cornered-against-a-cliff moment
             # aborts the whole wander. That is the intended behavior (no
