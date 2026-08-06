@@ -16,7 +16,7 @@ Tools available (invoke by outputting a single JSON object exactly as described 
 - tool_figure8  → Figure-eight (params: speed, duration, rest).
 - tool_stop     → Immediate halt (no params).
 - tool_wander → Autonomous wander (params: steps 1-20, mode "avoid"|"explore", duration 30-300). "avoid" = obstacle avoidance only (default). "explore" = sense, photograph, build mental map. Explore mode requires roaming_allowed in session.
-- tool_wander_calibrate → Recalibrate the cliff guard on the floor under SPARK right now (no params, nothing moves). Use when a wander aborts immediately with steps_driven 0, or after SPARK is carried to a different floor/room — the guard is armed against a stored floor signature and a new surface reads as a drop.
+- tool_wander_calibrate → Recalibrate the cliff guard on the floor under SPARK right now (params: accumulate true|false; nothing moves). accumulate=true folds this spot into the stored reference by keeping the darkest reading per channel — use it to calibrate several spots on a floor whose boards and gaps read very differently. Use when a wander aborts immediately with steps_driven 0, or after SPARK is carried to a different floor/room — the guard is armed against a stored floor signature and a new surface reads as a drop.
 
 **Expression**
 - tool_look   → Move camera to pan/tilt angle (params: pan -90..90, tilt -35..65, ease 0.1-5.0s).

@@ -392,6 +392,30 @@ def test_tool_wander_calibrate_dry_run(isolated_project):
     assert payload["dry"] is True
 
 
+def test_tool_wander_calibrate_passes_accumulate(isolated_project):
+    """PX_CALIBRATE_ACCUMULATE reaches px-wander as --accumulate.
+
+    Without the flag each calibration replaces the last, which on a floor whose
+    boards and gaps read an order of magnitude apart means the threshold only
+    ever describes the spot SPARK happened to be standing on.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_BYPASS_SUDO"] = "1"
+    env["PX_CALIBRATE_ACCUMULATE"] = "1"
+    fake = isolated_project["state_dir"].parent / "fake-px-wander-acc"
+    argv_log = isolated_project["state_dir"].parent / "argv.txt"
+    fake.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "$@" > {argv_log}\n'
+        'echo \'{"status": "ok", "floor_ref": [1,2,3], "cliff_ref": [1,2,3]}\'\n'
+    )
+    fake.chmod(0o755)
+    env["PX_WANDER_BIN"] = str(fake)
+    run_tool(["bin/tool-wander-calibrate"], env)
+    assert "--accumulate" in argv_log.read_text()
+
+
 def test_tool_wander_calibrate_forwards_refs(isolated_project):
     """A live calibration forwards floor_ref/cliff_ref from px-wander's JSON.
 

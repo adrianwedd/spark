@@ -42,6 +42,11 @@ def main() -> int:
     # and never drives. Gating it would make a robot with motion disabled
     # unable to fix the very reference that keeps it from driving safely.
     command = [str(PX_WANDER), "--calibrate-cliff"]
+    # Accumulate keeps the per-channel minimum across spots, so a floor whose
+    # boards and gaps read an order of magnitude apart gets one threshold that
+    # no legal patch of it trips.
+    if os.environ.get("PX_CALIBRATE_ACCUMULATE", "0") != "0":
+        command.append("--accumulate")
     if dry_mode:
         command.append("--dry-run")
 

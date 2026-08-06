@@ -20,7 +20,7 @@ Tools available (invoke by outputting a single JSON object exactly as described 
 - tool_face           → Sweep sonar and point camera at closest object (no params).
 - tool_describe_scene → Photograph and describe the scene via vision AI (no params).
 - tool_wander → Autonomous wander (params: steps 1-20, mode "avoid"|"explore", duration 30-300). "avoid" = obstacle avoidance only (default). "explore" = sense, photograph, build mental map. Explore mode requires roaming_allowed in session.
-- tool_wander_calibrate → Recalibrate the cliff guard on the floor under SPARK right now (no params, nothing moves). Use when a wander aborts immediately with steps_driven 0, or after SPARK is carried to a different floor/room — the guard is armed against a stored floor signature and a new surface reads as a drop.
+- tool_wander_calibrate → Recalibrate the cliff guard on the floor under SPARK right now (params: accumulate true|false; nothing moves). accumulate=true folds this spot into the stored reference by keeping the darkest reading per channel — use it to calibrate several spots on a floor whose boards and gaps read very differently. Use when a wander aborts immediately with steps_driven 0, or after SPARK is carried to a different floor/room — the guard is armed against a stored floor signature and a new surface reads as a drop.
 - tool_timer          → Background timer that speaks when done (params: seconds 5-3600, label).
 - tool_play_sound     → Play a bundled sound effect (param: name — chime|beep|tada|alert).
 - tool_qa             → Speak a free-form Q&A answer aloud (param: text, max 2000 chars).

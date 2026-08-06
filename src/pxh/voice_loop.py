@@ -716,7 +716,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             duration = int(clamp(_num(params.get("duration", 180), "duration"), 30, 300))
             sanitized["PX_WANDER_DURATION_S"] = str(duration)
     elif tool == "tool_wander_calibrate":
-        pass  # no params required
+        if params.get("accumulate"):
+            sanitized["PX_CALIBRATE_ACCUMULATE"] = "1"
     elif tool == "tool_timer":
         seconds = int(clamp(_num(params.get("seconds", 60), "seconds"), 5, 3600))
         label   = str(params.get("label", ""))[:100]

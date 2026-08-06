@@ -103,6 +103,44 @@ def test_calibrate_cliff_writes_reference(tmp_path):
     assert on_disk == cal
 
 
+def test_calibrate_cliff_accumulate_keeps_per_channel_minimum(tmp_path):
+    """Calibrating a second, darker spot must lower the threshold, not replace it.
+
+    A floorboard gap reads ~100 on a floor whose boards read ~950 (measured
+    2026-08-06). Whichever spot was calibrated last would otherwise decide, and
+    a board-derived threshold rejects a gap as a drop.
+    """
+    bright = FakePx(grayscale=[ADC_LATCH] * 2 + [[1000.0, 1100.0, 900.0]] * 3)
+    wander.calibrate_cliff(bright, tmp_path, settle_s=1.0, poll_s=0.0)
+
+    dark = FakePx(grayscale=[ADC_LATCH] * 2 + [[200.0, 1500.0, 400.0]] * 3)
+    cal = wander.calibrate_cliff(dark, tmp_path, settle_s=1.0, poll_s=0.0,
+                                 accumulate=True)
+    # per channel: min(1000,200)=200, min(1100,1500)=1100, min(900,400)=400
+    assert cal["floor_ref"] == [200.0, 1100.0, 400.0]
+    assert cal["cliff_ref"] == [130.0, 715.0, 260.0]
+    assert len(cal["spots"]) == 2
+
+
+def test_calibrate_cliff_without_accumulate_replaces(tmp_path):
+    """The default stays destructive — accumulating by accident would silently
+    lower the guard on a floor the operator meant to re-reference."""
+    first = FakePx(grayscale=[ADC_LATCH] * 2 + [[200.0, 300.0, 400.0]] * 3)
+    wander.calibrate_cliff(first, tmp_path, settle_s=1.0, poll_s=0.0)
+    second = FakePx(grayscale=[ADC_LATCH] * 2 + [[1000.0, 1100.0, 900.0]] * 3)
+    cal = wander.calibrate_cliff(second, tmp_path, settle_s=1.0, poll_s=0.0)
+    assert cal["floor_ref"] == [1000.0, 1100.0, 900.0]
+
+
+def test_calibrate_cliff_accumulate_without_prior_starts_fresh(tmp_path):
+    """No stored calibration (or a corrupt one) must not block the first spot."""
+    (tmp_path / "wander_calibration.json").write_text("{ not json")
+    px = FakePx(grayscale=[ADC_LATCH] * 2 + [[500.0, 600.0, 700.0]] * 3)
+    cal = wander.calibrate_cliff(px, tmp_path, settle_s=1.0, poll_s=0.0,
+                                 accumulate=True)
+    assert cal["floor_ref"] == [500.0, 600.0, 700.0]
+
+
 def test_calibrate_cliff_refuses_to_persist_the_adc_latch(tmp_path):
     """Regression: calibrating on the latch stores a reference ~5x too high,
     which grounds the robot — or, with a plausible floor, silently defeats the

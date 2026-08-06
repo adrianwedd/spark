@@ -514,20 +514,51 @@ def wait_for_grayscale(px, settle_s: float | None = None,
 
 
 def calibrate_cliff(px, state_dir: Path, settle_s: float | None = None,
-                     poll_s: float | None = None) -> dict:
+                     poll_s: float | None = None, accumulate: bool = False) -> dict:
     """Read the floor's grayscale signature and persist a cliff calibration.
 
     Raises RuntimeError if the grayscale sensor can't be read, including the
     case where it only ever returns its power-on latch — persisting that would
     write a fabricated reference, so nothing is written at all.
+
+    A single spot is a poor reference for a real floor. Measured 2026-08-06,
+    one channel read ~950 on open lit boards and ~100 over a floorboard gap:
+    a threshold derived from the bright spot rejects the dark one as a drop,
+    which is what grounded runs 8-10. `accumulate` folds this reading into the
+    stored one by keeping the per-channel MINIMUM, so calibrating at several
+    spots yields a threshold below the darkest floor SPARK is allowed to meet.
+
+    The trade is deliberate and one-way: the threshold can only fall, so the
+    guard grows more permissive with every spot added. Sensitivity to a genuine
+    drop is bounded by the darkest floor sampled — never accumulate a reading
+    taken over an actual edge.
     """
     gs = wait_for_grayscale(px, settle_s=settle_s, poll_s=poll_s)
     if gs is None:
         raise RuntimeError("grayscale read failed — cannot calibrate")
+    floor = [float(v) for v in gs]
+    spots = [list(floor)]
+
+    if accumulate:
+        prior = load_cliff_calibration(state_dir)
+        prior_floor = prior.get("floor_ref") if prior else None
+        if (isinstance(prior_floor, list) and len(prior_floor) == 3
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) and v > 0 for v in prior_floor)):
+            floor = [min(float(prior_floor[i]), floor[i]) for i in range(3)]
+            prior_spots = prior.get("spots")
+            if isinstance(prior_spots, list):
+                # Cap the history: it is diagnostic context for "how varied is
+                # this floor", not an unbounded log in a file read every wander.
+                spots = (prior_spots + spots)[-20:]
+        else:
+            log("accumulate: no usable prior calibration — starting fresh")
+
     cal = {
-        "floor_ref": [float(v) for v in gs],
-        "cliff_ref": [round(float(v) * CLIFF_MARGIN, 1) for v in gs],
+        "floor_ref": floor,
+        "cliff_ref": [round(v * CLIFF_MARGIN, 1) for v in floor],
         "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "spots": spots,
     }
     state_dir.mkdir(parents=True, exist_ok=True)
     tmp = None
@@ -833,6 +864,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--duration", type=int,   default=180, help="Explore mode duration in seconds")
     parser.add_argument("--calibrate-cliff", action="store_true",
                          help="Read the floor's grayscale signature and persist a cliff calibration")
+    parser.add_argument("--accumulate", action="store_true",
+                         help="Fold this reading into the stored calibration, keeping the "
+                              "per-channel minimum (calibrate several spots on a varied floor)")
     args = parser.parse_args(argv)
 
     mode   = args.mode
@@ -851,7 +885,7 @@ def main(argv: list[str]) -> int:
         try:
             from picarx import Picarx
             px = Picarx()
-            cal = calibrate_cliff(px, STATE_DIR)
+            cal = calibrate_cliff(px, STATE_DIR, accumulate=args.accumulate)
             print(json.dumps({"status": "ok", **cal}))
             return 0
         except Exception as exc:
