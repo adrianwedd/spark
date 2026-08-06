@@ -593,6 +593,8 @@ class CliffGuard:
     def __init__(self, cliff_ref: list[float]):
         self.cliff_ref = [float(v) for v in cliff_ref]
         self.edge_events = 0
+        self.last_median: list[float] | None = None
+        self.trip_channels: list[int] = []
 
     def check(self, px) -> str:
         """Return "clear" | "cliff" | "fail". An unreadable sensor ("fail")
@@ -612,9 +614,25 @@ class CliffGuard:
             log("cliff guard: grayscale read failed — treating as cliff (fail closed)")
             return "fail"
         med = [statistics.median(col) for col in zip(*samples)]
+        # Remember the deciding numbers. Three separate live runs aborted with
+        # steps_driven=0 and a log line that said only "tripped", leaving the
+        # readings — the one thing that identifies WHICH channel and by how
+        # much — to be re-derived by hand from the hardware afterwards.
+        self.last_median = med
         if any(med[i] <= self.cliff_ref[i] for i in range(3)):
+            self.trip_channels = [i for i in range(3) if med[i] <= self.cliff_ref[i]]
             return "cliff"
+        self.trip_channels = []
         return "clear"
+
+    def describe_last(self) -> str:
+        """Readings vs thresholds for the most recent check, for logging."""
+        if self.last_median is None:
+            return "no reading"
+        med = "/".join(f"{v:.0f}" for v in self.last_median)
+        ref = "/".join(f"{v:.0f}" for v in self.cliff_ref)
+        chans = ",".join("LCR"[i] for i in self.trip_channels) or "none"
+        return f"median={med} ref={ref} tripped={chans}"
 
 
 def bounded_reverse(px) -> bool:
@@ -650,6 +668,7 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
     while remaining > 0:
         status = guard.check(px)
         if status != "clear":
+            in_motion = guard.describe_last()
             px.stop()
             # In-motion trips are ~29% motor-noise phantoms even after the
             # median (see GUARD_CONFIRM_SETTLE_S). The stop above is the
@@ -659,9 +678,11 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
             time.sleep(GUARD_CONFIRM_SETTLE_S)
             status = guard.check(px)
             if status == "clear":
-                log("cliff guard: in-motion trip dismissed by stationary re-read (motor noise)")
+                log("cliff guard: in-motion trip dismissed by stationary re-read "
+                    f"(motor noise) — in-motion {in_motion}, stationary {guard.describe_last()}")
                 continue
-            log(f"cliff guard tripped ({status}) — stop + bounded reverse")
+            log(f"cliff guard tripped ({status}) — stop + bounded reverse "
+                f"— in-motion {in_motion}, stationary {guard.describe_last()}")
             # Cliff + stalled escape deliberately counts as TWO edge events:
             # at EDGE_ABORT_COUNT=2 a single cornered-against-a-cliff moment
             # aborts the whole wander. That is the intended behavior (no
@@ -908,7 +929,7 @@ def main(argv: list[str]) -> int:
                         if not quiet:
                             speak(f"Something's in the way, going {side}.")
                     elif action == "edge_event":
-                        log("cliff guard tripped during avoid step")
+                        log(f"cliff guard tripped during avoid step — {guard.describe_last()}")
 
             result = {
                 "status": "ok",
