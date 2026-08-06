@@ -639,6 +639,29 @@ def _resolve_dry(requested: Optional[bool]) -> bool:
     return requested
 
 
+def _wander_timeout(env_overrides: Dict[str, str]) -> float:
+    """Outer budget for an async wander, sized above tool-wander's own.
+
+    The wander timeout cascade is strictly ordered so inner layers fire first:
+    px-wander self-limits via --duration, then tool-wander (duration+180s for
+    explore, 180s for avoid) SIGTERMs the root px-wander by the pid in
+    exploring.json. Killing tool-wander from out here instead SIGKILLs the bash
+    wrapper — its handler never runs, and the sudo child underneath keeps
+    driving with nobody watching it. SYNC_TIMEOUT_SLOW (120s) did exactly that
+    to any explore longer than ~90s, so this stays above the inner budget.
+    """
+    mode = env_overrides.get("PX_WANDER_MODE", "avoid")
+    if mode == "explore":
+        try:
+            duration = float(env_overrides.get("PX_WANDER_DURATION_S", 180))
+        except (TypeError, ValueError):
+            duration = 180.0
+        inner = duration + 180.0
+    else:
+        inner = 180.0
+    return inner + 60.0
+
+
 def _public_state_dir() -> Path:
     """Resolve STATE_DIR respecting PX_STATE_DIR override (same as px-mind)."""
     return Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
@@ -1800,7 +1823,8 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
             loop = asyncio.get_running_loop()
             try:
                 rc, stdout, stderr = await loop.run_in_executor(
-                    None, execute_tool, tool, env_overrides, dry, SYNC_TIMEOUT_SLOW
+                    None, execute_tool, tool, env_overrides, dry,
+                    _wander_timeout(env_overrides)
                 )
                 _set_job(job_id, {
                     "status": "complete",
