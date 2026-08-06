@@ -147,6 +147,12 @@ Three-layer architecture:
 - Arrival detection uses module-level `_last_known_findmyhub` cache (not awareness snapshot) — survives M5.local→Pi push outages. Do not replace with snapshot diff.
 - `state/thought-images/` cleaned hourly (images >30 days deleted)
 
+**Battery sensing — both filters fail toward "keep running", so both need care.** SPARK browned out on 2026-08-06 with the ≤10% shutdown never firing.
+
+`filter_battery` (`mind.py`) rejects a reading that drops more than `BATTERY_MAX_DROP_PER_TICK` below the median. A streak of suspicious readings only accumulates confirmations **while it still looks like a discharge curve** — non-increasing (`BATTERY_RISE_TOLERANCE_PCT`) with each step survivable (`BATTERY_STREAK_MAX_STEP_PCT`). That coherence check is what earns the loose thresholds: scattered ADC garbage can never confirm, so a real collapse doesn't have to wait behind a slow gate. Acceptance **reseeds history from the streak** — without that, rejected readings never enter history and the median stays anchored above a collapsing pack, vetoing everything after it. Readings ≤`BATTERY_CRITICAL` use the shorter `BATTERY_CRITICAL_*` gate; a missed shutdown costs far more than a spurious one, and two guards still sit downstream (2 consecutive criticals, then a voltage/charging recheck). Note px-mind ticks are **not** reliably 60s — reflection calls of 90s+ starve them, so never express a battery gate in ticks alone.
+
+Charging detection (`pxh/battery_trend.py`) **cannot use adjacent polls**: the pack gains ~0.004V per 30s poll while readings swing up to 0.17V, so differencing measures noise — that bug read `charging: false` through a whole afternoon on the charger. Most of the swing is px-alive's servo load dragging the rail, and load only pulls *down*, so a rolling max recovers resting voltage (0.042V → 0.026V residual) before a least-squares slope over the window. Thresholds are bootstrapped from a measured trace: 0.6% false-charging, 85% detection — deliberately skewed, since a false `charging` **suppresses the emergency shutdown**. Detection costs ~10 min, so the plug-in chime lags. Re-tune against a fresh measured trace, never against intuition about the charge rate.
+
 ### Autonomous Racing (px-race)
 
 ```bash
