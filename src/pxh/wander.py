@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import shutil
 import signal
@@ -36,7 +37,11 @@ TURN_S         = 0.7
 PROBE_S        = 0.4
 
 EXPLORE_STEP_TIMEOUT   = 30
-DESCRIBE_SCENE_TIMEOUT = 75
+# Budget for one tool-describe-scene call: photo (~10s incl. a possible
+# stream pause) + Claude vision (60s in the tool) + onboard speech (~45s
+# worst case incl. the voice lock). Must stay comfortably above the tool's
+# CLAUDE_TIMEOUT — pinned by test_describe_scene_timeout_has_margin_over_claude.
+DESCRIBE_SCENE_TIMEOUT = 150
 PHOTO_COOLDOWN_S       = 30
 DAILY_VISION_CAP       = 50
 VISION_FAIL_MAX        = 3
@@ -49,6 +54,11 @@ BIN_DIR    = PROJECT_ROOT / "bin"
 
 CLIFF_MARGIN          = 0.65
 CALIBRATION_STALE_S   = 30 * 24 * 3600
+# px-alive treats exploring.json as stale once its mtime is >60s old, so any
+# live run longer than that must refresh the file or px-alive will retake
+# GPIO mid-drive (same contract px-wake-listen satisfies with its own
+# 20s refresher thread).
+EXPLORING_REFRESH_S   = 20.0
 GRAYSCALE_SETTLE_S    = 3.0
 GRAYSCALE_POLL_S      = 0.05
 
@@ -262,6 +272,30 @@ def _write_exploring_state(active: bool, pid: int | None = None,
         return False
 
 
+class _ExploringRefresher(threading.Thread):
+    """Rewrite exploring.json every EXPLORING_REFRESH_S while a run is live.
+
+    px-alive ignores the guard file once its mtime exceeds 60s, so a single
+    write at run start only protects the first minute of a 180-300s explore
+    (or a slow avoid run). This thread keeps the mtime fresh; the owner stops
+    it in the finally block before clearing the file.
+    """
+
+    def __init__(self, pid: int, started: str):
+        super().__init__(daemon=True, name="exploring-refresh")
+        self._stop_evt = threading.Event()
+        self._pid = pid
+        # NB: not "_started" — threading.Thread uses that name internally.
+        self._started_iso = started
+
+    def run(self) -> None:
+        while not self._stop_evt.wait(EXPLORING_REFRESH_S):
+            _write_exploring_state(True, pid=self._pid, started=self._started_iso)
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+
 def _load_exploration_meta() -> dict:
     path = STATE_DIR / "exploration_meta.json"
     try:
@@ -355,6 +389,10 @@ def _write_observation(entry: dict) -> None:
 def _call_describe_scene(dry: bool) -> dict:
     env = os.environ.copy()
     env["PX_DRY"] = "1" if dry else "0"
+    # Onboard speech only: routed Nest speech can take 90s+ and would blow
+    # DESCRIBE_SCENE_TIMEOUT, killing the tool mid-run and charging a
+    # spurious vision failure toward VISION_FAIL_MAX.
+    env["PX_VOICE_NO_ROUTE"] = "1"
     try:
         result = subprocess.run(
             [str(BIN_DIR / "tool-describe-scene")],
@@ -507,7 +545,13 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
     try:
         cal = json.loads(path.read_text(encoding="utf-8"))
         ref = cal["cliff_ref"]
-        if not (isinstance(ref, list) and len(ref) == 3):
+        # Finite positive numbers only. Python's json parser accepts NaN, and
+        # every `reading <= nan` comparison is False — a NaN reference would
+        # load "successfully" and silently disarm CliffGuard (fail-open).
+        if not (isinstance(ref, list) and len(ref) == 3
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) and v > 0 for v in ref)):
+            log(f"cliff calibration invalid (cliff_ref={ref!r}) — ignoring file")
             return None
         age = (dt.datetime.now(dt.timezone.utc)
                - dt.datetime.fromisoformat(cal["ts"])).total_seconds()
@@ -610,7 +654,12 @@ def probe_turn(px, guard: CliffGuard, prefer: str = "left") -> tuple[str, float]
         if d > best[1]:
             best = (side, d)
         if i == 0:                     # arc back before trying the other side
-            px.set_dir_servo_angle(-steer)
+            # Retrace the probe arc: reversing with the SAME steer angle
+            # follows the same circular path backward (bicycle model:
+            # heading rate = v/L * tan(steer); negating v alone undoes the
+            # rotation). Reversing with the MIRRORED angle negates both
+            # terms, which doubles the heading change instead of undoing it.
+            px.set_dir_servo_angle(steer)
             stalled = bounded_reverse(px)
             px.set_dir_servo_angle(0)
             if stalled:
@@ -624,7 +673,7 @@ def probe_turn(px, guard: CliffGuard, prefer: str = "left") -> tuple[str, float]
     # invariant requires physically recovering: arc back the same way as the
     # mid-probe recovery, then re-execute the first arc when committing.
     second_steer = -30 if order[1] == "left" else 30
-    px.set_dir_servo_angle(-second_steer)
+    px.set_dir_servo_angle(second_steer)   # same-steer reverse retraces the arc
     stalled = bounded_reverse(px)
     px.set_dir_servo_angle(0)
     if stalled:
@@ -695,7 +744,10 @@ def main(argv: list[str]) -> int:
 
     mode   = args.mode
     steps  = int(clamp(args.steps, 1, 20))
-    dry    = args.dry_run
+    # PX_DRY=1 must mean dry everywhere, not only when the caller remembered
+    # to translate it into --dry-run (tool-wander does; direct invocations
+    # historically did not).
+    dry    = args.dry_run or os.environ.get("PX_DRY", "0") != "0"
     quiet  = args.quiet or os.environ.get("PX_WANDER_QUIET", "0") != "0"
     duration = int(clamp(args.duration, 30, 300)) if mode == "explore" else 0
 
@@ -720,7 +772,30 @@ def main(argv: list[str]) -> int:
             "reason": "cliff guard not calibrated — run px-wander --calibrate-cliff"}))
         return 2
 
+    # Session motion gate applies to BOTH modes (explore re-checks it every
+    # step via _check_abort, but avoid mode had no session check at all —
+    # a direct live px-wander run must not bypass confirm_motion_allowed).
+    if not dry and not _read_session().get("confirm_motion_allowed", False):
+        print(json.dumps({"status": "blocked", "reason": "motion not confirmed safe"}))
+        return 2
+
     px = None
+    refresher = None
+
+    if not dry:
+        # Establish the GPIO guard BEFORE constructing Picarx: yield_alive
+        # already killed px-alive in the launcher, systemd relaunches it 15s
+        # later, and Picarx() + the ADC settle wait below eat several seconds
+        # of that window. Applies to both modes — avoid runs can outlive the
+        # 15s RestartSec too. The refresher keeps the mtime <60s for the
+        # whole run so px-alive's staleness rule never disarms the guard.
+        started_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        if not _write_exploring_state(True, pid=os.getpid(), started=started_iso):
+            log("abort: cannot write exploring.json — px-alive coordination broken")
+            print(json.dumps({"status": "error", "error": "exploring.json write failed"}))
+            return 1
+        refresher = _ExploringRefresher(os.getpid(), started_iso)
+        refresher.start()
 
     if not dry:
         try:
@@ -808,19 +883,19 @@ def main(argv: list[str]) -> int:
             signal.signal(signal.SIGTERM, _handle_sigterm)
             explore_id = f"e-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
             start_time = time.time()
-            if not _write_exploring_state(True, pid=os.getpid(),
-                                          started=dt.datetime.now(dt.timezone.utc).isoformat()):
-                log("explore abort: cannot write exploring.json — px-alive coordination broken")
-                print(json.dumps({"status": "error", "error": "exploring.json write failed"}))
-                return 1
+            # exploring.json guard + refresher already established above
+            # (before Picarx construction) for all live runs.
 
-            meta = _load_exploration_meta()
-            meta["last_explore_ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
-            meta["total_explorations"] = meta.get("total_explorations", 0) + 1
-            _save_exploration_meta(meta)
+            if not dry:
+                # Dry runs must not consume the real 20-min explore cooldown
+                # or inflate lifetime counters.
+                meta = _load_exploration_meta()
+                meta["last_explore_ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                meta["total_explorations"] = meta.get("total_explorations", 0) + 1
+                _save_exploration_meta(meta)
 
             log(f"explore start id={explore_id} duration={duration}s")
-            if not quiet:
+            if not quiet and not dry:
                 speak("Time to explore!")
 
             nav_buffer = []
@@ -974,8 +1049,9 @@ def main(argv: list[str]) -> int:
                         _write_observation(obs_entry)
                         observations.append(obs_entry)
 
-                        if not vision_failed and not quiet:
-                            speak(desc[:200])
+                        # No speak() here: tool-describe-scene already voices
+                        # the description via tool-voice — speaking it again
+                        # onboard played every observation twice.
 
                         if interesting and not vision_failed:
                             _auto_remember(f"While exploring: {desc[:300]}")
@@ -993,15 +1069,16 @@ def main(argv: list[str]) -> int:
             # Flush remaining nav entries
             _flush_nav_entries(nav_buffer, explore_id)
 
-            if abort_reason and not quiet and abort_reason != "time limit reached":
+            if abort_reason and not quiet and not dry and abort_reason != "time limit reached":
                 speak(abort_reason)
 
             interesting_count = sum(1 for o in observations if o.get("interesting"))
 
-            # Update meta with final counts
-            meta = _load_exploration_meta()
-            meta["total_observations"] = meta.get("total_observations", 0) + len(observations)
-            _save_exploration_meta(meta)
+            # Update meta with final counts (dry must not touch live meta)
+            if not dry:
+                meta = _load_exploration_meta()
+                meta["total_observations"] = meta.get("total_observations", 0) + len(observations)
+                _save_exploration_meta(meta)
 
             result = {
                 "status": "ok",
@@ -1017,7 +1094,7 @@ def main(argv: list[str]) -> int:
                 "dry": dry,
             }
             log(f"explore complete: {json.dumps(result)}")
-            if not quiet and abort_reason == "time limit reached":
+            if not quiet and not dry and abort_reason == "time limit reached":
                 speak("All done exploring!")
             print(json.dumps(result))
             return 0
@@ -1030,7 +1107,13 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 1
     finally:
-        _write_exploring_state(False)
+        if refresher is not None:
+            refresher.stop()
+            # Join before clearing the file so an in-flight refresh can't
+            # resurrect active:true after the False write below.
+            refresher.join(timeout=2)
+        if not dry:
+            _write_exploring_state(False)
         if px is not None:
             try:
                 px.stop()

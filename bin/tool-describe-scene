@@ -186,6 +186,23 @@ def call_claude_vision(image_path: Path) -> str:
     return result.stdout.strip()[:300]
 
 
+def _exploring_owner_alive() -> bool:
+    """True if another live process already owns exploring.json.
+
+    When px-wander invokes this tool mid-explore, the wander run owns the
+    GPIO guard. Writing our own pid — and worse, active:false on exit —
+    would clobber it and let px-alive retake GPIO while the car is still
+    driving. In that case we must not touch the file at all.
+    """
+    try:
+        data = json.loads((STATE_DIR / "exploring.json").read_text(encoding="utf-8"))
+        pid = data.get("pid")
+        return (bool(data.get("active")) and isinstance(pid, int)
+                and pid != os.getpid() and Path(f"/proc/{pid}").is_dir())
+    except Exception:
+        return False
+
+
 def _set_exploring(active: bool) -> None:
     """Write exploring.json so px-alive yields GPIO."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -225,7 +242,9 @@ def main() -> int:
         print(json.dumps(payload))
         return 0
 
-    _set_exploring(True)
+    owns_exploring = not _exploring_owner_alive()
+    if owns_exploring:
+        _set_exploring(True)
     try:
         timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
         photo_path = PROJECT_ROOT / "photos" / f"{timestamp}.jpg"
@@ -277,10 +296,16 @@ def main() -> int:
         # Step 2: describe with Claude vision
         description = call_claude_vision(photo_path)
 
-        # Step 3: speak the description
+        # Step 3: speak the description. Bounded: an unbounded tool-voice
+        # (routed Nest speech can run 90s+) would blow the caller's
+        # DESCRIBE_SCENE_TIMEOUT and charge a spurious vision failure.
         env = os.environ.copy()
         env["PX_TEXT"] = description[:2000]
-        subprocess.run([str(TOOL_VOICE)], capture_output=True, text=True, check=False, env=env)
+        try:
+            subprocess.run([str(TOOL_VOICE)], capture_output=True, text=True,
+                           check=False, env=env, timeout=60)
+        except subprocess.TimeoutExpired:
+            log_event("describe_scene", {"status": "voice_timeout"})
 
         payload = {
             "status": "ok",
@@ -297,7 +322,8 @@ def main() -> int:
         print(json.dumps(payload))
         return 0
     finally:
-        _set_exploring(False)
+        if owns_exploring:
+            _set_exploring(False)
 
 
 if __name__ == "__main__":

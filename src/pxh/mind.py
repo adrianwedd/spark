@@ -1349,6 +1349,29 @@ def read_battery() -> dict | None:
         return None
 
 
+def _stop_orphan_wander() -> None:
+    """Best-effort SIGTERM to a px-wander that outlived its wrappers.
+
+    Killing tool-wander's process tree cannot reach the sudo'd root
+    px-wander (pi cannot signal root; SIGKILLed sudo forwards nothing), so
+    a timed-out explore can leave a root process still driving the motors.
+    px-wander publishes its pid in exploring.json — signal it directly,
+    via sudo since it runs as root. SIGTERM lands in its graceful-stop
+    handler and motor-cleanup finally block.
+    """
+    try:
+        info = json.loads((STATE_DIR / "exploring.json").read_text(encoding="utf-8"))
+        pid = info.get("pid")
+        if not (info.get("active") and isinstance(pid, int)
+                and Path(f"/proc/{pid}").is_dir()):
+            return
+        subprocess.run(["sudo", "-n", "kill", "-TERM", str(pid)],
+                       capture_output=True, timeout=10, check=False)
+        log(f"expression: signalled orphaned px-wander pid={pid}")
+    except Exception as exc:
+        log(f"expression: orphan wander cleanup failed: {exc}")
+
+
 def _can_explore(session: dict, awareness: dict) -> bool:
     """Check all preconditions for autonomous exploration."""
     if not session.get("roaming_allowed", False):
@@ -3537,25 +3560,37 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
             explore_env["PX_WANDER_STEPS"] = "20"
             explore_result = {}
             try:
-                # Use Popen + SIGTERM instead of subprocess.run(timeout=) which
-                # sends SIGKILL (uncatchable) — px-wander's finally block needs
-                # SIGTERM to execute motor cleanup.
+                # Popen in its own process group. proc.terminate() alone only
+                # reaches the outer tool-wander bash — bash does not forward
+                # SIGTERM to its foreground child, so the wrapper tree (and
+                # the sudo'd px-wander below it) would keep driving. killpg
+                # reaches every same-uid member; the root px-wander is then
+                # signalled by name via exploring.json (_stop_orphan_wander).
+                # Budget: 180s duration + 180s tool-wander buffer + 60s so
+                # tool-wander's own timeout cleanup fires first.
                 proc = subprocess.Popen(
                     [str(BIN_DIR / "tool-wander")],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, env=explore_env,
+                    text=True, env=explore_env, start_new_session=True,
                 )
                 try:
-                    stdout, stderr = proc.communicate(timeout=240)
+                    stdout, stderr = proc.communicate(timeout=420)
                 except subprocess.TimeoutExpired:
-                    log("expression: exploration timeout — sending SIGTERM")
-                    proc.terminate()
+                    log("expression: exploration timeout — sending SIGTERM to group")
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        proc.terminate()
                     try:
                         stdout, stderr = proc.communicate(timeout=15)
                     except subprocess.TimeoutExpired:
                         log("expression: SIGTERM ignored — sending SIGKILL")
-                        proc.kill()
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            proc.kill()
                         stdout, stderr = proc.communicate()
+                    _stop_orphan_wander()
                     log("expression: exploration timed out")
                     stdout = None
                 if stdout:

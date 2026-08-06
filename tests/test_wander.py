@@ -1,6 +1,8 @@
 """Unit tests for pxh.wander (extracted from bin/px-wander heredoc)."""
 import datetime as dt
 import json
+import re
+import time
 from pathlib import Path
 from pxh import wander
 
@@ -140,6 +142,20 @@ def test_load_calibration_missing_or_corrupt_is_none(tmp_path):
     assert wander.load_cliff_calibration(tmp_path) is None
 
 
+def test_load_calibration_rejects_nan_and_nonpositive(tmp_path):
+    """Python's json parser accepts NaN, and every `reading <= nan` is False —
+    a NaN cliff_ref would load fine and silently disarm CliffGuard (fail-open).
+    Same for a non-numeric or non-positive reference."""
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    p = tmp_path / "wander_calibration.json"
+    for bad_ref in ('[NaN, NaN, NaN]', '[Infinity, 650, 650]',
+                    '["650", "650", "650"]', '[0, 650, 650]', '[-1, 650, 650]',
+                    '[true, true, true]'):
+        p.write_text('{"floor_ref": [1000, 1000, 1000], "cliff_ref": %s, "ts": "%s"}'
+                     % (bad_ref, now))
+        assert wander.load_cliff_calibration(tmp_path) is None, bad_ref
+
+
 def test_load_calibration_stale_warns_but_loads(tmp_path, monkeypatch):
     old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=45)).isoformat()
     (tmp_path / "wander_calibration.json").write_text(json.dumps(
@@ -246,6 +262,24 @@ def test_probe_turn_first_side_commit_rearcs(monkeypatch):
     assert steers[-1] == ("dir", -30)
 
 
+def test_probe_turn_arc_back_reverses_with_same_steer(monkeypatch):
+    """Retracing an arc in reverse requires the SAME steer angle (bicycle
+    model: heading rate = v/L*tan(steer); negating v alone undoes the
+    rotation). The old mirrored-steer recovery doubled the heading change,
+    leaving probe labels pointing at the wrong real-world direction."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*20)
+    # left probe 20cm, arc-back 40->55 (moved), right probe 90cm -> commit right
+    px._dist = iter([20.0, 40.0, 55.0, 90.0])
+    px.get_distance = lambda: next(px._dist, 90.0)
+    wander.probe_turn(px, _guard(), prefer="left")
+    bk = px.calls.index(("backward", wander.REVERSE_SPEED))
+    steers_before_reverse = [c for c in px.calls[:bk]
+                             if isinstance(c, tuple) and c[0] == "dir" and c[1] != 0]
+    # the left probe steered -30; the arc-back must ALSO be -30, not +30
+    assert steers_before_reverse[-1] == ("dir", -30)
+
+
 def test_sweep_helpers_are_gone():
     for name in ("sweep_distances", "_sweep_sonar", "read_dist", "_heading_label", "best_direction"):
         assert not hasattr(wander, name)
@@ -309,8 +343,82 @@ def test_explore_live_requires_calibration(isolated_project):
 
 
 def test_describe_scene_timeout_has_margin_over_claude():
-    """The outer wander timeout must outlive tool-describe-scene's 60s call."""
-    assert wander.DESCRIBE_SCENE_TIMEOUT >= 75
+    """The outer wander timeout must outlive tool-describe-scene's whole run:
+    Claude call + photo capture (incl. an 8s stream pause) + bounded speech.
+    Pin the RELATIONSHIP against the tool's actual constant, not a literal —
+    a literal check stays green when someone raises CLAUDE_TIMEOUT."""
+    src = (PROJECT_ROOT / "bin" / "tool-describe-scene").read_text(encoding="utf-8")
+    m = re.search(r"^CLAUDE_TIMEOUT = (\d+)", src, re.M)
+    assert m, "CLAUDE_TIMEOUT not found in bin/tool-describe-scene"
+    claude_timeout = int(m.group(1))
+    # 60s voice bound + ~20s photo/stream headroom
+    assert wander.DESCRIBE_SCENE_TIMEOUT >= claude_timeout + 80
+    # and the tool's voice call must itself be bounded
+    assert re.search(r"TOOL_VOICE.*\n.*\n\s*check=False, env=env, timeout=\d+", src) or \
+           re.search(r"timeout=60\)", src), "tool-voice call in describe-scene is unbounded"
+
+
+def test_px_dry_env_forces_dry(monkeypatch, capsys, tmp_path):
+    """PX_DRY=1 alone (no --dry-run flag) must produce a dry run."""
+    monkeypatch.setenv("PX_DRY", "1")
+    monkeypatch.setattr(wander, "STATE_DIR", tmp_path)
+    rc = wander.main(["--steps", "1", "--quiet"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 0
+    assert out["dry"] is True
+
+
+def test_live_avoid_requires_motion_confirmed(monkeypatch, capsys, tmp_path):
+    """A live avoid run must respect confirm_motion_allowed even when invoked
+    directly (tool-wander gates it, px-wander itself previously did not)."""
+    monkeypatch.delenv("PX_DRY", raising=False)
+    monkeypatch.setattr(wander, "STATE_DIR", tmp_path)
+    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    (tmp_path / "wander_calibration.json").write_text(json.dumps(
+        {"floor_ref": [1000, 1000, 1000], "cliff_ref": [650, 650, 650], "ts": now}))
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    (tmp_path / "session.json").write_text(json.dumps({"confirm_motion_allowed": False}))
+    rc = wander.main(["--steps", "1"])
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 2
+    assert out["status"] == "blocked"
+    assert "motion" in out["reason"]
+
+
+def test_dry_explore_is_silent_and_stateless(monkeypatch, capsys, tmp_path):
+    """PX_DRY / --dry-run must skip ALL audio and must not consume the live
+    explore cooldown, lifetime counters, or the px-alive guard file."""
+    spoken = []
+    monkeypatch.setattr(wander, "speak", lambda t: spoken.append(t))
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    monkeypatch.setattr(wander, "STATE_DIR", tmp_path)
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    rc = wander.main(["--mode", "explore", "--duration", "30", "--dry-run"])
+    assert rc == 0
+    assert spoken == []
+    assert not (tmp_path / "exploring.json").exists()
+    assert not (tmp_path / "exploration_meta.json").exists()
+
+
+def test_exploring_refresher_rewrites_guard_file(monkeypatch, tmp_path):
+    """px-alive ignores exploring.json once its mtime is >60s old; the
+    refresher must keep rewriting it (fresh mtime, same pid) while live."""
+    monkeypatch.setattr(wander, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(wander, "EXPLORING_REFRESH_S", 0.05)
+    r = wander._ExploringRefresher(pid=1234, started="2026-01-01T00:00:00+00:00")
+    r.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        path = tmp_path / "exploring.json"
+        while time.monotonic() < deadline and not path.exists():
+            time.sleep(0.02)
+        data = json.loads(path.read_text())
+        assert data == {"active": True, "pid": 1234,
+                        "started": "2026-01-01T00:00:00+00:00"}
+    finally:
+        r.stop()
+        r.join(timeout=2)
+        assert not r.is_alive()
 
 
 # ---------------------------------------------------------------------------
