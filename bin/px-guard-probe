@@ -64,12 +64,15 @@ import time
 from picarx import Picarx
 
 from pxh.race import safe_grayscale
-from pxh.wander import FORWARD_SPEED, load_cliff_calibration, STATE_DIR
+from pxh.wander import (FORWARD_SPEED, load_cliff_calibration, STATE_DIR,
+                        wait_for_grayscale)
 
 # Ladder spans two orders of magnitude around the current 0.05s constant, so
 # the result distinguishes "50ms is plenty" from "nothing under a second is
-# safe" rather than only confirming the value already in use.
-SETTLE_LADDER_S = [0.0, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6]
+# safe" rather than only confirming the value already in use. Extended past
+# 1.6s on 2026-08-06: the first run showed no recovery anywhere on the old
+# ladder, which cannot distinguish "recovers slowly" from "never recovers".
+SETTLE_LADDER_S = [0.0, 0.05, 0.2, 0.8, 1.6, 3.0, 5.0]
 DRIVE_S = 0.5
 CYCLES = int(sys.argv[1]) if len(sys.argv) > 1 else 5
 
@@ -89,7 +92,15 @@ def main() -> int:
 
     rows = []
     try:
-        idle = median3(px)
+        # wait_for_grayscale, not median3: for ~0.75s after Picarx() the ADC
+        # returns the [2571, 3085, 3599] power-on latch. The first version of
+        # this probe read straight through that window and reported the latch
+        # as the idle baseline — the one number every other row is compared
+        # against, silently ~6x too high.
+        idle = wait_for_grayscale(px)
+        # Second motionless read after the latch has cleared, so the baseline
+        # can be checked for self-consistency before any motor has turned.
+        idle_confirm = median3(px)
         for cycle in range(CYCLES):
             for settle in SETTLE_LADDER_S:
                 # Each ladder rung gets its own drive/stop cycle: the point is
@@ -147,6 +158,7 @@ def main() -> int:
     print(json.dumps({
         "status": "ok",
         "idle_baseline": idle,
+        "idle_confirm": idle_confirm,
         "cliff_ref": cliff_ref,
         "drive_s": DRIVE_S,
         "summary": summary,
