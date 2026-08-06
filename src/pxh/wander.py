@@ -657,6 +657,32 @@ GUARD_CONFIRM_SETTLE_S = 0.05
 # being asked three times.
 GUARD_CONFIRM_READS = 3
 
+# --- Creep confirm: telling a board gap from a drop by WIDTH, not depth ------
+#
+# Measured 2026-08-06 on the shed boards. A genuine drop (sensor overhanging a
+# desk edge) reads 48. The widest floorboard gap in the same room reads 63.
+# Those are not separable by any threshold, and no recalibration helps: both
+# are the same physical thing, an absence of return. Depth is the wrong axis.
+#
+# Width is the right one. A board gap is ~10mm with solid floor on the far
+# side; a cliff has no far side. The grayscale bar sits SENSOR_LEAD_MM ahead of
+# the front tyre's contact patch, so when the sensor is over a void the wheels
+# are still that far short of it — which buys enough room to nudge forward and
+# ask whether the void ends.
+#
+# The cap is the safety property: CREEP_MAX_PULSES * CREEP_MM_PER_PULSE must
+# stay well under SENSOR_LEAD_MM, so that even if every pulse reads void the
+# tyre never reaches the edge. Pinned by
+# test_creep_budget_cannot_reach_the_tyre_contact_patch.
+CREEP_SPEED = 12
+CREEP_PULSE_S = 0.04
+# 10 pulses at (CREEP_SPEED, CREEP_PULSE_S) measured 37mm of travel by tape.
+CREEP_MM_PER_PULSE = 3.7
+# 5 pulses = 18.5mm: clears a 10mm gap with room over, and is half the lead.
+CREEP_MAX_PULSES = 5
+# Sensor bar to front tyre contact patch, measured by tape 2026-08-06.
+SENSOR_LEAD_MM = 37.0
+
 
 class CliffGuard:
     """Fail-closed cliff detector backed by a calibrated grayscale reference."""
@@ -704,6 +730,35 @@ class CliffGuard:
         ref = "/".join(f"{v:.0f}" for v in self.cliff_ref)
         chans = ",".join("LCR"[i] for i in self.trip_channels) or "none"
         return f"median={med} ref={ref} tripped={chans}"
+
+
+def creep_confirm(px, guard: CliffGuard) -> str:
+    """Nudge forward in bounded increments to measure how WIDE a void is.
+
+    Returns "clear" if floor came back within the creep budget (a crossable
+    board gap) or "cliff" if the void outlasted it. Only ever called with the
+    wheels stopped and a *stationary-confirmed* void underneath, never on a
+    "fail" — an unreadable sensor must not be answered by driving forward.
+
+    The total distance travelled is bounded by CREEP_MAX_PULSES, and that
+    bound is what makes probing a possible cliff safe: the budget is half the
+    sensor's lead over the tyres, so the wheels cannot reach the edge even in
+    the worst case where every single pulse reads void.
+    """
+    for i in range(CREEP_MAX_PULSES):
+        px.forward(CREEP_SPEED)
+        time.sleep(CREEP_PULSE_S)
+        px.stop()
+        time.sleep(GUARD_CONFIRM_SETTLE_S)
+        travelled = (i + 1) * CREEP_MM_PER_PULSE
+        if guard.check(px) == "clear":
+            log(f"cliff guard: void ended after {travelled:.0f}mm of creep — "
+                f"board gap, not a drop ({guard.describe_last()})")
+            return "clear"
+    budget = CREEP_MAX_PULSES * CREEP_MM_PER_PULSE
+    log(f"cliff guard: void persisted through {budget:.0f}mm of creep — "
+        f"treating as a real drop ({guard.describe_last()})")
+    return "cliff"
 
 
 def bounded_reverse(px) -> bool:
@@ -757,6 +812,15 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
                 log("cliff guard: in-motion trip dismissed by stationary re-read "
                     f"(transient) — in-motion {in_motion}, stationary "
                     + "; ".join(confirms))
+                continue
+            # A stationary-confirmed void is still ambiguous on a board floor:
+            # gap 63 vs drop 48, indistinguishable by threshold. Measure its
+            # width before spending an edge event on it. Only for "cliff" —
+            # "fail" means the sensor is unreadable, and the answer to that is
+            # never to drive forward.
+            if status == "cliff" and creep_confirm(px, guard) == "clear":
+                log("cliff guard: in-motion trip resolved as a crossable gap "
+                    f"— in-motion {in_motion}, stationary " + "; ".join(confirms))
                 continue
             log(f"cliff guard tripped ({status}) — stop + bounded reverse "
                 f"— in-motion {in_motion}, stationary " + "; ".join(confirms))

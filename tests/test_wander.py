@@ -280,7 +280,13 @@ def test_cliff_guard_partial_samples_still_sense():
 
 def test_guarded_forward_stops_and_reverses_on_cliff(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*20)  # cliff persists through confirm
+    # Cliff persists through the confirm reads AND the whole creep budget —
+    # scripted explicitly rather than by running the reads out, so the test
+    # exercises a held-low sensor and not an exhausted one.
+    px = FakePx(grayscale=[[1000]*3]*3
+                + [[600]*3] * (wander.GUARD_SAMPLES
+                               * (wander.GUARD_CONFIRM_READS
+                                  + wander.CREEP_MAX_PULSES + 1)))
     px._dist = iter([50.0, 60.0])                # before/after reverse: moved
     px.get_distance = lambda: next(px._dist, 60.0)
     guard = _guard()
@@ -342,7 +348,9 @@ def test_guarded_forward_persistent_low_still_trips(monkeypatch):
     """A real cliff holds the sensor low across every confirm read — the
     persistence requirement must not disarm the guard it protects."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[600]*3] * (3 * (1 + wander.GUARD_CONFIRM_READS) + 20))
+    px = FakePx(grayscale=[[600]*3] * (wander.GUARD_SAMPLES
+                                       * (1 + wander.GUARD_CONFIRM_READS
+                                          + wander.CREEP_MAX_PULSES) + 20))
     px._dist = iter([50.0, 60.0])
     px.get_distance = lambda: next(px._dist, 60.0)
     guard = _guard()
@@ -363,10 +371,13 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     EDGE_ABORT_COUNT=2 aborts the wander on the spot. That instant abort is
     INTENTIONAL — this test pins it so a refactor can't silently change it."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    # first check + every confirm read trips: GUARD_SAMPLES per check, and the
-    # confirm only stands when the low reading persists across all of them
+    # first check + every confirm read + every creep pulse trips: GUARD_SAMPLES
+    # per check, and the trip only stands when the low reading persists across
+    # all of them. The creep pulses are what make this a cliff rather than a
+    # board gap — a void with a far side would be crossed, not reversed from.
     px = FakePx(grayscale=[[600]*3] * (wander.GUARD_SAMPLES
-                                       * (1 + wander.GUARD_CONFIRM_READS))
+                                       * (1 + wander.GUARD_CONFIRM_READS
+                                          + wander.CREEP_MAX_PULSES))
                 + [[1000]*3]*20)
     px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
     px.get_distance = lambda: next(px._dist, 50.5)
@@ -374,9 +385,17 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
     assert guard.edge_events == 2
     assert guard.edge_events >= wander.EDGE_ABORT_COUNT
-    # The guard is checked BEFORE the first slice — a wander that starts
-    # already at the desk edge must never move at all.
-    assert not any(isinstance(c, tuple) and c[0] == "forward" for c in px.calls)
+    # The guard is checked BEFORE the first slice, so a wander that starts
+    # already at the desk edge never takes a drive slice. It does now take up
+    # to CREEP_MAX_PULSES creep pulses deciding whether the void has a far
+    # side — a deliberate weakening of the old "never moves at all" invariant,
+    # bounded so the tyre still cannot reach the edge (see
+    # test_creep_budget_cannot_reach_the_tyre_contact_patch). Nothing may move
+    # it at drive speed, and nothing may creep it past the budget.
+    forwards = [c for c in px.calls if isinstance(c, tuple) and c[0] == "forward"]
+    assert all(c[1] == wander.CREEP_SPEED for c in forwards), (
+        "a wander starting at a cliff must never take a full drive slice")
+    assert len(forwards) <= wander.CREEP_MAX_PULSES
 
 
 def test_guarded_forward_noise_trip_confirms_stationary_and_continues(monkeypatch):
@@ -693,3 +712,81 @@ def test_speak_spawns_nothing_without_aplay(monkeypatch):
                             AssertionError("speak() spawned espeak with no aplay to drain it")))
     wander.speak("hello")
     assert spawned == []
+
+
+def test_creep_budget_cannot_reach_the_tyre_contact_patch():
+    """The safety property the creep test rests on.
+
+    Creeping forward over a *possible* cliff is only defensible because the
+    grayscale bar leads the front tyres, and the total creep is capped below
+    that lead. If a future tweak raises CREEP_MAX_PULSES or the pulse size
+    past the lead, the robot could drive a wheel over a real edge while
+    "confirming" it. Measured 2026-08-06: lead 37mm, 3.7mm per pulse.
+    """
+    budget = wander.CREEP_MAX_PULSES * wander.CREEP_MM_PER_PULSE
+    assert budget <= 0.6 * wander.SENSOR_LEAD_MM, (
+        f"creep budget {budget:.1f}mm is too close to the {wander.SENSOR_LEAD_MM}mm "
+        "sensor lead — the tyre could reach the edge mid-probe")
+
+
+def test_creep_confirm_clears_a_board_gap(monkeypatch):
+    """A ~10mm gap: void for the first two pulses, floor on the third."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[600]*3]*3 + [[600]*3]*3 + [[1000]*3]*3)
+    assert wander.creep_confirm(px, _guard()) == "clear"
+
+
+def test_creep_confirm_reports_a_persistent_void_as_cliff(monkeypatch):
+    """A drop has no far side — the void outlasts the whole budget."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[600]*3] * (3 * wander.CREEP_MAX_PULSES + 3))
+    assert wander.creep_confirm(px, _guard()) == "cliff"
+
+
+def test_creep_confirm_stops_pulsing_once_floor_returns(monkeypatch):
+    """It must not burn the rest of the budget after the gap has been crossed
+    — every extra pulse is distance spent toward a possible edge."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*3 + [[1000]*3]*30)
+    wander.creep_confirm(px, _guard())
+    assert len([c for c in px.calls if c == ("forward", wander.CREEP_SPEED)]) == 1
+
+
+def test_guarded_forward_crosses_a_gap_instead_of_spending_an_edge_event(monkeypatch):
+    """The whole point: on a gappy board floor the wander keeps going.
+
+    Before this, every board gap cost an edge event and two of them aborted
+    the run — which is why live runs ended with steps_driven=0.
+    """
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*3      # first slice clear
+                          + [[600]*3]*3     # in-motion trip
+                          + [[600]*3]*9     # stationary confirms hold it
+                          + [[1000]*3]*60)  # creep finds the far side
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.3) == "ok"
+    assert guard.edge_events == 0
+    assert ("backward", wander.REVERSE_SPEED) not in px.calls
+
+
+def test_guarded_forward_still_reverses_when_the_void_has_no_far_side(monkeypatch):
+    """The counterweight: creep must not become a way to ignore real cliffs."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*200)
+    px._dist = iter([50.0, 60.0])
+    px.get_distance = lambda: next(px._dist, 60.0)
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
+    assert guard.edge_events == 1
+    assert ("backward", wander.REVERSE_SPEED) in px.calls
+
+
+def test_guarded_forward_never_creeps_on_an_unreadable_sensor(monkeypatch):
+    """"fail" means the guard cannot see. Answering that by driving forward
+    would invert the fail-closed contract."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*3 + [None]*200)
+    px.get_distance = lambda: 60.0
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "edge"
+    assert ("forward", wander.CREEP_SPEED) not in px.calls
