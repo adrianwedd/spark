@@ -136,3 +136,123 @@ def test_startup_runs_janitor(monkeypatch):
     with TestClient(appmod.app):  # triggers startup event
         pass
     assert calls  # janitor ran at least once on startup
+
+
+from announce_relay import config
+
+CARD = {"headline": "8pm dose", "body": "Time for your meds.", "variant": "meds"}
+
+
+@pytest.fixture()
+def card_client(client, monkeypatch, tmp_dirs):
+    """Endpoint-contract client with the render/mux toolchain stubbed out.
+
+    These tests assert the HTTP contract, not that Pillow and ffmpeg work —
+    that is tests/test_card.py and tests/test_video.py. Stubbing keeps them
+    fast and keeps a host without ffmpeg from failing contract tests.
+    """
+    from announce_relay import app as appmod
+
+    def fake_render(headline, body, variant, when=None):
+        p = tmp_dirs["priv"] / "stub.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return p
+
+    def fake_mux(png, wav, tail_s=1.5):
+        p = tmp_dirs["priv"] / f"{'a' * 32}.mp4"
+        p.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        return p
+
+    monkeypatch.setattr(appmod.card, "render_card", fake_render)
+    monkeypatch.setattr(appmod.video, "mux", fake_mux)
+    return client
+
+
+def test_card_requires_auth(client):
+    r = client.post("/card", json=CARD)
+    assert r.status_code == 401
+
+
+def test_card_returns_video_url_and_kind(card_client):
+    r = card_client.post("/card", json=CARD, headers=AUTH)
+    assert r.status_code == 200
+    b = r.json()
+    assert b["kind"] == "video"
+    assert "/video/" in b["url"]
+    # Derive from config — RELAY_PUBLIC_BASE_URL differs between dev and the box.
+    assert b["url"].startswith(config.PUBLIC_BASE_URL)
+    assert b["duration_s"] > 0
+    assert b["variant"] == "meds"
+
+
+def test_card_duration_includes_the_cast_tail(card_client):
+    from announce_relay import video
+    r = card_client.post("/card", json=CARD, headers=AUTH)
+    b = r.json()
+    assert b["kind"] == "video"
+    # 0.1s of synthesized speech in the stub + the tail.
+    assert b["duration_s"] >= video.TAIL_S
+
+
+def test_card_rejects_disallowed_voice(client):
+    r = client.post("/card", json={**CARD, "voice": "nope"}, headers=AUTH)
+    assert r.status_code == 400
+
+
+def test_card_rejects_empty_after_sanitization(client):
+    r = client.post("/card", json={"headline": "***", "body": "***"}, headers=AUTH)
+    assert r.status_code == 400
+
+
+def test_card_falls_back_to_audio_when_render_fails(client, monkeypatch):
+    from announce_relay import app as appmod, card
+
+    def boom(*a, **kw):
+        raise card.CardError("no font")
+    monkeypatch.setattr(appmod.card, "render_card", boom)
+
+    r = client.post("/card", json=CARD, headers=AUTH)
+    assert r.status_code == 200          # a dose reminder must not be lost
+    b = r.json()
+    assert b["kind"] == "audio"
+    assert "/audio/" in b["url"]
+    assert b["duration_s"] > 0
+
+
+def test_card_falls_back_to_audio_when_mux_fails(client, monkeypatch):
+    from announce_relay import app as appmod, video
+
+    def boom(*a, **kw):
+        raise video.MuxError("no ffmpeg")
+    monkeypatch.setattr(appmod.video, "mux", boom)
+
+    r = client.post("/card", json=CARD, headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["kind"] == "audio"
+
+
+def test_card_falls_back_on_unexpected_exception(client, monkeypatch):
+    # Pillow raises a wide, version-dependent set; none of it may 500.
+    from announce_relay import app as appmod
+
+    def boom(*a, **kw):
+        raise RuntimeError("something exotic")
+    monkeypatch.setattr(appmod.card, "render_card", boom)
+
+    r = client.post("/card", json=CARD, headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["kind"] == "audio"
+
+
+def test_video_route_answers_head(card_client):
+    # Chromecast preflights with HEAD; a 405 makes the cast load and never start.
+    name = card_client.post("/card", json=CARD, headers=AUTH).json()["url"].rsplit("/", 1)[-1]
+    assert card_client.head(f"/video/{name}").status_code == 200
+    r = card_client.get(f"/video/{name}")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "video/mp4"
+
+
+def test_video_route_rejects_traversal(card_client):
+    assert card_client.get("/video/..%2F..%2Fetc%2Fpasswd").status_code == 404
+    assert card_client.get("/video/nope.mp4").status_code == 404
