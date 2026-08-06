@@ -92,6 +92,8 @@ def test_tool_voice_lock_timeout(isolated_project):
     env["PX_DRY"] = "0"  # non-dry so the lock path is exercised
     env["PX_TEXT"] = "Lock contention test"
     env["PX_VOICE_LOCK_TIMEOUT"] = "1"
+    env["PX_NIGHT_SILENCE_START_H"] = "99"  # never night — the gate returns
+    env["PX_NIGHT_SILENCE_END_H"] = "0"     # "suppressed" before the lock path
 
     log_dir = env.get("LOG_DIR", str(PROJECT_ROOT / "logs"))
     lock_path = str(Path(log_dir) / "voice.lock")
@@ -1328,6 +1330,33 @@ def test_tool_announce_suppressed_during_night_silence(isolated_project):
     payload = parse_json(stdout)
     assert payload["status"] == "suppressed"
     assert payload["reason"] == "night_silence"
+
+
+def test_tool_announce_fails_fast_on_empty_relay_token(isolated_project):
+    # A forgotten `.env` (empty ANNOUNCE_RELAY_TOKEN) must be reported as a local
+    # config error, not sent to the relay to bounce as a 401 that reads like a
+    # security event in relay.log (2026-08-05 "rogue process" hunt).
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_ANNOUNCE_TEXT"] = "hello"
+    env["PX_BYPASS_SUDO"] = "1"
+    env["PX_ANNOUNCE_RELAY_URL"] = base
+    env["PX_HA_HOST"] = base
+    env["PX_HA_TOKEN"] = "t"
+    env.pop("ANNOUNCE_RELAY_TOKEN", None)   # the forgotten-.env case
+    env["PX_NIGHT_SILENCE_START_H"] = "99"   # never night — deterministic
+    env["PX_NIGHT_SILENCE_END_H"] = "0"
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+    assert payload["status"] == "error"
+    assert "ANNOUNCE_RELAY_TOKEN" in payload["error"]
+    # Nothing may reach the relay with an empty bearer.
+    assert not any(p.endswith("/announce") for (_, p, _) in _StubHandler.captured)
 
 
 def test_tool_announce_resolves_single_target_from_multiple(isolated_project):

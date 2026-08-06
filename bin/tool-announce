@@ -181,8 +181,15 @@ def main() -> int:
         return _emit({"status": "suppressed", "reason": "night_silence",
                       "voice": cfg.ANNOUNCE_VOICE, "targets": targets})
 
-    relay_token = os.environ.get("ANNOUNCE_RELAY_TOKEN", "")
+    relay_token = os.environ.get("ANNOUNCE_RELAY_TOKEN", "").strip()
     ha_token = os.environ.get("PX_HA_TOKEN", "")
+
+    # Fail fast on a missing token: an empty bearer would bounce off the relay
+    # as a 401 that reads like an intrusion attempt in relay.log, when the real
+    # cause is a shell that never sourced .env.
+    if not relay_token:
+        return _emit({"status": "error",
+                      "error": "ANNOUNCE_RELAY_TOKEN is empty — source .env before running"})
 
     _set_exploring(True)
     try:
