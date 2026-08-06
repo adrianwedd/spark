@@ -55,8 +55,8 @@ OBI_CHAT_MAX_BACKOFF_S  = 14400  # 4 h cap
 OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
 
 # --- Announce pipeline (data-voice over Google Nest) ----------------------
-ANNOUNCE_ENABLED         = True   # G1+G2 passed 2026-08-01: relay live on M5, WAV plays natively on Mini + Hub Max (needed UniFi ZBF policies 10002/10003 — IoT VLAN 20 → .100:7862 and .200:8123)
-ANNOUNCE_RELAY_URL       = os.environ.get("PX_ANNOUNCE_RELAY_URL", "http://192.168.0.249:7862")   # IP, not M5.local (Nests can't resolve mDNS) — M5 moved .100→.249 (2026-08-05); needs a DHCP reservation for M5 or the pipeline breaks silently again. NOTE: UniFi ZBF policies 10002/10003 still allow VLAN 20 → .100 only — Nest audio fetches stay blocked until Adrian repoints them at .249
+ANNOUNCE_ENABLED         = True   # G1+G2 passed 2026-08-01: relay live on M5, WAV plays natively on Mini + Hub Max (needs UniFi ZBF policies 10002/10003 — IoT VLAN 20 → relay:7862 and .200:8123)
+ANNOUNCE_RELAY_URL       = os.environ.get("PX_ANNOUNCE_RELAY_URL", "http://192.168.0.249:7862")   # IP, not M5.local (Nests can't resolve mDNS). .249 is M5-wifi's DHCP reservation (M5's wired leg keeps .100 if ever replugged). ZBF policy 10002 repointed to .249 and E2E-verified 2026-08-05
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
 ANNOUNCE_DEFAULT_TARGETS = ["media_player.office_mini"]   # Office Mini — Adrian's default room (both it and nest_hub_max cast-verified 2026-08-01)
