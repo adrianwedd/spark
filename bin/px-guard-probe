@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Diagnostic: measure how long the grayscale ADC takes to recover after the
+# motors stop.
+#
+# The cliff guard confirms an in-motion trip with a stationary re-read taken
+# GUARD_CONFIRM_SETTLE_S after px.stop(). That constant was chosen without
+# measurement, and live run 8 (2026-08-06) produced a stationary median of
+# 257/79/79 on floor that had just read 718/540 in motion — the confirm read
+# is not automatically trustworthy. This samples the same sensor on a fixed
+# settle ladder so the constant can be set from data.
+#
+# GPIO handling mirrors bin/px-wander: self-elevate, publish exploring.json so
+# px-alive stands down without racing us for the handle, then yield.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+if [[ "${PX_BYPASS_SUDO:-0}" != "1" && "$EUID" -ne 0 ]]; then
+    exec sudo -n env \
+        "PYTHONPATH=$PYTHONPATH" \
+        "PROJECT_ROOT=$PROJECT_ROOT" \
+        "LOG_DIR=$LOG_DIR" \
+        "PX_STATE_DIR=${PX_STATE_DIR:-$PROJECT_ROOT/state}" \
+        "$SCRIPT_DIR/px-guard-probe" "$@"
+fi
+
+probe_guard=0
+
+set_probe_guard() {
+    /usr/bin/python3 - "$1" "$$" <<'PY'
+import datetime as dt
+import sys
+
+from pxh import wander
+
+active = sys.argv[1] == "1"
+pid = int(sys.argv[2]) if active else None
+started = dt.datetime.now(dt.timezone.utc).isoformat() if active else None
+if not wander._write_exploring_state(active, pid=pid, started=started):
+    raise SystemExit(1)
+PY
+}
+
+cleanup_probe_guard() {
+    if [[ "$probe_guard" == "1" ]]; then
+        set_probe_guard 0 || true
+    fi
+}
+
+set_probe_guard 1
+probe_guard=1
+trap cleanup_probe_guard EXIT INT TERM
+
+yield_alive
+
+/usr/bin/python3 - "$@" <<'PY'
+import json
+import statistics
+import sys
+import time
+
+from picarx import Picarx
+
+from pxh.race import safe_grayscale
+from pxh.wander import FORWARD_SPEED, load_cliff_calibration, STATE_DIR
+
+# Ladder spans two orders of magnitude around the current 0.05s constant, so
+# the result distinguishes "50ms is plenty" from "nothing under a second is
+# safe" rather than only confirming the value already in use.
+SETTLE_LADDER_S = [0.0, 0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6]
+DRIVE_S = 0.5
+CYCLES = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+
+
+def median3(px):
+    samples = [s for s in (safe_grayscale(px, retries=1) for _ in range(3))
+               if s is not None]
+    if not samples:
+        return None
+    return [statistics.median(col) for col in zip(*samples)]
+
+
+def main() -> int:
+    px = Picarx()
+    cal = load_cliff_calibration(STATE_DIR)
+    cliff_ref = cal["cliff_ref"] if cal else None
+
+    rows = []
+    try:
+        idle = median3(px)
+        for cycle in range(CYCLES):
+            for settle in SETTLE_LADDER_S:
+                # Each ladder rung gets its own drive/stop cycle: the point is
+                # the sensor's state at exactly `settle` after a stop, and
+                # sampling a single stop repeatedly would measure one recovery
+                # curve rather than the distribution across stops.
+                px.forward(FORWARD_SPEED)
+                in_motion = median3(px)
+                time.sleep(DRIVE_S)
+                px.stop()
+                if settle:
+                    time.sleep(settle)
+                after = median3(px)
+                tripped = None
+                if after is not None and cliff_ref is not None:
+                    tripped = [i for i in range(3) if after[i] <= cliff_ref[i]]
+                rows.append({
+                    "cycle": cycle,
+                    "settle_s": settle,
+                    "in_motion": in_motion,
+                    "after_stop": after,
+                    "tripped": tripped,
+                })
+                # Undo the cycle's travel so the probe stays over roughly the
+                # same floor instead of walking across the room mid-measurement.
+                px.backward(FORWARD_SPEED)
+                time.sleep(DRIVE_S)
+                px.stop()
+                time.sleep(0.3)
+    finally:
+        try:
+            px.stop()
+        except Exception:
+            pass
+
+    by_settle = {}
+    for row in rows:
+        if row["after_stop"] is None:
+            continue
+        by_settle.setdefault(row["settle_s"], []).append(row)
+
+    summary = []
+    for settle in sorted(by_settle):
+        group = by_settle[settle]
+        mins = [min(r["after_stop"]) for r in group]
+        trips = sum(1 for r in group if r["tripped"])
+        summary.append({
+            "settle_s": settle,
+            "n": len(group),
+            "min_channel_lo": min(mins),
+            "min_channel_median": statistics.median(mins),
+            "false_trips": trips,
+        })
+
+    print(json.dumps({
+        "status": "ok",
+        "idle_baseline": idle,
+        "cliff_ref": cliff_ref,
+        "drive_s": DRIVE_S,
+        "summary": summary,
+        "rows": rows,
+    }, indent=2))
+    return 0
+
+
+raise SystemExit(main())
+PY
