@@ -256,3 +256,10 @@ def test_video_route_answers_head(card_client):
 def test_video_route_rejects_traversal(card_client):
     assert card_client.get("/video/..%2F..%2Fetc%2Fpasswd").status_code == 404
     assert card_client.get("/video/nope.mp4").status_code == 404
+
+
+def test_health_reports_allowed_voices(client):
+    # Lets a restart be verified without reading .env (which holds the token).
+    b = client.get("/health").json()
+    assert isinstance(b["voices"], list)
+    assert set(b["voices"]) == set(config.ALLOWED_VOICES)

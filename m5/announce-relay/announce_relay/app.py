@@ -172,7 +172,15 @@ def card_announce(body: CardBody, authorization: str | None = Header(default=Non
 @app.get("/health")
 def health():
     n = len(list(config.CACHE_DIR.glob("*.wav"))) if config.CACHE_DIR.exists() else 0
-    return {"status": "ok", "afterwords": synth.ping(), "cache_files": n}
+    # `voices` is reported so a restart can be verified from outside without
+    # reading .env — which holds the bearer token and is deliberately
+    # unreadable. Voice names are not secret.
+    return {
+        "status": "ok",
+        "afterwords": synth.ping(),
+        "cache_files": n,
+        "voices": sorted(config.ALLOWED_VOICES),
+    }
 
 
 # GET+HEAD: Chromecast preflights the URL with HEAD before playing; a 405 there
