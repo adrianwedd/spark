@@ -1418,20 +1418,104 @@ def _can_explore(session: dict, awareness: dict) -> bool:
 _battery_history: list[int] = []        # last N pct readings (newest last)
 _battery_glitch_count: int = 0          # consecutive suspicious readings
 _battery_glitch_first_mono: float = 0.0  # monotonic time of first glitch in current streak
+_battery_pending: list[int] = []        # suspicious readings in the current streak
 
 BATTERY_GLITCH_MIN_ELAPSED_S = 90       # glitches must span at least this many seconds
+
+# A discharging pack falls monotonically; a broken ADC scatters. A streak of
+# suspicious readings only counts as evidence while it keeps declining — a
+# reading that jumps back up by more than this is noise, and restarts the
+# streak. This is what stops alternating garbage (0, 55, 2, 61) from
+# accumulating confirmations it hasn't earned.
+BATTERY_RISE_TOLERANCE_PCT = 3
+
+# ...and each step down must itself be survivable as a discharge. A fall of
+# 53 points between consecutive readings (55% then 2%) is not a steep curve,
+# it is two unrelated garbage values that happen to be ordered. Deliberately
+# looser than BATTERY_MAX_DROP_PER_TICK: a pack past the knee really can fall
+# hard under load, and by this point we are already inside a suspicious streak.
+BATTERY_STREAK_MAX_STEP_PCT = 2 * BATTERY_MAX_DROP_PER_TICK
+
+# Below BATTERY_CRITICAL the cost of the two errors is wildly asymmetric: a
+# false shutdown is a reboot, a missed one is a brownout mid-write. Confirm
+# faster down there. Two independent guards still sit downstream — the main
+# loop needs 2 consecutive criticals, and battery_emergency_shutdown re-reads
+# voltage and charging state before it pulls the plug.
+BATTERY_CRITICAL_CONFIRMS = 2
+BATTERY_CRITICAL_MIN_ELAPSED_S = 45
+
+
+def _battery_streak_note(pct: int) -> tuple[int, float]:
+    """Record a suspicious reading, returning (confirmations, elapsed seconds).
+
+    The streak restarts whenever a reading breaks the declining trend, so only
+    a coherent discharge curve accumulates confirmations.
+    """
+    global _battery_glitch_count, _battery_glitch_first_mono
+
+    now_mono = time.monotonic()
+    if _battery_pending:
+        last = _battery_pending[-1]
+        broke_trend = (pct > min(_battery_pending) + BATTERY_RISE_TOLERANCE_PCT
+                       or last - pct > BATTERY_STREAK_MAX_STEP_PCT)
+    else:
+        broke_trend = False
+
+    if not _battery_pending or broke_trend:
+        if broke_trend:
+            log(f"battery: reading {pct}% broke the declining streak "
+                f"{_battery_pending} — restarting confirmation")
+        _battery_pending[:] = [pct]
+        _battery_glitch_count = 1
+        _battery_glitch_first_mono = now_mono
+        return 1, 0.0
+
+    _battery_pending.append(pct)
+    _battery_pending[:] = _battery_pending[-10:]
+    _battery_glitch_count += 1
+    return _battery_glitch_count, now_mono - _battery_glitch_first_mono
+
+
+def _battery_confirm_gate(pct: int) -> tuple[int, float]:
+    """Confirmations and elapsed time required before accepting a low reading."""
+    if pct <= BATTERY_CRITICAL:
+        return BATTERY_CRITICAL_CONFIRMS, BATTERY_CRITICAL_MIN_ELAPSED_S
+    return BATTERY_GLITCH_CONFIRMS, BATTERY_GLITCH_MIN_ELAPSED_S
+
+
+def _battery_accept(pct: int) -> None:
+    """Accept a confirmed reading, reseeding history from the streak.
+
+    Reseeding matters: the rejected readings never entered history, so the
+    median stayed anchored to a stale pre-decline level and kept vetoing every
+    subsequent reading. Replacing history with the streak lets the baseline
+    follow the pack down.
+    """
+    global _battery_glitch_count
+    _battery_history[:] = (_battery_pending or [pct])[-10:]
+    _battery_pending.clear()
+    _battery_glitch_count = 0
 
 
 def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
     """Return the battery reading, or None if it looks like a sensor glitch.
 
     A reading is suspicious if it drops more than BATTERY_MAX_DROP_PER_TICK
-    from the median of recent history. Suspicious readings must repeat
-    BATTERY_GLITCH_CONFIRMS times AND span at least BATTERY_GLITCH_MIN_ELAPSED_S
-    seconds before being accepted (genuinely dead battery). This prevents a
-    batch of bad readings in a single tick from passing the filter.
+    from the median of recent history. Suspicious readings must repeat and span
+    a minimum time before being accepted, which stops a batch of bad readings
+    in a single tick from passing the filter.
+
+    Two properties keep a genuinely flat pack from being filtered away, both
+    learned from the 2026-08-06 brownout:
+
+    * The streak must keep declining (see BATTERY_RISE_TOLERANCE_PCT), so
+      scattered ADC garbage never accumulates confirmations — which in turn
+      lets the thresholds be loose enough to catch a real discharge in time.
+    * Readings at or below BATTERY_CRITICAL confirm on the shorter
+      BATTERY_CRITICAL_* gate, because down there a missed shutdown costs far
+      more than a spurious one.
     """
-    global _battery_glitch_count, _battery_glitch_first_mono
+    global _battery_glitch_count
     if raw is None:
         return None
 
@@ -1441,23 +1525,15 @@ def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
     # for implausibly low first readings (e.g. 0% from an ADC glitch on cold start).
     if not _battery_history:
         if pct < BATTERY_CRITICAL:
-            now_mono = time.monotonic()
-            if _battery_glitch_count == 0:
-                _battery_glitch_first_mono = now_mono
-            elapsed = now_mono - _battery_glitch_first_mono
-            if elapsed < BATTERY_GLITCH_MIN_ELAPSED_S:
-                # Don't increment past 1 within the same time window
-                _battery_glitch_count = min(_battery_glitch_count + 1, 1)
-            else:
-                _battery_glitch_count += 1
+            count, elapsed = _battery_streak_note(pct)
+            confirms, min_elapsed = _battery_confirm_gate(pct)
             log(f"battery: suspicious first reading {pct}% "
-                f"(count={_battery_glitch_count}/{BATTERY_GLITCH_CONFIRMS}, "
-                f"elapsed={elapsed:.0f}s/{BATTERY_GLITCH_MIN_ELAPSED_S}s)")
-            if _battery_glitch_count < BATTERY_GLITCH_CONFIRMS:
+                f"(count={count}/{confirms}, "
+                f"elapsed={elapsed:.0f}s/{min_elapsed:.0f}s)")
+            if count < confirms or elapsed < min_elapsed:
                 return None
             # Confirmed low — genuinely dead battery, accept it
-        _battery_history.append(pct)
-        _battery_glitch_count = 0
+        _battery_accept(pct)
         return raw
 
     # Median of recent readings as baseline
@@ -1466,31 +1542,23 @@ def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
     drop = median - pct
 
     if drop > BATTERY_MAX_DROP_PER_TICK:
-        now_mono = time.monotonic()
-        if _battery_glitch_count == 0:
-            _battery_glitch_first_mono = now_mono
-        elapsed = now_mono - _battery_glitch_first_mono
-        if elapsed < BATTERY_GLITCH_MIN_ELAPSED_S:
-            # Within same time window — don't increment past 1
-            _battery_glitch_count = min(_battery_glitch_count + 1, 1)
-        else:
-            _battery_glitch_count += 1
+        count, elapsed = _battery_streak_note(pct)
+        confirms, min_elapsed = _battery_confirm_gate(pct)
         log(f"battery: suspicious reading {pct}% (median={median}%, drop={drop}%, "
-            f"glitch_count={_battery_glitch_count}/{BATTERY_GLITCH_CONFIRMS}, "
-            f"elapsed={elapsed:.0f}s/{BATTERY_GLITCH_MIN_ELAPSED_S}s)")
-        if _battery_glitch_count < BATTERY_GLITCH_CONFIRMS:
+            f"glitch_count={count}/{confirms}, "
+            f"elapsed={elapsed:.0f}s/{min_elapsed:.0f}s)")
+        if count < confirms or elapsed < min_elapsed:
             # Reject — return previous known-good value
             return {"pct": prev_pct, "volts": raw["volts"], "charging": raw.get("charging", False)}
-        else:
-            # Confirmed — battery really is low (or sensor is consistently broken)
-            log(f"battery: accepting {pct}% after {_battery_glitch_count} confirmations "
-                f"spanning {elapsed:.0f}s")
-            _battery_history.append(pct)
-            _battery_history[:] = _battery_history[-10:]
-            return raw
+        # Confirmed — battery really is low (or sensor is consistently broken)
+        log(f"battery: accepting {pct}% after {count} confirmations "
+            f"spanning {elapsed:.0f}s")
+        _battery_accept(pct)
+        return raw
     else:
         # Normal reading — reset glitch counter
         _battery_glitch_count = 0
+        _battery_pending.clear()
         _battery_history.append(pct)
         _battery_history[:] = _battery_history[-10:]  # keep last 10
         return raw
@@ -2425,6 +2493,7 @@ def _reset_state():
     _battery_history = []
     _battery_glitch_count = 0
     _battery_glitch_first_mono = 0.0
+    _battery_pending.clear()
     _cached_weather = None
     _last_weather_fetch = 0.0
     _cached_ha = None

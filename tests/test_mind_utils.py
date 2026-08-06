@@ -380,6 +380,86 @@ def test_battery_glitch_confirms_requires_multiple():
     assert BATTERY_GLITCH_CONFIRMS >= 2  # safety: need at least 2 confirms
 
 
+class _FakeClock:
+    """Monotonic clock the test advances explicitly."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+@pytest.fixture
+def fake_mono(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(pxh.mind.time, "monotonic", clock)
+    return clock
+
+
+def _volts_for(pct: int) -> float:
+    """Inverse of px-battery-poll's volts_to_pct, for realistic readings."""
+    return round(6.0 + (pct / 100) * (8.4 - 6.0), 2)
+
+
+def test_sustained_decline_to_flat_is_reported_not_held(fake_mono):
+    """A real battery going flat must surface a critical pct, not be pinned at prev.
+
+    Replays the 2026-08-06 brownout at its real cadence. px-mind's ticks were
+    starved by slow reflection calls (86.9s and 99.4s), so the pack fell
+    34% -> 0% across only three evaluations spanning 222s while filter_battery
+    kept returning the stale 34%. The <=10% emergency shutdown never saw a
+    critical value and the Pi lost power mid-write.
+    """
+    for pct in (40, 38, 36, 34):
+        filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=pct + 2)
+        fake_mono.advance(60)
+
+    prev = 34
+    reported = []
+    # (pct, seconds until next evaluation) — gaps taken from the journal
+    for pct, gap in ((17, 60), (15, 162), (0, 0)):
+        out = filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=prev)
+        prev = out["pct"]
+        reported.append(out["pct"])
+        fake_mono.advance(gap)
+
+    assert min(reported) <= 10, (
+        f"filter never reported a critical level during a real decline: {reported}"
+    )
+
+
+def test_transient_zero_spike_is_still_rejected(fake_mono):
+    """A single 0% spike surrounded by healthy readings must never be accepted."""
+    for pct in (80, 79, 78):
+        filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=pct + 1)
+        fake_mono.advance(60)
+
+    spike = filter_battery({"pct": 0, "volts": 5.2}, prev_pct=78)
+    assert spike["pct"] == 78
+
+    fake_mono.advance(60)
+    recovered = filter_battery({"pct": 77, "volts": _volts_for(77)}, prev_pct=78)
+    assert recovered["pct"] == 77
+
+
+def test_scattered_garbage_readings_never_confirm(fake_mono):
+    """Wildly inconsistent low readings are a dead ADC, not a discharge curve."""
+    for pct in (80, 79, 78):
+        filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=pct + 1)
+        fake_mono.advance(60)
+
+    prev = 78
+    for pct in (0, 55, 2, 61, 0, 48):
+        out = filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=prev)
+        prev = out["pct"]
+        fake_mono.advance(60)
+        assert out["pct"] >= 40, f"garbage reading {pct}% was accepted as {out['pct']}%"
+
+
 # ---------------------------------------------------------------------------
 # HA presence tests
 # ---------------------------------------------------------------------------
