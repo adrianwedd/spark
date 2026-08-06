@@ -4,6 +4,7 @@ Cast devices replace the receiver app on every play_media, so an image and
 audio cannot be layered — the only way to show a card while speaking is to
 ship one video.
 """
+import contextlib
 import os
 import shutil
 import subprocess
@@ -58,6 +59,11 @@ def mux(png_path: Path, wav_path: Path, tail_s: float = TAIL_S) -> Path:
         with _mux_gate:
             proc = subprocess.run(cmd, capture_output=True, timeout=MUX_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # -y truncates the destination up front, so a timeout or a launch
+        # failure leaves a partial MP4 that stays fetchable until the janitor
+        # sweeps it. Clean up on the way out.
+        with contextlib.suppress(OSError):
+            out.unlink(missing_ok=True)
         raise MuxError(f"ffmpeg could not be run: {exc}") from exc
 
     if proc.returncode != 0 or not out.exists() or out.stat().st_size == 0:

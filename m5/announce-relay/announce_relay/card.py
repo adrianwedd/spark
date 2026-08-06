@@ -11,6 +11,7 @@ because a slightly-wrong OG image still functions; a bitmap-font card at two
 metres is illegible, and raising routes the caller into the audio fallback,
 which is the better failure.
 """
+import contextlib
 import datetime as _dt
 from pathlib import Path
 
@@ -122,15 +123,23 @@ def _wrap(draw, text: str, font, max_px: int, max_lines: int) -> list[str]:
 def render_card(headline: str, body: str, variant: str = "task",
                 when: str | None = None) -> Path:
     """Render a 1280x800 status card. Returns the PNG path. Raises CardError."""
+    out: Path | None = None
     try:
-        return _render(headline, body, variant, when)
-    except CardError:
-        raise
+        out, img = _render(headline, body, variant, when)
+        img.save(str(out), "PNG", optimize=True)
+        return out
     except Exception as exc:                      # noqa: BLE001 — see CardError
+        # A failure inside save() leaves a truncated PNG nobody can reach.
+        if out is not None:
+            with contextlib.suppress(OSError):
+                out.unlink(missing_ok=True)
+        if isinstance(exc, CardError):
+            raise
         raise CardError(f"card render failed: {exc!r}") from exc
 
 
-def _render(headline: str, body: str, variant: str, when: str | None) -> Path:
+def _render(headline: str, body: str, variant: str, when: str | None):
+    """Build the image and choose its path. The caller owns saving + cleanup."""
     accent = VARIANT_ACCENTS.get((variant or "").lower(), COPPER)
 
     f_head = _font(_FONT_CANDIDATES_BOLD, 64, bold=True)
@@ -184,5 +193,4 @@ def _render(headline: str, body: str, variant: str, when: str | None) -> Path:
 
     out = store.private_path_ext("png")
     out.parent.mkdir(parents=True, exist_ok=True)
-    img.save(str(out), "PNG", optimize=True)
-    return out
+    return out, img

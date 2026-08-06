@@ -21,6 +21,7 @@ _rate: dict[str, deque] = defaultdict(deque)
 # Afterwords is a single GPU model — serialize ALL synth jobs process-wide
 # (the per-key lock only dedups identical text; different texts must still queue).
 _synth_gate = threading.Lock()
+_rate_lock = threading.Lock()
 
 
 def _synth_serialized(text: str, voice: str) -> bytes:
@@ -54,13 +55,17 @@ def _check_auth(authorization: str | None) -> str:
 
 
 def _check_rate(token: str) -> None:
+    # Sync endpoints run in Starlette's threadpool, so prune/check/append must
+    # be atomic — otherwise concurrent requests can all observe a under-limit
+    # deque and every one of them passes.
     now = time.time()
-    dq = _rate[token]
-    while dq and dq[0] < now - 60:
-        dq.popleft()
-    if len(dq) >= config.RATE_LIMIT_PER_MIN:
-        raise HTTPException(429, "rate limited")
-    dq.append(now)
+    with _rate_lock:
+        dq = _rate[token]
+        while dq and dq[0] < now - 60:
+            dq.popleft()
+        if len(dq) >= config.RATE_LIMIT_PER_MIN:
+            raise HTTPException(429, "rate limited")
+        dq.append(now)
 
 
 @app.post("/announce")
