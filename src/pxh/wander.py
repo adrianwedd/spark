@@ -481,9 +481,22 @@ def wait_for_grayscale(px, settle_s: float | None = None,
     "clear" while the car sits at the edge of a step, and a calibration taken
     too early persists a reference ~5x too high.
 
-    Returns the first reading that differs from the initial sample, or None if
-    the ADC never updated within `settle_s`. None means "cannot sense" and
-    callers must fail closed, exactly as CliffGuard.check does.
+    The latch clears PER CHANNEL, not all at once: px-guard-probe measured a
+    live idle reading of [2571, 544, 385] — ch0 still on its exact latch value
+    while ch1/ch2 had gone live — with ch0 reading 320 seconds later. So the
+    reading must be held against every channel, not any: a rule of "differs
+    from the baseline" accepts that mixed sample and calibration then persists
+    a floor_ref carrying a ~6x-inflated channel, lifting the cliff threshold
+    with it until ordinary floor trips the guard.
+
+    Returns the first reading in which every channel has been observed to
+    change since the initial sample, or None if the ADC never fully updated
+    within `settle_s`. None means "cannot sense" and callers must fail closed,
+    exactly as CliffGuard.check does. Tracking each channel's change across the
+    whole poll loop (rather than requiring one reading to differ everywhere at
+    once) is what keeps an already-partially-live baseline from deadlocking:
+    a live channel still moves with sensor noise read to read, so it registers
+    its own change and the wait ends normally instead of failing closed.
 
     settle_s/poll_s read the module attributes at call time (not as captured
     default args) so tests can shorten them without patching time.sleep.
@@ -491,6 +504,7 @@ def wait_for_grayscale(px, settle_s: float | None = None,
     settle_s = GRAYSCALE_SETTLE_S if settle_s is None else settle_s
     poll_s   = GRAYSCALE_POLL_S if poll_s is None else poll_s
     first = safe_grayscale(px, retries=1)
+    changed = [False, False, False]
     deadline = time.monotonic() + settle_s
     while time.monotonic() < deadline:
         if poll_s:
@@ -505,11 +519,15 @@ def wait_for_grayscale(px, settle_s: float | None = None,
             # CHANGE — returning it here would hand back the very latch this
             # function exists to reject, with no sample to compare against.
             first = gs
+            changed = [False, False, False]
             continue
-        if gs != first:
+        for i in range(3):
+            if gs[i] != first[i]:
+                changed[i] = True
+        if all(changed):
             return gs
-    log("grayscale ADC never left its power-on latch — treating as unreadable "
-        "(fail closed)")
+    log("grayscale ADC never left its power-on latch on every channel — "
+        "treating as unreadable (fail closed)")
     return None
 
 

@@ -85,6 +85,35 @@ def test_wait_for_grayscale_failed_baseline_does_not_accept_the_latch():
     assert wander.wait_for_grayscale(px, settle_s=0.2, poll_s=0.0) is None
 
 
+def test_wait_for_grayscale_rejects_a_partially_latched_reading():
+    """Regression (measured 2026-08-06): the latch clears PER CHANNEL, not all
+    at once. px-guard-probe caught a live idle read of [2571, 544, 385] — ch0
+    still sitting on its exact latch value while ch1/ch2 had gone live, and a
+    motionless re-read seconds later put ch0 at 320.
+
+    'Differs from the baseline' was satisfied by that mixed reading, so
+    calibration persisted a floor_ref with a latched channel in it — inflated
+    ~6x on that channel, and the cliff threshold inflated with it. That is the
+    guard tripping on legal floor: every calibration this session landed on a
+    different ch0 (411/436/485/664) on one unchanged kitchen floor, according
+    to how many channels were still latched when it sampled.
+
+    Every channel must be observed to change before a reading is trusted."""
+    partial = [ADC_LATCH[0], 544.0, 385.0]
+    px = FakePx(grayscale=[ADC_LATCH] * 2 + [partial] * 3 + [REAL_FLOOR] * 5)
+    assert wander.wait_for_grayscale(px, settle_s=1.0, poll_s=0.0) == REAL_FLOOR
+
+
+def test_wait_for_grayscale_accepts_a_fully_live_reading_that_drifts():
+    """The all-channels rule must not deadlock on a baseline that is already
+    partially live. A channel that has gone live still moves with sensor noise
+    read to read (measured: 411 -> 436 motionless), so it registers its change
+    and the reading is returned rather than timing out into fail-closed."""
+    px = FakePx(grayscale=[[2571.0, 544.0, 385.0], [2571.0, 531.0, 402.0],
+                           [318.0, 529.0, 371.0]] + [REAL_FLOOR] * 5)
+    assert wander.wait_for_grayscale(px, settle_s=1.0, poll_s=0.0) == [318.0, 529.0, 371.0]
+
+
 def test_wait_for_grayscale_failed_baseline_still_returns_a_real_change():
     """The rebaselining must not cost us a genuine reading: once a real floor
     value appears after the latch, it is still returned."""
