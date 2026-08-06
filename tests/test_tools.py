@@ -383,6 +383,39 @@ def test_tool_wander_dry_run(isolated_project):
     assert payload["dry"] is True
 
 
+def test_tool_wander_calibrate_dry_run(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    stdout = run_tool(["bin/tool-wander-calibrate"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["dry"] is True
+
+
+def test_tool_wander_calibrate_forwards_refs(isolated_project):
+    """A live calibration forwards floor_ref/cliff_ref from px-wander's JSON.
+
+    The reference pair is the whole point of the call — an operator recalibrating
+    over HTTP has no other way to see what floor the guard is now armed against.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_BYPASS_SUDO"] = "1"
+    fake = isolated_project["state_dir"].parent / "fake-px-wander"
+    fake.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo \'{"status": "ok", "floor_ref": [340.0, 632.0, 440.0],'
+        ' "cliff_ref": [221.0, 410.8, 286.0], "ts": "2026-08-06T02:55:14+00:00"}\'\n'
+    )
+    fake.chmod(0o755)
+    env["PX_WANDER_BIN"] = str(fake)
+    stdout = run_tool(["bin/tool-wander-calibrate"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["floor_ref"] == [340.0, 632.0, 440.0]
+    assert payload["cliff_ref"] == [221.0, 410.8, 286.0]
+
+
 def test_tool_chat_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"

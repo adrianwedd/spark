@@ -44,6 +44,7 @@ ALLOWED_TOOLS = {
     "tool_describe_scene",
     "tool_frigate_events",
     "tool_wander",
+    "tool_wander_calibrate",
     "tool_timer",
     "tool_api_start",
     "tool_api_stop",
@@ -91,6 +92,7 @@ TOOL_COMMANDS = {
     "tool_describe_scene":   BIN_DIR / "tool-describe-scene",
     "tool_frigate_events":   BIN_DIR / "tool-frigate-events",
     "tool_wander":         BIN_DIR / "tool-wander",
+    "tool_wander_calibrate": BIN_DIR / "tool-wander-calibrate",
     "tool_timer":          BIN_DIR / "tool-timer",
     "tool_api_start":     BIN_DIR / "tool-api-start",
     "tool_api_stop":      BIN_DIR / "tool-api-stop",
@@ -713,6 +715,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if mode == "explore":
             duration = int(clamp(_num(params.get("duration", 180), "duration"), 30, 300))
             sanitized["PX_WANDER_DURATION_S"] = str(duration)
+    elif tool == "tool_wander_calibrate":
+        pass  # no params required
     elif tool == "tool_timer":
         seconds = int(clamp(_num(params.get("seconds", 60), "seconds"), 5, 3600))
         label   = str(params.get("label", ""))[:100]

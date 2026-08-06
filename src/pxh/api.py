@@ -617,6 +617,8 @@ SYNC_TIMEOUT_DEFAULT = float(os.environ.get("PX_API_TIMEOUT", "30"))
 # Tools that involve Ollama, network I/O, or multiple sequential subprocesses
 SLOW_TOOLS = {
     "tool_chat", "tool_chat_vixen", "tool_describe_scene", "tool_wander",
+    # yields px-alive, then settles the grayscale ADC before sampling
+    "tool_wander_calibrate",
     # SPARK tools: multiple subprocess calls (emote + voice + timer)
     "tool_routine", "tool_checkin", "tool_celebrate", "tool_transition",
     "tool_quiet", "tool_breathe", "tool_sensory_check", "tool_repair",
