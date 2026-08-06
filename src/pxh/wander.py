@@ -579,6 +579,12 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
 # the sensor low across every sample, so a per-channel median still trips.
 GUARD_SAMPLES = 3
 GUARD_SAMPLE_GAP_S = 0.01
+# Settle before the stationary confirm read after a driving trip. Motor noise
+# at FORWARD_SPEED=30 is dense enough that even medians dip below threshold
+# (measured 2026-08-06: 16 of 56 in-motion median checks tripped), but reads
+# taken after px.stop() are always at floor level — so a trip is confirmed or
+# dismissed stationary, where the sensor is trustworthy.
+GUARD_CONFIRM_SETTLE_S = 0.05
 
 
 class CliffGuard:
@@ -645,6 +651,16 @@ def guarded_forward(px, guard: CliffGuard, speed: int, duration_s: float,
         status = guard.check(px)
         if status != "clear":
             px.stop()
+            # In-motion trips are ~29% motor-noise phantoms even after the
+            # median (see GUARD_CONFIRM_SETTLE_S). The stop above is the
+            # safety reaction and is unconditional; whether to reverse/abort
+            # is decided by a stationary re-read, which noise cannot reach.
+            # A real cliff keeps the sensor low with the wheels stopped.
+            time.sleep(GUARD_CONFIRM_SETTLE_S)
+            status = guard.check(px)
+            if status == "clear":
+                log("cliff guard: in-motion trip dismissed by stationary re-read (motor noise)")
+                continue
             log(f"cliff guard tripped ({status}) — stop + bounded reverse")
             # Cliff + stalled escape deliberately counts as TWO edge events:
             # at EDGE_ABORT_COUNT=2 a single cornered-against-a-cliff moment

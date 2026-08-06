@@ -213,7 +213,7 @@ def test_cliff_guard_partial_samples_still_sense():
 
 def test_guarded_forward_stops_and_reverses_on_cliff(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*3 + [[1000]*3]*20)
+    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*20)  # cliff persists through confirm
     px._dist = iter([50.0, 60.0])                # before/after reverse: moved
     px.get_distance = lambda: next(px._dist, 60.0)
     guard = _guard()
@@ -237,7 +237,7 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     EDGE_ABORT_COUNT=2 aborts the wander on the spot. That instant abort is
     INTENTIONAL — this test pins it so a refactor can't silently change it."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[600]*3]*3 + [[1000]*3]*20)   # first check trips cliff
+    px = FakePx(grayscale=[[600]*3]*6 + [[1000]*3]*20)   # first check + confirm trip cliff
     px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
     px.get_distance = lambda: next(px._dist, 50.5)
     guard = _guard()
@@ -247,6 +247,24 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     # The guard is checked BEFORE the first slice — a wander that starts
     # already at the desk edge must never move at all.
     assert not any(isinstance(c, tuple) and c[0] == "forward" for c in px.calls)
+
+
+def test_guarded_forward_noise_trip_confirms_stationary_and_continues(monkeypatch):
+    """An in-motion trip whose stationary re-read is clear is motor noise, not
+    a cliff (measured 2026-08-06 at FORWARD_SPEED=30: 16 of 56 in-motion
+    median-of-3 checks tripped, while every read after px.stop() sat at floor
+    level). The guard must stop, confirm stationary, and resume — not charge
+    an edge event or abort the wander."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*3 + [[1000]*3]*100)
+    guard = _guard()
+    assert wander.guarded_forward(px, guard, speed=30, duration_s=0.5) == "ok"
+    assert guard.edge_events == 0
+    assert ("backward", wander.REVERSE_SPEED) not in px.calls
+    # it stopped for the confirm, then resumed driving
+    first_stop = px.calls.index("stop")
+    assert any(isinstance(c, tuple) and c[0] == "forward"
+               for c in px.calls[first_stop:])
 
 
 def test_probe_turn_picks_clearer_side(monkeypatch):
