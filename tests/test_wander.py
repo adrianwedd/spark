@@ -182,13 +182,38 @@ def test_cliff_guard_clear():
 
 
 def test_cliff_guard_read_failure_is_fail_closed():
-    px = FakePx(grayscale=[None, None, None])    # retries exhausted
+    px = FakePx(grayscale=[None] * 6)            # every sample's retries exhausted
     assert _guard().check(px) == "fail"
+
+
+def test_cliff_guard_median_ignores_transient_motor_spike():
+    """Motor load couples transient spikes into the grayscale ADC (measured
+    2026-08-06: idle 346–364 per channel, but single in-motion samples as low
+    as 135/222/186 vs floor_ref 340/632/440). A single-sample guard tripped on
+    the first drive slice of every live wander — steps_driven was always 0.
+    The median over GUARD_SAMPLES reads must ride out a one-sample spike."""
+    px = FakePx(grayscale=[[1000]*3, [135, 222, 186], [1000]*3])
+    assert _guard().check(px) == "clear"
+
+
+def test_cliff_guard_median_trips_on_persistent_drop():
+    """A genuine cliff holds the sensor low across every sample — the median
+    must still trip. This is the counterweight to the spike-rejection test."""
+    px = FakePx(grayscale=[[600]*3] * wander.GUARD_SAMPLES)
+    assert _guard().check(px) == "cliff"
+
+
+def test_cliff_guard_partial_samples_still_sense():
+    """If only one of the GUARD_SAMPLES reads succeeds, that read decides —
+    intermittent I2C failures must not blind the guard into 'fail' spam, nor
+    may they mask a real low reading."""
+    px = FakePx(grayscale=[[600]*3])             # samples 2 and 3 fail
+    assert _guard().check(px) == "cliff"
 
 
 def test_guarded_forward_stops_and_reverses_on_cliff(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3, [600]*3] + [[1000]*3]*5)
+    px = FakePx(grayscale=[[1000]*3]*3 + [[600]*3]*3 + [[1000]*3]*20)
     px._dist = iter([50.0, 60.0])                # before/after reverse: moved
     px.get_distance = lambda: next(px._dist, 60.0)
     guard = _guard()
@@ -212,7 +237,7 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
     EDGE_ABORT_COUNT=2 aborts the wander on the spot. That instant abort is
     INTENTIONAL — this test pins it so a refactor can't silently change it."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[600]*3] + [[1000]*3]*5)   # first check trips cliff
+    px = FakePx(grayscale=[[600]*3]*3 + [[1000]*3]*20)   # first check trips cliff
     px._dist = iter([50.0, 50.5])                # clearance didn't grow → stall
     px.get_distance = lambda: next(px._dist, 50.5)
     guard = _guard()
@@ -226,7 +251,7 @@ def test_guarded_forward_cliff_plus_stall_counts_two_events(monkeypatch):
 
 def test_probe_turn_picks_clearer_side(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*20)
+    px = FakePx(grayscale=[[1000]*3]*200)
     # left probe reads 20cm (blocked), arc-back ok, right probe reads 90cm → commit right
     px._dist = iter([20.0, 40.0, 55.0, 90.0])
     px.get_distance = lambda: next(px._dist, 90.0)
@@ -237,7 +262,7 @@ def test_probe_turn_picks_clearer_side(monkeypatch):
 
 def test_probe_turn_edge_aborts_probe(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[600]*3] * 5)     # cliff on first probe creep
+    px = FakePx(grayscale=[[600]*3] * 9)     # cliff on first probe creep
     px._dist = iter([50.0, 55.0])
     px.get_distance = lambda: next(px._dist, 55.0)
     guard = _guard()
@@ -250,7 +275,7 @@ def test_probe_turn_first_side_commit_rearcs(monkeypatch):
     """Both probes < CLEAR_CM, first side best: the chassis must END on the
     first side's arc, not stranded at the end of the second probe arc."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*30)
+    px = FakePx(grayscale=[[1000]*3]*200)
     # left probe 40cm (best), arc-back 50→55, right probe 20cm,
     # arc-back 50→55, then re-commit left (guarded creep, no sonar read)
     px._dist = iter([40.0, 50.0, 55.0, 20.0, 50.0, 55.0])
@@ -268,7 +293,7 @@ def test_probe_turn_arc_back_reverses_with_same_steer(monkeypatch):
     rotation). The old mirrored-steer recovery doubled the heading change,
     leaving probe labels pointing at the wrong real-world direction."""
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*20)
+    px = FakePx(grayscale=[[1000]*3]*200)
     # left probe 20cm, arc-back 40->55 (moved), right probe 90cm -> commit right
     px._dist = iter([20.0, 40.0, 55.0, 90.0])
     px.get_distance = lambda: next(px._dist, 90.0)
@@ -287,7 +312,7 @@ def test_sweep_helpers_are_gone():
 
 def test_explore_step_forward_when_clear(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*10)
+    px = FakePx(grayscale=[[1000]*3]*100)
     px.get_distance = lambda: 120.0
     state = {"forced_turn": None, "stuck_count": 0, "sensor_fail_streak": 0,
              "steps_completed": 1, "explore_id": "e-test"}
@@ -299,7 +324,7 @@ def test_explore_step_forward_when_clear(monkeypatch):
 
 def test_explore_step_probes_when_blocked(monkeypatch):
     monkeypatch.setattr(wander.time, "sleep", lambda s: None)
-    px = FakePx(grayscale=[[1000]*3]*20)
+    px = FakePx(grayscale=[[1000]*3]*200)
     px._dist = iter([15.0, 80.0])            # blocked ahead; left probe clear
     px.get_distance = lambda: next(px._dist, 80.0)
     state = {"forced_turn": None, "stuck_count": 0, "sensor_fail_streak": 0,

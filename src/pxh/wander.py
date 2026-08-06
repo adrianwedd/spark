@@ -12,6 +12,7 @@ import math
 import os
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -260,6 +261,11 @@ def _write_exploring_state(active: bool, pid: int | None = None,
         fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             json.dump(data, f)
+        # World-readable: wander runs as root but pi-user processes must read
+        # this file (tool-wander's timeout SIGTERM path reads the pid;
+        # tool-describe-scene's owner-liveness check). mkstemp's 0600 default
+        # locks them out with EACCES.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, str(path))
         return True
     except Exception as exc:
@@ -564,6 +570,17 @@ def load_cliff_calibration(state_dir: Path) -> dict | None:
         return None
 
 
+# Motor load couples transient spikes into the grayscale ADC: measured on
+# this hardware 2026-08-06, idle reads sat at 346–364/589–624/386–413 (stable)
+# but with motors running single samples dipped as low as 135/222/186 — below
+# any usable cliff threshold — while the median over the same window stayed at
+# floor level (433/678/435). A single-sample guard therefore trips on the
+# first drive slice of every wander (steps_driven=0). A genuine cliff holds
+# the sensor low across every sample, so a per-channel median still trips.
+GUARD_SAMPLES = 3
+GUARD_SAMPLE_GAP_S = 0.01
+
+
 class CliffGuard:
     """Fail-closed cliff detector backed by a calibrated grayscale reference."""
 
@@ -573,12 +590,23 @@ class CliffGuard:
 
     def check(self, px) -> str:
         """Return "clear" | "cliff" | "fail". An unreadable sensor ("fail")
-        must be treated identically to "cliff" by callers — fail closed."""
-        gs = safe_grayscale(px, retries=1)
-        if gs is None:
+        must be treated identically to "cliff" by callers — fail closed.
+
+        Medians GUARD_SAMPLES reads to reject motor-noise spikes (see above).
+        Partial sample sets still sense (a lone successful read decides);
+        only a fully unreadable window returns "fail"."""
+        samples = []
+        for i in range(GUARD_SAMPLES):
+            gs = safe_grayscale(px, retries=1)
+            if gs is not None:
+                samples.append(gs)
+            if i + 1 < GUARD_SAMPLES and GUARD_SAMPLE_GAP_S:
+                time.sleep(GUARD_SAMPLE_GAP_S)
+        if not samples:
             log("cliff guard: grayscale read failed — treating as cliff (fail closed)")
             return "fail"
-        if any(gs[i] <= self.cliff_ref[i] for i in range(3)):
+        med = [statistics.median(col) for col in zip(*samples)]
+        if any(med[i] <= self.cliff_ref[i] for i in range(3)):
             return "cliff"
         return "clear"
 
