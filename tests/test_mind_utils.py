@@ -718,6 +718,41 @@ def test_valid_actions_includes_new_actions():
     assert VALID_ACTIONS == expected
 
 
+# Actions deliberately absent from the static enum because reflection injects
+# them per-tick only when their preconditions hold (_inject_explore, gated on
+# _can_explore). Offering these unconditionally would spend a reflection on an
+# action that gets refused at re-check.
+DYNAMIC_ACTIONS = {"explore"}
+
+
+def test_prompt_action_enum_matches_valid_actions():
+    """The static enum must be exactly VALID_ACTIONS minus the injected ones.
+
+    Drift here is silent and one-directional: an action missing from both the
+    enum and the injection path is unreachable no matter how complete its
+    dispatch handler is, and nothing logs the omission.
+    """
+    from pxh.spark_config import _SPARK_REFLECTION_SUFFIX
+
+    line = [ln for ln in _SPARK_REFLECTION_SUFFIX.splitlines()
+            if '"action": "one of:' in ln]
+    assert len(line) == 1, "action enum line not found (or duplicated)"
+    listed = {a.strip() for a in
+              line[0].split("one of:", 1)[1].rstrip('",').split(",")}
+    assert listed == VALID_ACTIONS - DYNAMIC_ACTIONS
+
+
+def test_dynamic_actions_are_valid_and_injectable():
+    """Every dynamic action is a real action and does reach the prompt."""
+    from pxh import mind, spark_config
+
+    assert DYNAMIC_ACTIONS <= VALID_ACTIONS
+    injected = mind._inject_explore(spark_config._SPARK_REFLECTION_SUFFIX)
+    line = [ln for ln in injected.splitlines() if '"action": "one of:' in ln][0]
+    listed = {a.strip() for a in line.split("one of:", 1)[1].rstrip('",').split(",")}
+    assert listed == VALID_ACTIONS
+
+
 def test_mood_to_sound_mapping():
     """MOOD_TO_SOUND maps moods to the correct sound effects."""
     assert MOOD_TO_SOUND["curious"] == "beep"
