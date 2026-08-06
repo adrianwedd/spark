@@ -204,14 +204,27 @@ def _check_abort(session: dict, battery: dict | None, stuck_count: int,
     return None
 
 
+# An HC-SR04 echo timeout returns a negative distance, and on angled or soft
+# surfaces that is routine rather than a fault. Un-retried, three routine
+# timeouts in a row hit SENSOR_FAIL_ABORT_COUNT and end the wander: live run 9
+# (2026-08-06) burned steps 4, 5 and 6 inside one second that way, aborting a
+# run that was otherwise driving fine. Retries cost a few ms and only happen on
+# a bad read, so a streak now means the sensor really is dead.
+SONAR_RETRIES = 2
+SONAR_RETRY_GAP_S = 0.03
+
+
 def _read_sonar(px) -> float | None:
-    try:
-        d = px.get_distance()
-        if d is None or d < 0:
-            return None
-        return float(d)
-    except Exception:
-        return None
+    for attempt in range(1 + SONAR_RETRIES):
+        try:
+            d = px.get_distance()
+            if d is not None and d >= 0:
+                return float(d)
+        except Exception:
+            pass
+        if attempt < SONAR_RETRIES:
+            time.sleep(SONAR_RETRY_GAP_S)
+    return None
 
 
 def _query_frigate(after_epoch: float | None = None) -> list[dict] | None:

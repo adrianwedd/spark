@@ -224,6 +224,33 @@ def test_guarded_forward_stops_and_reverses_on_cliff(monkeypatch):
     assert ("backward", wander.REVERSE_SPEED) in px.calls
 
 
+def test_read_sonar_retries_echo_timeout(monkeypatch):
+    """A negative distance is an echo timeout, routine on angled/soft surfaces.
+
+    Run 9 (2026-08-06) aborted a healthy wander because three of them landed
+    back-to-back inside one second and hit SENSOR_FAIL_ABORT_COUNT.
+    """
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx()
+    seq = iter([-1.0, -1.0, 42.0])
+    px.get_distance = lambda: next(seq)
+    assert wander._read_sonar(px) == 42.0
+
+
+def test_read_sonar_gives_up_on_a_dead_sensor(monkeypatch):
+    """Retrying must not paper over a sensor that is genuinely gone — a streak
+    of these is what SENSOR_FAIL_ABORT_COUNT exists to catch."""
+    monkeypatch.setattr(wander.time, "sleep", lambda s: None)
+    px = FakePx()
+    px.get_distance = lambda: -1.0
+    assert wander._read_sonar(px) is None
+
+    def _boom():
+        raise OSError("I2C read failed")
+    px.get_distance = _boom
+    assert wander._read_sonar(px) is None
+
+
 def test_guarded_forward_single_low_confirm_is_not_enough(monkeypatch):
     """One low stationary read does not confirm a cliff — it must persist.
 
