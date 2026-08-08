@@ -77,6 +77,28 @@ def _write_thoughts(state_dir, date, count=5, moods=None):
     thoughts_file.write_text("\n".join(lines) + "\n")
 
 
+def _write_thoughts_for_days(state_dir, days_back_iter, count=5):
+    """Write thoughts for several days into ONE file.
+
+    _write_thoughts truncates on each call, so calling it in a loop leaves only
+    the last day's thoughts — every earlier day then reads as a quiet day and
+    gets skipped, which silently defeats multi-day catch-up tests.
+    """
+    now = dt.datetime.now(HOBART_TZ)
+    lines = []
+    for days_back in days_back_iter:
+        date = now - dt.timedelta(days=days_back)
+        for i in range(count):
+            ts = date.replace(hour=10 + i % 12, minute=0, second=0, microsecond=0)
+            lines.append(json.dumps({
+                "ts": ts.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "thought": f"Test thought {i}: I noticed something about the garden.",
+                "mood": "curious",
+                "salience": 0.6 + (i * 0.05),
+            }))
+    (state_dir / "thoughts-spark.jsonl").write_text("\n".join(lines) + "\n")
+
+
 def _write_blog_with_posts(state_dir, posts):
     """Write a blog.json with given posts."""
     data = {"updated": "2026-03-24T00:00:00Z", "posts": posts}
@@ -157,13 +179,21 @@ class TestBlogSchedule:
         assert not due, "Daily should not be due when all catchup days already have posts"
 
     def test_catchup_on_missed(self, blog_mod):
-        """Verify generate_post works for a date with enough thoughts."""
+        """Verify generate_post works for a date with enough thoughts.
+
+        PX_BLOG_QA=0 because the QA gate reaches the `claude` CLI through its
+        own subprocess.run, which mocking run_claude_session does not cover.
+        Without it this test shells out for real and reads whatever it gets
+        back as a rejection — and passed or failed depending on whether an
+        earlier test had already tripped the module-level _qa_breaker open.
+        """
         ns, state_dir, _ = blog_mod
         yesterday = dt.datetime.now(HOBART_TZ) - dt.timedelta(days=1)
         _write_thoughts(state_dir, yesterday, count=5)
 
         with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
-            post = ns["generate_post"]("daily", yesterday, {"posts": []})
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                post = ns["generate_post"]("daily", yesterday, {"posts": []})
 
         assert post is not None
         assert post["type"] == "daily"
@@ -755,6 +785,387 @@ class TestGenerationFailureCap:
         mock_run.assert_not_called()
         blog_data = ns["load_blog"]()
         assert not ns["post_exists"](blog_data, pid)
+
+
+# ---------------------------------------------------------------------------
+# Transport vs content failure classification (Phase 1.4)
+#
+# A strike means "this post's content cannot be generated" — three of them
+# retire the post permanently. Infrastructure that was merely unreachable at
+# the moment we asked says nothing about the post, so it must not count.
+# ---------------------------------------------------------------------------
+
+class TestTransportErrorsDoNotBurnStrikes:
+
+    def _setup(self, ns, state_dir):
+        today = dt.datetime.now(HOBART_TZ)
+        _write_thoughts(state_dir, today, count=5)
+        return today, ns["id_for_post"]("daily", today)
+
+    def _assert_transport(self, ns, today, pid, exc):
+        """A transport failure raises TransportUnavailable and records no strike."""
+        with patch("pxh.claude_session.run_claude_session", side_effect=exc):
+            with pytest.raises(ns["TransportUnavailable"]):
+                ns["generate_post"]("daily", today, {"posts": []})
+        assert pid not in ns["load_blog_failures"]()
+
+    def test_timeout_does_not_increment_failure(self, blog_mod):
+        """A Claude CLI timeout is transport, not a content failure."""
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+        self._assert_transport(ns, today, pid,
+                               subprocess.TimeoutExpired(cmd="claude", timeout=300))
+
+    def test_connection_error_does_not_increment_failure(self, blog_mod):
+        """A dropped socket says nothing about whether the post can be written."""
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+        self._assert_transport(ns, today, pid,
+                               ConnectionResetError("connection reset by peer"))
+
+    def test_missing_cli_does_not_increment_failure(self, blog_mod):
+        """An uninstalled/unreachable claude binary is infrastructure."""
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+        self._assert_transport(ns, today, pid,
+                               FileNotFoundError("No such file or directory: 'claude'"))
+
+    def test_overloaded_api_error_does_not_increment_failure(self, blog_mod):
+        """529 overloaded is upstream capacity, not this post's fault."""
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+        self._assert_transport(ns, today, pid,
+                               RuntimeError("API error 529 overloaded_error"))
+
+    def test_rate_limit_error_does_not_increment_failure(self, blog_mod):
+        """429 rate limit is throttling — retry later, don't retire the post."""
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+        self._assert_transport(ns, today, pid,
+                               RuntimeError("429 rate_limit_error: too many requests"))
+
+    def test_unexpected_error_still_increments_failure(self, blog_mod):
+        """PINNING TEST — passes before and after.
+
+        Guards the other direction: classifying every exception as transport
+        would disable the doom-loop breaker entirely. A genuine code bug must
+        still burn a strike. This fails if _is_transport_error is made
+        over-broad (e.g. a bare `return True`, or matching on Exception).
+        """
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+
+        with patch("pxh.claude_session.run_claude_session",
+                   side_effect=ValueError("unexpected token in prompt template")):
+            post = ns["generate_post"]("daily", today, {"posts": []})
+
+        assert post is None
+        assert ns["load_blog_failures"]()[pid]["failures"] == 1
+
+    def test_word_count_in_error_is_not_transport(self, blog_mod):
+        """PINNING TEST — the reason bare HTTP status numbers are not markers.
+
+        Blog prompts specify word counts, so an exception echoing the prompt
+        can contain "500". Treating that as transport would mean a genuinely
+        broken prompt template retries forever and never retires.
+        """
+        ns, state_dir, _ = blog_mod
+        today, pid = self._setup(ns, state_dir)
+
+        with patch("pxh.claude_session.run_claude_session",
+                   side_effect=ValueError("template rejected: write 500 words about 502 things")):
+            post = ns["generate_post"]("daily", today, {"posts": []})
+
+        assert post is None
+        assert ns["load_blog_failures"]()[pid]["failures"] == 1
+
+    def test_transport_failure_is_logged(self, blog_mod):
+        """A skipped strike must still be visible in the log, not swallowed."""
+        ns, state_dir, _ = blog_mod
+        today, _pid = self._setup(ns, state_dir)
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        with patch("pxh.claude_session.run_claude_session",
+                   side_effect=ConnectionResetError("connection reset by peer")):
+            with pytest.raises(ns["TransportUnavailable"]):
+                ns["generate_post"]("daily", today, {"posts": []})
+
+        joined = "\n".join(logged)
+        assert "transport" in joined.lower(), f"expected a transport log line, got: {logged}"
+
+    def test_transport_log_is_throttled(self, blog_mod):
+        """A multi-day outage must stay diagnosable without writing every poll.
+
+        Logging each transport failure unthrottled would recreate the 5.5 MB
+        log-growth defect this phase exists to fix.
+        """
+        ns, state_dir, _ = blog_mod
+        today, _pid = self._setup(ns, state_dir)
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        with patch("pxh.claude_session.run_claude_session",
+                   side_effect=ConnectionResetError("connection reset by peer")):
+            for _ in range(5):
+                with pytest.raises(ns["TransportUnavailable"]):
+                    ns["generate_post"]("daily", today, {"posts": []})
+
+        notices = [m for m in logged if "transport error" in m.lower()]
+        assert len(notices) == 1, f"expected 1 throttled notice, got {len(notices)}: {notices}"
+
+    def test_run_once_survives_transport_error_and_backs_off(self, blog_mod):
+        """run_once must absorb TransportUnavailable, not crash the poll loop.
+
+        Propagating would hit the main loop's generic handler, which logs
+        'poll: CRASHED' and records a health FAILURE — reporting px-blog red
+        for someone else's outage.
+        """
+        ns, state_dir, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        _write_thoughts_for_days(state_dir, range(1, ns["DAILY_CATCHUP_DAYS"] + 1), count=5)
+
+        # Isolate the daily path. had_skips is set by ANY post type skipping for
+        # ANY reason (a weekly missing child dailies, a monthly with no source),
+        # so without this the assertion below would pass whether or not the
+        # transport path ever touched it — a vacuous test.
+        real_is_due = ns["is_due"]
+        ns["is_due"] = lambda pt, bd: real_is_due(pt, bd) if pt == "daily" else (False, None)
+
+        # Control: same setup, healthy transport — the daily generates and
+        # nothing skips. Proves had_skips below can only come from transport.
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                ctrl_count, ctrl_skips = ns["run_once"](dry=False)
+        assert ctrl_count == 1 and ctrl_skips is False, (
+            f"control run should generate cleanly, got count={ctrl_count} skips={ctrl_skips}")
+
+        due, target = ns["is_due"]("daily", ns["load_blog"]())
+        assert due and target is not None, "test setup: expected another due daily"
+        pid = ns["id_for_post"]("daily", target)
+
+        with patch("pxh.claude_session.run_claude_session",
+                   side_effect=ConnectionResetError("connection reset by peer")):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                count, had_skips = ns["run_once"](dry=False)
+
+        assert count == 0
+        assert had_skips is True, "transport failure must trigger the loop's long backoff"
+
+        # The load-bearing assertion. run_once treats a None from generate_post
+        # as a QA rejection and permanently retires the day in blog.json's
+        # "skipped" list. Routing transport through that branch means ONE
+        # network blip silently costs a day of the blog forever — no strikes
+        # needed, and a different mechanism than blog_failures.json.
+        assert pid not in ns["load_blog"]().get("skipped", []), (
+            f"{pid} was permanently retired by a transient network error")
+        assert pid not in ns["load_blog_failures"]()
+
+
+# ---------------------------------------------------------------------------
+# Retired posts must back off, not narrate their retirement forever (Phase 1.4)
+# ---------------------------------------------------------------------------
+
+class TestRetiredPostBackoff:
+
+    def _due_capped_daily(self, ns, state_dir):
+        """Make a daily post due, then retire it via the failure cap."""
+        now = dt.datetime.now(HOBART_TZ)
+        _write_thoughts_for_days(state_dir, range(1, ns["DAILY_CATCHUP_DAYS"] + 1), count=5)
+        existing = [_make_daily_post(now - dt.timedelta(days=d))
+                    for d in range(2, ns["DAILY_CATCHUP_DAYS"] + 1)]
+        _write_blog_with_posts(state_dir, existing)
+
+        due, target = ns["is_due"]("daily", ns["load_blog"]())
+        assert due and target is not None, "test setup: expected a due daily"
+        pid = ns["id_for_post"]("daily", target)
+        for _ in range(ns["FAILURE_CAP"]):
+            ns["record_generation_failure"](pid, "empty body")
+        assert ns["is_generation_skipped"](pid) is True
+        return pid
+
+    def test_retired_post_leaves_the_due_set(self, blog_mod):
+        """A retired post stops being due; is_due advances past it.
+
+        Supersedes the earlier contract, where retirement only short-circuited
+        generation. The post stayed due, so every poll re-enumerated it, set
+        had_skips, and the loop backed off SKIP_BACKOFF_S — forever. Backing off
+        was a narrower symptom of the same defect that grew px-blog.log to
+        5.4 MB: the loop had nothing to wait for, because a retired post is
+        never going to become writable.
+        """
+        ns, state_dir, _ = blog_mod
+        pid = self._due_capped_daily(ns, state_dir)
+
+        due, target = ns["is_due"]("daily", ns["load_blog"]())
+        if due:
+            assert ns["id_for_post"]("daily", target) != pid, \
+                "is_due must advance past a retired post, not re-offer it"
+
+    def test_retired_post_never_narrates_its_retirement(self, blog_mod):
+        """Zero retirement notices — the skip branch is unreachable via is_due.
+
+        The previous fix throttled this message to once per post per process.
+        Removing the cause removes the message entirely; the branch is retained
+        in run_scheduled_posts only as defence for callers that bypass is_due.
+        """
+        ns, state_dir, _ = blog_mod
+        pid = self._due_capped_daily(ns, state_dir)
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                for _ in range(3):
+                    ns["run_once"](dry=False)
+
+        notices = [m for m in logged if pid in m and "not retrying" in m]
+        assert notices == [], f"retired post still narrated itself: {notices}"
+
+    def test_missing_source_material_still_backs_off(self, blog_mod):
+        """The had_skips backoff must survive for causes that can still resolve.
+
+        Only the retired case is removed. A daily whose thoughts are missing may
+        get thoughts later, so it must still set had_skips and slow the loop.
+        """
+        ns, state_dir, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        existing = [_make_daily_post(now - dt.timedelta(days=d))
+                    for d in range(2, ns["DAILY_CATCHUP_DAYS"] + 1)]
+        _write_blog_with_posts(state_dir, existing)
+        # No thoughts written at all — source material genuinely absent.
+
+        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
+                _count, had_skips = ns["run_once"](dry=False)
+
+        assert had_skips is True
+
+    def test_log_throttled_suppresses_repeats_within_interval(self, blog_mod):
+        """A steady-state condition repeats every poll; the log must not."""
+        ns, _, _ = blog_mod
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        for _ in range(10):
+            ns["_log_throttled"]("stuck", "still stuck", 3600)
+
+        assert len(logged) == 1
+
+    def test_log_throttled_keys_are_independent(self, blog_mod):
+        """Throttling one condition must not silence a different one."""
+        ns, _, _ = blog_mod
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        ns["_log_throttled"]("a", "condition a", 3600)
+        ns["_log_throttled"]("b", "condition b", 3600)
+        ns["_log_throttled"]("a", "condition a", 3600)
+
+        assert logged == ["condition a", "condition b"]
+
+    def test_log_throttled_logs_again_once_interval_elapses(self, blog_mod):
+        """The line must stay diagnosable, not be suppressed forever."""
+        ns, _, _ = blog_mod
+        logged = []
+        ns["log"] = lambda msg: logged.append(msg)
+
+        for _ in range(3):
+            ns["_log_throttled"]("c", "recurring", 0)
+
+        assert len(logged) == 3
+
+    def test_poll_backoff_line_is_throttled(self, blog_mod):
+        """Pins the call site, not just the helper.
+
+        A retired post keeps the backoff branch true forever, so an unthrottled
+        line there leaks ~288 lines/day for a state no poll will change.
+        """
+        script = _BLOG_SCRIPT.read_text(encoding="utf-8")
+        assert 'log(f"poll: all due posts skipped' not in script, \
+            "the poll backoff line must go through _log_throttled"
+        assert '"poll_backoff"' in script
+
+
+class TestRetiredPostsStopBeingDue:
+    """A retired post must leave the due set, not just the generation path.
+
+    Retirement is recorded in state/blog_failures.json, but is_due() only ever
+    consulted state/blog.json. A retired post therefore stayed due forever:
+    run_scheduled_posts() skipped it, set had_skips, and the poll loop backed
+    off SKIP_BACKOFF_S — every 5 minutes, indefinitely. Live symptom was 1940
+    identical log lines and a 5.4 MB px-blog.log.
+    """
+
+    def _week_with_dailies(self):
+        """Blog data whose only children sit in a fully-elapsed reporting week.
+
+        The Sunday must be one whose 22:30 target has already passed. Run on a
+        Sunday before 22:30 the current week is not yet due, is_due() falls
+        through to the previous-Sunday catch-up branch, and children built for
+        the current week are invisible to it — the precondition fails for a
+        calendar reason, not a code one.
+        """
+        now = dt.datetime.now(HOBART_TZ)
+        last_sunday = now - dt.timedelta(days=(now.weekday() + 1) % 7)
+        if last_sunday.replace(hour=22, minute=30, second=0, microsecond=0) > now:
+            last_sunday -= dt.timedelta(days=7)
+        posts = [_make_daily_post(last_sunday - dt.timedelta(days=i)) for i in range(7)]
+        return last_sunday, {"posts": posts, "skipped": []}
+
+    def test_retired_weekly_is_not_due(self, blog_mod):
+        ns, _, _ = blog_mod
+        last_sunday, blog_data = self._week_with_dailies()
+        pid = ns["id_for_post"]("weekly", last_sunday)
+
+        due, _ = ns["is_due"]("weekly", blog_data)
+        assert due, "precondition: weekly is due while children exist and it is unwritten"
+
+        for _ in range(3):
+            ns["record_generation_failure"](pid, "empty body")
+        assert ns["is_generation_skipped"](pid) is True
+
+        due, _ = ns["is_due"]("weekly", blog_data)
+        assert not due, "a retired weekly must not stay permanently due"
+
+    def test_skipped_list_suppresses_aggregate(self, blog_mod):
+        """is_due must read blog.json's skipped list for aggregates too.
+
+        The aggregate branches passed the posts *list* to post_exists(), which
+        takes a legacy branch that ignores `skipped` entirely — so a skip record
+        for a weekly/monthly/yearly was structurally unreachable.
+        """
+        ns, _, _ = blog_mod
+        last_sunday, blog_data = self._week_with_dailies()
+        pid = ns["id_for_post"]("weekly", last_sunday)
+
+        blog_data["skipped"].append(pid)
+
+        due, _ = ns["is_due"]("weekly", blog_data)
+        assert not due, "a weekly in blog.json['skipped'] must not be due"
+
+    def test_retired_monthly_is_not_due(self, blog_mod):
+        ns, _, _ = blog_mod
+        now = dt.datetime.now(HOBART_TZ)
+        weeklies = [_make_weekly_post(now - dt.timedelta(days=i * 7)) for i in range(3)]
+        blog_data = {"posts": weeklies, "skipped": []}
+
+        due, target = ns["is_due"]("monthly", blog_data)
+        assert due, "precondition: monthly is due while weekly children exist"
+
+        # The due target is calendar-dependent: before the 1st's scheduled hour
+        # the due monthly is last month's catch-up, not this month's, and the
+        # weeklies can span both months. Retire whichever pid is_due reports —
+        # at most the two reachable targets (current month + catch-up) — and
+        # require the due set to drain.
+        for _ in range(2):
+            pid = ns["id_for_post"]("monthly", target)
+            for _ in range(3):
+                ns["record_generation_failure"](pid, "qa_rejected")
+            due, target = ns["is_due"]("monthly", blog_data)
+            if not due:
+                break
+        assert not due, "a retired monthly must not stay permanently due"
 
 
 class TestBackfillRespectsFailureCap:

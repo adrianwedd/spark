@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+python - "$@" <<'PY'
+"""Tool wrapper: recalibrate the wander cliff guard on the current floor.
+
+Sensor-only — nothing moves. The guard is armed against a floor signature, so
+moving SPARK to a different surface (or a shadowed corner of the same one)
+strands the old reference and every drive slice trips the guard. Recalibrating
+used to require a shell on the Pi; this makes it reachable through the voice
+loop and POST /api/v1/tool like any other tool.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+from pxh.logging import log_event
+from pxh.state import update_session
+
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+# PX_WANDER_BIN is a test seam (a stub standing in for the GPIO-owning
+# launcher); live callers never set it.
+PX_WANDER = Path(os.environ.get("PX_WANDER_BIN", str(PROJECT_ROOT / "bin" / "px-wander")))
+
+# Calibration settles the ADC before sampling and holds GPIO for that window.
+# px-wander self-elevates and writes exploring.json, so this only needs to be
+# longer than the settle — not the minutes an explore run can take.
+CALIBRATE_TIMEOUT_S = 90
+
+
+def main() -> int:
+    dry_mode = os.environ.get("PX_DRY", "0") != "0"
+
+    # No confirm_motion_allowed gate: calibration reads the grayscale sensor
+    # and never drives. Gating it would make a robot with motion disabled
+    # unable to fix the very reference that keeps it from driving safely.
+    command = [str(PX_WANDER), "--calibrate-cliff"]
+    # Accumulate keeps the per-channel minimum across spots, so a floor whose
+    # boards and gaps read an order of magnitude apart gets one threshold that
+    # no legal patch of it trips.
+    if os.environ.get("PX_CALIBRATE_ACCUMULATE", "0") != "0":
+        command.append("--accumulate")
+    if dry_mode:
+        command.append("--dry-run")
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True,
+                                check=False, timeout=CALIBRATE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        payload = {"status": "error", "error": "px-wander --calibrate-cliff timed out"}
+        log_event("wander_calibrate", payload)
+        print(json.dumps(payload))
+        return 1
+    except Exception as exc:
+        payload = {"status": "error", "error": f"px-wander failed: {exc}"}
+        log_event("wander_calibrate", payload)
+        print(json.dumps(payload))
+        return 1
+
+    rc = result.returncode
+
+    inner = {}
+    try:
+        for line in reversed(result.stdout.strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                inner = json.loads(line)
+                break
+    except (json.JSONDecodeError, ValueError):
+        inner = {}
+
+    # A non-zero rc, or a px-wander payload that reports its own failure, is an
+    # error here even when the subprocess exited 0 — a fabricated "ok" would
+    # leave the caller believing the guard was re-armed on this floor.
+    ok = rc == 0 and inner.get("status", "ok") == "ok"
+    payload = {
+        "status": "ok" if ok else "error",
+        "dry": dry_mode,
+        "returncode": rc,
+    }
+    if not ok:
+        payload["error"] = inner.get("error") or (result.stderr[-512:] or "calibration failed")
+    for key in ("floor_ref", "cliff_ref", "ts"):
+        if key in inner:
+            payload[key] = inner[key]
+
+    update_session(
+        fields={"last_action": "tool_wander_calibrate"},
+        history_entry={"event": "wander_calibrate", "dry": dry_mode, "rc": rc},
+    )
+
+    log_event("wander_calibrate", payload)
+    print(json.dumps(payload))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY

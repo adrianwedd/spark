@@ -984,11 +984,13 @@ USB Mic (44100 Hz)
 
 **Sherpa-onnx model:** `sherpa-onnx-streaming-zipformer-en-2023-06-26` (~297MB int8). Streaming `OnlineRecognizer.from_transducer()`, num_threads=4. Processes full utterance at ~5s for a 6.6s clip (RTF ~0.78x, excellent accuracy for en-AU English).
 
-**Audio recording:** PyAudio, USB mic (usually card 2). Records 16-bit mono at 44100 Hz (USB mic hardware constraint), resampled to 16kHz via `audioop.ratecv` for both Vosk and sherpa-onnx.
+**Audio recording:** an `arecord` subprocess on `plughw:<card>,0` (resolved from `arecord -l` by matching `--mic`, default `USB`), wrapped by `ArecordStream` in `src/pxh/mic_stream.py`. Records 16-bit mono at 44100 Hz (USB mic hardware constraint), resampled to 16 kHz by the anti-aliased FIR resampler in `pxh.wake_audio` for both Vosk and sherpa-onnx.
+
+**Not PyAudio** — PortAudio's ALSA backend drops ~32% of samples on this mic in a permanent overrun-recovery loop, invisibly (no clipping, no zero-runs; the recorded WAV measures clean). Verify the capture path with `bin/px-mic-check`, which loops a chirp train through SPARK's speaker: healthy is 18/18 chirps within ~3 ms, the PyAudio path scored 13/18.
 
 **Silence detection:** Stops recording when a 30-frame (~960ms) RMS window falls below threshold for 1.5s, or after a hard maximum of 8s.
 
-**Python interpreter:** `$PROJECT_ROOT/.venv/bin/python3` (venv has `vosk`, `pyaudio`, `sherpa_onnx`, `numpy`).
+**Python interpreter:** `$PROJECT_ROOT/.venv/bin/python3` (venv has `vosk`, `sherpa_onnx`, `numpy`).
 
 **Log file:** `$LOG_DIR/px-wake-listen.log` (or `PX_LOG_FILE`).
 
@@ -1389,7 +1391,7 @@ Scripts that need GPIO (`picarx`, `robot_hat`) require root. The pattern used:
 | Use case | Interpreter |
 |---|---|
 | Scripts needing `robot_hat`/`picarx` | `/usr/bin/python3` (system Python) |
-| Scripts needing `vosk`, `pyaudio`, `sherpa_onnx` | `$PROJECT_ROOT/.venv/bin/python3` |
+| Scripts needing `vosk`, `sherpa_onnx` | `$PROJECT_ROOT/.venv/bin/python3` |
 | `pxh.*` library scripts | venv Python (activated by `px-env`) |
 
 System Python has `robot_hat` and `picarx` in its site-packages. The venv has the project library (`pxh`) plus AI/audio packages. The venv explicitly excludes system site-packages.

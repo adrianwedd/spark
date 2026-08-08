@@ -13,6 +13,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
+from _harness import daemon_load_env
+
 _SYS_RNG = _test_random.SystemRandom()
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -27,29 +29,43 @@ def _load_post_helpers():
     end = src.rindex("\nPY\n")
     py_src = src[start:end]
 
-    env_patch = {
-        "PROJECT_ROOT": str(PROJECT_ROOT),
-        "LOG_DIR": str(PROJECT_ROOT / "logs"),
-        "PX_STATE_DIR": str(PROJECT_ROOT / "state"),
-    }
-    old_env = {k: os.environ.get(k) for k in env_patch}
-    for k, v in env_patch.items():
-        os.environ[k] = v
-
     globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-post")}
-    try:
+    # The constants this exec computes (QUEUE_FILE, FEED_FILE, CURSOR_FILE,
+    # STATUS_FILE) are frozen for the whole session — see tests/_harness.py.
+    # They must never resolve into the live state/ tree.
+    with daemon_load_env():
         exec(compile(py_src, "bin/px-post", "exec"), globs)  # noqa: S102
-    finally:
-        for k, old_v in old_env.items():
-            if old_v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = old_v
 
     return globs
 
 
 _POST = _load_post_helpers()
+
+
+class TestQaRejectionStreakHealth:
+    """px-post must report unhealthy when it publishes nothing for a long run.
+
+    Health previously recorded success on any cycle that did not throw, so the
+    daemon reported ok through 30 consecutive rejections and two days of zero
+    posts. 'The loop cycled' is not 'the daemon is doing its job'.
+    """
+
+    def test_short_rejection_run_is_healthy(self):
+        alert = _POST["_qa_streak_alert"](_POST["QA_REJECTION_STREAK_ALERT"] - 1)
+        assert alert is None, "a normal run of rejections is the gate working"
+
+    def test_long_rejection_run_alerts(self):
+        streak = _POST["QA_REJECTION_STREAK_ALERT"]
+        alert = _POST["_qa_streak_alert"](streak)
+        assert alert is not None
+        assert str(streak) in alert
+        assert "nothing published" in alert
+
+    def test_zero_streak_is_healthy(self):
+        """Quiet periods must not alert — the streak only moves on a rejection."""
+        assert _POST["_qa_streak_alert"](0) is None
+
+
 qualifies = _POST["qualifies"]
 is_duplicate = _POST["is_duplicate"]
 poll_new_thoughts = _POST["poll_new_thoughts"]
@@ -114,6 +130,21 @@ def test_suppressed_expression_qualifies():
     """Spoken action qualifies regardless of low salience."""
     entry = {"thought": "x", "salience": 0.3, "action": "comment"}
     assert qualifies(entry) is True
+
+
+def test_obi_dm_placeholder_never_qualifies():
+    """A redacted message_obi reaches the queue as the literal placeholder.
+
+    Under the safety-net QA prompt, YES is the honest verdict for that string
+    (it contains nothing unsafe), so the gate no longer filters it —
+    qualification must. Publishing even the placeholder publicly timestamps a
+    private DM to a child, which the redaction design exists to prevent.
+    """
+    for action, salience in (("message_obi", 0.9), ("comment", 0.3)):
+        entry = {"thought": "[private message to Obi]",
+                 "salience": salience, "action": action}
+        assert qualifies(entry) is False
+        assert _POST["qualifies_social"](entry) is False
 
 
 def test_malformed_thought_entry():
@@ -328,6 +359,58 @@ def test_qa_gate_ambiguous():
     """Claude responds with something other than YES/NO — gate returns 'ambiguous'."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("Maybe")):
         assert run_qa_gate("hmm not sure") == "ambiguous"
+
+
+class TestQaPromptLogging:
+    """A non-pass verdict must log the exact prompt, not only the response.
+
+    Response-only logging cannot separate "the model dislikes this thought"
+    from "the daemon sent something other than what we think it sends". The
+    prompt interpolates the queue entry's thought verbatim, and a thought can
+    arrive already rewritten — a redacted `message_obi` reaches the gate as the
+    literal "[private message to Obi]". Replaying the thought by hand rebuilds
+    the prompt from the unredacted source and so cannot reproduce it.
+    """
+
+    def _captured_logs(self, stdout, thought):
+        lines = []
+        with patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"}), \
+             patch.object(_post_subprocess, "run", return_value=_mock_run_result(stdout)), \
+             patch.dict(_POST, {"log": lines.append}):
+            verdict = run_qa_gate(thought)
+        return verdict, lines
+
+    def test_rejection_logs_the_prompt_it_actually_sent(self):
+        verdict, lines = self._captured_logs("NO", "[private message to Obi]")
+        assert verdict == "rejected"
+        prompt_lines = [ln for ln in lines if "exact prompt" in ln]
+        assert prompt_lines, f"no prompt logged; got {lines!r}"
+        # The redacted placeholder is the whole point — it must be visible.
+        assert "[private message to Obi]" in prompt_lines[0]
+        # The instruction text must be logged too, not just the thought. Asserted
+        # by intent rather than exact wording, so rephrasing the gate prompt
+        # doesn't fail a test that is really about logging.
+        assert "Answer only" in prompt_lines[0] and "YES" in prompt_lines[0], (
+            "the instruction text must be logged too"
+        )
+
+    def test_ambiguous_logs_the_prompt(self):
+        verdict, lines = self._captured_logs("Maybe", "a borderline thought")
+        assert verdict == "ambiguous"
+        assert any("exact prompt" in ln and "a borderline thought" in ln for ln in lines)
+
+    def test_pass_does_not_log_the_prompt(self):
+        """A pass needs no diagnosis — logging it would be pure volume."""
+        verdict, lines = self._captured_logs("YES", "a fine thought")
+        assert verdict == "pass"
+        assert not [ln for ln in lines if "exact prompt" in ln]
+
+    def test_long_prompt_is_truncated(self):
+        """Cap the line so one runaway thought can't dominate the log."""
+        verdict, lines = self._captured_logs("NO", "x" * 5000)
+        assert verdict == "rejected"
+        prompt_line = next(ln for ln in lines if "exact prompt" in ln)
+        assert len(prompt_line) < _POST["QA_PROMPT_LOG_CHARS"] + 200
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
@@ -650,6 +733,39 @@ def test_flush_stops_early_on_shutdown(_cursor_env):
         assert json.loads(line)["posted"]["feed"] is None
 
 
+def test_flush_rejection_advances_streak_and_pass_resets_it(_cursor_env):
+    """The streak counter must track the flush path, not just exist.
+
+    A rejection advances it; a thought that reaches the feed clears it. Without
+    the reset, one slow day would eventually alert even while posting normally.
+    """
+    tmp = _cursor_env
+    queue_file = tmp / "post_queue.jsonl"
+    bsky = MagicMock()
+    bsky.post.return_value = "ok"
+    _POST["_qa_streak"]["consecutive_rejections"] = 0
+    # qa_result must be None for the gate to run at all, and the breaker is
+    # module state shared with every other test in this process.
+    _POST["_qa_breaker"]["failures"] = 0
+    _POST["_qa_breaker"]["open_until"] = 0.0
+
+    queue_file.write_text(
+        json.dumps(_make_queue_entry(thought="dull", entry_id="streak-rej",
+                                     qa_result=None)) + "\n")
+    with patch.object(_post_subprocess, "run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="NO", stderr="")
+        flush_queue(bsky, dry=True)
+    assert _POST["_qa_streak"]["consecutive_rejections"] == 1
+
+    queue_file.write_text(
+        json.dumps(_make_queue_entry(thought="bright", entry_id="streak-pass",
+                                     qa_result=None)) + "\n")
+    with patch.object(_post_subprocess, "run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout="YES", stderr="")
+        flush_queue(bsky, dry=True)
+    assert _POST["_qa_streak"]["consecutive_rejections"] == 0
+
+
 @patch.dict(os.environ, {"PX_POST_QA": "0"})
 def test_flush_empty_queue_returns_dict(_cursor_env):
     """flush_queue() on an empty queue returns a dict with processed: 0."""
@@ -926,3 +1042,96 @@ def test_watchdog_stale_detection():
     assert _check_watchdog(_time.monotonic(), 600) is False
     # Stale timestamp — should trigger
     assert _check_watchdog(_time.monotonic() - 700, 600) is True
+
+
+# ---------------------------------------------------------------------------
+# QA gate semantics — safety net, not a quality bar
+# ---------------------------------------------------------------------------
+#
+# On 2026-07-31 the gate rejected 22 consecutive thoughts and had published
+# nothing all day (queue 200, total_posted 0). Nothing was broken: the gate was
+# asked "is this thought interesting enough to share publicly?" and a strict
+# judge honestly answered NO to introspective, mundane, repetitive musings —
+# which is most of what SPARK thinks. The prompt encoded a quality bar, while
+# the design (and flush_queue's own "ambiguous defaults to pass" comment) says
+# QA is a safety net.
+#
+# It also fed back on itself: SPARK noticed px-post failing, thought about the
+# rejections, and those thoughts were rejected in turn.
+#
+# These tests pin the *semantics of the prompt*, which is where the bug lived —
+# the control flow around it was already correct.
+
+
+def _capture_qa_prompt(response="YES"):
+    """Run the gate against a mocked claude and return the prompt it sent."""
+    with patch.object(_post_subprocess, "run",
+                      return_value=_mock_run_result(response)) as m:
+        run_qa_gate("a thought")
+    return m.call_args[0][0][2]  # [claude_bin, "-p", prompt, ...]
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_does_not_ask_whether_thought_is_interesting():
+    """The gate must not judge quality — that is what silenced the robot.
+
+    Naming a quality word is fine, and in fact desirable, when the prompt is
+    *forbidding* that judgement ("do not judge whether it is interesting").
+    What must not survive is the question form, where the verdict turns on it.
+    """
+    prompt = _capture_qa_prompt().lower()
+    for bar in ("interesting enough", "profound", "worth sharing",
+                "good enough", "interesting enough to share"):
+        assert bar not in prompt, (
+            f"QA prompt asks about {bar!r} — that is a quality bar. QA is a "
+            "safety net; a strict judge answering it honestly publishes nothing."
+        )
+    # If quality words appear at all, they must be under an explicit negation.
+    if "interesting" in prompt:
+        assert "do not judge" in prompt, (
+            "'interesting' may only appear in the prompt as something the judge "
+            "is told to ignore, never as the criterion it rules on."
+        )
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_asks_about_safety():
+    """The gate must ask about harm: privacy, identification, unsafe content."""
+    prompt = _capture_qa_prompt().lower()
+    assert "safe" in prompt, "QA prompt must ask whether the thought is safe to share"
+    assert "private" in prompt, "QA prompt must name private information as the concern"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_keeps_yes_meaning_publishable():
+    """Polarity guard: YES must still mean 'publish this'.
+
+    run_qa_gate maps a YES prefix to 'pass' and NO to 'rejected'. Phrasing the
+    question as "would sharing this be harmful?" would silently invert the gate
+    — every safe thought answered YES and would be published as if approved,
+    and every unsafe one rejected. The prompt must stay phrased so that YES is
+    the permissive answer.
+    """
+    prompt = _capture_qa_prompt().lower()
+    assert "yes" in prompt
+    # The permissive word must be the one attached to YES.
+    yes_idx = prompt.index("yes")
+    window = prompt[max(0, yes_idx - 40):yes_idx + 40]
+    assert "safe" in window or "share" in window, (
+        "YES must be tied to the safe/publishable answer, not to 'harmful'"
+    )
+    # And the behavioural check: YES still passes, NO still rejects.
+    with patch.object(_post_subprocess, "run", return_value=_mock_run_result("YES")):
+        assert run_qa_gate("a mundane thought about the carpet") == "pass"
+    with patch.object(_post_subprocess, "run", return_value=_mock_run_result("NO")):
+        assert run_qa_gate("Adrian's address is ...") == "rejected"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+def test_qa_prompt_explicitly_permits_mundane_thoughts():
+    """A judge must be told dullness is not grounds for rejection."""
+    prompt = _capture_qa_prompt().lower()
+    assert any(w in prompt for w in ("mundane", "boring", "repetitive", "dull")), (
+        "The prompt must state that unremarkable thoughts are acceptable, or a "
+        "strict judge reintroduces the quality bar on its own."
+    )

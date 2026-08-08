@@ -68,11 +68,32 @@ def main() -> int:
         command.append("--dry-run")
 
     try:
-        # Explore mode gets longer timeout (duration + 60s buffer)
-        timeout = (duration + 60) if mode == "explore" else 120
+        # Explore mode: duration + 180s buffer. A single explore step can
+        # legitimately take ~150s (vision call) on top of the duration, and
+        # this timeout must stay BELOW mind.py's outer explore budget so this
+        # layer — which can still clean up — fires first.
+        timeout = (duration + 180) if mode == "explore" else 180
         result = subprocess.run(command, capture_output=True, text=True,
                                 check=False, timeout=timeout)
     except subprocess.TimeoutExpired:
+        # subprocess.run SIGKILLs its direct child — the sudo wrapper — which
+        # cannot forward SIGKILL, so the root px-wander underneath survives
+        # with motors possibly live. Signal it directly via the pid it
+        # published in exploring.json (SIGTERM → its graceful-stop handler
+        # and motor-cleanup finally block).
+        try:
+            state_dir = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
+            info = json.loads((state_dir / "exploring.json").read_text())
+            pid = info.get("pid")
+            if info.get("active") and isinstance(pid, int) and Path(f"/proc/{pid}").is_dir():
+                try:
+                    os.kill(pid, 15)
+                except PermissionError:
+                    subprocess.run(["sudo", "-n", "kill", "-TERM", str(pid)],
+                                   capture_output=True, timeout=10, check=False)
+                log_event("wander", {"status": "timeout_cleanup", "signalled_pid": pid})
+        except Exception:
+            pass
         payload = {"status": "error", "error": "px-wander timed out"}
         log_event("wander", payload)
         print(json.dumps(payload))

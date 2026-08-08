@@ -6,7 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/px-env"
 
 SESSION_NAME=${PX_TMUX_SESSION:-picar-x}
-VOICE_CMD=${PX_VOICE_CMD:-bin/run-voice-loop --auto-log}
+# Claude is the default backend — Codex (bin/run-voice-loop) is quota-limited.
+# Override with PX_VOICE_CMD to use another backend.
+VOICE_CMD=${PX_VOICE_CMD:-bin/run-voice-loop-claude --auto-log}
 WAKE_CMD=${PX_WAKE_CMD:-bin/px-wake --keyboard}
 LOG_CMD=${PX_LOG_CMD:-tail -f logs/tool-voice-transcript.log}
 

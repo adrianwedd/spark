@@ -236,6 +236,37 @@ class TestAsyncJobs:
         assert resp2.status_code == 200
         assert resp2.json()["status"] in ("running", "complete", "error")
 
+    def test_wander_timeout_stays_above_tool_wander_budget(self):
+        """The async wander budget must never cut tool-wander's own short.
+
+        Killing tool-wander from the API SIGKILLs the bash wrapper, so its
+        handler never signals the root px-wander by pid and the sudo child
+        keeps driving. SYNC_TIMEOUT_SLOW (120s) did that to every explore
+        longer than ~90s — run 7, 2026-08-06.
+        """
+        from pxh.api import _wander_timeout
+
+        for duration in (30, 90, 150, 300):
+            outer = _wander_timeout({
+                "PX_WANDER_MODE": "explore",
+                "PX_WANDER_DURATION_S": str(duration),
+            })
+            assert outer > duration + 180, (
+                f"explore {duration}s: outer {outer}s does not clear "
+                f"tool-wander's {duration + 180}s budget"
+            )
+
+        assert _wander_timeout({"PX_WANDER_MODE": "avoid"}) > 180
+
+    def test_wander_timeout_survives_junk_duration(self):
+        """A non-numeric duration falls back, never crashes the launch path."""
+        from pxh.api import _wander_timeout
+
+        outer = _wander_timeout({
+            "PX_WANDER_MODE": "explore", "PX_WANDER_DURATION_S": "soon",
+        })
+        assert outer > 180
+
     def test_job_not_found(self, api_client, auth_headers):
         resp = api_client.get(
             "/api/v1/jobs/nonexistent-id",

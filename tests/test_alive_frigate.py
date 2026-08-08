@@ -1,10 +1,11 @@
 """Tests for px-alive directional gaze toward Frigate-detected person."""
 from __future__ import annotations
-import os
+import datetime as dt
 import sys
 import types
 from pathlib import Path
 
+from _harness import daemon_load_env
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -23,23 +24,14 @@ def _load_alive_helpers():
     stubs_state.load_session = lambda: {}
     sys.modules["pxh.state"] = stubs_state  # explicit, not overwritten by loop
 
-    env_patch = {
-        "PROJECT_ROOT": str(PROJECT_ROOT),
-        "LOG_DIR": str(PROJECT_ROOT / "logs"),
-        "PX_STATE_DIR": str(PROJECT_ROOT / "state"),
-    }
-    old_env = {k: os.environ.get(k) for k in env_patch}
-    for k, v in env_patch.items():
-        os.environ[k] = v
-
     globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-alive")}
     try:
-        exec(compile(py_src, "bin/px-alive", "exec"), globs)  # noqa: S102
+        # STATE_DIR is frozen here for the session — see tests/_harness.py.
+        with daemon_load_env():
+            exec(compile(py_src, "bin/px-alive", "exec"), globs)  # noqa: S102
     finally:
         for k, old_mod in saved.items():
             sys.modules.pop(k, None) if old_mod is None else sys.modules.update({k: old_mod})
-        for k, old_v in old_env.items():
-            os.environ.pop(k, None) if old_v is None else os.environ.update({k: old_v})
     return globs
 
 
@@ -95,3 +87,170 @@ def test_pan_non_numeric_x_center():
 def test_frigate_stale_s_constant():
     # Staleness threshold should be defined
     assert FRIGATE_STALE_S > 0
+
+
+# ---------------------------------------------------------------------------
+# _person_confirmed — the veto that stops SPARK greeting furniture
+# ---------------------------------------------------------------------------
+
+_person_confirmed = _ALIVE["_person_confirmed"]
+GREET_FRIGATE_STALE_S = _ALIVE["GREET_FRIGATE_STALE_S"]
+GREET_CONFIRM_CAMERAS = _ALIVE["GREET_CONFIRM_CAMERAS"]
+
+
+def _presence(cameras, age_s=0.0):
+    ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=age_s)
+    return {"ts": ts.isoformat(), "cameras": cameras}
+
+
+def test_greet_confirmed_by_robot_camera():
+    assert _person_confirmed(_presence({"picar_x": {"person": True}})) is True
+
+
+def test_greet_confirmed_by_indoor_camera():
+    """Robot's own head may be turned away — the indoor camera still confirms."""
+    assert _person_confirmed(
+        _presence({"picar_x": {"person": False}, "picamera": {"person": True}})
+    ) is True
+
+
+def test_greet_not_confirmed_by_outdoor_camera_only():
+    """Someone in the driveway says nothing about what's in front of the robot."""
+    assert _person_confirmed(
+        _presence({"driveway_camera": {"person": True}, "garden_camera": {"person": True}})
+    ) is False
+
+
+def test_greet_not_confirmed_without_person():
+    """The chair-leg case: sonar fired, no camera saw anyone."""
+    assert _person_confirmed(
+        _presence({"picar_x": {"person": False}, "picamera": {"person": False}})
+    ) is False
+
+
+def test_greet_not_confirmed_when_stale():
+    """Past the window, a person sighting means a room someone already left."""
+    stale = _presence({"picar_x": {"person": True}}, age_s=GREET_FRIGATE_STALE_S + 30)
+    assert _person_confirmed(stale) is False
+
+
+def test_greet_stale_bound_is_tighter_than_pan_bound():
+    """Aiming the head tolerates stale data; speaking does not."""
+    assert GREET_FRIGATE_STALE_S < FRIGATE_STALE_S
+
+
+def test_greet_confirmation_survives_malformed_input():
+    """px-alive must never die on a bad state file — every branch returns False."""
+    for bad in (None, [1, 2, 3], "person", {}, {"ts": "not-a-timestamp"},
+                {"ts": None, "cameras": {}},
+                _presence("cameras-not-a-dict"),
+                _presence({"picar_x": "not-a-dict"})):
+        assert _person_confirmed(bad) is False
+
+
+def test_greet_confirm_cameras_are_indoor_only():
+    assert "driveway_camera" not in GREET_CONFIRM_CAMERAS
+    assert "garden_camera" not in GREET_CONFIRM_CAMERAS
+
+
+def test_alive_fallbacks_match_spark_config():
+    """_load_alive_helpers() stubs out pxh, so the constants under test above
+    are px-alive's ImportError fallbacks. Pin them to spark_config — otherwise
+    SPARK evolves the config and the values px-alive actually uses on a stripped
+    PYTHONPATH drift away silently."""
+    from pxh import spark_config
+
+    assert _ALIVE["PROXIMITY_GREETINGS"] == spark_config.PROXIMITY_GREETINGS
+    assert GREET_CONFIRM_CAMERAS == spark_config.GREET_CONFIRM_CAMERAS
+    assert GREET_FRIGATE_STALE_S == spark_config.GREET_FRIGATE_STALE_S
+
+
+# ---------------------------------------------------------------------------
+# Recency-based confirmation (2026-08-01): a person who approached and then
+# stood still ages out of Frigate's 90s event window while still present.
+# px-mind now carries cameras.*.last_person_ts; a sighting within
+# GREET_PERSON_RECENCY_S confirms the greet even when person=False right now.
+# ---------------------------------------------------------------------------
+
+GREET_PERSON_RECENCY_S = _ALIVE["GREET_PERSON_RECENCY_S"]
+
+
+def _iso_ago(seconds):
+    return (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)).isoformat()
+
+
+def test_greet_confirmed_by_recent_sighting():
+    """Person seen 60s ago, no live event now → still confirmed."""
+    assert _person_confirmed(_presence({
+        "picar_x": {"person": False, "last_person_ts": _iso_ago(60)},
+    })) is True
+
+
+def test_greet_recency_expired_not_confirmed():
+    assert _person_confirmed(_presence({
+        "picar_x": {"person": False,
+                    "last_person_ts": _iso_ago(GREET_PERSON_RECENCY_S + 30)},
+    })) is False
+
+
+def test_greet_recency_survives_stale_snapshot():
+    """last_person_ts carries its own timestamp — a snapshot past the live
+    staleness bound can still confirm via a recent absolute sighting."""
+    assert _person_confirmed(_presence(
+        {"picar_x": {"person": True, "last_person_ts": _iso_ago(100)}},
+        age_s=GREET_FRIGATE_STALE_S + 60,
+    )) is True
+
+
+def test_greet_recency_outdoor_camera_does_not_confirm():
+    assert _person_confirmed(_presence({
+        "driveway_camera": {"person": False, "last_person_ts": _iso_ago(10)},
+    })) is False
+
+
+def test_greet_recency_malformed_ts_not_confirmed():
+    assert _person_confirmed(_presence({
+        "picar_x": {"person": False, "last_person_ts": "garbage"},
+    })) is False
+
+
+def test_greet_recency_bound_pinned_to_spark_config():
+    from pxh import spark_config
+    assert GREET_PERSON_RECENCY_S == spark_config.GREET_PERSON_RECENCY_S
+
+
+def test_greet_suppress_detail_is_informative():
+    """The suppression log line must say WHY: snapshot age + last sightings."""
+    detail = _ALIVE["_greet_suppress_detail"](_presence({
+        "picar_x": {"person": False, "last_person_ts": _iso_ago(400)},
+        "picamera": {"person": False},
+    }, age_s=30))
+    assert "snapshot 30s" in detail
+    assert "picar_x" in detail and "400s" in detail
+    assert "picamera: never" in detail
+    assert _ALIVE["_greet_suppress_detail"](None) == "no presence snapshot"
+
+
+def test_spark_greet_env_never_routes():
+    """spark_greet's tool-voice env must carry PX_VOICE_NO_ROUTE=1.
+
+    Routing would spawn tool-announce, whose yield_alive SIGUSR1-kills
+    px-alive (its own grandparent) mid-greeting; the 8s subprocess timeout
+    would also kill a route attempt before any speech could land.
+    """
+    captured = {}
+
+    def _fake_run(args, env=None, **kwargs):
+        captured["env"] = env
+        class _Result:
+            returncode = 0
+        return _Result()
+
+    orig_run = _ALIVE["_subprocess"].run
+    _ALIVE["_subprocess"].run = _fake_run
+    try:
+        _ALIVE["spark_greet"](dry=True)
+    finally:
+        _ALIVE["_subprocess"].run = orig_run
+
+    assert captured.get("env", {}).get("PX_VOICE_NO_ROUTE") == "1"

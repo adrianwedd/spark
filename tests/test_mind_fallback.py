@@ -132,3 +132,54 @@ def test_returns_error_when_all_tiers_fail():
                side_effect=urllib.error.URLError("all down")):
         result = call_llm("prompt", "system", persona="spark")
     assert "error" in result
+
+
+# ── Which tier actually served ─────────────────────────────────────
+# The `backend=` reflection log line reports the *configured* primary, so the
+# tier that answered was previously only recoverable by grepping for "falling
+# back". call_llm() now labels the result, and that label is what makes paid-
+# tier drift measurable (see token_log.by_backend).
+
+def test_result_is_labelled_with_the_tier_that_served():
+    with patch("urllib.request.urlopen", return_value=_fake_ollama_cm("hello")):
+        result = call_llm("prompt", "system", persona="spark")
+    assert result["backend"] == "ollama-m5"
+
+
+def test_claude_fallback_is_labelled_claude():
+    """M5 down, SPARK falls through to Claude — the expensive tier must be
+    identifiable, since this is the unbudgeted path."""
+    with patch("urllib.request.urlopen",
+               side_effect=urllib.error.URLError("M5 unreachable")), \
+         patch("subprocess.run",
+               return_value=_fake_claude(0, stdout='{"thought": "hi", "mood": "curious"}')):
+        result = call_llm("prompt", "system", persona="spark")
+    assert "error" not in result
+    assert result["backend"] == "claude"
+
+
+def test_token_usage_is_split_by_backend(tmp_path, monkeypatch):
+    """Top-level totals mix free Ollama with paid Claude and cannot answer
+    'what am I spending' — only the per-backend split can."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    from pxh import token_log
+
+    token_log.log_usage("prompt text", "response text", "ollama-m5")
+    token_log.log_usage("prompt text", "response text", "claude")
+    token_log.log_usage("prompt text", "response text", "claude")
+
+    data = json.loads((tmp_path / "token_usage.json").read_text())
+    assert data["call_count"] == 3
+    assert data["by_backend"]["ollama-m5"]["call_count"] == 1
+    assert data["by_backend"]["claude"]["call_count"] == 2
+    assert data["by_backend"]["claude"]["input_tokens"] > 0
+
+
+def test_token_usage_backend_defaults_to_unknown(tmp_path, monkeypatch):
+    """Two-arg callers predate the split and must keep working."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    from pxh import token_log
+
+    token_log.log_usage("prompt", "response")
+    data = json.loads((tmp_path / "token_usage.json").read_text())
+    assert data["by_backend"]["unknown"]["call_count"] == 1

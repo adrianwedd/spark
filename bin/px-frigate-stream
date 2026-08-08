@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -26,24 +27,54 @@ PID_FILE = LOG_DIR / "px-frigate-stream.pid"
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "."))
 GO2RTC_BIN = PROJECT_ROOT / "bin" / "go2rtc"
 
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
+# The watch loop polls twice a second; coalesce successes.
+HEALTH_INTERVAL_S = 60
+
 
 def handle_sigint(signum, frame):
     global STOP_REQUESTED
     STOP_REQUESTED = True
 
 
+def build_rpicam_cmd(args) -> list[str]:
+    """The single source of truth for the rpicam-vid command line.
+
+    Previously this existed as two hand-maintained copies — an f-string for the
+    go2rtc exec: source and a separate argv list for the dry-run payload — which
+    could (and did) drift apart. Both callers now derive from here.
+    """
+    cmd = [
+        "rpicam-vid", "--codec", "h264", "--profile", "baseline", "--inline",
+        "--timeout", "0", "--framerate", str(args.fps),
+        "--width", str(args.width), "--height", str(args.height),
+    ]
+    # Without --bitrate, rpicam-vid defaults to ~10 Mbps, which measured
+    # 9.97 Mbps on the wire — ~5x what picamera uses at the identical
+    # 1280x720 and ~7x what garden_camera uses at 1080p. Frigate records this
+    # stream verbatim (no re-encode), so the default was writing ~58 GB/day and
+    # filling pi5-hailo. 2 Mbps is ample for 720p15 detection.
+    # bitrate=0 means "omit the flag" i.e. fall back to that ~10 Mbps default.
+    if args.bitrate > 0:
+        cmd += ["--bitrate", str(args.bitrate)]
+    cmd += ["--output", "-"]
+    return cmd
+
+
 def build_go2rtc_config(args) -> dict:
     """go2rtc config that runs rpicam-vid as a local RTSP source.
 
-    Frigate (on pi5-hailo) pulls from rtsp://192.168.0.236:{port}/{stream}.
+    Frigate (on pi5-hailo) pulls from rtsp://192.168.0.236:{port}/{stream}
+    — that is PiCar's wlan0; eth0 is 192.168.0.27.
     The exec: source starts rpicam-vid on demand when a consumer connects.
     """
-    rpicam_cmd = (
-        f"rpicam-vid --codec h264 --profile baseline --inline"
-        f" --timeout 0 --framerate {args.fps}"
-        f" --width {args.width} --height {args.height}"
-        f" --output -"
-    )
+    rpicam_cmd = shlex.join(build_rpicam_cmd(args))
     return {
         "api": {"listen": f":{args.api_port}"},
         "rtsp": {"listen": f":{args.port}"},
@@ -61,6 +92,8 @@ def main() -> int:
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--bitrate", type=int, default=2_000_000,
+                        help="H264 target bits/sec (default 2 Mbps; 0 = rpicam-vid default ~10 Mbps)")
     parser.add_argument("--duration", type=float, default=0, help="Stop after N seconds (0 = forever)")
     parser.add_argument("--host", default="picar.local", help="Hostname for the served RTSP URL")
     parser.add_argument("--dry-run", action="store_true", help="Print config without executing")
@@ -70,11 +103,7 @@ def main() -> int:
     serve_url = f"rtsp://{args.host}:{args.port}/{args.stream}"
     config = build_go2rtc_config(args)
 
-    camera_cmd = [
-        "rpicam-vid", "--codec", "h264", "--profile", "baseline", "--inline",
-        "--timeout", "0", "--framerate", str(args.fps),
-        "--width", str(args.width), "--height", str(args.height), "--output", "-",
-    ]
+    camera_cmd = build_rpicam_cmd(args)
     ffmpeg_cmd = [
         "ffmpeg", "-use_wallclock_as_timestamps", "1", "-i", "pipe:0",
         "-c:v", "copy", "-f", "rtsp", "-rtsp_transport", "tcp", "-muxdelay", "0.1",
@@ -139,6 +168,13 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
         )
 
+    # Set before the try, not after the early-exit check below: the finally
+    # block reads start_ts on every path out, including the go2rtc-exited-early
+    # `return 1`. Assigning it only on the success path made that path raise
+    # UnboundLocalError from finally, which replaces the go2rtc stderr you need
+    # to diagnose the failure with a traceback about a missing variable.
+    start_ts = time.time()
+
     try:
         time.sleep(1.0)  # let go2rtc bind the port
         if go2rtc_proc.poll() is not None:
@@ -149,7 +185,6 @@ def main() -> int:
         # Kick off the keepalive consumer — this triggers go2rtc to start rpicam-vid
         keepalive_proc = start_keepalive(args.port, args.stream)
 
-        start_ts = time.time()
         payload = {
             "status": "streaming",
             "serve_url": serve_url,
@@ -166,10 +201,15 @@ def main() -> int:
                 break
             if go2rtc_proc.poll() is not None:
                 log_event("frigate-stream", {"status": "go2rtc_exited_unexpectedly"})
+                _health.record_failure("px-frigate-stream", "go2rtc exited unexpectedly")
                 break
             # Restart keepalive if it died (e.g. go2rtc hiccup)
             if keepalive_proc.poll() is not None:
                 keepalive_proc = start_keepalive(args.port, args.stream)
+                _health.record_failure("px-frigate-stream", "keepalive died — restarted")
+            else:
+                _health.record_success("px-frigate-stream",
+                                       min_interval_s=HEALTH_INTERVAL_S)
             time.sleep(0.5)
 
     finally:

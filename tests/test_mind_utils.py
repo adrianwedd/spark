@@ -213,6 +213,48 @@ def test_frigate_presence_network_error():
     assert result is None
 
 
+def test_frigate_unreachable_sets_backoff_and_skips_next_call():
+    """An unreachable host is skipped for the backoff window without a second
+    connect attempt. FRIGATE_TIMEOUT_S bounds the socket but not DNS, so a
+    retry every tick costs a 15-20 s resolver hang on a 60 s loop."""
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("fail")):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert pxh.mind._host_failure_until.get(pxh.mind.FRIGATE_HOST, 0) > _time.monotonic()
+
+    # Host is now "up", but the backoff must suppress the call entirely.
+    opener = MagicMock(side_effect=_mock_urlopen_fn([_make_frigate_event()]))
+    with patch("urllib.request.urlopen", opener):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert opener.call_count == 0
+
+    # Once the window lapses, the next call goes out normally.
+    pxh.mind._host_failure_until[pxh.mind.FRIGATE_HOST] = _time.monotonic() - 1
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([_make_frigate_event()])):
+        assert _fetch_frigate_presence(dry=False).get("person_present") is True
+
+
+def test_frigate_malformed_response_does_not_set_backoff():
+    """A host that answers with garbage is reachable — it must not be backed
+    off, or one bad payload blinds SPARK's cameras for the whole window."""
+    def _bad_body(*args, **kwargs):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=MagicMock(return_value=None, read=MagicMock(return_value=b"not json")))
+        cm.__exit__ = MagicMock(return_value=False)
+        return cm
+
+    with patch("urllib.request.urlopen", side_effect=_bad_body):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert pxh.mind.FRIGATE_HOST not in pxh.mind._host_failure_until
+
+
+def test_frigate_http_error_does_not_set_backoff():
+    """HTTPError subclasses URLError but means the host replied — no backoff."""
+    err = urllib.error.HTTPError("http://x/api/events", 500, "boom", {}, None)
+    with patch("urllib.request.urlopen", side_effect=err):
+        assert _fetch_frigate_presence(dry=False) is None
+    assert pxh.mind.FRIGATE_HOST not in pxh.mind._host_failure_until
+
+
 def test_frigate_presence_empty_events():
     """Empty event list → no person detected."""
     with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
@@ -237,6 +279,31 @@ def test_frigate_presence_low_score():
         result = _fetch_frigate_presence(dry=False)
     assert result is not None
     assert result.get("person_present") is False
+
+
+def test_frigate_carries_sub_label_through():
+    """Frigate's recognised name rides on sub_label. Nothing consumes it yet;
+    this pins the data path so named greetings stay a phrasing change."""
+    ev = _make_frigate_event(camera="picar_x")
+    ev["sub_label"] = "Obi"
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([ev])):
+        result = _fetch_frigate_presence(dry=False)
+    cam = result["cameras"]["picar_x"]
+    assert cam["people"] == ["Obi"]
+    assert cam["detections"][0]["sub_labels"] == ["Obi"]
+
+
+def test_frigate_sub_label_list_form_and_absence():
+    """Frigate has sent sub_label as [name, score] as well as a bare string,
+    and sends nothing at all when recognition is off."""
+    named = _make_frigate_event(camera="picar_x")
+    named["sub_label"] = ["Adrian", 0.91]
+    anon = _make_frigate_event(camera="picamera")   # no sub_label key
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([named, anon])):
+        result = _fetch_frigate_presence(dry=False)
+    assert result["cameras"]["picar_x"]["people"] == ["Adrian"]
+    assert result["cameras"]["picamera"]["people"] == []
+    assert result["cameras"]["picamera"]["person"] is True
 
 
 def test_frigate_presence_multi_camera():
@@ -311,6 +378,86 @@ def test_battery_filter_charging_resets_glitch():
 def test_battery_glitch_confirms_requires_multiple():
     """Glitch detection requires BATTERY_GLITCH_CONFIRMS before accepting a low reading."""
     assert BATTERY_GLITCH_CONFIRMS >= 2  # safety: need at least 2 confirms
+
+
+class _FakeClock:
+    """Monotonic clock the test advances explicitly."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+@pytest.fixture
+def fake_mono(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(pxh.mind.time, "monotonic", clock)
+    return clock
+
+
+def _volts_for(pct: int) -> float:
+    """Inverse of px-battery-poll's volts_to_pct, for realistic readings."""
+    return round(6.0 + (pct / 100) * (8.4 - 6.0), 2)
+
+
+def test_sustained_decline_to_flat_is_reported_not_held(fake_mono):
+    """A real battery going flat must surface a critical pct, not be pinned at prev.
+
+    Replays the 2026-08-06 brownout at its real cadence. px-mind's ticks were
+    starved by slow reflection calls (86.9s and 99.4s), so the pack fell
+    34% -> 0% across only three evaluations spanning 222s while filter_battery
+    kept returning the stale 34%. The <=10% emergency shutdown never saw a
+    critical value and the Pi lost power mid-write.
+    """
+    for pct in (40, 38, 36, 34):
+        filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=pct + 2)
+        fake_mono.advance(60)
+
+    prev = 34
+    reported = []
+    # (pct, seconds until next evaluation) — gaps taken from the journal
+    for pct, gap in ((17, 60), (15, 162), (0, 0)):
+        out = filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=prev)
+        prev = out["pct"]
+        reported.append(out["pct"])
+        fake_mono.advance(gap)
+
+    assert min(reported) <= 10, (
+        f"filter never reported a critical level during a real decline: {reported}"
+    )
+
+
+def test_transient_zero_spike_is_still_rejected(fake_mono):
+    """A single 0% spike surrounded by healthy readings must never be accepted."""
+    for pct in (80, 79, 78):
+        filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=pct + 1)
+        fake_mono.advance(60)
+
+    spike = filter_battery({"pct": 0, "volts": 5.2}, prev_pct=78)
+    assert spike["pct"] == 78
+
+    fake_mono.advance(60)
+    recovered = filter_battery({"pct": 77, "volts": _volts_for(77)}, prev_pct=78)
+    assert recovered["pct"] == 77
+
+
+def test_scattered_garbage_readings_never_confirm(fake_mono):
+    """Wildly inconsistent low readings are a dead ADC, not a discharge curve."""
+    for pct in (80, 79, 78):
+        filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=pct + 1)
+        fake_mono.advance(60)
+
+    prev = 78
+    for pct in (0, 55, 2, 61, 0, 48):
+        out = filter_battery({"pct": pct, "volts": _volts_for(pct)}, prev_pct=prev)
+        prev = out["pct"]
+        fake_mono.advance(60)
+        assert out["pct"] >= 40, f"garbage reading {pct}% was accepted as {out['pct']}%"
 
 
 # ---------------------------------------------------------------------------
@@ -546,9 +693,17 @@ def _base_awareness(**overrides):
 
 @pytest.fixture
 def explore_state(tmp_path):
-    """Temporarily redirect STATE_DIR so _can_explore reads meta from tmp_path."""
+    """Temporarily redirect STATE_DIR so _can_explore reads meta from tmp_path.
+
+    Also seeds a valid cliff calibration so the gate tests below exercise the
+    condition they name rather than short-circuiting on the calibration gate.
+    """
     old = getattr(pxh.mind, "STATE_DIR", None)
     pxh.mind.STATE_DIR = tmp_path
+    (tmp_path / "wander_calibration.json").write_text(_json.dumps({
+        "floor_ref": [1000, 1000, 1000], "cliff_ref": [650, 650, 650],
+        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }))
     yield tmp_path
     if old is not None:
         pxh.mind.STATE_DIR = old
@@ -610,6 +765,19 @@ def test_can_explore_corrupt_meta_fails_safe(explore_state):
     assert _can_explore(_base_session(), _base_awareness()) is False
 
 
+def test_can_explore_requires_cliff_calibration(tmp_path, monkeypatch):
+    """Autonomous explore must not arm without a calibrated cliff reference."""
+    monkeypatch.setattr(pxh.mind, "STATE_DIR", tmp_path)
+    session = _base_session()
+    awareness = _base_awareness()
+    assert _can_explore(session, awareness) is False  # no calibration file
+    (tmp_path / "wander_calibration.json").write_text(_json.dumps({
+        "floor_ref": [1000, 1000, 1000], "cliff_ref": [650, 650, 650],
+        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    }))
+    assert _can_explore(session, awareness) is True  # no cooldown file yet
+
+
 # ---------------------------------------------------------------------------
 # VALID_ACTIONS expansion + mood mapping dicts
 # ---------------------------------------------------------------------------
@@ -628,6 +796,41 @@ def test_valid_actions_includes_new_actions():
         "set_goal", "update_goal", "complete_goal",
     }
     assert VALID_ACTIONS == expected
+
+
+# Actions deliberately absent from the static enum because reflection injects
+# them per-tick only when their preconditions hold (_inject_explore, gated on
+# _can_explore). Offering these unconditionally would spend a reflection on an
+# action that gets refused at re-check.
+DYNAMIC_ACTIONS = {"explore"}
+
+
+def test_prompt_action_enum_matches_valid_actions():
+    """The static enum must be exactly VALID_ACTIONS minus the injected ones.
+
+    Drift here is silent and one-directional: an action missing from both the
+    enum and the injection path is unreachable no matter how complete its
+    dispatch handler is, and nothing logs the omission.
+    """
+    from pxh.spark_config import _SPARK_REFLECTION_SUFFIX
+
+    line = [ln for ln in _SPARK_REFLECTION_SUFFIX.splitlines()
+            if '"action": "one of:' in ln]
+    assert len(line) == 1, "action enum line not found (or duplicated)"
+    listed = {a.strip() for a in
+              line[0].split("one of:", 1)[1].rstrip('",').split(",")}
+    assert listed == VALID_ACTIONS - DYNAMIC_ACTIONS
+
+
+def test_dynamic_actions_are_valid_and_injectable():
+    """Every dynamic action is a real action and does reach the prompt."""
+    from pxh import mind, spark_config
+
+    assert DYNAMIC_ACTIONS <= VALID_ACTIONS
+    injected = mind._inject_explore(spark_config._SPARK_REFLECTION_SUFFIX)
+    line = [ln for ln in injected.splitlines() if '"action": "one of:' in ln][0]
+    listed = {a.strip() for a in line.split("one of:", 1)[1].rstrip('",').split(",")}
+    assert listed == VALID_ACTIONS
 
 
 def test_mood_to_sound_mapping():
@@ -1559,3 +1762,172 @@ def test_spark_prompt_offers_goal_actions_and_explore_injection_still_works():
     assert '- "set_goal"' in _SPARK_REFLECTION_SUFFIX
     patched = _inject_explore(_SPARK_REFLECTION_SUFFIX)
     assert ", explore" in patched  # regex injection survives the longer enum
+
+
+def test_awareness_reads_observations_file(tmp_path, monkeypatch):
+    from pxh import mind
+    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
+    obs = {"type": "observation", "landmark": "bookshelf corner",
+           "heading_estimate": "", "interesting": True, "vision_failed": False}
+    (tmp_path / "observations.jsonl").write_text(_json.dumps(obs) + "\n")
+    # nav spam in the OLD file must not shadow observations anymore
+    (tmp_path / "exploration.jsonl").write_text(
+        "\n".join(_json.dumps({"type": "nav", "action": "forward"}) for _ in range(100)) + "\n")
+    recent = mind._recent_exploration_observations()   # extracted helper, see Step 3
+    assert recent and recent[0]["landmark"] == "bookshelf corner"
+
+
+# ---------------------------------------------------------------------------
+# Find Hub feed health (surfaces silent auth breakage — 2026-08-01)
+# ---------------------------------------------------------------------------
+
+
+def _write_findmyhub(tmp_path, monkeypatch, trackers, ts=None):
+    from pxh import mind
+    path = tmp_path / "findmyhub.json"
+    path.write_text(_json.dumps({"ts": ts or _time.time(), "trackers": trackers}))
+    monkeypatch.setattr(mind, "FINDMYHUB_FILE", path)
+    return path
+
+
+def test_findmyhub_health_ok_on_valid_trackers(tmp_path, monkeypatch):
+    from pxh import health, mind
+    now = _time.time()
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"lat": -43.13567, "lon": 147.11840, "accuracy_m": 10, "ts": now},
+    })
+    result = mind._read_findmyhub()
+    assert "obi" in result
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "ok"
+
+
+def test_findmyhub_health_fails_when_all_trackers_error(tmp_path, monkeypatch):
+    """The BadAuthentication signature: fresh file, valid JSON, every tracker
+    carries an error key. Must surface as a health failure, not silence."""
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"error": "'Auth'"},
+        "adrian": {"error": "'Auth'"},
+    })
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "degraded"
+    assert "Auth" in rec["last_error"]
+    # Three consecutive bad reads → failing.
+    mind._read_findmyhub()
+    mind._read_findmyhub()
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "failing"
+
+
+def test_findmyhub_health_recovers_after_auth_fixed(tmp_path, monkeypatch):
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {"obi": {"error": "'Auth'"}})
+    mind._read_findmyhub()
+    now = _time.time()
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"lat": -43.13567, "lon": 147.11840, "ts": now},
+    })
+    mind._read_findmyhub()
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "ok"
+
+
+def test_findmyhub_health_semantic_only_is_ok(tmp_path, monkeypatch):
+    """Semantic (address-only) locations are a healthy feed, not a failure."""
+    from pxh import health, mind
+    now = _time.time()
+    _write_findmyhub(tmp_path, monkeypatch, {
+        "obi": {"semantic": True, "address": "school", "ts": now},
+    })
+    mind._read_findmyhub()
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "ok"
+
+
+def test_findmyhub_health_empty_trackers_is_failure(tmp_path, monkeypatch):
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {})
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "degraded"
+
+
+def test_findmyhub_health_stale_file_writes_nothing(tmp_path, monkeypatch):
+    """A stale file means the *push* stopped — the record must be allowed to
+    age into 'stale' on its own, not be refreshed as success or failure."""
+    from pxh import health, mind
+    _write_findmyhub(tmp_path, monkeypatch, {"obi": {"error": "x"}},
+                     ts=_time.time() - 10_000)
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "missing"  # nothing ever recorded
+
+
+def test_findmyhub_health_missing_file_writes_nothing(tmp_path, monkeypatch):
+    from pxh import health, mind
+    monkeypatch.setattr(mind, "FINDMYHUB_FILE", tmp_path / "nope.json")
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "missing"
+
+
+def test_findmyhub_health_corrupt_json_is_failure(tmp_path, monkeypatch):
+    from pxh import health, mind
+    path = tmp_path / "findmyhub.json"
+    path.write_text("{not json")
+    monkeypatch.setattr(mind, "FINDMYHUB_FILE", path)
+    assert mind._read_findmyhub() == {}
+    rec = health.read_health(("findmyhub",))["components"]["findmyhub"]
+    assert rec["status"] == "degraded"
+    assert "read error" in rec["last_error"]
+
+
+# ---------------------------------------------------------------------------
+# Frigate last_person_ts carry-through (greet recency, 2026-08-01)
+# ---------------------------------------------------------------------------
+
+
+def test_frigate_snapshot_carries_last_person_ts(monkeypatch, tmp_path):
+    from pxh import mind
+    monkeypatch.setattr(mind, "FRIGATE_FILE", tmp_path / "frigate_presence.json")
+    mind._last_person_seen.clear()
+    mind._host_failure_until.clear()
+    events = [_make_frigate_event(score=0.8, camera="picar_x")]
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn(events)):
+        r1 = _fetch_frigate_presence(dry=False)
+    ts1 = r1["cameras"]["picar_x"]["last_person_ts"]
+    assert ts1
+    # Person goes still → no events — the sighting timestamp is carried forward.
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
+        r2 = _fetch_frigate_presence(dry=False)
+    assert r2["cameras"]["picar_x"]["person"] is False
+    assert r2["cameras"]["picar_x"]["last_person_ts"] == ts1
+
+
+def test_frigate_last_person_ts_absent_when_never_seen(monkeypatch, tmp_path):
+    from pxh import mind
+    monkeypatch.setattr(mind, "FRIGATE_FILE", tmp_path / "frigate_presence.json")
+    mind._last_person_seen.clear()
+    mind._host_failure_until.clear()
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
+        r = _fetch_frigate_presence(dry=False)
+    assert "last_person_ts" not in r["cameras"]["picar_x"]
+
+
+def test_frigate_last_person_ts_seeds_from_snapshot_file(monkeypatch, tmp_path):
+    """px-mind restarts must not forget a recent sighting: the in-memory cache
+    seeds from the previous snapshot file on first fetch."""
+    from pxh import mind
+    snap = tmp_path / "frigate_presence.json"
+    snap.write_text(_json.dumps({
+        "cameras": {"picar_x": {"person": True, "last_person_ts": "2026-08-01T03:00:00+00:00"}},
+    }))
+    monkeypatch.setattr(mind, "FRIGATE_FILE", snap)
+    mind._last_person_seen.clear()
+    monkeypatch.setattr(mind, "_last_person_seen_seeded", False)
+    mind._host_failure_until.clear()
+    with patch("urllib.request.urlopen", side_effect=_mock_urlopen_fn([])):
+        r = _fetch_frigate_presence(dry=False)
+    assert r["cameras"]["picar_x"]["last_person_ts"] == "2026-08-01T03:00:00+00:00"

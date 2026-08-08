@@ -12,15 +12,16 @@ PROJECT_ROOT = Path(__file__).parent.parent
 
 
 def _load_wander_helpers():
-    """Parse bin/px-wander and extract explore-mode helper functions."""
-    src = (PROJECT_ROOT / "bin" / "px-wander").read_text()
-    start = src.index("<<'PY'\n") + len("<<'PY'\n")
-    end = src.rindex("\nPY\n")
-    py_src = src[start:end]
-    globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-wander")}
-    compiled = compile(py_src, "bin/px-wander", "exec")
-    exec(compiled, globs)  # noqa: S102
-    return globs
+    """Load a private copy of pxh.wander (not registered in sys.modules) so its
+    module-level env-var reads pick up the patched env without mutating the
+    real, cached pxh.wander module used elsewhere in the process."""
+    import importlib.util
+
+    wander_path = PROJECT_ROOT / "src" / "pxh" / "wander.py"
+    spec = importlib.util.spec_from_file_location("pxh_wander_test_copy", wander_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return vars(module)
 
 
 @pytest.fixture
@@ -48,29 +49,6 @@ def wander(tmp_path):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-
-
-# -- Heading estimation --
-
-def test_heading_estimate(wander):
-    hl = wander["_heading_label"]
-    assert hl(0) == "ahead"
-    assert hl(45) == "ahead"
-    assert hl(46) == "right"
-    assert hl(90) == "right"
-    assert hl(135) == "right"
-    assert hl(136) == "behind-right"
-    assert hl(-46) == "left"
-    assert hl(-90) == "left"
-    assert hl(-135) == "left"
-    assert hl(-136) == "behind-left"
-
-
-def test_heading_wraps_at_180(wander):
-    hl = wander["_heading_label"]
-    assert hl(180) == "behind-left"
-    assert hl(-180) == "behind-left"
-    assert hl(360) == "ahead"
 
 
 # -- Exploration log --
@@ -114,7 +92,9 @@ def test_exploration_log_observation_entry(wander, tmp_path):
         "steps_from_start": 5,
     }
     write_obs(entry)
-    path = tmp_path / "exploration.jsonl"
+    path = tmp_path / "observations.jsonl"
+    assert path.exists()
+    assert not (tmp_path / "exploration.jsonl").exists()
     lines = path.read_text().strip().splitlines()
     parsed = json.loads(lines[0])
     assert parsed["type"] == "observation"

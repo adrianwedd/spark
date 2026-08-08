@@ -19,7 +19,7 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (716 tests)
+python -m pytest                          # full suite (1000+ tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
 python -m pytest -m "not live"           # skip hardware tests
@@ -79,6 +79,12 @@ bin/run-wake [--wake-word "hey robot"] [--dry-run]
 
 STT priority chain: SenseVoice (primary, ~5s) → faster-whisper (best AU accent) → sherpa-onnx Zipformer → Vosk (wake word grammar only). Models gitignored, must be downloaded separately.
 
+**Capture is `arecord`, never PyAudio** (`src/pxh/mic_stream.py`). PortAudio's ALSA backend sits in a permanent overrun-recovery loop on the C-Media USB mic: opened at 44100 Hz it delivers ~29,900 samples/sec, and since the listener must pass `exception_on_overflow=False`, ~32% of every utterance is silently spliced out. There is no clipping, no zero-run and no envelope anomaly, so **every offline metric on the recorded WAV looks clean** — only listening reveals it. Do not reintroduce PyAudio.
+
+`ArecordStream` mirrors `pyaudio.Stream.read/start_stream/close`, so call sites are unchanged. A reader thread drains the pipe into a bounded deque; this is load-bearing, not decoration — the listener stops reading for seconds at a time (STT, then the LLM call) and a 64 KB pipe holds only ~0.37 s, so without it arecord would block and overrun its own ALSA buffer, rebuilding the original bug. Drops are counted and logged (`dropped_chunks`), never silent. A wedged mic surfaces as `OSError` after `read_timeout_s` so systemd restarts the daemon instead of hanging.
+
+**Regression test:** `bin/px-mic-check` — chirp-train loopback through SPARK's own speaker. Healthy: 18/18 chirps, ≤3 ms deviation, 0 drops. The broken PyAudio path scored 13/18 with the timeline compressed by seconds. Needs the mic free (`systemctl stop px-wake-listen` first).
+
 **Whisper anti-hallucination**: `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`. Post-filters: non-ASCII dominant, phantom phrases, repetitive text → reject.
 
 **Critical:** `bpe_model` kwarg is **not** supported by the installed sherpa-onnx — do not add it to `load_stt_model()`.
@@ -92,11 +98,34 @@ Speech: `espeak --stdout` → WAV bytes → `aplay -D pulse` → PulseAudio → 
 - `robot_hat.enable_speaker()` must be called before any audio (toggles GPIO 20 for MAX98357A amp). aplay exits 0 but nothing plays if skipped.
 - PulseAudio holds the DAC exclusively — `aplay -D robothat` (ALSA bypass) fails "device busy".
 
+### Daemon Health (`src/pxh/health.py`)
+
+Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every daemon calls `record_success()` / `record_failure()`; `read_health()` aggregates.
+
+**Store: `state/health/<component>.json`, one file per component — never a single shared file.** `px-alive` and `px-battery-poll` run as root while everything else runs as `pi`; a shared file would need a `FileLock`, and a root-created lock at 0644 locks out every `pi` daemon with EACCES. Per-component files remove the lock, the read-modify-write race, and the ownership hazard together.
+
+**The directory is created `1777`** (sticky, world-writable, like `/tmp`) because `atomic_write()`'s `mkstemp` needs directory write permission — a root-created 0755 dir would break every `pi` writer. `_ensure_health_dir()` re-chmods on every write, so whichever user wins the creation race, both can write. Do not "tighten" this to 0755.
+
+**Status is derived at read time, never stored** — a dead daemon can't leave a lying "ok" behind. `ok` → `degraded` (1–2 failures) → `stale` (silent past its per-component `STALE_AFTER_S`) → `failing` (≥3 consecutive) / `missing`. Per-component windows matter: `px-blog` runs daily, `px-mind` every 60s.
+
+- `record_success(..., min_interval_s=N)` throttles fast loops (px-alive ticks 2×/s — an fsync per tick would wear the SD card). **Failures never throttle**, and a failure clears the throttle so the recovery is written immediately — otherwise a flapping component accumulates failures while its successes are dropped, and reads as "failing" while working.
+- Reporting never raises. Health must not be able to kill the daemon it reports on.
+- px-mind publishes the aggregate to `state/health.json` and into `awareness["health"]`; `summarize()` feeds reflection context. Readers that must be correct **when px-mind is down** call `read_health()` directly, not the snapshot.
+- `tests/conftest.py` has an **autouse** fixture redirecting `health_dir()` to tmp. Without it, in-process tests write mock health records into the live robot's `state/health/` — `isolated_project` is opt-in and only isolates subprocesses.
+
+**Claude spend visibility:** `token_log.log_usage()` takes a `backend` argument and splits totals under `by_backend` in `state/token_usage.json`. The top-level totals mix free Ollama with paid Claude and cannot answer "what am I spending". `call_llm()` also sets `result["backend"]` to the tier that actually served — the `backend=` reflection log line shows the *configured* primary, not the one that answered.
+
 ### Idle-Alive Daemon
 
 Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not refactor to create/destroy per-action (`reset_mcu` leaks GPIO5 and `close()` doesn't release it).
 
-**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Tools set `state/exploring.json` to prevent restart mid-operation.
+**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 15s (`RestartSec=15`). Tools set `state/exploring.json` to prevent restart mid-operation — px-alive ignores the file once its mtime is >60s old, so long operations must refresh it (px-wake-listen runs a 20s refresher thread for the whole voice turn). Wake-listen's `_stop_alive` kills px-alive by pid *deliberately* — an explicit `systemctl stop` would disarm Restart=always and lose the dead-man's-switch recovery; the exploring.json guard is what keeps the armed auto-restart from retaking GPIO mid-turn.
+
+**Wander calibration**: Before live wandering on a new floor, place all grayscale sensors over that surface and run `bin/px-wander --calibrate-cliff`. The launcher self-elevates for GPIO access and writes `exploring.json` before yielding `px-alive`; do not replace it with a direct Python invocation. The ADC power-on latch is rejected, so calibration fails closed until live sensor values appear.
+
+**Wander GPIO guard**: every live wander (both modes) writes `exploring.json` *before* constructing Picarx and runs a 20s `_ExploringRefresher` thread for the whole run — px-alive ignores the file once its mtime is >60s old, so a single start-of-run write only protects the first minute. `tool-describe-scene` checks for a live owning pid and leaves the file alone when called mid-explore (its own finally-write of `active:false` used to clobber the wander's guard). Timeout cascade is strictly ordered so inner layers fire first: wander self-limits via `--duration`; tool-wander waits duration+180s and on timeout SIGTERMs the pid in `exploring.json` (subprocess SIGKILL only reaches the sudo wrapper — the root px-wander survives it); mind.py waits 420s, kills the process group, then calls `_stop_orphan_wander()`. Probe-turn arc recovery reverses with the SAME steer angle as the probe (bicycle model — mirrored steer doubles the heading change instead of undoing it; pinned by `test_probe_turn_arc_back_reverses_with_same_steer`).
+
+**Wander vision credentials**: Wander owns GPIO as root, but `tool-describe-scene` runs only the Claude CLI subprocess as the authenticated `pi` user (`PX_VISION_USER` overrides). Running Claude itself as root returns the fallback description because root has no Claude credentials. Keep wander's outer vision timeout longer than the tool's whole run — Claude call + photo capture + its now-bounded (60s) tool-voice step (currently 150s outer vs 60s Claude); the relationship is pinned by `test_describe_scene_timeout_has_margin_over_claude`. Wander sets `PX_VOICE_NO_ROUTE=1` for the tool and no longer re-speaks the description itself (the tool already voices it).
 
 ### Cognitive Loop (px-mind)
 
@@ -117,6 +146,12 @@ Three-layer architecture:
 - Single-instance PID guard via `/proc/{pid}` liveness check
 - Arrival detection uses module-level `_last_known_findmyhub` cache (not awareness snapshot) — survives M5.local→Pi push outages. Do not replace with snapshot diff.
 - `state/thought-images/` cleaned hourly (images >30 days deleted)
+
+**Battery sensing — both filters fail toward "keep running", so both need care.** SPARK browned out on 2026-08-06 with the ≤10% shutdown never firing.
+
+`filter_battery` (`mind.py`) rejects a reading that drops more than `BATTERY_MAX_DROP_PER_TICK` below the median. A streak of suspicious readings only accumulates confirmations **while it still looks like a discharge curve** — non-increasing (`BATTERY_RISE_TOLERANCE_PCT`) with each step survivable (`BATTERY_STREAK_MAX_STEP_PCT`). That coherence check is what earns the loose thresholds: scattered ADC garbage can never confirm, so a real collapse doesn't have to wait behind a slow gate. Acceptance **reseeds history from the streak** — without that, rejected readings never enter history and the median stays anchored above a collapsing pack, vetoing everything after it. Readings ≤`BATTERY_CRITICAL` use the shorter `BATTERY_CRITICAL_*` gate; a missed shutdown costs far more than a spurious one, and two guards still sit downstream (2 consecutive criticals, then a voltage/charging recheck). Note px-mind ticks are **not** reliably 60s — reflection calls of 90s+ starve them, so never express a battery gate in ticks alone.
+
+Charging detection (`pxh/battery_trend.py`) **cannot use adjacent polls**: the pack gains ~0.004V per 30s poll while readings swing up to 0.17V, so differencing measures noise — that bug read `charging: false` through a whole afternoon on the charger. Most of the swing is px-alive's servo load dragging the rail, and load only pulls *down*, so a rolling max recovers resting voltage (0.042V → 0.026V residual) before a least-squares slope over the window. Thresholds are bootstrapped from a measured trace: 0.6% false-charging, 85% detection — deliberately skewed, since a false `charging` **suppresses the emergency shutdown**. Detection costs ~10 min, so the plug-in chime lags. Re-tune against a fresh measured trace, never against intuition about the charge rate.
 
 ### Autonomous Racing (px-race)
 
@@ -193,14 +228,22 @@ SPARK speaks through the Nest Mini/Hub Max via a two-hop chain: `bin/tool-announ
 **Architecture:**
 - M5 relay (`m5/announce-relay/`) runs on port **7862**, fronting afterwords on `127.0.0.1:7860`. Afterwords never listens on LAN.
 - `POST /announce` pre-synthesizes text to a WAV file; `GET /audio/{key}` serves it unauthed so HA can fetch by URL.
-- Always address the relay by IP (`192.168.0.100`, the M5 DHCP reservation — see `ANNOUNCE_RELAY_URL` in `spark_config.py`) — never `M5.local`. Nest speakers fetch the audio URL themselves and can't resolve mDNS.
+- Always address the relay by IP (`192.168.0.249`, M5-wifi's DHCP reservation — see `ANNOUNCE_RELAY_URL` in `spark_config.py`) — never `M5.local`. Nest speakers fetch the audio URL themselves and can't resolve mDNS. (M5's wired leg is pinned `.100` but its adapter is unplugged; the relay moved to `.249` on 2026-08-05. The relay's own `RELAY_PUBLIC_BASE_URL` in `~/announce-relay/.env` on M5 must match, or every audio URL it hands out points at the wrong address.)
 - `data` voice only (afterwords `data` model); single target in v1 (no speaker groups → no echo).
 
 **Night silence:** Enforced inside `bin/tool-announce` using `NIGHT_SILENCE_START_H`/`NIGHT_SILENCE_END_H` from `spark_config` (default 19:00–07:00 Hobart time, via `ZoneInfo`). All trigger paths (voice loop, px-mind `announce` action, `message_obi` private audio) pass through the tool, so the gate is a single chokepoint — a suppressed call returns `{"status":"suppressed","reason":"night_silence"}`. The same bounds also gate the px-mind `announce` action in `mind.py` (`_is_night_silence`). Tests force the window deterministically via the `PX_NIGHT_SILENCE_START_H`/`PX_NIGHT_SILENCE_END_H` env overrides.
 
-**`ANNOUNCE_ENABLED` flag:** Defined in `src/pxh/spark_config.py`, ships `False`. Gates whether the autonomous paths (`_dispatch_announce` in `mind.py` → px-mind `announce` action and `message_obi` audio) fire the tool at all; a user-initiated voice-loop announce is independent of it. Flip to `True` only after the relay is live on M5 and the manual pre-flight gates have been run by hand: G1 (a static WAV actually plays when cast to a Nest, else transcode to MP3) and G2 (which `media_player.*` entity casts + the working `media_content_type`, pinned into `ANNOUNCE_DEFAULT_TARGETS`/`ANNOUNCE_MEDIA_CONTENT_TYPE`). Confirm reachability first: `curl http://192.168.0.100:7862/health` from the Pi.
+**`ANNOUNCE_ENABLED` flag:** Defined in `src/pxh/spark_config.py`, **`True` since 2026-08-01** — pre-flight gates G1/G2 passed: WAV casts natively to both the Office Mini (`media_player.office_mini`, the pinned default target) and Hub Max, `media_content_type` pinned to `"music"`. Gates whether the autonomous paths (`_dispatch_announce` in `mind.py` → px-mind `announce` action and `message_obi` audio) fire the tool at all; a user-initiated voice-loop announce is independent of it. **Network prerequisite:** the Nests live on IoT VLAN 20 and can only fetch LAN audio because UniFi ZBF policies 10002/10003 allow VLAN 20 → `192.168.0.249:7862` (relay, repointed from `.100` 2026-08-05) and → `192.168.0.200:8123` (HA). If casts silently stop playing, check those policies and relay health first: `curl http://192.168.0.249:7862/health` from the Pi. ZBF policies are API-writable from the Mac's `~/unifi` repo (full-object PUT) — don't assume router-UI-only.
+
+**Ambient announce guardrails:** the `announce` action is offered in SPARK's reflection menu, absent-gated (never announces to an empty house), call-gated (`CALL_GATED_ACTIONS` — never while Adrian is on a call/mic), and rate-capped to one public announce per `ANNOUNCE_MIN_INTERVAL_S` (1h) inside `_dispatch_announce` — `message_obi` private audio is exempt from the cap. The cap is persisted in `state/announce_meta.json` (survives px-mind restarts), consumed only after a successful launch, and never under dry. `_dispatch_announce` returns a bool; a suppressed/failed announce must not charge the 30-min expression budget.
 
 **Private audio (`message_obi`):** Uses the relay's `priv/` namespace with a 3-minute TTL (vs. 7-day for public audio). The DM text itself is still redacted from `thoughts-spark.jsonl` as `[private message to Obi]`; only the audio is ephemeral on-relay.
+
+### Speaker Routing (tool-voice → nearest Nest)
+
+`bin/tool-voice` is the routing chokepoint for SPARK speech (persona empty or `spark` only — GREMLIN/VIXEN always speak onboard). Resolution (`src/pxh/speaker_router.py`): fresh `state/last_heard.json` room (< `SPEAKER_STICKY_S`, 30 min) → `SPEAKER_DEFAULT_ROOM` (office) → first available `ANNOUNCE_ALLOWED_TARGETS` entry → onboard fallback. Every routed entity must be in `ANNOUNCE_ALLOWED_TARGETS`. `last_heard.json` is written by `POST /api/v1/public/chat` when the HA conversation component sends the satellite's `area` — accepted only from RFC1918/loopback client IPs (`_area_trusted`; tunnel traffic carries a public CF-Connecting-IP and is rejected). `SPEAKER_ROOMS` keys are lowercased HA area names, spaces kept (`"living room"`).
+
+**Suppression never falls back:** a night-suppressed announce, or any *failed* route attempt during the night window, must not reach the onboard speaker (`PX_VOICE_URGENT=1` bypasses — battery warnings at night are deliberate). **`PX_VOICE_NO_ROUTE=1` skips routing entirely** and is set by everything interactive or urgent: `voice_loop.execute_tool` (unconditionally — the human is at the robot, and tool-announce's `yield_alive` must never fire from voice-loop tools), px-alive `spark_greet` (a routed greeting would SIGUSR1-kill px-alive via its own grandchild), px-battery-poll, and `bin/tool-time`. Only mind.py's `_run_voice` path routes, with `timeout=SPEAKER_ROUTE_TIMEOUT_S+15` (90+15s; measured routed speech is ~14s). **Cap semantics (deliberate):** `ANNOUNCE_MIN_INTERVAL_S` (1/hour) governs the `announce` action only; routed greet/comment/weather speech is governed by the 30-min expression cooldown instead — it replaces onboard speech at the same cadence on the speaker nearest Adrian, it does not add interruptions.
 
 ### Site (spark.wedd.au)
 
@@ -241,17 +284,17 @@ See `src/pxh/api.py` for full endpoint list.
 
 | Service | Script | User | Restart |
 |---|---|---|---|
-| `px-alive` | `bin/px-alive` | root | always, 10s (StartLimitIntervalSec=0) |
+| `px-alive` | `bin/px-alive` | root | always, 15s (StartLimitIntervalSec=0) |
 | `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10s |
-| `px-battery-poll` | `bin/px-battery-poll` | root | always, 10s |
+| `px-battery-poll` | `bin/px-battery-poll` | root | always, 30s |
 | `px-mind` | `bin/px-mind` | pi | always, 10s |
 | `px-post` | `bin/px-post` | pi | always, 30s |
-| `px-api-server` | `bin/px-api-server` | pi | always, 2s |
-| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10s |
+| `px-api-server` | `bin/px-api-server` | pi | always, 5s |
+| `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 15s |
 | `px-evolve` | `bin/px-evolve` | pi | on-failure, 30s |
 | `px-blog` | `bin/px-blog` | pi | on-failure, 30s |
 | `px-tts-glados` | GLaDOS TTS :7861 | pi | always, 10s |
-| `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 10s |
+| `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 5s |
 
 ## Safety Model
 
@@ -304,7 +347,9 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 # Run in parallel via run_in_background; synthesise results
 
 hermes -z "QA prompt" 2>&1
-agy --print --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark "QA prompt" 2>&1
+# agy: the prompt is the VALUE of --print, not a positional arg. Passed
+# positionally it is silently ignored and agy just replies "How can I help?".
+agy --print "$(cat prompt.md)" --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark --print-timeout 15m 2>&1
 gemini -p "QA prompt" 2>&1
 echo "QA prompt" | codex exec --full-auto - 2>&1
 ```

@@ -26,6 +26,8 @@ state/consolidation_meta.json
 state/notes.jsonl.vixen-backup
 state/conversation-*.jsonl
 state/awareness.json
+state/health/
+state/health.json
 state/thoughts.jsonl
 state/thoughts-*.jsonl
 state/thoughts.jsonl.vixen-backup
@@ -39,6 +41,7 @@ state/exploring.json
 state/feed.json
 state/blog.json
 state/blog_log.jsonl
+state/blog_failures.json
 state/post_queue.jsonl
 state/px-post-cursor.json
 state/px-post.pid
@@ -49,6 +52,8 @@ state/introspection.json
 state/evolve_queue.jsonl
 state/evolve_log.jsonl
 state/spark-reflect/
+state/wander_calibration.json
+state/observations.jsonl
 state/race_calibration.json
 state/race_track.json
 state/race_log.jsonl
@@ -69,8 +74,17 @@ state/obi_chat.jsonl
 state/obi_chat_meta.json
 state/exploration.jsonl
 state/exploration_meta.json
+state/last_heard.json
+state/announce_meta.json
+state/wake-debug/
+state/notes-*.jsonl.bak-*
 photos/
 .env
+# Rotation backups (.env.bak-YYYYMMDD-rotate), .env.local, and anything else
+# derived from .env — all hold live secrets. The negation must stay last:
+# .env.* matches .env.example, which is tracked and must remain so.
+.env.*
+!.env.example
 bin/go2rtc
 logs/*.pid
 diag_summary.json

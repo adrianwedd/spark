@@ -52,6 +52,11 @@ def private_path() -> Path:
     return config.PRIV_DIR / f"{uuid.uuid4().hex}.wav"
 
 
+def private_path_ext(ext: str) -> Path:
+    """A private-TTL artifact path with an arbitrary extension (png, mp4)."""
+    return config.PRIV_DIR / f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
+
+
 def atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
@@ -98,10 +103,15 @@ def run_janitor(now: float | None = None) -> int:
     removed = 0
     pub_cut = now - config.CACHE_TTL_DAYS * 86400
     priv_cut = now - config.PRIVATE_TTL_MIN * 60
-    for d, cut in ((config.CACHE_DIR, pub_cut), (config.PRIV_DIR, priv_cut)):
+    # Cache holds only WAVs. Priv also holds card PNGs and muxed MP4s — globbing
+    # *.wav there would leak them past their TTL and grow without bound.
+    for d, cut, pats in (
+        (config.CACHE_DIR, pub_cut, ("*.wav",)),
+        (config.PRIV_DIR, priv_cut, ("*.wav", "*.png", "*.mp4")),
+    ):
         if not d.exists():
             continue
-        for f in d.glob("*.wav"):
+        for f in (x for pat in pats for x in d.glob(pat)):
             try:
                 if f.stat().st_mtime < cut:
                     f.unlink()

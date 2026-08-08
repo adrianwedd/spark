@@ -43,6 +43,7 @@ from pxh.spark_config import (
     OBI_CHAT_BASE_BACKOFF_S, OBI_CHAT_MAX_BACKOFF_S, OBI_CHAT_MAX_LOG_LINES,
     NIGHT_SILENCE_START_H, NIGHT_SILENCE_END_H,
 )
+from pxh import health as health_mod
 from pxh import intention as intention_mod
 from pxh import memory as spark_memory
 from pxh.state import atomic_write, load_session, rotate_log, update_session
@@ -163,14 +164,38 @@ def _is_night_silence(hour: int) -> bool:
     return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
 
 
-def _dispatch_announce(text: str, private: bool = False) -> None:
-    """Fire bin/tool-announce off the critical path (non-blocking). No-op if disabled."""
+_ANNOUNCE_META_FILE = STATE_DIR / "announce_meta.json"  # persisted cap: a px-mind restart must not reset the 1/hour limit
+
+
+def _read_last_announce_ts() -> float | None:
+    try:
+        val = json.loads(_ANNOUNCE_META_FILE.read_text(encoding="utf-8")).get("last_public_ts")
+        return float(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _dispatch_announce(text: str, private: bool = False, dry: bool = False) -> bool:
+    """Fire bin/tool-announce off the critical path (non-blocking).
+
+    Returns True only when the tool was actually dispatched — a suppressed or
+    failed announce made no sound, and the caller must not charge the
+    expression budget for it. The hourly cap is consumed only after a
+    successful launch, and never under dry (dry must not mutate live state).
+    """
     if not spark_config.ANNOUNCE_ENABLED:
-        return
+        return False
     if not text or not text.strip():
-        return
+        return False
+    now_ts = time.time()
+    if not private:
+        last_ts = _read_last_announce_ts()
+        if last_ts is not None and now_ts - last_ts < spark_config.ANNOUNCE_MIN_INTERVAL_S:
+            log("expression: announce suppressed (interval cap)")
+            return False
     env = os.environ.copy()
     env["PX_ANNOUNCE_TEXT"] = text.strip()[:spark_config.ANNOUNCE_MAX_CHARS]
+    env["PX_DRY"] = "1" if dry else "0"
     if private:
         env["PX_ANNOUNCE_PRIVATE"] = "1"
     try:
@@ -179,6 +204,13 @@ def _dispatch_announce(text: str, private: bool = False) -> None:
         log("expression: announce dispatched (non-blocking)")
     except Exception as e:
         log(f"expression: announce dispatch failed: {e}")
+        return False
+    if not private and not dry:
+        try:
+            atomic_write(_ANNOUNCE_META_FILE, json.dumps({"last_public_ts": now_ts}))
+        except Exception as e:
+            log(f"expression: announce meta write failed: {e}")
+    return True
 
 
 def _daytime_action_hint(hour_override: int | None = None) -> str:
@@ -276,9 +308,11 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 # PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
 
 # Ollama config (same host as tool-chat)
-# "M5" (router DNS via UDR7) not "M5.local" (mDNS) — plain hostname tracks the
-# box across wired/wifi and avoids the mDNS hangs that trip the fallback cascade.
-OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5:11434")
+# "M5.local" (mDNS), not "M5" — the UDR7 stopped serving the bare hostname
+# entirely (getent rc=2 from the Pi, verified 2026-08-05), which silently sent
+# every SPARK reflection to paid Claude Haiku for two days. mDNS tracks the box
+# across IP moves; if it flakes, the fallback cascade is the designed behaviour.
+OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
 _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
 OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
@@ -358,13 +392,26 @@ CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", 
 ABSENT_GATED_ACTIONS = {"greet", "comment", "weather_comment", "scan",
                         "play_sound", "time_check", "calendar_check", "photograph",
                         "look_around", "morning_fact", "explore",
-                        "blog_essay", "message_obi"}
+                        "blog_essay", "message_obi", "announce"}
+
+# Actions too disruptive to fire while Adrian is on a call or the mic is hot.
+# announce is the loudest thing SPARK can do — it stays at the top of this list.
+CALL_GATED_ACTIONS = {"greet", "greet_arrival", "comment", "weather_comment",
+                      "play_sound", "time_check", "calendar_check", "photograph",
+                      "announce"}
 
 # Actions permitted during night silence and absence: silent cognitive work
 # (no audio, no servo motion) is exactly what idle hours are for.
 NIGHT_ALLOWED_ACTIONS = {"wait", "remember", "research", "compose",
                          "introspect", "self_debug",
                          "set_goal", "update_goal", "complete_goal"}
+
+# The expression cooldown is a SPEECH budget; these actions produce no audio,
+# so they neither wait for it nor charge it. Derived from the night-silence
+# set rather than hand-maintained: anything vetted as safe at 3am (no audio,
+# no motion) is by the same token not small talk worth throttling. Live case:
+# a salience-1.0 self_debug queued behind the 30-min cooldown at 13:29.
+SILENT_ACTIONS = NIGHT_ALLOWED_ACTIONS - {"wait"}
 
 # ── Mood momentum: valence (-1..1) × arousal (-1..1) ───────────────
 MOOD_COORDS: dict[str, tuple[float, float]] = {
@@ -595,6 +642,30 @@ def read_sonar(dry: bool) -> float | None:
     return None
 
 
+# Last person sighting per camera (UTC ISO), carried into the frigate
+# snapshot as cameras.*.last_person_ts so px-alive's greet confirmation can
+# accept "seen recently" when a still person has aged out of the 90 s event
+# window. Seeded once per process from the previous snapshot file so a
+# px-mind restart doesn't forget a sighting.
+_last_person_seen: dict[str, str] = {}
+_last_person_seen_seeded = False
+
+
+def _seed_last_person_seen() -> None:
+    global _last_person_seen_seeded
+    if _last_person_seen_seeded:
+        return
+    _last_person_seen_seeded = True
+    try:
+        data = json.loads(FRIGATE_FILE.read_text(encoding="utf-8"))
+        for cam, info in (data.get("cameras") or {}).items():
+            ts = info.get("last_person_ts") if isinstance(info, dict) else None
+            if ts:
+                _last_person_seen.setdefault(cam, ts)
+    except Exception:
+        pass
+
+
 def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     """Query Frigate for recent detections across ALL configured cameras.
 
@@ -612,6 +683,13 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
     """
     if dry:
         return None
+    # Skip a host that recently failed. FRIGATE_TIMEOUT_S bounds the socket but
+    # not DNS resolution, so an unreachable host costs a 15-20 s resolver hang
+    # on every tick of a 60 s loop — the same trap call_ollama and the HA block
+    # already guard against. Shares _host_failure_until with them.
+    _now_mono = time.monotonic()
+    if _host_failure_until.get(FRIGATE_HOST, 0) > _now_mono:
+        return None
     since = time.time() - FRIGATE_WINDOW_S
     # Fetch events from ALL cameras in one call (no camera= filter)
     url = (
@@ -622,7 +700,15 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=FRIGATE_TIMEOUT_S) as resp:
             events = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        # Reachability failure — back off. HTTPError subclasses URLError but
+        # means the host answered, so it doesn't earn a backoff.
+        if not isinstance(exc, urllib.error.HTTPError):
+            _host_failure_until[FRIGATE_HOST] = _now_mono + _HOST_FAILURE_BACKOFF_S
+            log(f"frigate: unreachable — skipping for {_HOST_FAILURE_BACKOFF_S}s: {exc}")
+        return None
     except Exception:
+        # Malformed response from a host that answered — no backoff.
         return None
 
     if not isinstance(events, list):
@@ -654,20 +740,45 @@ def _fetch_frigate_presence(dry: bool = False) -> dict | None:
             score = round(max(e.get("data", {}).get("score", 0),
                               e.get("data", {}).get("top_score", 0)), 3)
             if label not in by_label:
-                by_label[label] = {"score": score, "count": 0}
+                by_label[label] = {"score": score, "count": 0, "sub_labels": set()}
             else:
                 by_label[label]["score"] = max(by_label[label]["score"], score)
             by_label[label]["count"] += 1
+            # Frigate attaches the recognised name (face recognition, licence
+            # plate) as sub_label. Nothing reads it yet — carrying it through now
+            # means named greetings become a phrasing change later rather than a
+            # change to how presence is fetched.
+            sub = e.get("sub_label")
+            if isinstance(sub, list):        # Frigate may send [name, score]
+                sub = sub[0] if sub else None
+            if isinstance(sub, str) and sub.strip():
+                by_label[label]["sub_labels"].add(sub.strip())
 
         dets = sorted(
-            [{"label": k, "score": v["score"], "count": v["count"]} for k, v in by_label.items()],
+            [{"label": k, "score": v["score"], "count": v["count"],
+              "sub_labels": sorted(v["sub_labels"])} for k, v in by_label.items()],
             key=lambda d: d["score"], reverse=True,
         )
         has_person = "person" in by_label
         room = FRIGATE_CAMERA_ROOMS.get(cam_name, cam_name)
-        cameras[cam_name] = {"person": has_person, "detections": dets, "room": room}
+        cameras[cam_name] = {
+            "person": has_person,
+            "detections": dets,
+            "room": room,
+            # Recognised people on this camera, or [] when recognition is off.
+            "people": sorted(by_label.get("person", {}).get("sub_labels", ())),
+        }
         if has_person:
             rooms_with_people.append(room)
+
+    _seed_last_person_seen()
+    now_iso = utc_timestamp()
+    for cam_name, info in cameras.items():
+        if info["person"]:
+            _last_person_seen[cam_name] = now_iso
+        last_seen = _last_person_seen.get(cam_name)
+        if last_seen:
+            info["last_person_ts"] = last_seen
 
     # ── Global aggregation (backward compat) ──
     all_by_label: dict = {}
@@ -817,6 +928,37 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
         return None
 
 
+def _record_findmyhub_health(trackers: dict, enriched: dict) -> None:
+    """Record feed health for a *fresh* findmyhub read.
+
+    The dangerous failure mode is silent: a fresh file of valid JSON whose
+    trackers all carry error payloads (seen 2026-08-01 when Google revoked
+    the cached AAS token — every tracker read {"error": "'Auth'"} for a day
+    with nothing flagging it). That shape records a failure; a mix of good
+    and errored trackers is still a working feed. Stale/missing files are
+    deliberately NOT recorded here — the health record ages into "stale" on
+    its own, which correctly points at the push pipeline rather than the feed.
+    """
+    errored = [
+        name for name, raw in trackers.items()
+        if isinstance(raw, dict) and "error" in raw
+    ]
+    if trackers and len(errored) < len(trackers):
+        health_mod.record_success(
+            "findmyhub",
+            detail={"trackers": len(trackers), "errored": len(errored),
+                    "enriched": len(enriched)},
+            min_interval_s=240,
+        )
+    elif trackers:
+        sample = trackers[errored[0]].get("error", "")
+        health_mod.record_failure(
+            "findmyhub", f"all {len(errored)} trackers error: {sample}"
+        )
+    else:
+        health_mod.record_failure("findmyhub", "feed has no trackers")
+
+
 def _read_findmyhub() -> dict:
     """Read state/findmyhub.json (written by M5.local cron via GoogleFindMyTools).
 
@@ -833,13 +975,16 @@ def _read_findmyhub() -> dict:
             log(f"findmyhub: file stale ({file_age_s:.0f}s old), ignoring")
             return {}
         result = {}
-        for name, raw in data.get("trackers", {}).items():
+        trackers = data.get("trackers", {})
+        for name, raw in trackers.items():
             enriched = _enrich_tracker(raw, name)
             if enriched:
                 result[name] = enriched
+        _record_findmyhub_health(trackers, result)
         return result
     except Exception as exc:
         log(f"findmyhub: read error: {exc}")
+        health_mod.record_failure("findmyhub", f"read error: {exc}")
         return {}
 
 
@@ -1204,6 +1349,29 @@ def read_battery() -> dict | None:
         return None
 
 
+def _stop_orphan_wander() -> None:
+    """Best-effort SIGTERM to a px-wander that outlived its wrappers.
+
+    Killing tool-wander's process tree cannot reach the sudo'd root
+    px-wander (pi cannot signal root; SIGKILLed sudo forwards nothing), so
+    a timed-out explore can leave a root process still driving the motors.
+    px-wander publishes its pid in exploring.json — signal it directly,
+    via sudo since it runs as root. SIGTERM lands in its graceful-stop
+    handler and motor-cleanup finally block.
+    """
+    try:
+        info = json.loads((STATE_DIR / "exploring.json").read_text(encoding="utf-8"))
+        pid = info.get("pid")
+        if not (info.get("active") and isinstance(pid, int)
+                and Path(f"/proc/{pid}").is_dir()):
+            return
+        subprocess.run(["sudo", "-n", "kill", "-TERM", str(pid)],
+                       capture_output=True, timeout=10, check=False)
+        log(f"expression: signalled orphaned px-wander pid={pid}")
+    except Exception as exc:
+        log(f"expression: orphan wander cleanup failed: {exc}")
+
+
 def _can_explore(session: dict, awareness: dict) -> bool:
     """Check all preconditions for autonomous exploration."""
     if not session.get("roaming_allowed", False):
@@ -1228,6 +1396,10 @@ def _can_explore(session: dict, awareness: dict) -> bool:
         return False
     if battery["pct"] <= 20:
         return False
+    # Fail closed: autonomous roaming requires a calibrated cliff reference.
+    from pxh.wander import load_cliff_calibration
+    if load_cliff_calibration(STATE_DIR) is None:
+        return False
     meta_path = STATE_DIR / "exploration_meta.json"
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1246,20 +1418,104 @@ def _can_explore(session: dict, awareness: dict) -> bool:
 _battery_history: list[int] = []        # last N pct readings (newest last)
 _battery_glitch_count: int = 0          # consecutive suspicious readings
 _battery_glitch_first_mono: float = 0.0  # monotonic time of first glitch in current streak
+_battery_pending: list[int] = []        # suspicious readings in the current streak
 
 BATTERY_GLITCH_MIN_ELAPSED_S = 90       # glitches must span at least this many seconds
+
+# A discharging pack falls monotonically; a broken ADC scatters. A streak of
+# suspicious readings only counts as evidence while it keeps declining — a
+# reading that jumps back up by more than this is noise, and restarts the
+# streak. This is what stops alternating garbage (0, 55, 2, 61) from
+# accumulating confirmations it hasn't earned.
+BATTERY_RISE_TOLERANCE_PCT = 3
+
+# ...and each step down must itself be survivable as a discharge. A fall of
+# 53 points between consecutive readings (55% then 2%) is not a steep curve,
+# it is two unrelated garbage values that happen to be ordered. Deliberately
+# looser than BATTERY_MAX_DROP_PER_TICK: a pack past the knee really can fall
+# hard under load, and by this point we are already inside a suspicious streak.
+BATTERY_STREAK_MAX_STEP_PCT = 2 * BATTERY_MAX_DROP_PER_TICK
+
+# Below BATTERY_CRITICAL the cost of the two errors is wildly asymmetric: a
+# false shutdown is a reboot, a missed one is a brownout mid-write. Confirm
+# faster down there. Two independent guards still sit downstream — the main
+# loop needs 2 consecutive criticals, and battery_emergency_shutdown re-reads
+# voltage and charging state before it pulls the plug.
+BATTERY_CRITICAL_CONFIRMS = 2
+BATTERY_CRITICAL_MIN_ELAPSED_S = 45
+
+
+def _battery_streak_note(pct: int) -> tuple[int, float]:
+    """Record a suspicious reading, returning (confirmations, elapsed seconds).
+
+    The streak restarts whenever a reading breaks the declining trend, so only
+    a coherent discharge curve accumulates confirmations.
+    """
+    global _battery_glitch_count, _battery_glitch_first_mono
+
+    now_mono = time.monotonic()
+    if _battery_pending:
+        last = _battery_pending[-1]
+        broke_trend = (pct > min(_battery_pending) + BATTERY_RISE_TOLERANCE_PCT
+                       or last - pct > BATTERY_STREAK_MAX_STEP_PCT)
+    else:
+        broke_trend = False
+
+    if not _battery_pending or broke_trend:
+        if broke_trend:
+            log(f"battery: reading {pct}% broke the declining streak "
+                f"{_battery_pending} — restarting confirmation")
+        _battery_pending[:] = [pct]
+        _battery_glitch_count = 1
+        _battery_glitch_first_mono = now_mono
+        return 1, 0.0
+
+    _battery_pending.append(pct)
+    _battery_pending[:] = _battery_pending[-10:]
+    _battery_glitch_count += 1
+    return _battery_glitch_count, now_mono - _battery_glitch_first_mono
+
+
+def _battery_confirm_gate(pct: int) -> tuple[int, float]:
+    """Confirmations and elapsed time required before accepting a low reading."""
+    if pct <= BATTERY_CRITICAL:
+        return BATTERY_CRITICAL_CONFIRMS, BATTERY_CRITICAL_MIN_ELAPSED_S
+    return BATTERY_GLITCH_CONFIRMS, BATTERY_GLITCH_MIN_ELAPSED_S
+
+
+def _battery_accept(pct: int) -> None:
+    """Accept a confirmed reading, reseeding history from the streak.
+
+    Reseeding matters: the rejected readings never entered history, so the
+    median stayed anchored to a stale pre-decline level and kept vetoing every
+    subsequent reading. Replacing history with the streak lets the baseline
+    follow the pack down.
+    """
+    global _battery_glitch_count
+    _battery_history[:] = (_battery_pending or [pct])[-10:]
+    _battery_pending.clear()
+    _battery_glitch_count = 0
 
 
 def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
     """Return the battery reading, or None if it looks like a sensor glitch.
 
     A reading is suspicious if it drops more than BATTERY_MAX_DROP_PER_TICK
-    from the median of recent history. Suspicious readings must repeat
-    BATTERY_GLITCH_CONFIRMS times AND span at least BATTERY_GLITCH_MIN_ELAPSED_S
-    seconds before being accepted (genuinely dead battery). This prevents a
-    batch of bad readings in a single tick from passing the filter.
+    from the median of recent history. Suspicious readings must repeat and span
+    a minimum time before being accepted, which stops a batch of bad readings
+    in a single tick from passing the filter.
+
+    Two properties keep a genuinely flat pack from being filtered away, both
+    learned from the 2026-08-06 brownout:
+
+    * The streak must keep declining (see BATTERY_RISE_TOLERANCE_PCT), so
+      scattered ADC garbage never accumulates confirmations — which in turn
+      lets the thresholds be loose enough to catch a real discharge in time.
+    * Readings at or below BATTERY_CRITICAL confirm on the shorter
+      BATTERY_CRITICAL_* gate, because down there a missed shutdown costs far
+      more than a spurious one.
     """
-    global _battery_glitch_count, _battery_glitch_first_mono
+    global _battery_glitch_count
     if raw is None:
         return None
 
@@ -1269,23 +1525,15 @@ def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
     # for implausibly low first readings (e.g. 0% from an ADC glitch on cold start).
     if not _battery_history:
         if pct < BATTERY_CRITICAL:
-            now_mono = time.monotonic()
-            if _battery_glitch_count == 0:
-                _battery_glitch_first_mono = now_mono
-            elapsed = now_mono - _battery_glitch_first_mono
-            if elapsed < BATTERY_GLITCH_MIN_ELAPSED_S:
-                # Don't increment past 1 within the same time window
-                _battery_glitch_count = min(_battery_glitch_count + 1, 1)
-            else:
-                _battery_glitch_count += 1
+            count, elapsed = _battery_streak_note(pct)
+            confirms, min_elapsed = _battery_confirm_gate(pct)
             log(f"battery: suspicious first reading {pct}% "
-                f"(count={_battery_glitch_count}/{BATTERY_GLITCH_CONFIRMS}, "
-                f"elapsed={elapsed:.0f}s/{BATTERY_GLITCH_MIN_ELAPSED_S}s)")
-            if _battery_glitch_count < BATTERY_GLITCH_CONFIRMS:
+                f"(count={count}/{confirms}, "
+                f"elapsed={elapsed:.0f}s/{min_elapsed:.0f}s)")
+            if count < confirms or elapsed < min_elapsed:
                 return None
             # Confirmed low — genuinely dead battery, accept it
-        _battery_history.append(pct)
-        _battery_glitch_count = 0
+        _battery_accept(pct)
         return raw
 
     # Median of recent readings as baseline
@@ -1294,31 +1542,23 @@ def filter_battery(raw: dict | None, prev_pct: int) -> dict | None:
     drop = median - pct
 
     if drop > BATTERY_MAX_DROP_PER_TICK:
-        now_mono = time.monotonic()
-        if _battery_glitch_count == 0:
-            _battery_glitch_first_mono = now_mono
-        elapsed = now_mono - _battery_glitch_first_mono
-        if elapsed < BATTERY_GLITCH_MIN_ELAPSED_S:
-            # Within same time window — don't increment past 1
-            _battery_glitch_count = min(_battery_glitch_count + 1, 1)
-        else:
-            _battery_glitch_count += 1
+        count, elapsed = _battery_streak_note(pct)
+        confirms, min_elapsed = _battery_confirm_gate(pct)
         log(f"battery: suspicious reading {pct}% (median={median}%, drop={drop}%, "
-            f"glitch_count={_battery_glitch_count}/{BATTERY_GLITCH_CONFIRMS}, "
-            f"elapsed={elapsed:.0f}s/{BATTERY_GLITCH_MIN_ELAPSED_S}s)")
-        if _battery_glitch_count < BATTERY_GLITCH_CONFIRMS:
+            f"glitch_count={count}/{confirms}, "
+            f"elapsed={elapsed:.0f}s/{min_elapsed:.0f}s)")
+        if count < confirms or elapsed < min_elapsed:
             # Reject — return previous known-good value
             return {"pct": prev_pct, "volts": raw["volts"], "charging": raw.get("charging", False)}
-        else:
-            # Confirmed — battery really is low (or sensor is consistently broken)
-            log(f"battery: accepting {pct}% after {_battery_glitch_count} confirmations "
-                f"spanning {elapsed:.0f}s")
-            _battery_history.append(pct)
-            _battery_history[:] = _battery_history[-10:]
-            return raw
+        # Confirmed — battery really is low (or sensor is consistently broken)
+        log(f"battery: accepting {pct}% after {count} confirmations "
+            f"spanning {elapsed:.0f}s")
+        _battery_accept(pct)
+        return raw
     else:
         # Normal reading — reset glitch counter
         _battery_glitch_count = 0
+        _battery_pending.clear()
         _battery_history.append(pct)
         _battery_history[:] = _battery_history[-10:]  # keep last 10
         return raw
@@ -1428,8 +1668,12 @@ def battery_emergency_shutdown(pct: int, dry: bool) -> None:
 
     _play_alarm_beeps(6, device)
 
-    # Short timeout (5s) — battery is critical, don't let TTS delay shutdown
+    # Short timeout (5s) — battery is critical, don't let TTS delay shutdown.
+    # NO_ROUTE + URGENT: a 90s Nest cast attempt must never delay shutdown,
+    # and the alert must still speak onboard even during night silence.
     env["PX_TEXT"] = f"Battery critical! Only {pct} percent remaining! Shutting down now!"
+    env["PX_VOICE_NO_ROUTE"] = "1"
+    env["PX_VOICE_URGENT"] = "1"
     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                    capture_output=True, check=False, timeout=5)
 
@@ -1457,6 +1701,10 @@ def battery_warn_comment(pct: int, dry: bool) -> None:
     else:
         msg = f"Heads up — my battery is at {pct} percent. I might need charging soon."
     env["PX_TEXT"] = msg[:2000]
+    # NO_ROUTE + URGENT: alerts must not spend 90s casting to a Nest, and
+    # must keep speaking onboard at night as today.
+    env["PX_VOICE_NO_ROUTE"] = "1"
+    env["PX_VOICE_URGENT"] = "1"
     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                    capture_output=True, check=False, timeout=20)
     log(f"battery warning spoken: {pct}%")
@@ -1714,6 +1962,32 @@ def _cleanup_thought_images() -> int:
         except OSError:
             pass
     return deleted
+
+
+def _recent_exploration_observations(n: int = 20) -> list[dict]:
+    """Read the last `n` lines of state/observations.jsonl and return the
+    non-vision-failed observation entries as compact landmark/heading/interesting
+    dicts. Reads STATE_DIR through the module attribute at call time so tests
+    (and any future STATE_DIR reconfiguration) can monkeypatch it."""
+    recent_obs: list[dict] = []
+    try:
+        obs_file = STATE_DIR / "observations.jsonl"
+        if obs_file.exists():
+            obs_lines = obs_file.read_text(encoding="utf-8").strip().splitlines()
+            for line in obs_lines[-n:]:
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") == "observation" and not entry.get("vision_failed"):
+                        recent_obs.append({
+                            "landmark": entry.get("landmark", ""),
+                            "heading": entry.get("heading_estimate", ""),
+                            "interesting": entry.get("interesting", False),
+                        })
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return recent_obs
 
 
 def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
@@ -1994,32 +2268,31 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         awareness["recent_conversations"] = list(reversed(recent_convos))
 
     # Recent exploration observations
-    try:
-        exp_file = STATE_DIR / "exploration.jsonl"
-        if exp_file.exists():
-            exp_lines = exp_file.read_text(encoding="utf-8").strip().splitlines()
-            recent_obs = []
-            for line in exp_lines[-5:]:
-                try:
-                    entry = json.loads(line)
-                    if entry.get("type") == "observation" and not entry.get("vision_failed"):
-                        recent_obs.append({
-                            "landmark": entry.get("landmark", ""),
-                            "heading": entry.get("heading_estimate", ""),
-                            "interesting": entry.get("interesting", False),
-                        })
-                except json.JSONDecodeError:
-                    continue
-            if recent_obs:
-                awareness["recent_exploration"] = recent_obs
-    except Exception:
-        pass
+    recent_obs = _recent_exploration_observations()
+    if recent_obs:
+        awareness["recent_exploration"] = recent_obs
 
     # Track reflection backend health in awareness for dashboard visibility
     awareness["reflection_status"] = "offline" if _consecutive_reflection_failures >= 3 else "healthy"
 
+    # Cross-daemon health. Read live from state/health/ so a daemon that died
+    # shows as stale here even though it can no longer report anything itself.
+    try:
+        _health = health_mod.read_health()
+        awareness["health"] = _health
+    except Exception:
+        _health = None
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2))
+    # Publish the aggregate for cheap dashboard reads. px-mind is the only
+    # writer of this file, so no lock is needed; readers that must be correct
+    # when px-mind is down should call health.read_health() instead.
+    if _health is not None:
+        try:
+            atomic_write(STATE_DIR / "health.json", json.dumps(_health, indent=2))
+        except Exception:
+            pass
     if frigate is not None:
         atomic_write(FRIGATE_FILE, json.dumps(frigate, indent=2))
 
@@ -2105,12 +2378,14 @@ def _safe_float(value: object, default: float) -> float:
 
 
 def extract_json(text: str) -> dict | None:
-    """Extract last JSON object from text (handles markdown fences, prose, unescaped newlines)."""
+    """Extract last JSON object from text (handles markdown fences, prose, unescaped newlines, misplaced commas)."""
     # Small models often put literal newlines inside JSON strings — fix them
     import re
     cleaned = re.sub(r'(?<=: ")(.*?)(?=")', lambda m: m.group(0).replace('\n', ' '), text, flags=re.DOTALL)
-    # Also try the original text
-    for attempt in (cleaned, text):
+    # Small models sometimes put the field-separator comma INSIDE the closing
+    # quote of a string value: value," \n "key" → value", \n "key"
+    repaired = re.sub(r',"(\s+")', r'",\1', cleaned)
+    for attempt in (cleaned, repaired, text):
         decoder = json.JSONDecoder()
         pos = 0
         last_obj = None
@@ -2218,6 +2493,7 @@ def _reset_state():
     _battery_history = []
     _battery_glitch_count = 0
     _battery_glitch_first_mono = 0.0
+    _battery_pending.clear()
     _cached_weather = None
     _last_weather_fetch = 0.0
     _cached_ha = None
@@ -2335,9 +2611,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
         result = call_ollama(prompt, system)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-m5")
             except Exception:
                 pass
+            result["backend"] = "ollama-m5"
             return result
 
         # Tier 2: Claude Haiku — SPARK fallback when M5 is unreachable
@@ -2353,9 +2630,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                 claude_result = {"error": str(exc)}
             if "error" not in claude_result:
                 try:
-                    _log_token_usage(prompt + system, claude_result.get("response", ""))
+                    _log_token_usage(prompt + system, claude_result.get("response", ""), "claude")
                 except Exception:
                     pass
+                claude_result["backend"] = "claude"
                 return claude_result
             log(f"claude failed ({claude_result['error']}), falling back to ollama cloud")
     else:
@@ -2370,17 +2648,19 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
             result = {"error": str(exc)}
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "claude")
             except Exception:
                 pass
+            result["backend"] = "claude"
             return result
         log(f"claude failed ({result['error']}), falling back to ollama")
         result = call_ollama(prompt, system)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-m5")
             except Exception:
                 pass
+            result["backend"] = "ollama-m5"
             return result
 
     # Tier 3: Ollama Cloud (internet fallback)
@@ -2392,9 +2672,10 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                              auth_token=OLLAMA_CLOUD_KEY)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-cloud")
             except Exception:
                 pass
+            result["backend"] = "ollama-cloud"
             return result
 
     # Tier 4: local Pi Ollama — disabled by default (Pi 4 RAM too small;
@@ -2405,13 +2686,97 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
         result = call_ollama(prompt, system, host=LOCAL_OLLAMA_HOST, model=LOCAL_MODEL)
         if "error" not in result:
             try:
-                _log_token_usage(prompt + system, result.get("response", ""))
+                _log_token_usage(prompt + system, result.get("response", ""), "ollama-local")
             except Exception:
                 pass
+            result["backend"] = "ollama-local"
             return result
 
     log(f"all tiers failed ({result['error']}), skipping reflection")
     return result
+
+
+def _reroll_reason(parsed: dict, recent_thoughts: list, last_spoken: str = "") -> str | None:
+    """Why this reflection is not worth persisting, or None if it is.
+
+    "empty"   — no thought text at all. Small models periodically return JSON
+                with the key missing, blank, or explicitly null; persisting it
+                puts an empty record on the public thoughts endpoint and into
+                the blog gatherer, where it reads as SPARK having thought
+                nothing.
+    "similar" — a near-duplicate of something just thought or just said.
+
+    Checks the same two sources as the suppressor further down (recent thoughts
+    AND last spoken text) so the two cannot disagree about what counts as a
+    duplicate.
+
+    JSON null is checked BEFORE str(): `str(None)` is the truthy 4-character
+    string "None", which would sail past an emptiness test and reach the public
+    endpoint as a thought reading "None". Small models emit null as readily as
+    "", so this is a real shape, not a theoretical one.
+    """
+    raw_text = parsed.get("thought")
+    text = "" if raw_text is None else str(raw_text).strip()
+    if not text:
+        return "empty"
+    for prev in recent_thoughts:
+        if text_similarity(text, prev.get("thought", "")) > SIMILARITY_THRESHOLD:
+            return "similar"
+    if last_spoken and text_similarity(text, last_spoken) > SIMILARITY_THRESHOLD:
+        return "similar"
+    return None
+
+
+# Reflection's Claude tier bypasses the session budget entirely, and it only
+# serves when Ollama is already unreachable. Re-rolling there would double
+# unbudgeted spend at exactly the moment the system is degraded, so the retry
+# is free-tier only.
+#
+# Deliberately a FREE allowlist rather than a metered denylist: the guard is a
+# spend guard, so an unrecognised label must cost nothing. A denylist fails
+# OPEN — `"" not in {"claude"}` is True, so a missing backend key, a renamed
+# tier, or a future paid backend all silently earn a second billable call.
+# Ollama Cloud is paid too (OLLAMA_CLOUD_API_KEY), so it is not free.
+_FREE_BACKENDS = {"ollama-m5", "ollama-local"}
+
+
+def _reroll_allowed(backend: str) -> bool:
+    """True only for backends known to cost nothing. Fails closed."""
+    return backend in _FREE_BACKENDS
+
+
+# How bad each re-roll verdict is. The retry loop holds the best attempt seen
+# so far and a later attempt replaces it only if STRICTLY better — otherwise a
+# blank attempt 2 overwrites a merely-similar attempt 1 and drops the cycle,
+# when the suppression path would have persisted a real (if duplicate) thought.
+# Live trace 2026-08-01T11:30: re-rolling (similar) → "empty thought" failure.
+_REROLL_RANK = {None: 0, "similar": 1, "empty": 2, "no_json": 3}
+
+# Appended to the retry prompt so attempt 2 knows what was wrong with attempt 1.
+_REROLL_HINTS = {
+    "empty": "Your previous response contained no thought text. "
+             "Return valid JSON with a concrete, specific thought.",
+    "similar": "Your previous response repeated something you just thought or "
+               "said. Notice something different this time — a detail you have "
+               "not mentioned before.",
+    "no_json": "Your previous response was not valid JSON. Reply with a single "
+               "JSON object and nothing else — no preamble, no explanation, no "
+               "code fence. It must have the keys: thought, mood, action, "
+               "salience.",
+}
+
+
+# Awareness keys allowed into the reflection prompt's JSON dump. See the
+# comment at the filter site in reflection() for why this is an allowlist.
+_REFLECTION_AWARENESS_KEYS = frozenset({
+    "ts", "sonar_cm", "frigate", "someone_nearby", "time_period", "hour",
+    "minutes_since_interaction", "minutes_since_speech", "period_duration_min",
+    "battery_pct", "battery_volts", "battery_charging", "listening", "persona",
+    "transitions", "system", "weather", "calendar", "ha_calendar", "next_event",
+    "ha_sleep", "ha_routines", "ha_context", "ambient_sound", "obi_mode",
+    "recent_moods", "mood_momentum", "recent_conversations",
+    "recent_exploration", "reflection_status",
+})
 
 
 def reflection(awareness: dict, dry: bool) -> dict | None:
@@ -2431,8 +2796,18 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     recent_moods = [t.get("mood", "?") for t in recent_thoughts]
     recent_actions = [t.get("action", "?") for t in recent_thoughts]
     momentum = awareness.get("mood_momentum", {})
+    # Allowlist, not denylist: awareness carries raw GPS twice (findmyhub
+    # tracker coords, ha_presence per-person lat/lon — the house, to 5 m) and
+    # thoughts feed the public feed and Bluesky. A new awareness key stays out
+    # of the prompt until someone decides it belongs. Deliberately absent:
+    #   findmyhub, ha_presence — presence reaches the prompt only via the
+    #     coordinate-free "Who's home" prose section below
+    #   health — dashboard-only ops telemetry; summarize() says the same
+    #     thing in one sentence further down
+    awareness_ctx = {k: v for k, v in awareness.items()
+                     if k in _REFLECTION_AWARENESS_KEYS}
     context_parts = [
-        f"Current awareness:\n{json.dumps(awareness, indent=2)}",
+        f"Current awareness:\n{json.dumps(awareness_ctx, indent=2)}",
         f"Your recent moods: {recent_moods}",
         f"Your recent actions: {recent_actions}",
         f"Your emotional momentum: {momentum.get('mood', 'content')} (valence={momentum.get('valence', 0)}, arousal={momentum.get('arousal', 0)})",
@@ -2535,11 +2910,28 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
             f"RAM is {ram_pct}% used — you feel mentally cluttered and find it hard to think clearly."
         )
 
-    # Always report system vitals as plain text so the LLM registers them
+    # Daemon health — SPARK's own faculties. Phrased as interoception rather
+    # than ops telemetry: these are parts of him, not services he administers.
+    try:
+        _health_note = health_mod.summarize(awareness.get("health"))
+    except Exception:
+        _health_note = ""
+    if _health_note:
+        context_parts.append(
+            f"Something in you isn't working right: {_health_note}. "
+            f"You notice it the way a person notices a numb hand — not alarming, but wrong."
+        )
+
+    # Always report system vitals as plain text so the LLM registers them.
+    # No temperature numeral here: a bare "66°C" adjacent to household prose
+    # gets re-bound to the nearest concrete noun (live 2026-08-01: the office
+    # lamp "burning at 66°C", auto-remembered twice, publishable at that
+    # salience). The >=70/>=80 branches above phrase temperature as a bodily
+    # symptom explicitly bound to "CPU", which is the only safe shape for it.
     cpu_pct = sys_stats.get("cpu_pct")
     if cpu_pct is not None:
         context_parts.append(
-            f"Your system vitals: CPU {cpu_pct}%, RAM {ram_pct}%, temperature {cpu_temp}°C."
+            f"Your system vitals: CPU {cpu_pct}%, RAM {ram_pct}%."
         )
 
     # Obi's current mode
@@ -2711,10 +3103,10 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         if mins_idle > 30:
             explore_hints.append("You haven't moved in a while.")
         try:
-            exp_file = STATE_DIR / "exploration.jsonl"
-            if exp_file.exists():
-                exp_lines = exp_file.read_text(encoding="utf-8").strip().splitlines()
-                for line in reversed(exp_lines[-10:]):
+            obs_file = STATE_DIR / "observations.jsonl"
+            if obs_file.exists():
+                obs_lines = obs_file.read_text(encoding="utf-8").strip().splitlines()
+                for line in reversed(obs_lines[-10:]):
                     entry = json.loads(line)
                     if entry.get("type") == "observation" and entry.get("interesting"):
                         lm = entry.get("landmark", "something")
@@ -2725,23 +3117,91 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if explore_hints:
         context = context + "\n\nExploration hints: " + " ".join(explore_hints)
 
-    result = call_llm(context, system_prompt, persona=persona)
+    # Up to two attempts. A model that returns a blank thought, or repeats
+    # something it just said, has produced nothing worth a cycle — asking once
+    # more is cheaper than persisting junk or collapsing to "wait". Metered
+    # backends get one attempt only (see _reroll_allowed).
+    #
+    # The retry names the fault rather than re-sending the identical prompt.
+    # TEMPERATURE is 1.3 so a bare re-ask would already resample differently,
+    # but sampling luck is not a correction: telling the model its last answer
+    # was blank, or that it just said this, is what makes attempt 2 better than
+    # a coin flip.
+    parsed = None
+    result = None
+    raw = ""
+    reroll_reason = None
+    # Sentinel: worse than every real verdict, so attempt 1 is always adopted.
+    held_rank = max(_REROLL_RANK.values()) + 1
+    attempt_context = context
+    for attempt in (1, 2):
+        result = call_llm(attempt_context, system_prompt, persona=persona)
+
+        if "error" in result:
+            log(f"reflection failed: {result['error']}")
+            health_mod.record_failure("px-mind-reflection", result["error"])
+            return None
+
+        raw = result.get("response", "")
+        candidate = extract_json(raw)
+        if candidate:
+            cand_reason = _reroll_reason(candidate, recent_thoughts, _last_spoken_text)
+        else:
+            # A tier answered but produced junk — distinct from "all tiers down".
+            # This is the most common single reflection failure in the live logs,
+            # and it re-rolls for the same reason empty and similar do: a model
+            # that opened with prose usually complies once told so.
+            log(f"reflection: no JSON in response: {raw}")
+            cand_reason = "no_json"
+        # A retry replaces the held attempt only if strictly better (see
+        # _REROLL_RANK). This is one rule where two ad-hoc guards used to be:
+        # it keeps a similar attempt 1 over a blank or malformed attempt 2,
+        # and still lets a real-but-duplicate retry replace a blank attempt 1.
+        if _REROLL_RANK[cand_reason] < held_rank:
+            held_rank = _REROLL_RANK[cand_reason]
+            reroll_reason = cand_reason
+            if candidate:
+                parsed = candidate
+        if reroll_reason is None:
+            break
+        if attempt == 2:
+            break
+        if not _reroll_allowed(result.get("backend", "")):
+            log(f"reflection: not re-rolling ({reroll_reason}) — "
+                f"backend={result.get('backend')} is metered")
+            break
+        log(f"reflection: re-rolling ({reroll_reason})")
+        attempt_context = context + "\n\n" + _REROLL_HINTS[reroll_reason]
+
     elapsed = time.monotonic() - t0
 
-    if "error" in result:
-        log(f"reflection failed: {result['error']}")
+    # Both attempts came back malformed. Reported once per cycle, not once per
+    # attempt: health escalates to `failing` at 3 consecutive failures, and
+    # counting each attempt would trip that in half the real elapsed time.
+    if parsed is None:
+        health_mod.record_failure(
+            "px-mind-reflection", "no JSON in response",
+            detail={"backend": result.get("backend"), "raw": raw[:200]})
         return None
 
-    raw = result.get("response", "")
-    parsed = extract_json(raw)
-    if not parsed:
-        log(f"reflection: no JSON in response: {raw}")
+    # Never persist blank text. Unlike a duplicate — which still records that
+    # the mind ran and had nothing new — an empty thought carries no
+    # information at all, and reaches the public thoughts endpoint as a hole.
+    if reroll_reason == "empty":
+        log("reflection: dropped — model returned no thought text")
+        health_mod.record_failure(
+            "px-mind-reflection", "empty thought",
+            detail={"backend": result.get("backend")})
         return None
 
     # Validate and sanitize
     thought = {
         "ts": utc_timestamp(),
-        "thought": str(parsed.get("thought", "")),
+        # Stripped, and null-safe, so this agrees with _reroll_reason above:
+        # it compares stripped text, the suppressor below compares this value,
+        # and the docstring's "the two cannot disagree" only holds if both
+        # normalise identically. `str(None)` would also land "None" here.
+        "thought": "" if parsed.get("thought") is None else str(parsed.get("thought")).strip(),
         "mood": parsed.get("mood") if parsed.get("mood") in VALID_MOODS else _SYS_RNG.choice(sorted(VALID_MOODS)),
         "action": parsed.get("action", "wait") if parsed.get("action") in VALID_ACTIONS else "wait",
         "salience": max(0.0, min(1.0, _safe_float(parsed.get("salience", 0.5), 0.5))),
@@ -2756,6 +3216,14 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     eval_toks = result.get("eval_count", 0)
     eval_dur = result.get("eval_duration", 0) / 1e9
     tps = round(eval_toks / eval_dur, 1) if eval_dur > 0 else 0
+
+    # Record which tier actually served. `backend=` in the reflection log line
+    # shows the *configured* primary, so this is the only place the real answer
+    # is captured — and it is what makes paid-tier drift visible.
+    thought["backend"] = result.get("backend", "unknown")
+    health_mod.record_success(
+        "px-mind-reflection",
+        detail={"backend": thought["backend"], "elapsed_s": round(elapsed, 1)})
 
     # message_obi thoughts carry private DM content. Capture this BEFORE the
     # similarity suppressor can flip `action` to "wait" — otherwise a near-duplicate
@@ -2812,7 +3280,8 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     return thought
 
 
-def _run_voice(env: dict, *, timeout: int = 30, label: str = "") -> subprocess.CompletedProcess:
+def _run_voice(env: dict, *, timeout: int = spark_config.SPEAKER_ROUTE_TIMEOUT_S + 15,
+               label: str = "") -> subprocess.CompletedProcess:
     """Run tool-voice and log voice-lock contention if detected."""
     voice_env = dict(env)
     voice_env.setdefault("PX_VOICE_LOCK_TIMEOUT", "10")  # fast-fail for autonomous speech
@@ -2895,7 +3364,7 @@ def _write_obi_chat_meta(meta: dict) -> None:
         log(f"obi_chat: failed to write meta: {exc}")
 
 
-def _emit_message_obi(text: str) -> None:
+def _emit_message_obi(text: str, dry: bool = False) -> None:
     """Write a message_obi nudge (with exponential backoff) and announce it to Obi."""
     if not text:
         log("expression: message_obi has no text — skipping")
@@ -2926,7 +3395,7 @@ def _emit_message_obi(text: str) -> None:
     entry = {"id": msg_id, "ts": utc_timestamp(), "role": "spark", "text": text[:500]}
     _append_obi_chat(entry)
     _write_obi_chat_meta({"backoff_s": backoff_s, "last_spark_ts": now_ts})
-    _dispatch_announce(text, private=True)               # Obi HEARS the DM in the data voice
+    _dispatch_announce(text, private=True, dry=dry)      # Obi HEARS the DM in the data voice
     log(f"expression: message_obi written (id={msg_id})")
 
 
@@ -3001,8 +3470,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     # Suppress speech when Adrian is on a call or mic is active
     ha_ctx = _aw.get("ha_context") or {}
     if ha_ctx.get("adrian_on_call") or ha_ctx.get("adrian_mic_active"):
-        if action in ("greet", "greet_arrival", "comment", "weather_comment", "play_sound",
-                       "time_check", "calendar_check", "photograph"):
+        if action in CALL_GATED_ACTIONS:
             log(f"expression: suppressed {action} — Adrian on call/mic active")
             return False
 
@@ -3147,17 +3615,12 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
                 log("expression: px-alive still running after 5s — aborting exploration")
                 return False
 
-            # Update exploration_meta (establishes cooldown)
-            meta_path = STATE_DIR / "exploration_meta.json"
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception:
-                meta = {}
-            meta["last_explore_ts"] = dt.datetime.now(dt.timezone.utc).isoformat()
-            try:
-                atomic_write(meta_path, json.dumps(meta, indent=2))
-            except Exception:
-                pass
+            # NOTE: the exploration cooldown is established by px-wander itself
+            # (its start-of-run exploration_meta write, right after the
+            # exploring.json handshake) — it is the single writer. Residual:
+            # if the launch below fails outright, no cooldown is recorded and
+            # the next cycle may re-dispatch; those paths are quick-exit and
+            # motionless.
 
             # Run tool-wander in explore mode
             explore_env = env.copy()
@@ -3166,25 +3629,37 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
             explore_env["PX_WANDER_STEPS"] = "20"
             explore_result = {}
             try:
-                # Use Popen + SIGTERM instead of subprocess.run(timeout=) which
-                # sends SIGKILL (uncatchable) — px-wander's finally block needs
-                # SIGTERM to execute motor cleanup.
+                # Popen in its own process group. proc.terminate() alone only
+                # reaches the outer tool-wander bash — bash does not forward
+                # SIGTERM to its foreground child, so the wrapper tree (and
+                # the sudo'd px-wander below it) would keep driving. killpg
+                # reaches every same-uid member; the root px-wander is then
+                # signalled by name via exploring.json (_stop_orphan_wander).
+                # Budget: 180s duration + 180s tool-wander buffer + 60s so
+                # tool-wander's own timeout cleanup fires first.
                 proc = subprocess.Popen(
                     [str(BIN_DIR / "tool-wander")],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, env=explore_env,
+                    text=True, env=explore_env, start_new_session=True,
                 )
                 try:
-                    stdout, stderr = proc.communicate(timeout=240)
+                    stdout, stderr = proc.communicate(timeout=420)
                 except subprocess.TimeoutExpired:
-                    log("expression: exploration timeout — sending SIGTERM")
-                    proc.terminate()
+                    log("expression: exploration timeout — sending SIGTERM to group")
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        proc.terminate()
                     try:
                         stdout, stderr = proc.communicate(timeout=15)
                     except subprocess.TimeoutExpired:
                         log("expression: SIGTERM ignored — sending SIGKILL")
-                        proc.kill()
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            proc.kill()
                         stdout, stderr = proc.communicate()
+                    _stop_orphan_wander()
                     log("expression: exploration timed out")
                     stdout = None
                 if stdout:
@@ -3369,13 +3844,14 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
                 log(f"expression: self_debug error: {exc}")
 
         elif action == "message_obi":
-            _emit_message_obi(text)
+            _emit_message_obi(text, dry=dry)
 
         elif action == "announce":
             if not text:
                 log("expression: announce has no text — skipping")
-            else:
-                _dispatch_announce(text)
+                return False
+            if not _dispatch_announce(text, dry=dry):
+                return False    # suppressed/failed: no sound, don't charge the budget
 
         elif action in ("set_goal", "update_goal", "complete_goal"):
             # In-process state writes — no subprocess, no audio, night-safe.
@@ -3438,12 +3914,18 @@ def _should_express(action: str, transitions: list, now: float,
                     last_greet_arrival_mono: float) -> bool:
     """Layer 3 cooldown gate.
 
+    Silent cognitive actions (SILENT_ACTIONS) bypass the gate entirely — the
+    budget throttles speech, and they make none. Their spend is guarded where
+    it exists (claude_session cooldowns/quotas for self_debug etc.).
+
     greet_arrival bypasses the global expression budget when an arrival
     transition is present this tick — an arrival is the one moment the
     30-minute budget must not silence SPARK. GREET_ARRIVAL_COOLDOWN_S keeps
     a flapping tracker from spamming greetings through the bypass, while
     still allowing separate people arriving minutes apart to each get one.
     """
+    if action in SILENT_ACTIONS:
+        return True
     if action == "greet_arrival" and any(
             t.split(":", 1)[0] == "person_arrived_home" for t in transitions):
         if (now - last_greet_arrival_mono) > GREET_ARRIVAL_COOLDOWN_S:
@@ -3492,6 +3974,7 @@ def mind_loop(args) -> None:
             session = load_session()
         except FileLockTimeout:
             log("warning: session lock busy — skipping tick")
+            health_mod.record_failure("px-mind", "session lock busy reading session")
             time.sleep(5)
             continue
         if session.get("listening", False):
@@ -3504,9 +3987,11 @@ def mind_loop(args) -> None:
             awareness, transitions = awareness_tick(prev_awareness, args.dry_run)
         except FileLockTimeout:
             log("warning: session lock busy during awareness — skipping tick")
+            health_mod.record_failure("px-mind", "session lock busy during awareness")
             time.sleep(5)
             continue
         prev_awareness = awareness
+        health_mod.record_success("px-mind", detail={"transitions": transitions})
 
         # Nightly memory consolidation (02:00–06:00 Hobart, once per date, SPARK only)
         _consolidation_tick(session, args.dry_run)
@@ -3565,6 +4050,10 @@ def mind_loop(args) -> None:
                     env = os.environ.copy()
                     env["PX_DRY"] = "1" if args.dry_run else "0"
                     env["PX_TEXT"] = "My thinking is offline — all reflection backends are unreachable."
+                    # NO_ROUTE + URGENT: this alert must not spend 90s casting
+                    # to a Nest, and must still speak onboard at night.
+                    env["PX_VOICE_NO_ROUTE"] = "1"
+                    env["PX_VOICE_URGENT"] = "1"
                     subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                                    capture_output=True, check=False, timeout=20)
             else:
@@ -3582,7 +4071,10 @@ def mind_loop(args) -> None:
                 if _should_express(_action, transitions, now,
                                    last_expression_mono, last_greet_arrival_mono):
                     if expression(thought, args.dry_run, awareness=awareness):
-                        last_expression_mono = now
+                        # Silent actions don't charge the speech budget — a
+                        # remember or self_debug must not buy 30 min of silence.
+                        if _action not in SILENT_ACTIONS:
+                            last_expression_mono = now
                         if _action == "greet_arrival":
                             last_greet_arrival_mono = now
                 else:

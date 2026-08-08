@@ -18,6 +18,7 @@ Flow:
   4. Restart px-alive, return to step 1.
 """
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -25,6 +26,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -34,6 +36,21 @@ LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
 PID_FILE = Path(os.environ.get("PX_WAKE_PID", LOG_DIR / "px-wake-listen.pid"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
+# Capture backend. No fallback shim on purpose: without this the daemon has no
+# working microphone, and the PyAudio path it replaced failed *silently*.
+from pxh.mic_stream import (                          # noqa: E402
+    ArecordStream as _ArecordStream,
+    resolve_arecord_device as _resolve_arecord_device,
+)
 
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
@@ -137,6 +154,35 @@ def log(msg: str) -> None:
         pass
 
 
+def enable_speaker_amp(timeout_s: float = 3.0) -> None:
+    """Enable the MAX98357A amp (GPIO 20) so aplay output is audible.
+
+    robot_hat lives in system site-packages, not the venv, so the direct
+    import only succeeds under /usr/bin/python3 — ModuleNotFoundError is the
+    expected path here, not a failure worth logging. Fall back to a system
+    python subprocess; best-effort either way.
+    """
+    try:
+        from robot_hat import enable_speaker
+        enable_speaker()
+        return
+    except ModuleNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"enable_speaker (direct) failed: {exc}")
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3", "-c",
+             "from robot_hat import enable_speaker; enable_speaker()"],
+            capture_output=True, timeout=timeout_s,
+        )
+        if proc.returncode != 0:
+            err = proc.stderr.decode(errors="replace").strip().splitlines()
+            log(f"enable_speaker (subprocess) failed: {err[-1] if err else 'unknown'}")
+    except Exception as exc:
+        log(f"enable_speaker (subprocess) failed: {exc}")
+
+
 def rms(data: bytes) -> float:
     """Compute RMS amplitude of 16-bit PCM chunk."""
     count = len(data) // 2
@@ -146,31 +192,26 @@ def rms(data: bytes) -> float:
     return (sum(s * s for s in shorts) / count) ** 0.5
 
 
-def find_input_device(pa, preferred_name: str = "") -> int:
-    """Return PyAudio device index for the best available input.
+def open_mic_stream(preferred_name: str = ""):
+    """Open the microphone via an arecord subprocess.
 
-    Search order:
-      1. Direct match on preferred_name substring (e.g. 'USB')
-      2. 'pulse' device (PulseAudio — routes USB mic when ALSA direct unavailable)
-      3. First device with input channels
+    Capture does NOT go through PyAudio: PortAudio's ALSA backend sits in a
+    permanent overrun-recovery loop on this C-Media USB mic and silently
+    discards ~32% of every utterance (see src/pxh/mic_stream.py for the full
+    diagnosis and the chirp-loopback evidence). arecord on the same device is
+    clean.
     """
-    best = None
-    pulse_idx = None
-    for i in range(pa.get_device_count()):
-        info = pa.get_device_info_by_index(i)
-        if info["maxInputChannels"] < 1:
-            continue
-        name_lower = info["name"].lower()
-        if preferred_name and preferred_name.lower() in name_lower:
-            return i
-        if name_lower == "pulse":
-            pulse_idx = i
-        if best is None:
-            best = i
-    result = pulse_idx if pulse_idx is not None else best
-    if result is None:
-        raise RuntimeError("No input audio device found")
-    return result
+    device = _resolve_arecord_device(preferred_name or "USB")
+    log(f"mic capture: arecord device {device} @ {MIC_RATE} Hz")
+    stream = _ArecordStream(
+        device=device,
+        rate=MIC_RATE,
+        channels=CHANNELS,
+        chunk_frames=CHUNK,
+        log=log,
+    )
+    stream.start_stream()
+    return stream
 
 
 def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000,
@@ -183,18 +224,7 @@ def _play_tone_sequence(segments: list, device: str = "", amplitude: int = 22000
     Segments are separated by gap_s seconds of silence.
     10ms linear fade-in/out on each segment to prevent clicks.
     """
-    try:
-        from robot_hat import enable_speaker
-        enable_speaker()
-    except Exception:
-        try:
-            subprocess.run(
-                ["/usr/bin/python3", "-c",
-                 "from robot_hat import enable_speaker; enable_speaker()"],
-                capture_output=True, timeout=3,
-            )
-        except Exception:
-            pass  # amp enable is best-effort; audio may still work via PulseAudio
+    enable_speaker_amp()
     try:
         import math, wave as wv, tempfile
         all_samples: list[int] = []
@@ -370,10 +400,31 @@ def _ratecv(data: bytes, width: int, nchannels: int, inrate: int, outrate: int, 
     return struct.pack(f"<{len(out)}h", *out), new_state
 
 
+try:
+    from pxh.wake_audio import StreamingResampler as _StreamingResampler
+except ImportError:                                   # pxh/numpy unavailable
+    _StreamingResampler = None
+
+
 def resample(data: bytes, state=None):
-    """Downsample 44100 Hz 16-bit mono PCM to 16000 Hz. Returns (resampled_bytes, new_state)."""
+    """Downsample 44100 Hz 16-bit mono PCM to 16000 Hz. Returns (resampled_bytes, new_state).
+
+    Prefers the anti-aliased FIR resampler (pxh.wake_audio) — plain _ratecv
+    linear interpolation folds >8 kHz content into the speech band and
+    degrades every STT backend. Falls back to _ratecv if numpy is missing.
+    """
+    if _StreamingResampler is not None:
+        if state is None:
+            state = _StreamingResampler(MIC_RATE, VOSK_RATE)
+        return state.process(data), state
     resampled, new_state = _ratecv(data, 2, 1, MIC_RATE, VOSK_RATE, state)
     return resampled, new_state
+
+
+def resample_oneshot(audio_bytes: bytes) -> bytes:
+    """Resample a complete utterance buffer (non-streaming call sites)."""
+    out, _ = resample(audio_bytes, None)
+    return out
 
 
 def transcribe(model, audio_bytes: bytes) -> str:
@@ -438,7 +489,7 @@ def load_stt_model(model_dir: str):
 def transcribe_sherpa(stt, audio_bytes: bytes) -> str:
     """Transcribe 44100 Hz PCM using sherpa-onnx Zipformer (resamples to 16kHz internally)."""
     import numpy as np
-    resampled, _ = _ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    resampled = resample_oneshot(audio_bytes)
     samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
     # Append 0.5 s silence tail to flush final tokens through the decoder
     tail = np.zeros(int(VOSK_RATE * 0.5), dtype=np.float32)
@@ -485,7 +536,7 @@ def transcribe_whisper(whisper, audio_bytes: bytes) -> str:
     - vad_filter=False: don't clip utterance-start (we already gate on RMS onset)
     """
     import numpy as np
-    resampled, _ = _ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    resampled = resample_oneshot(audio_bytes)
     samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
     segments, _info = whisper.transcribe(
         samples,
@@ -583,7 +634,7 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     the same anti-hallucination filters as Whisper.
     """
     import numpy as np
-    resampled, _ = _ratecv(audio_bytes, 2, 1, MIC_RATE, VOSK_RATE, None)
+    resampled = resample_oneshot(audio_bytes)
     samples = np.frombuffer(resampled, dtype=np.int16).astype(np.float32) / 32768.0
 
     stream = sv.create_stream()
@@ -647,6 +698,62 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     return text
 
 
+# px-alive treats exploring.json as stale once its mtime is >60s old, and a
+# single voice turn can block far longer than that (the Claude CLI alone is
+# routinely 15-80s), so a refresher thread re-writes the file while a turn runs.
+_EXPLORING_REFRESH_S = 20
+_exploring_stop = threading.Event()
+_exploring_thread: threading.Thread | None = None
+
+
+def _set_exploring(active: bool) -> None:
+    """Write state/exploring.json so a systemd-respawned px-alive yields GPIO.
+
+    _stop_alive kills px-alive by pid, which leaves the unit's Restart=always
+    armed: systemd retries every 15s for the whole voice turn. Each retry reads
+    this file and exits cleanly while it is fresh; without it, the respawn
+    retakes GPIO mid-turn. Same contract as px-wander and tool-announce.
+    """
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        data: dict = {"active": active}
+        if active:
+            data["pid"] = os.getpid()
+            data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, str(STATE_DIR / "exploring.json"))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        log(f"_set_exploring: {exc}")
+
+
+def _start_exploring_refresh() -> None:
+    global _exploring_thread
+    _exploring_stop.clear()
+
+    def _refresh() -> None:
+        while not _exploring_stop.wait(_EXPLORING_REFRESH_S):
+            _set_exploring(True)
+
+    _exploring_thread = threading.Thread(
+        target=_refresh, daemon=True, name="exploring-refresh")
+    _exploring_thread.start()
+
+
+def _stop_exploring_refresh() -> None:
+    _exploring_stop.set()
+    if _exploring_thread is not None:
+        _exploring_thread.join(timeout=2)
+
+
 def _alive_pid() -> int | None:
     """Return px-alive PID if running, else None."""
     try:
@@ -659,7 +766,18 @@ def _alive_pid() -> int | None:
 
 
 def _stop_alive() -> int | None:
-    """Send SIGTERM to px-alive so it releases GPIO. Returns PID if killed."""
+    """Send SIGTERM to px-alive so it releases GPIO. Returns PID if killed.
+
+    Deliberately a pid-kill, not an explicit systemd stop: stopping the unit
+    administratively disarms Restart=always, so if this process died mid-turn
+    px-alive would stay down forever. The kill keeps the auto-restart armed as a dead-man's
+    switch, and the exploring.json guard makes its ~15s retries exit cleanly
+    instead of retaking GPIO. The guard goes up before the pid lookup so it
+    also covers the window where px-alive is between respawns (no live pid,
+    but a restart timer already ticking).
+    """
+    _set_exploring(True)
+    _start_exploring_refresh()
     pid = _alive_pid()
     if pid:
         log(f"pausing px-alive (pid={pid}) for voice turn")
@@ -674,24 +792,56 @@ def _stop_alive() -> int | None:
     return pid
 
 
-def _restart_alive() -> None:
-    """Restart px-alive in background."""
-    alive_script = PROJECT_ROOT / "bin" / "px-alive"
-    if alive_script.exists():
-        log("restarting px-alive")
-        try:
-            subprocess.Popen(
-                ["sudo", "-n", str(alive_script)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as exc:
-            log(f"_restart_alive: failed to spawn: {exc}")
+def _restart_alive(had_alive: int | None = 1) -> None:
+    """Hand px-alive back to systemd after a voice turn.
+
+    Must go through systemctl, never spawn bin/px-alive directly. A directly
+    spawned instance is a child of *this* process, writes px-alive.pid and takes
+    the GPIO handle; the systemd unit (Restart=always) then starts, trips
+    px-alive's single-instance guard, and exits — looping forever while
+    `systemctl is-active` reports a misleading `activating`. It would also drop
+    the unit's --no-face flag.
+
+    The verb is `start`, matching mind.py and the sudoers grant precedent: it
+    cancels the unit's restart-backoff timer and runs now, but is a no-op if a
+    retry already brought px-alive back — `restart` would bounce a healthy
+    instance every turn.
+
+    Called unconditionally from the voice-turn `finally` (even when px-alive
+    wasn't running at turn start) so the exploring guard always comes down;
+    the systemctl call itself is skipped when there was nothing to hand back.
+    """
+    _stop_exploring_refresh()
+    _set_exploring(False)
+    if not had_alive:
+        return
+    log("restarting px-alive")
+    try:
+        r = subprocess.run(
+            ["sudo", "-n", "systemctl", "start", "px-alive"],
+            capture_output=True, check=False, timeout=15,
+        )
+        if r.returncode != 0:
+            log(f"_restart_alive: systemctl start failed (rc={r.returncode}): "
+                f"{r.stderr.decode(errors='replace').strip()}")
+    except Exception as exc:
+        log(f"_restart_alive: failed to restart: {exc}")
 
 
 
 def flush_stream(stream, chunks: int = 15) -> None:
-    """Discard buffered audio that built up while the robot was speaking."""
+    """Discard buffered audio that built up while the robot was speaking.
+
+    ArecordStream can drop exactly the backlog, which is tighter than the old
+    fixed 15-chunk read: a user replying the instant the chime ends is no
+    longer clipped. `chunks` is the fallback path's budget only.
+    """
+    flush = getattr(stream, "flush", None)
+    if callable(flush):
+        dropped = flush()
+        if dropped:
+            log(f"flushed {dropped} buffered chunks ({dropped * CHUNK / MIC_RATE:.1f}s)")
+        return
     for _ in range(chunks):
         try:
             stream.read(CHUNK, exception_on_overflow=False)
@@ -705,16 +855,51 @@ def record_utterance(stream, max_s: float, silence_s: float) -> bytes:
     silence_frames = 0
     silence_limit = int(silence_s * MIC_RATE / CHUNK)
     max_frames = int(max_s * MIC_RATE / CHUNK)
-    for _ in range(max_frames):
-        chunk = stream.read(CHUNK, exception_on_overflow=False)
-        captured.append(chunk)
-        if rms(chunk) < RMS_SILENCE:
-            silence_frames += 1
-            if silence_frames >= silence_limit:
-                break
-        else:
-            silence_frames = 0
+    # Declare the capture so a ring overflow here is reported as lost speech
+    # rather than folded in with the benign backlog every STT/LLM pause
+    # produces. Older stream objects (and the PyAudio-shaped test doubles)
+    # have no capturing(), so degrade to a plain no-op context.
+    mark = getattr(stream, "capturing", None)
+    with (mark() if callable(mark) else contextlib.nullcontext()):
+        for _ in range(max_frames):
+            chunk = stream.read(CHUNK, exception_on_overflow=False)
+            captured.append(chunk)
+            if rms(chunk) < RMS_SILENCE:
+                silence_frames += 1
+                if silence_frames >= silence_limit:
+                    break
+            else:
+                silence_frames = 0
     return b"".join(captured)
+
+
+def _debug_dump_wav(audio_bytes: bytes) -> None:
+    """When PX_WAKE_DEBUG_WAV=1, save the raw 44.1k capture to state/wake-debug/
+    and log peak/RMS so clipping vs. low-level can be diagnosed offline.
+    Keeps the 10 most recent dumps."""
+    if os.environ.get("PX_WAKE_DEBUG_WAV") != "1":
+        return
+    try:
+        import array
+        samples = array.array("h", audio_bytes)
+        peak = max(abs(s) for s in samples) if samples else 0
+        clipped = sum(1 for s in samples if abs(s) >= 32700)
+        level = rms(audio_bytes)
+        dbg_dir = STATE_DIR / "wake-debug"
+        dbg_dir.mkdir(parents=True, exist_ok=True)
+        ts = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
+        path = dbg_dir / f"utt-{ts}.wav"
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(MIC_RATE)
+            wf.writeframes(audio_bytes)
+        log(f"debug wav: {path.name} peak={peak} clipped={clipped}/{len(samples)} rms={level:.0f}")
+        old = sorted(dbg_dir.glob("utt-*.wav"))[:-10]
+        for p in old:
+            p.unlink(missing_ok=True)
+    except Exception as exc:
+        log(f"debug wav dump failed: {exc}")
 
 
 def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice=None) -> str:
@@ -723,6 +908,7 @@ def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice
     If the primary backend returns empty (hallucination filtered), falls through
     to the next backend instead of returning empty.
     """
+    _debug_dump_wav(audio_bytes)
     if sensevoice is not None:
         result = transcribe_sensevoice(sensevoice, audio_bytes)
         if result.strip():
@@ -862,8 +1048,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             current_text = follow_text
 
     finally:
-        if had_alive:
-            _restart_alive()
+        _restart_alive(had_alive)
 
 
 def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
@@ -941,17 +1126,12 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
             current_text = follow_text
 
     finally:
-        if had_alive:
-            _restart_alive()
+        _restart_alive(had_alive)
 
 
-def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> None:
+def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
     """Main listen loop: wake-word detect → conversation → return to listening."""
     import vosk
-    import pyaudio
-
-    device_idx = find_input_device(pa, args.mic)
-    log(f"using mic device idx={device_idx} ({pa.get_device_info_by_index(device_idx)['name']})")
 
     # Grammar recognizer for wake word (fast, low-CPU)
     wake_phrase = args.wake_word.lower().strip()
@@ -961,17 +1141,9 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
     all_wake_phrases = [wake_phrase] + [p for p in _extra_wake if p != wake_phrase] + ["[unk]"]
     grammar = json.dumps(all_wake_phrases)
     wake_rec = vosk.KaldiRecognizer(model, VOSK_RATE, grammar)
-    resample_state = None  # _ratecv state for wake recognizer
+    resample_state = None  # resampler state for wake recognizer
 
-    stream = pa.open(
-        format=pyaudio.paInt16,
-        channels=CHANNELS,
-        rate=MIC_RATE,
-        input=True,
-        input_device_index=device_idx,
-        frames_per_buffer=CHUNK,
-    )
-    stream.start_stream()
+    stream = open_mic_stream(args.mic)
     persona_names = [k.split()[-1] for k in PERSONA_WAKE]
     log(f"listening for wake word: '{wake_phrase}' or 'hey spark' / 'hey vixen' / 'hey gremlin'")
 
@@ -1005,8 +1177,14 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                             "ts": _utc_ts(), "rms": avg_rms, "level": level,
                         }), encoding="utf-8")
                         _tmp.rename(AMBIENT_FILE)
+                        # Reaching here proves the audio stream is being read
+                        # AND state is writable — the two ways this daemon dies
+                        # quietly while its process stays up.
+                        _health.record_success("px-wake-listen",
+                                               detail={"rms": avg_rms, "level": level})
                     except (OSError, TypeError) as exc:
                         log(f"ambient file write failed: {exc}")
+                        _health.record_failure("px-wake-listen", f"ambient write: {exc}")
                     _ambient_rms_sum = 0
                     _ambient_rms_count = 0
                     _ambient_last_write = _now_mono
@@ -1032,18 +1210,7 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                 if any(p in text for p in all_wake_phrases if p != "[unk]") and len(text.strip().split()) >= 2:
                     log(f"wake word detected: {text!r}")
                     # Pre-enable speaker amp so it's warm before chime audio arrives
-                    try:
-                        from robot_hat import enable_speaker
-                        enable_speaker()
-                    except Exception:
-                        try:
-                            subprocess.run(
-                                ["/usr/bin/python3", "-c",
-                                 "from robot_hat import enable_speaker; enable_speaker()"],
-                                capture_output=True, timeout=3,
-                            )
-                        except Exception:
-                            pass
+                    enable_speaker_amp()
                     # Chime in background while we start recording
                     threading.Thread(target=play_chime, args=(args.aplay_device,), daemon=True).start()
                     # Periodic heartbeat: soft tick every 5s so user knows we're listening/thinking
@@ -1131,7 +1298,6 @@ def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> Non
                     log(f"listening for wake word: '{wake_phrase}' (also: hey spark, hey vixen, hey gremlin)")
 
     finally:
-        stream.stop_stream()
         stream.close()
 
 
@@ -1148,7 +1314,7 @@ def main(argv) -> int:
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL,
                         help="Path to faster-whisper model snapshot dir (fallback STT, best AU accent support)")
     parser.add_argument("--mic",           default="USB",
-                        help="Substring to match in mic device name (default: USB)")
+                        help="Substring to match in the `arecord -l` card description (default: USB)")
     parser.add_argument("--aplay-device",  default="",
                         help="ALSA device for chime output (default: system default)")
     parser.add_argument("--voice-cmd",     default=DEFAULT_VOICE_CMD,
@@ -1175,20 +1341,8 @@ def main(argv) -> int:
     log(f"starting pid={os.getpid()} dry={args.dry_run}")
 
     # Enable speaker amp once at startup — GPIO 20 stays high for the process lifetime.
-    # robot_hat is in system site-packages (not venv), so use system python fallback.
-    try:
-        from robot_hat import enable_speaker
-        enable_speaker()
-    except Exception as exc:
-        log(f"enable_speaker (direct) failed: {exc}")
-        try:
-            subprocess.run(
-                ["/usr/bin/python3", "-c",
-                 "from robot_hat import enable_speaker; enable_speaker()"],
-                capture_output=True, timeout=3,
-            )
-        except Exception as exc2:
-            log(f"enable_speaker (subprocess) failed: {exc2}")
+    # Startup races other services for GPIO/I2C, so allow a longer subprocess timeout.
+    enable_speaker_amp(timeout_s=10.0)
     log(f"personas available: {', '.join(persona_names)} (say name after wake word)")
 
     def _shutdown(sig, _frame):
@@ -1212,7 +1366,6 @@ def main(argv) -> int:
 
     try:
         import vosk
-        import pyaudio
     except ImportError as exc:
         log(f"missing dependency: {exc}")
         return 1
@@ -1259,21 +1412,8 @@ def main(argv) -> int:
     backend = "sensevoice" if sensevoice else ("faster-whisper" if whisper else ("sherpa-onnx" if stt else "vosk"))
     log(f"STT backend: {backend}")
 
-    # PyAudio init spams ALSA warnings to stderr — suppress at the fd level
-    import ctypes
     try:
-        _libc = ctypes.CDLL("libc.so.6")
-        _devnull = os.open(os.devnull, os.O_WRONLY)
-        _saved_stderr = os.dup(2)
-        os.dup2(_devnull, 2)
-        os.close(_devnull)
-        pa = pyaudio.PyAudio()
-        os.dup2(_saved_stderr, 2)
-        os.close(_saved_stderr)
-    except (OSError, AttributeError):
-        pa = pyaudio.PyAudio()  # fallback without stderr suppression
-    try:
-        listen_loop(pa, model, args, stt, whisper, sensevoice)
+        listen_loop(model, args, stt, whisper, sensevoice)
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -1282,7 +1422,6 @@ def main(argv) -> int:
         traceback.print_exc()
         return 1
     finally:
-        pa.terminate()
         PID_FILE.unlink(missing_ok=True)
         log("stopped")
 

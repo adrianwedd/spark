@@ -66,3 +66,25 @@ def test_janitor_deletes_expired_public_and_private(tmp_dirs):
     assert not old_pub.exists() and not old_priv.exists()
     assert fresh_priv.exists()
     assert fresh_pub.exists()
+
+
+def test_janitor_sweeps_png_and_mp4_from_priv(tmp_dirs):
+    import os
+    old = time.time() - (config.PRIVATE_TTL_MIN * 60 + 60)
+    made = []
+    for name in ("a.wav", "b.png", "c.mp4"):
+        p = tmp_dirs["priv"] / name
+        p.write_bytes(b"x")
+        os.utime(p, (old, old))
+        made.append(p)
+
+    removed = store.run_janitor()
+    assert removed == 3
+    assert not any(p.exists() for p in made)
+
+
+def test_janitor_leaves_fresh_private_artifacts(tmp_dirs):
+    p = tmp_dirs["priv"] / "fresh.mp4"
+    p.write_bytes(b"x")
+    store.run_janitor()
+    assert p.exists()

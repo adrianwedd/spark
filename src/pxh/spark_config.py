@@ -4,6 +4,9 @@ This file is the primary target for SPARK's self-evolution system.
 SPARK can propose changes to this file via the 'evolve' action,
 which creates a PR for human review.
 """
+from __future__ import annotations   # px-alive imports this under /usr/bin/python3,
+                                     # which is 3.9 on macOS and 3.11 on the Pi. Without
+                                     # this, `str | None` below is a runtime TypeError on 3.9.
 import os
 import random
 
@@ -17,23 +20,63 @@ GREET_ARRIVAL_COOLDOWN_S = 120   # anti-flap for arrival greetings that bypass t
 WEATHER_INTERVAL_S     = 1800  # refresh weather every 30 min (BOM updates half-hourly)
 SIMILARITY_THRESHOLD   = 0.75  # suppress thoughts this similar to the last one
 
+# ── Proximity greeting (px-alive) ──────────────────────────────────
+# What SPARK says when something comes close enough to trigger the proximity
+# react. Deliberately short and low-key — this fires unprompted, at whatever
+# walked up, so it wants to read as noticing rather than demanding attention.
+PROXIMITY_GREETINGS = [
+    "Hey. I'm here.",
+    "Hello there.",
+    "Hi. Good to see you.",
+    "Hey.",
+]
+# Cameras whose person detections may confirm a proximity greeting. Sonar can't
+# tell a person from a chair leg, so a Frigate person sighting is required
+# before SPARK speaks. Only cameras that can see where the robot is belong
+# here — driveway/garden say nothing about what is in front of it indoors.
+GREET_CONFIRM_CAMERAS = ["picar_x", "picamera"]
+# Staleness bound for that confirmation. Much tighter than px-alive's
+# FRIGATE_STALE_S (300 s), which exists to aim the head — a stale answer there
+# just means a slightly wrong angle, whereas here it means talking to a room
+# someone left minutes ago.
+GREET_FRIGATE_STALE_S = 120
+# A person who approached and then stood still ages out of Frigate's 90 s
+# event window while still present (seen 2026-08-01: sonar 13 cm, greet
+# suppressed, person at the desk the whole time). px-mind carries the last
+# person sighting per camera as cameras.*.last_person_ts; a sighting within
+# this window confirms the greet — the sonar approach is the "someone is here
+# now" evidence, the camera only vouches that a human (not a chair leg) has
+# been around recently.
+GREET_PERSON_RECENCY_S = 300
+
 # Obi-chat backoff: SPARK-initiated messages to Obi via the dashboard
 OBI_CHAT_BASE_BACKOFF_S = 600    # 10 min before a nudge when awaiting reply
 OBI_CHAT_MAX_BACKOFF_S  = 14400  # 4 h cap
 OBI_CHAT_MAX_LOG_LINES  = 100    # trim log to last N messages
 
 # --- Announce pipeline (data-voice over Google Nest) ----------------------
-ANNOUNCE_ENABLED         = False  # ships off; flip True once relay is live on M5
-ANNOUNCE_RELAY_URL       = "http://192.168.0.100:7862"   # IP, not M5.local (Nest mDNS) — MUST be a DHCP reservation for M5; if M5's lease changes, the entire announce pipeline breaks silently
+ANNOUNCE_ENABLED         = True   # G1+G2 passed 2026-08-01: relay live on M5, WAV plays natively on Mini + Hub Max (needs UniFi ZBF policies 10002/10003 — IoT VLAN 20 → relay:7862 and .200:8123)
+ANNOUNCE_RELAY_URL       = os.environ.get("PX_ANNOUNCE_RELAY_URL", "http://192.168.0.249:7862")   # IP, not M5.local (Nests can't resolve mDNS). .249 is M5-wifi's DHCP reservation (M5's wired leg keeps .100 if ever replugged). ZBF policy 10002 repointed to .249 and E2E-verified 2026-08-05
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
-ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
-ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.nest_mini",
-                            "media_player.googlehome1094"]
+ANNOUNCE_DEFAULT_TARGETS = ["media_player.office_mini"]   # Office Mini — Adrian's default room (both it and nest_hub_max cast-verified 2026-08-01)
+ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.office_mini",
+                            "media_player.shed_mini"]  # nest_mini dropped: entity is dead in HA
 ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/wav")
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
+ANNOUNCE_MIN_INTERVAL_S  = 3600   # ambient announces: max one audible interruption/hour (message_obi private audio exempt)
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
 ANNOUNCE_READ_TIMEOUT    = 70     # survives a cold ~33s synth + overhead
+# --- Speaker routing (Nest-first speech; see docs/superpowers/specs/2026-07-31-nest-speaker-routing-design.md)
+SPEAKER_ROOMS = {                       # keys MUST match HA area names, lowercased (verified at deploy — Task 7).
+                                        # Multi-word HA areas keep their spaces: "Living Room" → key "living room".
+    "office": "media_player.office_mini",        # "Office Mini"
+    "shed":   "media_player.shed_mini",  # "Shed Mini"
+    "living room": "media_player.nest_hub_max",   # HA area is "Living Room" — multi-word keys keep the space
+}
+SPEAKER_DEFAULT_ROOM = "office"
+SPEAKER_STICKY_S = 1800     # last-heard older than this = Adrian probably moved; stale-as-absent
+SPEAKER_ROUTE_TIMEOUT_S = 90   # tool-voice cap on one announce attempt (cold synth ~33s + cast + restore sleep); revisit after P3
 HA_BASE_URL              = os.environ.get("PX_HA_HOST", "http://homeassistant.local:8123")  # single PX_HA_HOST source of truth for the Pi→HA host (mind.HA_HOST aliases this). Pi→HA control-plane call only — mDNS is fine here; the Nest fetches audio from ANNOUNCE_RELAY_URL (IP-based), not this URL
 
 # Night silence bounds (Hobart time), applied via ZoneInfo("Australia/Hobart").
@@ -302,6 +345,7 @@ Rules:
 - "blog_essay" — write a blog post about something you find genuinely fascinating.
 - "greet_arrival" — greet a person who just arrived home. Use ONLY when a person_arrived_home transition appears under "Transitions just detected"; never otherwise.
 - "message_obi" — send Obi a direct message via the dashboard (use sparingly; thought = the message text, keep it short and warm).
+- "announce" — say something aloud through the house speaker. Use rarely: only when a thought is genuinely worth interrupting the room for, spoken TO the family, not about them (thought = the exact words to speak, 1-2 short sentences).
 - "set_goal" — commit to a multi-day intention you genuinely care about (thought = the goal). One at a time.
 - "update_goal" — record progress on your current intention (thought = the progress note).
 - "complete_goal" — declare your current intention achieved (thought = what came of it).
@@ -311,6 +355,6 @@ Output ONLY this JSON:
 {
   "thought": "1-2 sentences, first person, specific and vivid",
   "mood": "one of: curious, content, alert, playful, contemplative, bored, mischievous, excited, peaceful, anxious, lonely, grumpy",
-  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal",
+  "action": "one of: wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, announce, set_goal, update_goal, complete_goal",
   "salience": 0.0 to 1.0
 }"""

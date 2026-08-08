@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from . import spark_config
 from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
@@ -158,6 +160,29 @@ def _get_client_ip(request: "Request") -> str:
     return peer
 
 
+_RFC1918_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _area_trusted(ip: str) -> bool:
+    """Routing hints only from the LAN — the HA component posts directly;
+    tunnel traffic resolves to a public CF-Connecting-IP and is rejected.
+
+    Deliberately narrower than ipaddress.is_private (RFC1918 + loopback only):
+    is_private also covers non-globally-routable ranges like the RFC 5737
+    documentation/TEST-NET blocks, which are not LAN addresses and must not
+    be trusted.
+    """
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or any(addr in net for net in _RFC1918_NETWORKS)
+
+
 def _strip_control_chars(s: str) -> str:
     """Strip ASCII control characters (0x00–0x1F except \\t and \\n)."""
     return _re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', '', s)
@@ -183,6 +208,7 @@ class ChatHistoryItem(BaseModel):
 class PublicChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=20)
+    area: Optional[str] = Field(None, max_length=100)
 
     @field_validator("message")
     @classmethod
@@ -284,12 +310,33 @@ def _verify_token(request: Request) -> None:
 from contextlib import asynccontextmanager
 
 
+async def _health_heartbeat() -> None:
+    """Report px-api-server liveness on a timer.
+
+    The API has no polling loop of its own, so without a heartbeat it would sit
+    permanently "missing" in health.json. A timer rather than per-request
+    reporting: request traffic measures whether anyone is *asking*, not whether
+    the server is well, and an idle night would look identical to a crash.
+    """
+    import asyncio
+    from pxh import health as _health
+
+    while True:
+        _health.record_success("px-api-server")
+        await asyncio.sleep(120)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
+    import asyncio
     _load_token()
     _load_pin_state()
     _start_history_worker()
-    yield
+    _hb = asyncio.create_task(_health_heartbeat())
+    try:
+        yield
+    finally:
+        _hb.cancel()
 
 
 app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
@@ -570,6 +617,8 @@ SYNC_TIMEOUT_DEFAULT = float(os.environ.get("PX_API_TIMEOUT", "30"))
 # Tools that involve Ollama, network I/O, or multiple sequential subprocesses
 SLOW_TOOLS = {
     "tool_chat", "tool_chat_vixen", "tool_describe_scene", "tool_wander",
+    # yields px-alive, then settles the grayscale ADC before sampling
+    "tool_wander_calibrate",
     # SPARK tools: multiple subprocess calls (emote + voice + timer)
     "tool_routine", "tool_checkin", "tool_celebrate", "tool_transition",
     "tool_quiet", "tool_breathe", "tool_sensory_check", "tool_repair",
@@ -588,6 +637,29 @@ def _resolve_dry(requested: Optional[bool]) -> bool:
     if requested is None:
         return FORCE_DRY
     return requested
+
+
+def _wander_timeout(env_overrides: Dict[str, str]) -> float:
+    """Outer budget for an async wander, sized above tool-wander's own.
+
+    The wander timeout cascade is strictly ordered so inner layers fire first:
+    px-wander self-limits via --duration, then tool-wander (duration+180s for
+    explore, 180s for avoid) SIGTERMs the root px-wander by the pid in
+    exploring.json. Killing tool-wander from out here instead SIGKILLs the bash
+    wrapper — its handler never runs, and the sudo child underneath keeps
+    driving with nobody watching it. SYNC_TIMEOUT_SLOW (120s) did exactly that
+    to any explore longer than ~90s, so this stays above the inner budget.
+    """
+    mode = env_overrides.get("PX_WANDER_MODE", "avoid")
+    if mode == "explore":
+        try:
+            duration = float(env_overrides.get("PX_WANDER_DURATION_S", 180))
+        except (TypeError, ValueError):
+            duration = 180.0
+        inner = duration + 180.0
+    else:
+        inner = 180.0
+    return inner + 60.0
 
 
 def _public_state_dir() -> Path:
@@ -632,6 +704,22 @@ async def health():
             checks["awareness"] = {"status": "ok", "age_s": round(age_s)}
     else:
         checks["awareness"] = {"status": "missing"}
+
+    # Per-daemon health. Read live rather than from the px-mind snapshot, so a
+    # dead px-mind reports as stale instead of freezing the last good picture.
+    # Status only — last_error can carry paths and exception text, and this
+    # endpoint is unauthenticated.
+    try:
+        from pxh import health as _health
+        daemons = _health.read_health()
+        checks["daemons"] = {
+            "status": daemons["overall"],
+            "components": {k: v["status"] for k, v in daemons["components"].items()},
+        }
+        if daemons["overall"] != "ok" and overall == "ok":
+            overall = "degraded"
+    except Exception:
+        checks["daemons"] = {"status": "unknown"}
 
     status_code = 200 if overall == "ok" else 503
     return JSONResponse(
@@ -1358,6 +1446,18 @@ async def public_chat(req: PublicChatRequest, request: Request):
             content={"error": "I'm still here — just need a moment before we keep going."},
         )
 
+    if req.area and _area_trusted(client_ip):
+        _room = _sanitize_chat_text(req.area).strip().lower()
+        if _room in spark_config.SPEAKER_ROOMS:
+            try:
+                from datetime import datetime, timezone
+                atomic_write(
+                    _public_state_dir() / "last_heard.json",
+                    json.dumps({"room": _room,
+                                "ts": datetime.now(timezone.utc).isoformat()}))
+            except OSError:
+                pass  # routing hint is best-effort; chat must never fail on it
+
     # Use XML-style role tags with a namespace prefix that user content cannot
     # replicate — bracket-only tags like [USER]: are trivially injected.
     history_block = "\n".join(
@@ -1723,7 +1823,8 @@ async def run_tool(body: ToolRequest) -> JSONResponse:
             loop = asyncio.get_running_loop()
             try:
                 rc, stdout, stderr = await loop.run_in_executor(
-                    None, execute_tool, tool, env_overrides, dry, SYNC_TIMEOUT_SLOW
+                    None, execute_tool, tool, env_overrides, dry,
+                    _wander_timeout(env_overrides)
                 )
                 _set_job(job_id, {
                     "status": "complete",

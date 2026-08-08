@@ -1,9 +1,15 @@
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+# Portable "discard input, exit 0" player for tool-voice fallback tests — the
+# brief specifies /bin/true, which is the Linux/Pi path; macOS keeps it under
+# /usr/bin/true, so resolve via PATH rather than hardcoding one or the other.
+_TRUE_BIN = shutil.which("true") or "/bin/true"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,6 +92,8 @@ def test_tool_voice_lock_timeout(isolated_project):
     env["PX_DRY"] = "0"  # non-dry so the lock path is exercised
     env["PX_TEXT"] = "Lock contention test"
     env["PX_VOICE_LOCK_TIMEOUT"] = "1"
+    env["PX_NIGHT_SILENCE_START_H"] = "99"  # never night — the gate returns
+    env["PX_NIGHT_SILENCE_END_H"] = "0"     # "suppressed" before the lock path
 
     log_dir = env.get("LOG_DIR", str(PROJECT_ROOT / "logs"))
     lock_path = str(Path(log_dir) / "voice.lock")
@@ -263,6 +271,67 @@ def test_tool_describe_scene_dry_run(isolated_project):
     assert len(payload["description"]) > 0
 
 
+def test_describe_scene_root_runs_claude_as_pi(tmp_path, monkeypatch):
+    """Root keeps hardware ownership but crosses to pi for Claude credentials."""
+    ns = _load_tool_heredoc("tool-describe-scene", monkeypatch, tmp_path)
+    monkeypatch.setattr(ns["os"], "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        ns["pwd"], "getpwnam",
+        lambda name: _types.SimpleNamespace(pw_dir=f"/home/{name}"),
+    )
+    monkeypatch.setenv("SUDO_USER", "root")
+
+    command = ns["_claude_command"]("describe this")
+
+    assert command[:5] == ["sudo", "-n", "-u", "pi", "env"]
+    assert "HOME=/home/pi" in command
+    assert command[-7:] == [
+        ns["CLAUDE_BIN"], "-p", "describe this",
+        "--allowedTools", "Read", "--output-format", "text",
+    ]
+    assert ns["CLAUDE_TIMEOUT"] == 60
+
+
+def test_px_wander_calibration_wrapper_self_elevates(isolated_project, tmp_path):
+    """The gate's px-wander calibration command must acquire hardware access."""
+    if __import__("os").geteuid() == 0:
+        pytest.skip("self-elevation is only observable from a non-root test user")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    sudo_log = tmp_path / "sudo-args.txt"
+    fake_sudo = fake_bin / "sudo"
+    fake_sudo.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$PX_TEST_SUDO_LOG\"\n",
+        encoding="utf-8",
+    )
+    fake_sudo.chmod(0o755)
+
+    env = isolated_project["env"].copy()
+    env["PX_BYPASS_SUDO"] = "0"
+    env["PX_TEST_SUDO_LOG"] = str(sudo_log)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    result = subprocess.run(
+        ["bin/px-wander", "--calibrate-cliff"],
+        cwd=PROJECT_ROOT, text=True, capture_output=True, env=env, check=False,
+    )
+
+    assert result.returncode == 0
+    args = sudo_log.read_text(encoding="utf-8").splitlines()
+    assert args[:2] == ["-n", "env"]
+    assert str(PROJECT_ROOT / "bin" / "px-wander") in args
+    assert args[-1] == "--calibrate-cliff"
+
+
+def test_px_wander_calibration_guard_precedes_alive_yield():
+    """The ownership marker must exist before px-alive is asked to exit."""
+    source = (PROJECT_ROOT / "bin" / "px-wander").read_text(encoding="utf-8")
+    guard_call = source.index("set_calibration_guard 1")
+    yield_call = source.index("\nyield_alive\n", guard_call)
+    hardware_launch = source.index("\n/usr/bin/python3 -", yield_call)
+    assert guard_call < yield_call < hardware_launch
+
+
 def test_tool_frigate_events_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -312,6 +381,63 @@ def test_tool_wander_dry_run(isolated_project):
     assert payload["status"] == "ok"
     assert payload["steps"] == 2
     assert payload["dry"] is True
+
+
+def test_tool_wander_calibrate_dry_run(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    stdout = run_tool(["bin/tool-wander-calibrate"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["dry"] is True
+
+
+def test_tool_wander_calibrate_passes_accumulate(isolated_project):
+    """PX_CALIBRATE_ACCUMULATE reaches px-wander as --accumulate.
+
+    Without the flag each calibration replaces the last, which on a floor whose
+    boards and gaps read an order of magnitude apart means the threshold only
+    ever describes the spot SPARK happened to be standing on.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_BYPASS_SUDO"] = "1"
+    env["PX_CALIBRATE_ACCUMULATE"] = "1"
+    fake = isolated_project["state_dir"].parent / "fake-px-wander-acc"
+    argv_log = isolated_project["state_dir"].parent / "argv.txt"
+    fake.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "$@" > {argv_log}\n'
+        'echo \'{"status": "ok", "floor_ref": [1,2,3], "cliff_ref": [1,2,3]}\'\n'
+    )
+    fake.chmod(0o755)
+    env["PX_WANDER_BIN"] = str(fake)
+    run_tool(["bin/tool-wander-calibrate"], env)
+    assert "--accumulate" in argv_log.read_text()
+
+
+def test_tool_wander_calibrate_forwards_refs(isolated_project):
+    """A live calibration forwards floor_ref/cliff_ref from px-wander's JSON.
+
+    The reference pair is the whole point of the call — an operator recalibrating
+    over HTTP has no other way to see what floor the guard is now armed against.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_BYPASS_SUDO"] = "1"
+    fake = isolated_project["state_dir"].parent / "fake-px-wander"
+    fake.write_text(
+        '#!/usr/bin/env bash\n'
+        'echo \'{"status": "ok", "floor_ref": [340.0, 632.0, 440.0],'
+        ' "cliff_ref": [221.0, 410.8, 286.0], "ts": "2026-08-06T02:55:14+00:00"}\'\n'
+    )
+    fake.chmod(0o755)
+    env["PX_WANDER_BIN"] = str(fake)
+    stdout = run_tool(["bin/tool-wander-calibrate"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["floor_ref"] == [340.0, 632.0, 440.0]
+    assert payload["cliff_ref"] == [221.0, 410.8, 286.0]
 
 
 def test_tool_chat_dry_run(isolated_project):
@@ -1093,6 +1219,8 @@ import threading
 
 class _StubHandler(http.server.BaseHTTPRequestHandler):
     captured = []  # class-level capture: list of (method, path, body)
+    get_state = {"state": "idle"}  # configurable HA state response for GET /api/states/<entity>
+    announce_duration = 1.2  # configurable duration_s for the /announce response
 
     def log_message(self, *a):  # silence
         pass
@@ -1108,7 +1236,7 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         # HA state lookups: /api/states/<entity>
         _StubHandler.captured.append(("GET", self.path, None))
-        self._send(200, {"state": "idle"})
+        self._send(200, _StubHandler.get_state)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -1116,8 +1244,9 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
         _StubHandler.captured.append(("POST", self.path, body))
         if self.path.endswith("/announce"):
             self._send(200, {"audio_url": "http://192.168.0.100:7862/audio/abc123.wav",
-                             "voice": "data", "cached": False, "duration_s": 1.2})
-        else:  # HA play_media
+                             "voice": "data", "cached": False,
+                             "duration_s": _StubHandler.announce_duration})
+        else:  # HA play_media / volume_set / etc.
             self._send(200, [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])
 
 
@@ -1149,10 +1278,61 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     payload = parse_json(stdout)
     assert payload["status"] == "ok"
     assert payload["audio_url"].endswith("/audio/abc123.wav")
-    assert payload["targets"] == ["media_player.nest_hub_max"]
+    assert payload["targets"] == ["media_player.office_mini"]
     paths = [p for (_, p, _) in _StubHandler.captured]
     assert any(p.endswith("/announce") for p in paths)
     assert any("/api/services/media_player/play_media" in p for p in paths)
+
+
+def test_tool_announce_restores_volume_and_playback(isolated_project):
+    _StubHandler.captured = []
+    _StubHandler.get_state = {"state": "playing",
+                              "attributes": {"volume_level": 0.4, "app_name": "Spotify"}}
+    _StubHandler.announce_duration = 1.2
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_ANNOUNCE_TEXT": "Dinner", "PX_BYPASS_SUDO": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+        _StubHandler.get_state = {"state": "idle"}
+    assert payload["status"] == "ok"
+    posts = [(p, b) for (m, p, b) in _StubHandler.captured if m == "POST"]
+    vol = [b for (p, b) in posts if p.endswith("/media_player/volume_set")]
+    play = [b for (p, b) in posts if p.endswith("/media_player/media_play")]
+    assert vol and vol[0]["volume_level"] == 0.4
+    assert not play   # media_play would replay the announcement, never issue it
+
+
+def test_tool_announce_restores_volume_on_bad_duration(isolated_project):
+    _StubHandler.captured = []
+    _StubHandler.get_state = {"state": "playing",
+                              "attributes": {"volume_level": 0.6, "app_name": "Spotify"}}
+    _StubHandler.announce_duration = "garbage"
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_ANNOUNCE_TEXT": "Dinner", "PX_BYPASS_SUDO": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+        _StubHandler.get_state = {"state": "idle"}
+        _StubHandler.announce_duration = 1.2
+    assert payload["status"] == "ok"
+    posts = [(p, b) for (m, p, b) in _StubHandler.captured if m == "POST"]
+    vol = [b for (p, b) in posts if p.endswith("/media_player/volume_set")]
+    play = [b for (p, b) in posts if p.endswith("/media_player/media_play")]
+    assert vol and vol[0]["volume_level"] == 0.6
+    assert not play
 
 
 def _run_announce_against_stub(isolated_project, text, *, private):
@@ -1209,12 +1389,39 @@ def test_tool_announce_suppressed_during_night_silence(isolated_project):
     assert payload["reason"] == "night_silence"
 
 
+def test_tool_announce_fails_fast_on_empty_relay_token(isolated_project):
+    # A forgotten `.env` (empty ANNOUNCE_RELAY_TOKEN) must be reported as a local
+    # config error, not sent to the relay to bounce as a 401 that reads like a
+    # security event in relay.log (2026-08-05 "rogue process" hunt).
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_ANNOUNCE_TEXT"] = "hello"
+    env["PX_BYPASS_SUDO"] = "1"
+    env["PX_ANNOUNCE_RELAY_URL"] = base
+    env["PX_HA_HOST"] = base
+    env["PX_HA_TOKEN"] = "t"
+    env.pop("ANNOUNCE_RELAY_TOKEN", None)   # the forgotten-.env case
+    env["PX_NIGHT_SILENCE_START_H"] = "99"   # never night — deterministic
+    env["PX_NIGHT_SILENCE_END_H"] = "0"
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+    assert payload["status"] == "error"
+    assert "ANNOUNCE_RELAY_TOKEN" in payload["error"]
+    # Nothing may reach the relay with an empty bearer.
+    assert not any(p.endswith("/announce") for (_, p, _) in _StubHandler.captured)
+
+
 def test_tool_announce_resolves_single_target_from_multiple(isolated_project):
     # Even if multiple allowed targets are requested, v1 casts to exactly one (echo).
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
     env["PX_ANNOUNCE_TEXT"] = "hi"
-    env["PX_ANNOUNCE_TARGETS"] = "media_player.nest_hub_max,media_player.nest_mini"
+    env["PX_ANNOUNCE_TARGETS"] = "media_player.nest_hub_max,media_player.office_mini"
     payload = parse_json(run_tool(["bin/tool-announce"], env))
     assert payload["status"] == "dry"
     assert len(payload["targets"]) == 1
@@ -1235,6 +1442,7 @@ def _load_tool_heredoc(name, monkeypatch, tmp_path, extra_env=None):
     pxh.claude_session so main() can run without a live Claude CLI."""
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("PX_DRY", "0")
+    monkeypatch.setenv("PROJECT_ROOT", str(_TOOLS_ROOT))
     for k, v in (extra_env or {}).items():
         monkeypatch.setenv(k, v)
 
@@ -1277,3 +1485,187 @@ def test_tool_compose_writes_note_record(tmp_path, monkeypatch, capsys):
     # and a note summary lands in notes
     note_rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
     assert note_rec.get("note", "").startswith("Composed: the wind in the eucalyptus")
+
+
+# ---------------------------------------------------------------------------
+# tool-voice: Nest speaker routing (Task 6, nest-speaker-routing plan)
+# ---------------------------------------------------------------------------
+
+def _reset_stub_defaults():
+    """Restore _StubHandler class attrs to their defaults — order-independence
+    for tests that don't otherwise touch get_state/announce_duration."""
+    _StubHandler.get_state = {"state": "idle"}
+    _StubHandler.announce_duration = 1.2
+
+
+def test_tool_voice_routes_spark_speech_to_nest(isolated_project):
+    """With a working relay stub and a routed target, tool-voice casts instead of espeak."""
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+        _reset_stub_defaults()
+    assert payload["route"] == "nest"
+    assert payload["status"] == "ok"
+    assert any("/announce" in p for (_, p, _) in _StubHandler.captured)
+
+
+def test_tool_voice_persona_spark_without_done_flag_still_routes(isolated_project):
+    """CRITICAL: 'spark' must never take the persona-rephrase wrapper detour,
+    with or without _PX_VOICE_PERSONA_DONE — that's GREMLIN/VIXEN-only. A
+    spark call missing the flag (as mind.py's weather_comment path does
+    today) must still produce a "route" key and cast via the stub, not
+    silently vanish into the wrapper (which has no "spark" rephrase prompt,
+    discards the inner payload, and can blow its own 45s timeout once the
+    inner call may route for up to 90s)."""
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1",   # deliberately NOT setting _PX_VOICE_PERSONA_DONE
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+        _reset_stub_defaults()
+    assert "route" in payload
+    assert payload["route"] == "nest"
+    assert payload["status"] == "ok"
+    assert any("/announce" in p for (_, p, _) in _StubHandler.captured)
+
+
+def test_tool_voice_falls_back_onboard_when_relay_dead(isolated_project):
+    """Route attempted + failed (dead relay) during daytime: falls back onboard.
+
+    PX_DRY=0 so the route is actually attempted against a dead port; espeak's
+    output is discarded via PX_VOICE_PLAYER=/bin/true so no audio is spawned
+    in CI (see task brief's "Note on the dry-run test" resolution).
+    """
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_PLAYER": _TRUE_BIN,
+                "PX_ANNOUNCE_RELAY_URL": "http://127.0.0.1:1",   # dead port
+                "PX_HA_HOST": "http://127.0.0.1:1",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["route"] == "onboard"
+    assert payload["status"] == "ok"
+
+
+def test_tool_voice_night_suppression_does_not_fall_back(isolated_project):
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "0", "PX_NIGHT_SILENCE_END_H": "24"})  # always night
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+        _reset_stub_defaults()
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+
+
+def test_tool_voice_gremlin_never_routes_to_nest(isolated_project):
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "1", "PX_TEXT": "hello", "PX_PERSONA": "gremlin",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1"})
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload.get("route", "onboard") == "onboard"
+
+
+def test_tool_voice_no_route_env_skips_nest(isolated_project):
+    """PX_VOICE_NO_ROUTE=1 (voice loop, urgent mind callers) goes straight onboard."""
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://{srv.server_address[0]}:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "1", "PX_TEXT": "hello", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_NO_ROUTE": "1",
+                "PX_ANNOUNCE_RELAY_URL": base, "PX_HA_HOST": base,
+                "ANNOUNCE_RELAY_TOKEN": "t", "PX_HA_TOKEN": "t",
+                "PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"})
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+        _reset_stub_defaults()
+    assert payload.get("route", "onboard") == "onboard"
+    assert not any("/announce" in p for (_, p, _) in _StubHandler.captured)
+
+
+def test_tool_voice_dead_relay_at_night_stays_silent(isolated_project):
+    """Route attempted + failed (dead relay) during night: the onboard fallback
+    must NOT sidestep the night gate that lives inside tool-announce."""
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_PLAYER": _TRUE_BIN,
+                "PX_ANNOUNCE_RELAY_URL": "http://127.0.0.1:1",   # dead port
+                "PX_HA_HOST": "http://127.0.0.1:1",
+                "PX_NIGHT_SILENCE_START_H": "0", "PX_NIGHT_SILENCE_END_H": "24"})  # always night
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+
+
+def test_tool_voice_urgent_without_no_route_falls_back_onboard_at_night(isolated_project):
+    """PX_VOICE_URGENT=1 bypasses the night-suppression fallback rule: a route
+    attempted and failed at night must fall back onboard instead of being
+    suppressed, when the caller marked the speech urgent (battery
+    warn/critical, reflection-offline). Exercises the _failed() bypass branch
+    left untested by the dead-relay-at-night test above (which asserts the
+    opposite outcome for non-urgent calls).
+
+    Note: this can't be driven through an actually-unreachable relay, because
+    tool-announce checks its own night-silence gate BEFORE contacting the
+    relay (bin/tool-announce main()) — with the shared night-bounds env
+    always-night, tool-announce would itself return an explicit "suppressed"
+    status, which tool-voice passes through unconditionally (real
+    suppression, not a failure — URGENT correctly does not override an
+    upstream tool's explicit suppression). So instead we drive the same
+    _failed() code path via speaker_router resolving no target at all: an HA
+    stub that reports every candidate speaker "unavailable" makes
+    resolve_speaker() return None, which hits _failed() directly without
+    ever invoking tool-announce.
+    """
+    _StubHandler.captured = []
+    _StubHandler.get_state = {"state": "unavailable"}
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({"PX_DRY": "0", "PX_TEXT": "hello there", "PX_PERSONA": "spark",
+                "PX_BYPASS_SUDO": "1", "_PX_VOICE_PERSONA_DONE": "1",
+                "PX_VOICE_PLAYER": _TRUE_BIN,
+                "PX_VOICE_URGENT": "1",
+                "PX_HA_HOST": base,                              # reachable, but nothing available
+                "PX_ANNOUNCE_RELAY_URL": "http://127.0.0.1:1",   # dead port — must never be contacted
+                "PX_NIGHT_SILENCE_START_H": "0", "PX_NIGHT_SILENCE_END_H": "24"})  # always night
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+        _reset_stub_defaults()
+    assert payload["route"] == "onboard"
+    assert payload["status"] == "ok"
+    assert not any("/announce" in p for (_, p, _) in _StubHandler.captured)

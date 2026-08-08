@@ -68,9 +68,17 @@ def main() -> int:
         return 1
 
     # If a persona is active, reroute through the persona voice wrapper
-    # which rephrases text via Ollama before speaking
+    # which rephrases text via Ollama before speaking. "spark" is never in
+    # the wrapper's REPHRASE_PROMPTS (it's GREMLIN/VIXEN only), so spark
+    # speech must always take the direct path below — that's where the
+    # routing/night-suppression logic lives, and a spark call that took the
+    # wrapper detour could blow the outer 45s subprocess timeout once the
+    # inner call may spend up to 90s routing (uncaught TimeoutExpired kills
+    # tool-voice with no JSON emitted), and would also discard the inner
+    # payload's route/status (a night-suppressed inner call would be
+    # reported as spoken).
     persona = os.environ.get("PX_PERSONA", "")
-    if persona and not os.environ.get("_PX_VOICE_PERSONA_DONE"):
+    if persona and persona != "spark" and not os.environ.get("_PX_VOICE_PERSONA_DONE"):
         persona_wrapper = Path(os.environ.get("PROJECT_ROOT", ".")) / "bin" / "tool-voice-persona"
         if persona_wrapper.exists():
             env = os.environ.copy()
@@ -88,11 +96,85 @@ def main() -> int:
             print(result.stdout, end="")
             return result.returncode
     
+    from pxh import spark_config
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
+
+    def _night_now() -> bool:
+        """Same env-overridable bounds as tool-announce (PX_NIGHT_SILENCE_*)."""
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+
+        def _int_env(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, default))
+            except ValueError:
+                return default
+
+        start = _int_env("PX_NIGHT_SILENCE_START_H", spark_config.NIGHT_SILENCE_START_H)
+        end = _int_env("PX_NIGHT_SILENCE_END_H", spark_config.NIGHT_SILENCE_END_H)
+        hour = _dt.datetime.now(ZoneInfo("Australia/Hobart")).hour
+        return hour >= start or hour < end
+
+    def _try_nest_route(route_text: str) -> dict | None:
+        """Route SPARK speech to a Nest via tool-announce.
+
+        Returns a payload dict when the route HANDLED the request (ok or
+        suppressed — suppression must not fall through to onboard), or None
+        to fall back to the onboard path. A failed attempt during night
+        silence returns a suppressed payload instead of None: a dead relay
+        must not sidestep the night gate (PX_VOICE_URGENT=1 bypasses).
+        """
+        if dry_mode or not spark_config.ANNOUNCE_ENABLED:
+            return None
+        if os.environ.get("PX_VOICE_NO_ROUTE") == "1":
+            return None                    # voice loop / urgent callers: straight onboard
+        if os.environ.get("PX_PERSONA", "") not in ("", "spark"):
+            return None
+
+        def _failed() -> dict | None:
+            if _night_now() and os.environ.get("PX_VOICE_URGENT") != "1":
+                return {"status": "suppressed", "route": "nest",
+                        "reason": "night_silence", "text": route_text}
+            return None                    # daytime/urgent → onboard fallback
+
+        try:
+            from pxh.speaker_router import resolve_speaker
+            target = resolve_speaker()
+            if not target:
+                return _failed()
+            announce_env = os.environ.copy()
+            announce_env["PX_ANNOUNCE_TEXT"] = route_text
+            announce_env["PX_ANNOUNCE_TARGETS"] = target
+            result = subprocess.run(
+                [str(PROJECT_ROOT / "bin" / "tool-announce")], env=announce_env,
+                capture_output=True, text=True,
+                timeout=spark_config.SPEAKER_ROUTE_TIMEOUT_S)
+            announce_payload = json.loads(result.stdout.strip().splitlines()[-1])
+        except Exception:
+            return _failed()               # relay/HA breakage
+        if announce_payload.get("status") == "ok":
+            return {"status": "ok", "route": "nest", "text": route_text,
+                    "target": (announce_payload.get("targets") or [None])[0]}
+        if announce_payload.get("status") == "suppressed":
+            return {"status": "suppressed", "route": "nest",
+                    "reason": announce_payload.get("reason", "suppressed"), "text": route_text}
+        return _failed()                   # error / dry / unknown
+
+    routed = _try_nest_route(text)
+    if routed is not None:
+        log_event("voice", routed)
+        if routed["status"] == "ok":
+            update_session(fields={"last_action": "tool_voice"},
+                           history_entry={"event": "voice", "text": text,
+                                          "route": "nest", "dry": False})
+        print(json.dumps(routed))
+        return 0
+
     payload = {
         "status": "ok",
         "dry": dry_mode,
         "text": text,
+        "route": "onboard",
     }
 
     # Network TTS routing by persona
@@ -188,7 +270,7 @@ def main() -> int:
                         payload["tts_aplay_error"] = play_res.stderr[-512:].decode("latin1", errors="ignore")
                         # Don't set status=error — fall through to espeak fallback
             except _FileLockTimeout:
-                payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
+                payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text, "route": "onboard"}
                 log_event("voice", payload)
                 print(json.dumps(payload))
                 return 1
@@ -259,12 +341,12 @@ def main() -> int:
                     if result.returncode != 0:
                         payload["status"] = "error"
         except _FileLockTimeout:
-            payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
+            payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text, "route": "onboard"}
             log_event("voice", payload)
             print(json.dumps(payload))
             return 1
         except Exception as exc:
-            payload = {"status": "error", "error": f"playback error: {exc}", "dry": dry_mode, "text": text}
+            payload = {"status": "error", "error": f"playback error: {exc}", "dry": dry_mode, "text": text, "route": "onboard"}
             log_event("voice", payload)
             print(json.dumps(payload))
             return 1
@@ -279,5 +361,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException as e:   # never raises — always emit a JSON error line
+        print(json.dumps({"status": "error", "error": f"tool-voice crashed: {e}"}))
+        raise SystemExit(0)
 PY

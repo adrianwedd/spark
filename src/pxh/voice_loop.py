@@ -44,6 +44,7 @@ ALLOWED_TOOLS = {
     "tool_describe_scene",
     "tool_frigate_events",
     "tool_wander",
+    "tool_wander_calibrate",
     "tool_timer",
     "tool_api_start",
     "tool_api_stop",
@@ -91,6 +92,7 @@ TOOL_COMMANDS = {
     "tool_describe_scene":   BIN_DIR / "tool-describe-scene",
     "tool_frigate_events":   BIN_DIR / "tool-frigate-events",
     "tool_wander":         BIN_DIR / "tool-wander",
+    "tool_wander_calibrate": BIN_DIR / "tool-wander-calibrate",
     "tool_timer":          BIN_DIR / "tool-timer",
     "tool_api_start":     BIN_DIR / "tool-api-start",
     "tool_api_stop":      BIN_DIR / "tool-api-stop",
@@ -471,10 +473,10 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
             print(f"[voice-loop] failed to read findmyhub.json: {exc}", file=sys.stderr)
 
     # Inject recent exploration observations
-    exploration_file = state_dir / "exploration.jsonl"
-    if exploration_file.exists():
+    observations_file = state_dir / "observations.jsonl"
+    if observations_file.exists():
         try:
-            lines = tail_lines(exploration_file, n=10)
+            lines = tail_lines(observations_file, n=10)
             recent_obs = []
             for line in lines:
                 try:
@@ -489,7 +491,7 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
                 context_sections.append("Recent exploration landmarks:")
                 context_sections.append(", ".join(recent_obs[-5:]))
         except Exception as exc:
-            print(f"[voice-loop] failed to read exploration.jsonl: {exc}", file=sys.stderr)
+            print(f"[voice-loop] failed to read observations.jsonl: {exc}", file=sys.stderr)
 
     context_block = "\n".join(context_sections)
 
@@ -515,6 +517,33 @@ def run_codex(command_spec: str, prompt: str, timeout: Optional[float] = None) -
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return 1, "", f"run_codex timed out after {timeout}s"
+
+
+def backend_label(command_spec: str) -> str:
+    """Name the LLM tier behind ``CODEX_CHAT_CMD`` for token accounting.
+
+    The three launchers all drive the same supervisor loop and differ only in
+    the chat command they export, so the command string is the only place the
+    tier is recorded. Without this every voice-loop call landed in the
+    ``unknown`` bucket of ``state/token_usage.json``, which mixes paid Claude
+    with free Ollama and cannot answer "what am I spending".
+
+    Labels match the tiers ``mind.call_llm`` already reports, so both writers
+    accumulate into the same ``by_backend`` keys.
+    """
+    spec = (command_spec or "").lower()
+    if "claude" in spec:
+        return "claude"
+    if "ollama" in spec:
+        # bin/codex-ollama defaults to 127.0.0.1; OLLAMA_HOST redirects it to
+        # M5. Which host answered decides whether the call was free-and-local
+        # or free-but-remote, so read the same env var the bridge reads rather
+        # than assuming the M5 tier.
+        host = os.environ.get("OLLAMA_HOST", "").lower()
+        return "ollama-m5" if "m5" in host else "ollama-local"
+    if "codex" in spec:
+        return "codex"
+    return "unknown"
 
 
 def extract_action(text: str) -> Optional[Dict[str, Any]]:
@@ -602,6 +631,10 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if len(text) > 2000:
             text = text[:2000]
         sanitized["PX_TEXT"] = text
+        # The human is standing at the robot — onboard is the right speaker
+        # anyway, and a 90s Nest route attempt would blow past the 30s
+        # watchdog stale-heartbeat SIGTERM (see PX_WATCHDOG_STALE_SECONDS).
+        sanitized["PX_VOICE_NO_ROUTE"] = "1"
     elif tool == "tool_look":
         pan  = int(clamp(_num(params.get("pan",  0), "pan"), -90, 90))
         tilt = int(clamp(_num(params.get("tilt", 0), "tilt"), -35, 65))
@@ -682,6 +715,9 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if mode == "explore":
             duration = int(clamp(_num(params.get("duration", 180), "duration"), 30, 300))
             sanitized["PX_WANDER_DURATION_S"] = str(duration)
+    elif tool == "tool_wander_calibrate":
+        if params.get("accumulate"):
+            sanitized["PX_CALIBRATE_ACCUMULATE"] = "1"
     elif tool == "tool_timer":
         seconds = int(clamp(_num(params.get("seconds", 60), "seconds"), 5, 3600))
         label   = str(params.get("label", ""))[:100]
@@ -874,6 +910,15 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
     # else: leave PX_DRY as inherited from the operator's environment
     for key, value in env_overrides.items():
         env[key] = value
+    # Everything launched via execute_tool is interactive — the human is at
+    # the robot, so onboard is the right speaker regardless of which tool
+    # this is or how it reaches tool-voice (directly, like the weather
+    # summary below, or transitively via another tool's own subprocess
+    # call). A 90s Nest route attempt here would also blow the voice-loop
+    # watchdog's 30s stale-heartbeat SIGTERM. Set unconditionally, once,
+    # after the env_overrides loop above so no per-tool override (from the
+    # model or elsewhere) can clobber it and re-enable routing by mistake.
+    env["PX_VOICE_NO_ROUTE"] = "1"
     # Inject persona voice settings if a persona is active in session
     session_persona = load_session().get("persona") or ""
     if session_persona and session_persona in PERSONA_VOICE_ENV:
@@ -961,7 +1006,7 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         if rc == 0 and stdout.strip():
             try:
                 from .token_log import log_usage
-                log_usage(prompt, stdout)
+                log_usage(prompt, stdout, backend_label(args.codex_cmd))
             except Exception:
                 print("[voice-loop] token logging failed", file=sys.stderr)
 

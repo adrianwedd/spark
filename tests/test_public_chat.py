@@ -91,3 +91,67 @@ def test_cors_preflight(client):
     )
     assert r.status_code in (200, 204)
     assert "access-control-allow-origin" in r.headers
+
+
+# --- Speaker routing: last-heard room from HA `area` hint -------------------
+
+def test_public_chat_area_writes_last_heard(client, monkeypatch, tmp_path):
+    import json as _json
+    from pxh import api as api_mod
+    monkeypatch.setattr(api_mod, "_area_trusted", lambda ip: True)
+    # in-process TestClient resolves _public_state_dir() to the live
+    # PROJECT_ROOT/state (isolated_project only sets env for subprocesses),
+    # so pin it to tmp_path or this test plants a fake routing hint in the
+    # robot's real state directory.
+    monkeypatch.setattr(api_mod, "_public_state_dir", lambda: tmp_path)
+    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+               return_value="ok"):
+        resp = client.post("/api/v1/public/chat",
+                           json={"message": "hello", "area": "Office"})
+    assert resp.status_code == 200
+    data = _json.loads((tmp_path / "last_heard.json").read_text())
+    assert data["room"] == "office"
+    assert "ts" in data
+
+
+def test_public_chat_unknown_area_writes_nothing(client, monkeypatch, tmp_path):
+    from pxh import api as api_mod
+    monkeypatch.setattr(api_mod, "_area_trusted", lambda ip: True)
+    monkeypatch.setattr(api_mod, "_public_state_dir", lambda: tmp_path)
+    lh = tmp_path / "last_heard.json"
+    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+               return_value="ok"):
+        resp = client.post("/api/v1/public/chat",
+                           json={"message": "hello", "area": "<script>garage</script>"})
+    assert resp.status_code == 200
+    assert not lh.exists()
+
+
+def test_public_chat_untrusted_ip_writes_nothing(client, monkeypatch, tmp_path):
+    # peer host "testclient" is not a private IP -> hint rejected by default
+    from pxh import api as api_mod
+    monkeypatch.setattr(api_mod, "_public_state_dir", lambda: tmp_path)
+    lh = tmp_path / "last_heard.json"
+    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+               return_value="ok"):
+        resp = client.post("/api/v1/public/chat",
+                           json={"message": "hello", "area": "Office"})
+    assert resp.status_code == 200
+    assert not lh.exists()
+
+
+def test_area_trusted_ip_classes():
+    from pxh.api import _area_trusted
+    assert _area_trusted("192.168.0.200") is True    # HA on the LAN
+    assert _area_trusted("127.0.0.1") is True        # local curl
+    assert _area_trusted("203.0.113.7") is False     # tunnel / internet
+    assert _area_trusted("testclient") is False      # not an IP at all
+
+
+def test_public_chat_without_area_still_works(client, monkeypatch, tmp_path):
+    from pxh import api as api_mod
+    monkeypatch.setattr(api_mod, "_public_state_dir", lambda: tmp_path)
+    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+               return_value="ok"):
+        resp = client.post("/api/v1/public/chat", json={"message": "hello"})
+    assert resp.status_code == 200

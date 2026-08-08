@@ -62,6 +62,18 @@ FACE_LOST_TIMEOUT    = 3.0    # seconds without face before returning to gaze dr
 # Emotional servo coordination: mood → body language
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
+# The loop ticks twice a second; coalesce successes so health reporting doesn't
+# fsync the SD card 172,800 times a day.
+HEALTH_INTERVAL_S = 60
+
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
 SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
@@ -70,6 +82,29 @@ FRIGATE_FILE = STATE_DIR / "frigate_presence.json"
 FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
 MOOD_CHECK_S = 10    # how often to read mood file
 SPARK_GREET_COOLDOWN_S = 120   # minimum seconds between SPARK proximity greetings
+
+# Greeting phrasing and its confirmation policy live in spark_config so SPARK
+# can evolve them (px-alive itself is off the evolve whitelist). spark_config
+# is stdlib-only, so it imports cleanly under the system python3 this script
+# runs on; the fallbacks keep px-alive working if src/ isn't on PYTHONPATH.
+try:
+    from pxh.spark_config import (
+        GREET_CONFIRM_CAMERAS,
+        GREET_FRIGATE_STALE_S,
+        GREET_PERSON_RECENCY_S,
+        PROXIMITY_GREETINGS,
+    )
+except Exception:  # noqa: BLE001 — deliberately broad; see below
+    # Not just ImportError. spark_config is the primary target of SPARK's own
+    # self-evolution PRs, and this daemon holds the GPIO handle — a bad edit
+    # there must degrade to stock greetings, never take the robot's servos
+    # offline. It is also imported under /usr/bin/python3, which is 3.9 on a
+    # dev Mac and 3.11 on the Pi, so a 3.10-only annotation raises TypeError
+    # at import rather than ImportError.
+    PROXIMITY_GREETINGS = ["Hey. I'm here.", "Hello there.", "Hi. Good to see you.", "Hey."]
+    GREET_CONFIRM_CAMERAS = ["picar_x", "picamera"]
+    GREET_FRIGATE_STALE_S = 120
+    GREET_PERSON_RECENCY_S = 300
 
 MOOD_BEHAVIOR = {
     "excited":       {"gaze_min": 5,  "gaze_max": 12, "tilt_bias": 10},
@@ -187,16 +222,91 @@ def read_session_persona() -> str:
 
 import subprocess as _subprocess
 
+def _person_confirmed(presence: dict | None, now_utc=None) -> bool:
+    """True when a camera that can see the robot recently detected a person.
+
+    Sonar only reports a distance, so the proximity react fires at furniture as
+    readily as at people. This is the veto that stops SPARK greeting a chair
+    leg. It deliberately does not consult the outdoor cameras: someone in the
+    driveway says nothing about what is standing in front of the robot.
+
+    Treated as a veto rather than a trigger, so a false negative costs a missed
+    greeting, not a wrong one. Two signals confirm:
+
+    1. Live: a confirm camera reports a person and the snapshot is within
+       GREET_FRIGATE_STALE_S.
+    2. Recent: cameras.*.last_person_ts (carried by px-mind across event
+       windows) is within GREET_PERSON_RECENCY_S. Covers the person who
+       approached, sat down, and aged out of Frigate's 90 s event window
+       while still there — the sonar approach supplies the "someone is here
+       now" half, the camera only vouches it's a human, not a chair leg.
+       The sighting timestamp is absolute, so it stands even when the
+       snapshot itself has gone stale.
+    """
+    if not isinstance(presence, dict):
+        return False
+    now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
+    cameras = presence.get("cameras")
+    if not isinstance(cameras, dict):
+        return False
+    ts = presence.get("ts")
+    try:
+        fresh = bool(ts) and (
+            now_utc - dt.datetime.fromisoformat(ts)
+        ).total_seconds() <= GREET_FRIGATE_STALE_S
+    except (TypeError, ValueError):
+        fresh = False
+    if fresh and any(
+        isinstance(cameras.get(cam), dict) and cameras[cam].get("person")
+        for cam in GREET_CONFIRM_CAMERAS
+    ):
+        return True
+    for cam in GREET_CONFIRM_CAMERAS:
+        info = cameras.get(cam)
+        if not isinstance(info, dict):
+            continue
+        last_seen = info.get("last_person_ts")
+        if not last_seen:
+            continue
+        try:
+            if (now_utc - dt.datetime.fromisoformat(last_seen)).total_seconds() <= GREET_PERSON_RECENCY_S:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _greet_suppress_detail(presence: dict | None, now_utc=None) -> str:
+    """One-line WHY for a suppressed greeting — snapshot age plus the last
+    person sighting per confirm camera. Today's log line ("no camera
+    confirmation") forced a manual dig through px-mind logs to tell a stale
+    snapshot from an empty room."""
+    if not isinstance(presence, dict):
+        return "no presence snapshot"
+    now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
+    bits = []
+    try:
+        age = (now_utc - dt.datetime.fromisoformat(presence["ts"])).total_seconds()
+        bits.append(f"snapshot {age:.0f}s old")
+    except (KeyError, TypeError, ValueError):
+        bits.append("snapshot ts invalid")
+    cameras = presence.get("cameras")
+    cameras = cameras if isinstance(cameras, dict) else {}
+    for cam in GREET_CONFIRM_CAMERAS:
+        info = cameras.get(cam)
+        last_seen = info.get("last_person_ts") if isinstance(info, dict) else None
+        try:
+            ago = (now_utc - dt.datetime.fromisoformat(last_seen)).total_seconds()
+            bits.append(f"{cam}: last person {ago:.0f}s ago")
+        except (TypeError, ValueError):
+            bits.append(f"{cam}: never")
+    return ", ".join(bits)
+
+
 def spark_greet(dry: bool) -> None:
     """Speak a soft SPARK proximity greeting via tool-voice."""
     import random as _random
-    greetings = [
-        "Hey. I'm here.",
-        "Hello there.",
-        "Hi. Good to see you.",
-        "Hey.",
-    ]
-    text = _random.choice(greetings)
+    text = _random.choice(PROXIMITY_GREETINGS)
     tool_voice = PROJECT_ROOT / "bin" / "tool-voice"
     env = os.environ.copy()
     env["PX_TEXT"] = text
@@ -204,6 +314,10 @@ def spark_greet(dry: bool) -> None:
     env["PX_VOICE_VARIANT"] = "en+m3"
     env["PX_VOICE_PITCH"] = "58"
     env["PX_VOICE_RATE"] = "120"
+    # Onboard only: routing would spawn tool-announce, whose yield_alive
+    # SIGUSR1-kills px-alive (its own grandparent) mid-greeting, and the
+    # 8s timeout below would kill the route before any speech anyway.
+    env["PX_VOICE_NO_ROUTE"] = "1"
     if dry:
         env["PX_DRY"] = "1"
     try:
@@ -284,14 +398,19 @@ def do_ease(from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration: 
 I2C_BACKOFF_S = 30     # seconds to wait after an I2C failure before retrying
 
 
+_face_detection_started = False   # camera_close() on a never-started camera re-raises the init error
+
+
 def start_face_detection(retries: int = 2) -> bool:
     """Start Vilib camera + face detection. Returns True if successful."""
+    global _face_detection_started
     for attempt in range(retries + 1):
         try:
             from vilib import Vilib
             Vilib.camera_start(vflip=False, hflip=False)
             Vilib.face_detect_switch(True)
             log("face detection started (Vilib)")
+            _face_detection_started = True
             return True
         except Exception as exc:
             log(f"face detection attempt {attempt+1} failed: {exc}")
@@ -308,12 +427,19 @@ def start_face_detection(retries: int = 2) -> bool:
 
 
 def stop_face_detection() -> None:
-    """Stop Vilib camera."""
+    """Stop Vilib camera. No-op when the camera never started (e.g. held by
+    px-frigate-stream's rpicam-vid) — closing then would re-raise the init
+    error and delay the SIGUSR1 GPIO yield."""
+    global _face_detection_started
+    if not _face_detection_started:
+        return
     try:
         from vilib import Vilib
         Vilib.camera_close()
     except Exception as exc:
         log(f"stop_face_detection cleanup failed: {exc}")
+    finally:
+        _face_detection_started = False
 
 
 def get_face() -> tuple[int, int] | None:
@@ -363,7 +489,10 @@ def idle_loop(args) -> None:
     prox_last_react: float = 0.0     # monotonic time of last proximity react (cooldown guard)
     spark_last_greet: float = 0.0    # monotonic time of last SPARK greeting
     i2c_ok_after: float = 0.0  # monotonic time after which I2C retries are allowed
-    face_tracking = not args.no_face
+    # Opt-in since px-frigate-stream holds the camera permanently: the old
+    # default-on start burned ~10s of retries and logged failures on every
+    # boot for a capability that cannot work while Frigate streams.
+    face_tracking = args.face and not args.no_face
     face_active = False
     face_last_seen: float = 0.0  # monotonic time of last face detection
 
@@ -499,11 +628,16 @@ def idle_loop(args) -> None:
                             prox_near_since = None
                             prox_last_react = now
                             next_gaze = now + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
-                            # SPARK greeting — speak only when SPARK persona active + cooldown ok
+                            # SPARK greeting — SPARK persona + cooldown + a camera
+                            # that can see the robot actually saw a person. Head
+                            # movement above stays unconditional; only speech is gated.
                             if (read_session_persona() == "spark"
                                     and now - spark_last_greet >= SPARK_GREET_COOLDOWN_S):
-                                spark_greet(args.dry_run)
-                                spark_last_greet = now
+                                if _person_confirmed(_fp):
+                                    spark_greet(args.dry_run)
+                                    spark_last_greet = now
+                                else:
+                                    log(f"greet suppressed: no camera confirmation of a person ({_greet_suppress_detail(_fp)})")
                     else:
                         prox_near_since = None
                     prox_was_close = is_close
@@ -587,11 +721,14 @@ def idle_loop(args) -> None:
 
             except OSError as exc:
                 log(f"I2C error (will retry in {I2C_BACKOFF_S}s): {exc}")
+                _health.record_failure("px-alive", f"I2C error: {exc}")
                 drop_px(force_reset_on_reacquire=True)  # hard reset MCU on next get_px()
                 i2c_ok_after = time.monotonic() + I2C_BACKOFF_S
                 next_gaze = i2c_ok_after + random.uniform(cur_mood_behavior.get("gaze_min", GAZE_MIN_S), cur_mood_behavior.get("gaze_max", GAZE_MAX_S))
                 next_scan = i2c_ok_after + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
                 next_prox = i2c_ok_after + PROX_CHECK_S
+            else:
+                _health.record_success("px-alive", min_interval_s=HEALTH_INTERVAL_S)
 
             time.sleep(0.5)
     finally:
@@ -611,8 +748,11 @@ def main(argv) -> int:
                         help="Proximity threshold in cm to trigger reaction")
     parser.add_argument("--no-prox",    action="store_true",
                         help="Disable proximity sensing")
+    parser.add_argument("--face",       action="store_true",
+                        help="Enable Vilib face tracking (needs exclusive camera — "
+                             "stop px-frigate-stream first, it holds it permanently)")
     parser.add_argument("--no-face",    action="store_true",
-                        help="Disable camera face tracking")
+                        help="Deprecated no-op: face tracking is opt-in via --face")
     parser.add_argument("--dry-run",    action="store_true",
                         help="Log planned actions without moving servos")
     args = parser.parse_args(argv)
@@ -699,8 +839,7 @@ def main(argv) -> int:
         log(f"fatal: {exc}")
         return 1
     finally:
-        if not args.no_face:
-            stop_face_detection()
+        stop_face_detection()  # no-op unless the camera actually started
         _safe_unlink_pid()
         log("stopped")
     return 0

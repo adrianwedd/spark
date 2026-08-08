@@ -16,6 +16,24 @@ from robot_hat.utils import get_battery_voltage
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 BIN_DIR      = PROJECT_ROOT / "bin"
+
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
+try:
+    from pxh.battery_trend import ChargeDetector
+except ImportError:                                   # pxh not on PYTHONPATH
+    class ChargeDetector:                             # conservative shim
+        # Reporting "not charging" is the safe direction: it can cost a
+        # needless shutdown while plugged in, never a suppressed one.
+        charging = False
+
+        def update(self, volts: float) -> bool:
+            return False
 OUT          = STATE_DIR / "battery.json"
 TMP          = STATE_DIR / "battery.tmp"
 
@@ -40,10 +58,8 @@ def _write_battery(data: dict) -> None:
 DEVICE       = os.environ.get("PX_VOICE_DEVICE", "")
 POLL_S       = 30         # check every 30s (was 60s — faster detection)
 
-# Voltage must rise by this much per poll to count as "charging"
-CHARGE_RISE_V   = 0.05    # V/poll rise to count as charging evidence
-CHARGE_FALL_V   = 0.03    # V/poll drop to count as discharging evidence
-CHARGE_CONFIRM  = 2       # consecutive confirming readings required before transition
+# Charge detection lives in pxh.battery_trend: per-poll deltas sit below the
+# ADC's own noise floor, so the trend is measured across a 6-sample window.
 
 
 VOLTAGE_FLOOR = 5.0  # 2S LiPo min is ~6.0V; anything below 5V is I2C glitch
@@ -102,6 +118,11 @@ def speak(text: str) -> None:
     """Speak text via tool-voice (handles speaker enable + persona voice)."""
     env = os.environ.copy()
     env["PX_TEXT"] = text
+    # Battery state changes are urgent onboard alerts: never route to a Nest
+    # (routing would be killed by the 20s timeout before any speech), and
+    # bypass night silence so plug/unplug is still heard overnight.
+    env["PX_VOICE_NO_ROUTE"] = "1"
+    env["PX_VOICE_URGENT"] = "1"
     try:
         subprocess.run([str(BIN_DIR / "tool-voice")], env=env,
                        capture_output=True, check=False, timeout=20)
@@ -124,10 +145,8 @@ def on_unplug(pct: int) -> None:
 
 
 # ── Main polling loop ────────────────────────────────────────────────
-prev_volts: float | None = None
 was_charging: bool = False
-# How many consecutive readings confirm current trend
-charge_streak: int = 0
+detector = ChargeDetector()
 warmup_remaining: int = 2  # skip first N readings for ADC to settle after restart
 
 while True:
@@ -138,6 +157,10 @@ while True:
         # entirely so we don't write a bogus 0% that triggers emergency shutdown.
         if volts < VOLTAGE_FLOOR:
             print(f"[battery-poll] ADC glitch: {volts}V < {VOLTAGE_FLOOR}V floor — skipping", file=sys.stderr)
+            # One glitch is noise; three in a row is a dead ADC. The streak in
+            # health.json is what tells them apart.
+            _health.record_failure("px-battery-poll",
+                                   f"ADC glitch: {volts}V below {VOLTAGE_FLOOR}V floor")
             time.sleep(POLL_S)
             continue
         pct   = volts_to_pct(volts)
@@ -146,44 +169,30 @@ while True:
         # Warmup: skip first readings (ADC noise on cold start causes false transitions)
         if warmup_remaining > 0:
             warmup_remaining -= 1
-            prev_volts = volts
             # Still write state (with charging=False) so file stays fresh
             data = {"ts": ts, "volts": volts, "pct": pct, "charging": False}
             _write_battery(data)
             time.sleep(POLL_S)
             continue
 
-        # Detect charging state
-        charging = was_charging  # default: maintain previous state
-        if prev_volts is not None:
-            delta = volts - prev_volts
-            if delta >= CHARGE_RISE_V:
-                charge_streak = min(charge_streak + 1, 5)
-            elif delta <= -CHARGE_FALL_V:
-                charge_streak = max(charge_streak - 1, -5)
-            # else: noise — don't move streak
-
-            # Require CHARGE_CONFIRM consecutive readings before triggering
-            now_charging = charge_streak >= CHARGE_CONFIRM
-
-            if now_charging and not was_charging:
-                charging = True
-                on_plug_in(pct)
-            elif charge_streak <= -CHARGE_CONFIRM and was_charging:
-                charging = False
-                on_unplug(pct)
-            else:
-                charging = now_charging
+        # Detect charging state from the windowed trend
+        charging = detector.update(volts)
+        if charging and not was_charging:
+            on_plug_in(pct)
+        elif was_charging and not charging:
+            on_unplug(pct)
 
         was_charging = charging
-        prev_volts = volts
 
         # Write state atomically
         data = {"ts": ts, "volts": volts, "pct": pct, "charging": charging}
         _write_battery(data)
+        _health.record_success("px-battery-poll", detail={"volts": volts, "pct": pct,
+                                                          "charging": charging})
 
     except Exception as exc:
         print(f"[battery-poll] error: {exc}", file=sys.stderr)
+        _health.record_failure("px-battery-poll", str(exc))
 
     time.sleep(POLL_S)
 PY

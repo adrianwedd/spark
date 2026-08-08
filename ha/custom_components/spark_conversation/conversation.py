@@ -7,7 +7,7 @@ import aiohttp
 from homeassistant.components.conversation import ConversationEntity, ConversationInput, ConversationResult
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr, intent
+from homeassistant.helpers import area_registry as ar, device_registry as dr, intent
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
@@ -48,11 +48,22 @@ class SparkConversationEntity(ConversationEntity):
     async def async_process(self, user_input: ConversationInput) -> ConversationResult:
         intent_response = intent.IntentResponse(language=user_input.language)
 
+        area_name = None
+        try:
+            if user_input.device_id:
+                device = dr.async_get(self.hass).async_get(user_input.device_id)
+                if device and device.area_id:
+                    area = ar.async_get(self.hass).async_get_area(device.area_id)
+                    if area:
+                        area_name = area.name
+        except Exception:
+            _LOGGER.debug("area resolution failed", exc_info=True)
+
         try:
             session = async_get_clientsession(self.hass)
             async with session.post(
                 f"{self._url}/api/v1/public/chat",
-                json={"message": user_input.text, "conversation_id": user_input.conversation_id},
+                json={"message": user_input.text, "conversation_id": user_input.conversation_id, "area": area_name},
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()

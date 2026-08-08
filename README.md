@@ -485,7 +485,7 @@ Every tool emits a single JSON object to stdout, supports `PX_DRY=1`, and handle
 | `tool-weather` | Bureau of Meteorology observation (HTTPS with FTP fallback) | `PX_WEATHER_STATION` |
 | `tool-photograph` | Capture still photo via rpicam-still | — |
 | `tool-face` | Sonar sweep, then point camera at closest object | — |
-| `tool-describe-scene` | Photograph + Claude vision + speak description | — |
+| `tool-describe-scene` | Photograph + Claude vision + speak description. When hardware work runs as root, only the Claude subprocess crosses back to the authenticated `pi` account. | `PX_VISION_USER` (default `pi`) |
 
 ### Motion (Gated by `confirm_motion_allowed`)
 
@@ -494,7 +494,7 @@ Every tool emits a single JSON object to stdout, supports `PX_DRY=1`, and handle
 | `tool-drive` | Drive forward/backward with steering | `PX_DIRECTION`, `PX_SPEED` (0-60), `PX_DURATION` (0.1-10s), `PX_STEER` (-35..35) |
 | `tool-circle` | Clockwise circle in pulses | `PX_SPEED`, `PX_DURATION` |
 | `tool-figure8` | Two-leg figure-eight pattern | `PX_SPEED`, `PX_DURATION`, `PX_REST` |
-| `tool-wander` | Smart obstacle-avoiding wander: sonar sweep picks best direction, speaks while navigating | `PX_WANDER_STEPS` (1-20), `PX_WANDER_QUIET` |
+| `tool-wander` | Cliff-guarded obstacle avoidance/exploration with probe turns, Frigate observations, and vision | `PX_WANDER_STEPS` (1-20), `PX_WANDER_MODE`, `PX_WANDER_DURATION_S`, `PX_WANDER_QUIET` |
 | `tool-stop` | Immediate halt, reset steering to neutral | — |
 
 ### Expression

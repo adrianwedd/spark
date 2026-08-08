@@ -105,6 +105,91 @@ def test_append_trims_to_limit(monkeypatch):
     assert loaded[0]["text"] == "m2" and loaded[-1]["text"] == "m6"
 
 
+# --- dedupe window ---------------------------------------------------------
+
+def test_dedupe_suppresses_a_memory_older_than_the_old_window():
+    """A memory SPARK already holds must never be re-learned, however old.
+
+    The window was 14 days, so anything older stopped counting as existing and
+    the same memory could be written again every fortnight — SPARK
+    rediscovering the same fact forever, and each copy diluting retrieval.
+    """
+    existing = [_mem("Obi and I built a lego tower", ts="2024-01-01T00:00:00Z")]
+    fresh = memory._dedupe(
+        [{"text": "Obi and I built a lego tower", "tags": [], "importance": 0.5}],
+        existing)
+    assert fresh == [], "an old duplicate must still be suppressed"
+
+
+def test_dedupe_still_admits_a_genuinely_new_memory():
+    """Unbounding must not turn into suppressing everything."""
+    existing = [_mem("Obi and I built a lego tower", ts="2024-01-01T00:00:00Z")]
+    fresh = memory._dedupe(
+        [{"text": "the north wind rattled the studio window", "tags": [],
+          "importance": 0.5}],
+        existing)
+    assert len(fresh) == 1
+
+
+def test_dedupe_considers_memories_with_unparseable_timestamps():
+    """A bad ts used to drop the memory from the comparison set entirely.
+
+    Under the windowed version an unparseable ts hit `except: continue`, so a
+    single corrupt line let its own duplicate straight back in.
+    """
+    existing = [{"ts": "not-a-timestamp", "text": "Obi and I built a lego tower"}]
+    fresh = memory._dedupe(
+        [{"text": "Obi and I built a lego tower", "tags": [], "importance": 0.5}],
+        existing)
+    assert fresh == [], "a corrupt ts must not defeat dedup"
+
+
+def test_dedupe_null_text_in_store_is_ignored():
+    """A stored `"text": null` must not become the string "none".
+
+    Stringifying it would let it dedup against any candidate mentioning the
+    word, and the pre-unbounding code raised AttributeError on it — swallowed
+    by consolidate()'s never-raises wrapper, so one bad line silently killed
+    the whole night's consolidation.
+    """
+    existing = [{"ts": "2026-07-10T12:00:00Z", "text": None}]
+    fresh = memory._dedupe(
+        [{"text": "none of the lights were on", "tags": [], "importance": 0.5}],
+        existing)
+    assert len(fresh) == 1
+
+
+def test_dedupe_over_a_clustered_store_stays_bounded():
+    """Cost on the realistic worst case: no candidate matches, so nothing breaks
+    early and every pair is scanned.
+
+    Memories cluster on recurring subjects, so the candidates here share the
+    store's vocabulary and length — the case where the character-frequency
+    prefilter is least able to help. An earlier version of this test used
+    maximally diverse filler, which let quick_ratio() short-circuit and gave
+    false confidence.
+
+    Uses a reduced store to keep the suite fast. Measured on the Pi 4 at the
+    real MEMORIES_LIMIT of 5000, with SPARK's actual memories: 17.3s for this
+    no-match scan, 0.06s when a candidate matches early. The bound below is
+    deliberately loose — it exists to catch a return to the unfiltered
+    quadratic pass, not to police a few hundred milliseconds.
+    """
+    import time
+    subjects = ["Obi and I built a lego tower on the kitchen floor after school",
+                "the southerly rattled the studio window most of the afternoon",
+                "Adrian re-seated the servo cable on the workshop bench again"]
+    existing = [_mem(f"{subjects[i % 3]} — recollection {i}", ts="2026-07-01T00:00:00Z")
+                for i in range(500)]
+    candidates = [{"text": f"{subjects[i % 3]} but the light was different that day",
+                   "tags": [], "importance": 0.5} for i in range(8)]
+    t0 = time.monotonic()
+    fresh = memory._dedupe(candidates, existing)
+    elapsed = time.monotonic() - t0
+    assert len(fresh) >= 1, "clustered but distinct candidates must not all collapse"
+    assert elapsed < 20.0, f"dedupe over a clustered store took {elapsed:.1f}s"
+
+
 # --- consolidation ---------------------------------------------------------
 from unittest.mock import MagicMock, patch
 
