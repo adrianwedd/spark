@@ -85,6 +85,31 @@ def test_retrieve_empty_store_returns_empty():
     assert memory.retrieve_memories("anything") == []
 
 
+def test_retrieve_zero_topical_match_returns_recent_memories():
+    memory.append_memories([
+        _mem("alpha bravo charlie", ts="2026-07-01T00:00:00Z"),
+        _mem("delta echo foxtrot", ts="2026-07-10T00:00:00Z"),
+    ])
+
+    out = memory.retrieve_memories("unrelated xylophone quartz", n=2, now=NOW)
+
+    assert [m["text"] for m in out] == [
+        "delta echo foxtrot",
+        "alpha bravo charlie",
+    ]
+
+
+def test_importance_does_not_affect_retrieval_ranking():
+    memory.append_memories([
+        _mem("obi played lego", importance=1.0),
+        _mem("obi played lego", importance=0.0),
+    ])
+
+    out = memory.retrieve_memories("obi lego", n=2, now=NOW)
+
+    assert [m["importance"] for m in out] == [0.0, 1.0]
+
+
 def test_zero_overlap_scores_zero_despite_recency():
     fresh = _mem("xylophone quartz", ts="2026-07-11T11:00:00Z")
     assert memory.score_memory(fresh, memory._tokenize("lego tower"), now=NOW) == 0.0
@@ -143,7 +168,10 @@ def test_consolidate_skips_on_too_few_thoughts():
 
 def test_consolidate_success_writes_deduped_memories():
     _write_thoughts(None, n=8)
-    memory.append_memories([_mem("Obi and I built a lego tower on the kitchen floor")])
+    recent_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    memory.append_memories([
+        _mem("Obi and I built a lego tower on the kitchen floor", ts=recent_ts)
+    ])
     payload = [
         {"text": "Obi and I built a lego tower on the kitchen floor", "tags": ["obi"],
          "importance": 0.8},                          # dup of existing → dropped
@@ -157,6 +185,28 @@ def test_consolidate_success_writes_deduped_memories():
     texts = [m["text"] for m in memory.load_memories()]
     assert any("rewired my memory" in t for t in texts)
     assert sum("lego tower" in t for t in texts) == 1  # no duplicate
+
+
+def test_consolidation_keeps_only_coarse_source_not_evidence_metadata():
+    _write_thoughts(None, n=8)
+    payload = [{
+        "text": "I decided the hallway was empty",
+        "tags": ["hallway"],
+        "importance": 0.7,
+        "kind": "inference",
+        "evidence_refs": ["thought-123"],
+        "confidence": 0.2,
+    }]
+
+    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+        result = memory.consolidate()
+
+    assert result["status"] == "ok"
+    record = memory.load_memories()[0]
+    assert record["source"] == "consolidation"
+    assert "kind" not in record
+    assert "evidence_refs" not in record
+    assert "confidence" not in record
 
 
 def test_consolidate_budget_exhausted_is_failed_not_raised():
