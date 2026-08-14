@@ -22,6 +22,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.race import safe_grayscale
 from pxh.utils import clamp
 
@@ -55,10 +56,8 @@ BIN_DIR    = PROJECT_ROOT / "bin"
 
 CLIFF_MARGIN          = 0.65
 CALIBRATION_STALE_S   = 30 * 24 * 3600
-# px-alive treats exploring.json as stale once its mtime is >60s old, so any
-# live run longer than that must refresh the file or px-alive will retake
-# GPIO mid-drive (same contract px-wake-listen satisfies with its own
-# 20s refresher thread).
+# Keep the published exploration state current for observers and timeout
+# cleanup. GPIO exclusion itself is owned separately by gpio_lease.json.
 EXPLORING_REFRESH_S   = 20.0
 GRAYSCALE_SETTLE_S    = 3.0
 GRAYSCALE_POLL_S      = 0.05
@@ -294,10 +293,9 @@ def _write_exploring_state(active: bool, pid: int | None = None,
 class _ExploringRefresher(threading.Thread):
     """Rewrite exploring.json every EXPLORING_REFRESH_S while a run is live.
 
-    px-alive ignores the guard file once its mtime exceeds 60s, so a single
-    write at run start only protects the first minute of a 180-300s explore
-    (or a slow avoid run). This thread keeps the mtime fresh; the owner stops
-    it in the finally block before clearing the file.
+    Observers use this state to identify and stop an orphaned wander process.
+    The owner stops this refresher before clearing the state in its finally
+    block so an in-flight write cannot resurrect active exploration.
     """
 
     def __init__(self, pid: int, started: str):
@@ -990,17 +988,24 @@ def main(argv: list[str]) -> int:
 
     px = None
     refresher = None
+    gpio_guard = None
 
     if not dry:
-        # Establish the GPIO guard BEFORE constructing Picarx: yield_alive
+        # Establish hardware ownership BEFORE constructing Picarx: yield_alive
         # already killed px-alive in the launcher, systemd relaunches it 15s
-        # later, and Picarx() + the ADC settle wait below eat several seconds
-        # of that window. Applies to both modes — avoid runs can outlive the
-        # 15s RestartSec too. The refresher keeps the mtime <60s for the
-        # whole run so px-alive's staleness rule never disarms the guard.
+        # later. The lease is distinct from exploration state and can only be
+        # refreshed or released by this generation's token.
+        gpio_guard = GpioLeaseGuard(GpioLeaseStore(STATE_DIR), "wander")
+        if not gpio_guard.acquire():
+            log("abort: GPIO is leased by another live owner")
+            print(json.dumps({"status": "error", "error": "GPIO already leased"}))
+            return 1
+        os.environ["PX_GPIO_LEASE_ID"] = gpio_guard.lease.lease_id
         started_iso = dt.datetime.now(dt.timezone.utc).isoformat()
         if not _write_exploring_state(True, pid=os.getpid(), started=started_iso):
-            log("abort: cannot write exploring.json — px-alive coordination broken")
+            gpio_guard.release()
+            os.environ.pop("PX_GPIO_LEASE_ID", None)
+            log("abort: cannot publish exploration state")
             print(json.dumps({"status": "error", "error": "exploring.json write failed"}))
             return 1
         refresher = _ExploringRefresher(os.getpid(), started_iso)
@@ -1014,6 +1019,11 @@ def main(argv: list[str]) -> int:
         except Exception as exc:
             log(f"picarx import error: {exc}")
             print(json.dumps({"status": "error", "error": str(exc)}))
+            refresher.stop()
+            refresher.join(timeout=2)
+            _write_exploring_state(False)
+            gpio_guard.release()
+            os.environ.pop("PX_GPIO_LEASE_ID", None)
             return 1
 
         # The ADC returns a power-on latch for ~0.75s after Picarx(). That latch
@@ -1026,6 +1036,11 @@ def main(argv: list[str]) -> int:
             log("explore abort: grayscale ADC not live — refusing to move")
             print(json.dumps({"status": "blocked",
                 "reason": "grayscale sensor not live — cannot guard against cliffs"}))
+            refresher.stop()
+            refresher.join(timeout=2)
+            _write_exploring_state(False)
+            gpio_guard.release()
+            os.environ.pop("PX_GPIO_LEASE_ID", None)
             return 2
 
     guard = CliffGuard([0, 0, 0] if dry else cal["cliff_ref"])
@@ -1092,8 +1107,7 @@ def main(argv: list[str]) -> int:
             signal.signal(signal.SIGTERM, _handle_sigterm)
             explore_id = f"e-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
             start_time = time.time()
-            # exploring.json guard + refresher already established above
-            # (before Picarx construction) for all live runs.
+            # Exploration state + GPIO lease are already established above.
 
             if not dry:
                 # Dry runs must not consume the real 20-min explore cooldown
@@ -1323,6 +1337,9 @@ def main(argv: list[str]) -> int:
             refresher.join(timeout=2)
         if not dry:
             _write_exploring_state(False)
+            if gpio_guard is not None:
+                gpio_guard.release()
+                os.environ.pop("PX_GPIO_LEASE_ID", None)
         if px is not None:
             try:
                 px.stop()

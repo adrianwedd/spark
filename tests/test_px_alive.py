@@ -1,6 +1,10 @@
 """Tests for px-alive idle-alive daemon (dry-run only — no GPIO)."""
+import json
+import os
 import subprocess
 from pathlib import Path
+
+from pxh.gpio_lease import GpioLeaseStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -79,3 +83,38 @@ def test_px_alive_no_prox_flag(isolated_project):
 
     result = run_alive(["--no-prox"], env)
     assert result.returncode == 0
+
+
+def test_non_exploration_process_cannot_strand_alive_via_exploring_state(isolated_project):
+    """Regression for #176: a live unrelated PID in exploring.json is state,
+    not a GPIO lease, and must not suppress px-alive startup."""
+    env = isolated_project["env"].copy()
+    state_dir = isolated_project["state_dir"]
+    log_dir = isolated_project["log_dir"]
+    env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
+    env["PX_ALIVE_PID"] = str(log_dir / "px-alive.pid")
+    (state_dir / "exploring.json").write_text(json.dumps({
+        "active": True, "pid": os.getpid(), "started": "2026-08-14T00:00:00Z",
+    }))
+
+    result = run_alive([], env)
+
+    assert result.returncode == 0
+    assert "dry gaze" in (log_dir / "px-alive.log").read_text()
+
+
+def test_live_gpio_lease_suppresses_alive_startup(isolated_project):
+    env = isolated_project["env"].copy()
+    state_dir = isolated_project["state_dir"]
+    log_dir = isolated_project["log_dir"]
+    env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
+    env["PX_ALIVE_PID"] = str(log_dir / "px-alive.pid")
+    lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
+    assert lease is not None
+
+    result = run_alive([], env)
+
+    assert result.returncode == 0
+    content = (log_dir / "px-alive.log").read_text()
+    assert "GPIO lease active" in content
+    assert "dry gaze" not in content

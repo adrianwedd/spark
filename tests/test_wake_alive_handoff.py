@@ -16,9 +16,8 @@ sudoers grants pi NOPASSWD on start/stop/restart of px-alive specifically, so
 delegating to systemd is both the supported and the already-established path.
 
 Killing px-alive by pid arms Restart=always: systemd retries every 15s for the
-whole voice turn. The exploring.json guard (same contract as px-wander and
-tool-announce) makes each retry exit cleanly instead of retaking GPIO mid-turn,
-and a refresher thread keeps the file inside px-alive's 60s staleness window.
+whole voice turn. A tokenized GPIO lease makes each retry exit cleanly instead
+of retaking GPIO mid-turn; the shared guard refreshes that lease while owned.
 
 bin/px-wake-listen runs its Python as a heredoc and cannot be imported, so these
 assert against the source text.
@@ -97,35 +96,26 @@ def test_stop_alive_still_signals_by_pid():
     )
 
 
-def test_stop_alive_raises_exploring_guard():
-    """The pid-kill arms a 15s systemd respawn; exploring.json is what stops
-    that respawn retaking GPIO mid-turn (px-alive exits cleanly while the file
-    is fresh — same contract px-wander and tool-announce rely on)."""
+def test_stop_alive_acquires_gpio_lease():
+    """The lease must be owned before the pid-kill arms systemd respawn."""
     src = SCRIPT.read_text()
     start = src.index("def _stop_alive(")
     body = src[start : src.index("def _restart_alive(")]
-    assert "_set_exploring(True)" in body, (
-        "_stop_alive must write exploring.json before yielding GPIO, or the "
+    assert "_gpio_guard.acquire()" in body, (
+        "_stop_alive must acquire the GPIO lease before yielding GPIO, or the "
         "systemd auto-restart retakes it ~15s into the voice turn."
     )
 
 
-def test_restart_alive_clears_exploring_guard(restart_alive_body):
+def test_restart_alive_releases_gpio_lease(restart_alive_body):
     """The guard must drop before systemd is asked to start px-alive, or the
     fresh instance reads it and exits cleanly — recreating the outage."""
-    assert "_set_exploring(False)" in restart_alive_body
+    assert "_gpio_guard.release()" in restart_alive_body
 
 
-def test_exploring_refresh_beats_staleness_window():
-    """px-alive ignores exploring.json older than 60s. A single voice turn can
-    block >60s (Claude CLI cold start alone is 15–80s), so a refresher must
-    rewrite the file on an interval well inside that window."""
+def test_voice_uses_shared_tokenized_gpio_guard():
+    """Lease refresh/release semantics live in the behavior-tested shared guard."""
     src = SCRIPT.read_text()
-    m = re.search(r"_EXPLORING_REFRESH_S\s*=\s*(\d+)", src)
-    assert m, "px-wake-listen must define _EXPLORING_REFRESH_S"
-    assert int(m.group(1)) <= 30, (
-        "refresh interval must sit well inside px-alive's 60s staleness window"
-    )
-    assert "_exploring_stop.wait(_EXPLORING_REFRESH_S)" in src, (
-        "a refresher thread must re-write exploring.json while the turn runs"
-    )
+    assert "GpioLeaseGuard" in src
+    assert '"voice"' in src
+    assert "exploring.json" not in src

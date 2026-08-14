@@ -51,6 +51,7 @@ from pxh.mic_stream import (                          # noqa: E402
     ArecordStream as _ArecordStream,
     resolve_arecord_device as _resolve_arecord_device,
 )
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore  # noqa: E402
 
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
@@ -698,60 +699,9 @@ def transcribe_sensevoice(sv, audio_bytes: bytes) -> str:
     return text
 
 
-# px-alive treats exploring.json as stale once its mtime is >60s old, and a
-# single voice turn can block far longer than that (the Claude CLI alone is
-# routinely 15-80s), so a refresher thread re-writes the file while a turn runs.
-_EXPLORING_REFRESH_S = 20
-_exploring_stop = threading.Event()
-_exploring_thread: threading.Thread | None = None
-
-
-def _set_exploring(active: bool) -> None:
-    """Write state/exploring.json so a systemd-respawned px-alive yields GPIO.
-
-    _stop_alive kills px-alive by pid, which leaves the unit's Restart=always
-    armed: systemd retries every 15s for the whole voice turn. Each retry reads
-    this file and exits cleanly while it is fresh; without it, the respawn
-    retakes GPIO mid-turn. Same contract as px-wander and tool-announce.
-    """
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        data: dict = {"active": active}
-        if active:
-            data["pid"] = os.getpid()
-            data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp, str(STATE_DIR / "exploring.json"))
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
-        log(f"_set_exploring: {exc}")
-
-
-def _start_exploring_refresh() -> None:
-    global _exploring_thread
-    _exploring_stop.clear()
-
-    def _refresh() -> None:
-        while not _exploring_stop.wait(_EXPLORING_REFRESH_S):
-            _set_exploring(True)
-
-    _exploring_thread = threading.Thread(
-        target=_refresh, daemon=True, name="exploring-refresh")
-    _exploring_thread.start()
-
-
-def _stop_exploring_refresh() -> None:
-    _exploring_stop.set()
-    if _exploring_thread is not None:
-        _exploring_thread.join(timeout=2)
+# Voice turns reserve GPIO; they are not exploration. The token prevents this
+# process from refreshing or clearing a newer owner's claim.
+_gpio_guard = GpioLeaseGuard(GpioLeaseStore(STATE_DIR), "voice")
 
 
 def _alive_pid() -> int | None:
@@ -771,13 +721,14 @@ def _stop_alive() -> int | None:
     Deliberately a pid-kill, not an explicit systemd stop: stopping the unit
     administratively disarms Restart=always, so if this process died mid-turn
     px-alive would stay down forever. The kill keeps the auto-restart armed as a dead-man's
-    switch, and the exploring.json guard makes its ~15s retries exit cleanly
-    instead of retaking GPIO. The guard goes up before the pid lookup so it
+    switch, and the GPIO lease makes its ~15s retries exit cleanly instead of
+    retaking GPIO. The lease goes up before the pid lookup so it
     also covers the window where px-alive is between respawns (no live pid,
     but a restart timer already ticking).
     """
-    _set_exploring(True)
-    _start_exploring_refresh()
+    if not _gpio_guard.acquire():
+        log("_stop_alive: GPIO already leased by another live owner")
+        return None
     pid = _alive_pid()
     if pid:
         log(f"pausing px-alive (pid={pid}) for voice turn")
@@ -811,8 +762,7 @@ def _restart_alive(had_alive: int | None = 1) -> None:
     wasn't running at turn start) so the exploring guard always comes down;
     the systemctl call itself is skipped when there was nothing to hand back.
     """
-    _stop_exploring_refresh()
-    _set_exploring(False)
+    _gpio_guard.release()
     if not had_alive:
         return
     log("restarting px-alive")

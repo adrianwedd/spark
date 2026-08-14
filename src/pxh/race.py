@@ -11,6 +11,7 @@ import signal
 import time
 from pathlib import Path
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.utils import clamp
 from pxh.time import utc_timestamp
 
@@ -334,6 +335,7 @@ class RaceController:
         self.profile: TrackProfile | None = None
         self.calibration: dict = {}
         self._stop_flag = False
+        self._gpio_guard: GpioLeaseGuard | None = None
 
         # Battery cache
         self._battery_cache: dict | None = None
@@ -415,12 +417,18 @@ class RaceController:
             return None
 
     def _set_exploring(self, active: bool) -> None:
-        from pxh.state import atomic_write
-        path = self.state_dir / "exploring.json"
-        try:
-            atomic_write(path, json.dumps({"active": active, "pid": os.getpid()}))
-        except Exception:
-            pass
+        """Compatibility name: racing owns GPIO, not exploration state."""
+        if self.dry:
+            return
+        if active:
+            if self._gpio_guard is None:
+                guard = GpioLeaseGuard(GpioLeaseStore(self.state_dir), "race")
+                if not guard.acquire():
+                    raise RuntimeError("GPIO already leased by another live owner")
+                self._gpio_guard = guard
+        elif self._gpio_guard is not None:
+            self._gpio_guard.release()
+            self._gpio_guard = None
 
     def _append_race_log(self, entry: dict) -> None:
         path = self.state_dir / "race_log.jsonl"

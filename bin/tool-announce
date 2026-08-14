@@ -18,7 +18,6 @@ import datetime as dt
 import http.client
 import json
 import os
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -26,6 +25,7 @@ import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.state import update_session
 from pxh import spark_config as cfg
 
@@ -47,24 +47,7 @@ STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
 HOBART_TZ    = ZoneInfo("Australia/Hobart")
 
 
-def _set_exploring(active: bool) -> None:
-    """Write exploring.json so px-alive yields/doesn't restart us mid-call."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    path = STATE_DIR / "exploring.json"
-    data = {"active": active}
-    if active:
-        data["pid"] = os.getpid()
-        data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+_gpio_guard = GpioLeaseGuard(GpioLeaseStore(STATE_DIR), "announce")
 
 
 def _emit(payload: dict) -> int:
@@ -191,7 +174,8 @@ def main() -> int:
         return _emit({"status": "error",
                       "error": "ANNOUNCE_RELAY_TOKEN is empty — source .env before running"})
 
-    _set_exploring(True)
+    if not _gpio_guard.acquire():
+        return _emit({"status": "error", "error": "GPIO already leased"})
     try:
         # 1) synth on the relay
         try:
@@ -272,7 +256,7 @@ def main() -> int:
             pass   # session bookkeeping must never break the announce contract
         return _emit(payload)
     finally:
-        _set_exploring(False)
+        _gpio_guard.release()
 
 
 if __name__ == "__main__":
