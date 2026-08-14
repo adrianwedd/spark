@@ -1,6 +1,7 @@
 """Tests for the PiCar-X REST API."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -49,6 +50,18 @@ class TestHealth:
     def _write_fresh_core_state(state_dir):
         (state_dir / "thoughts-spark.jsonl").write_text('{"thought":"awake"}\n')
         (state_dir / "awareness.json").write_text("{}")
+        from pxh import health
+        health._last_success_write.clear()
+        for component in health.KNOWN_COMPONENTS:
+            health.record_success(component)
+
+    @staticmethod
+    def _stale_daemon(component):
+        from pxh import health
+        record_path = health._component_path(component)
+        record = json.loads(record_path.read_text())
+        record["updated_ts"] = "2020-01-01T00:00:00Z"
+        record_path.write_text(json.dumps(record))
 
     @staticmethod
     def _write_heartbeat(state_dir, *, age_s=0, mode="running"):
@@ -83,6 +96,21 @@ class TestHealth:
         resp = api_client.get("/api/v1/health")
         assert resp.status_code in (200, 503)
 
+    def test_api_liveness_heartbeat_records_success(self, monkeypatch):
+        from pxh import api, health
+        recorded = []
+
+        async def stop_after_first_tick(_seconds):
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(health, "record_success",
+                            lambda component: recorded.append(component))
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(api._health_heartbeat(sleep=stop_after_first_tick))
+
+        assert recorded == ["px-api-server"]
+
     def test_health_reports_fresh_loop_and_fresh_sonar_independently(
             self, api_client, isolated_project):
         state_dir = isolated_project["state_dir"]
@@ -114,6 +142,108 @@ class TestHealth:
         assert checks["alive_loop"]["age_s"] == pytest.approx(0, abs=2)
         assert checks["sonar"]["status"] == "expected_stale"
         assert checks["sonar"]["reason"] == "charging"
+
+    def test_fresh_heartbeat_overrides_legacy_px_alive_staleness(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-alive")
+        self._write_heartbeat(state_dir, mode="charging")
+        self._write_sonar(state_dir, age_s=120)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "ok"
+        assert checks["daemons"]["components"]["px-alive"] == "stale"
+        assert checks["daemons"]["status"] == "ok"
+
+    def test_other_stale_daemon_still_degrades_with_fresh_alive_heartbeat(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-mind")
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        assert response.json()["checks"]["daemons"]["status"] == "stale"
+
+    def test_missing_heartbeat_uses_legacy_px_alive_fallback(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-alive")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "missing"
+        assert checks["daemons"]["status"] == "stale"
+
+    def test_invalid_heartbeat_does_not_restore_legacy_px_alive_authority(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-alive")
+        (state_dir / "alive_heartbeat.json").write_text("not json")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "invalid"
+        assert checks["daemons"]["components"]["px-alive"] == "stale"
+        assert checks["daemons"]["status"] == "ok"
+
+    @pytest.mark.parametrize("timestamp", [float("nan"), float("inf")])
+    def test_non_finite_heartbeat_timestamp_is_invalid(
+            self, api_client, isolated_project, timestamp):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        (state_dir / "alive_heartbeat.json").write_text(json.dumps({
+            "ts": timestamp,
+            "mode": "running",
+        }))
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        assert response.json()["checks"]["alive_loop"]["status"] == "invalid"
+
+    def test_future_heartbeat_timestamp_is_invalid(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, age_s=-60, mode="running")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        assert response.json()["checks"]["alive_loop"]["status"] == "invalid"
+
+    def test_unreadable_daemon_health_degrades_closed(
+            self, api_client, isolated_project, monkeypatch):
+        from pxh import health
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir)
+        monkeypatch.setattr(health, "read_health",
+                            lambda: (_ for _ in ()).throw(ValueError("bad record")))
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        assert response.json()["checks"]["daemons"]["status"] == "unknown"
 
     def test_health_degrades_on_stale_loop_even_when_sonar_is_fresh(
             self, api_client, isolated_project):

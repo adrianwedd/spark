@@ -92,6 +92,23 @@ Speech: `espeak --stdout` → WAV bytes → `aplay -D pulse` → PulseAudio → 
 - `robot_hat.enable_speaker()` must be called before any audio (toggles GPIO 20 for MAX98357A amp). aplay exits 0 but nothing plays if skipped.
 - PulseAudio holds the DAC exclusively — `aplay -D robothat` (ALSA bypass) fails "device busy".
 
+### Daemon Health (`src/pxh/health.py`)
+
+Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every daemon calls `record_success()` / `record_failure()`; `read_health()` aggregates.
+
+**Store: `state/health/<component>.json`, one file per component — never a single shared file.** `px-alive` and `px-battery-poll` run as root while everything else runs as `pi`; a shared file would need a `FileLock`, and a root-created lock at 0644 locks out every `pi` daemon with EACCES. Per-component files remove the lock, the read-modify-write race, and the ownership hazard together.
+
+**The directory is created `1777`** (sticky, world-writable, like `/tmp`) because `atomic_write()`'s `mkstemp` needs directory write permission — a root-created 0755 dir would break every `pi` writer. `_ensure_health_dir()` re-chmods on every write, so whichever user wins the creation race, both can write. Do not "tighten" this to 0755.
+
+**Status is derived at read time, never stored** — a dead daemon can't leave a lying "ok" behind. `ok` → `degraded` (1–2 failures) → `stale` (silent past its per-component `STALE_AFTER_S`) → `failing` (≥3 consecutive) / `missing`. Per-component windows matter: `px-blog` runs daily, `px-mind` every 60s.
+
+- `record_success(..., min_interval_s=N)` throttles fast loops (px-alive ticks 2×/s — an fsync per tick would wear the SD card). **Failures never throttle**, and a failure clears the throttle so the recovery is written immediately — otherwise a flapping component accumulates failures while its successes are dropped, and reads as "failing" while working.
+- Reporting never raises. Health must not be able to kill the daemon it reports on.
+- px-mind publishes the aggregate to `state/health.json` and into `awareness["health"]`; `summarize()` feeds reflection context. Readers that must be correct **when px-mind is down** call `read_health()` directly, not the snapshot.
+- `tests/conftest.py` has an **autouse** fixture redirecting `health_dir()` to tmp. Without it, in-process tests write mock health records into the live robot's `state/health/` — `isolated_project` is opt-in and only isolates subprocesses.
+
+**Claude spend visibility:** `token_log.log_usage()` takes a `backend` argument and splits totals under `by_backend` in `state/token_usage.json`. The top-level totals mix free Ollama with paid Claude and cannot answer "what am I spending". `call_llm()` also sets `result["backend"]` to the tier that actually served — the `backend=` reflection log line shows the *configured* primary, not the one that answered.
+
 ### Idle-Alive Daemon
 
 Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not refactor to create/destroy per-action (`reset_mcu` leaks GPIO5 and `close()` doesn't release it).
