@@ -16,9 +16,9 @@
     gtag('config', 'G-BJD5ZFHRLV');
   </script>
   <title>SPARK — a robot with an inner life</title>
-  <meta name="description" content="SPARK is a robot with an inner life — a three-layer cognitive architecture giving a PiCar-X robot thoughts, moods, and a voice. Built by Adrian and Obi.">
+  <meta name="description" content="SPARK is a robot with an inner life. He remembers not only things, but where those memories came from — and can change in small, explainable ways because of what actually happened to him. Built by Adrian and Obi.">
   <meta property="og:title" content="SPARK — a robot with an inner life">
-  <meta property="og:description" content="A three-layer cognitive architecture giving a PiCar-X robot thoughts, moods, and a voice. Built by Adrian and Obi.">
+  <meta property="og:description" content="SPARK remembers not only things, but where those memories came from — and can change in small, explainable ways because of what actually happened to him. Built by Adrian and Obi.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://spark.wedd.au/">
   <meta property="og:image" content="https://spark.wedd.au/og-image.png">
@@ -28,7 +28,7 @@
   <meta name="twitter:image" content="https://spark.wedd.au/og-image.png">
   <meta property="og:site_name" content="SPARK">
   <meta name="twitter:title" content="SPARK — a robot with an inner life">
-  <meta name="twitter:description" content="A three-layer cognitive architecture giving a PiCar-X robot thoughts, moods, and a voice. Built by Adrian and Obi.">
+  <meta name="twitter:description" content="SPARK remembers not only things, but where those memories came from — and can change in small, explainable ways because of what actually happened to him. Built by Adrian and Obi.">
   <link rel="canonical" href="https://spark.wedd.au/">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -46,7 +46,7 @@
     "@type": "WebSite",
     "name": "SPARK",
     "url": "https://spark.wedd.au/",
-    "description": "A robot with an inner life — a three-layer cognitive architecture giving a PiCar-X robot thoughts, moods, and a voice.",
+    "description": "A robot with an inner life. He remembers not only things, but where those memories came from — and can change in small, explainable ways because of what actually happened to him.",
     "author": {
       "@type": "Person",
       "name": "Adrian Wedd"
@@ -113,6 +113,44 @@
   </div>
 </section>
 
+<!-- ══════════════════════════════════════ WHAT MAKES SPARK DIFFERENT -->
+<section id="what-makes-spark-different" data-theme="warm">
+  <div class="container">
+    <div class="warm-card mb-md">
+      <p class="text-lead">
+        SPARK remembers not only things, but where those memories came from —
+        and can now change in small, explainable ways because of what actually
+        happened to him.
+      </p>
+      <p class="mt-sm">
+        Not every memory gets treated the same. Something SPARK's sensors
+        measured directly, something Obi or Adrian told him, something an AI
+        guessed while looking at a photo, something SPARK worked out on its own,
+        and something SPARK actually double-checked — those are five different
+        kinds of knowing, and SPARK keeps track of which one produced each memory.
+        A camera's guess never gets to pretend it's a fact.
+      </p>
+      <p class="mt-sm">
+        That record of "how do I know this" is also what lets SPARK grow small,
+        specific habits from lived experience — not by adjusting the model or
+        editing a prompt, but by noticing, over repeated real afternoons, that
+        one option keeps going well for one particular kid in one particular
+        situation. It takes more than a single moment to count, it fades if
+        nothing reinforces it, and a contradicting afternoon can outweigh it. A
+        guess from a picture or one of SPARK's own private thoughts is never
+        enough on its own to start or shift a habit — only things directly seen
+        or directly said.
+      </p>
+      <p class="mt-sm">
+        None of that — not a thought, not a guess, not a learned habit — can
+        move a wheel or unlock a tool by itself. A separate, boring,
+        non-AI layer decides what's actually allowed to happen, every time.
+      </p>
+    </div>
+  </div>
+</section>
+
+<div class="section-divider"></div>
 <!-- ══════════════════════════════════════════════════ LIVE STATUS -->
 <section id="live" data-theme="dark">
   <div class="container">
@@ -415,7 +453,7 @@
             ┌───────────────┐
             │  EYES & NECK  │  ← always moving (px-alive)
             │  PCA9685 PWM  │  ← yields on SIGUSR1 for other tools
-            └───────────────┘  ← exploring.json guard for long ops
+            └───────────────┘  ← tokenized GPIO lease governs authority
             ┌───────────────┐
             │  BATTERY      │  ← px-battery-poll (30s)
             │  MONITOR      │  ← escalating warnings + emergency shutdown
@@ -430,14 +468,14 @@
             └───────────────┘
 </pre>
 
-    <h3>Three-Tier LLM Fallback</h3>
+    <h3>Four-Tier LLM Fallback</h3>
     <p class="text-muted-dark">
       SPARK's reflection layer degrades gracefully when upstream AI is unavailable:
     </p>
     <pre class="arch">
-  Tier 1: Claude Haiku  →  Tier 2: Ollama on M1 (LAN)  →  Tier 3: Ollama on Pi
-          (subprocess)             (192.168.1.x)                   (offline)
-          SPARK persona            auto-detected model            (disabled — Pi 4 OOM)
+  Tier 1: Ollama on M5 (LAN)  →  Tier 2: Claude Haiku  →  Tier 3: Ollama Cloud  →  Tier 4: Ollama on Pi
+          primary, all personas       SPARK fallback           internet fallback         final fallback
+                                       when M5 unreachable       when M5 + Claude fail     (off by default — Pi 4 OOM risk)
     </pre>
 
     <h3>Three Voices</h3>
@@ -478,7 +516,7 @@
   Atomic writes      mkstemp + fsync + os.replace (SD card safe)
   Session locks      FileLock with 10s timeout (no deadlocks)
   PID guards         /proc/{pid} liveness check (no duplicate daemons)
-  GPIO exclusivity   SIGUSR1 yield + exploring.json guard
+  GPIO exclusivity   SIGUSR1 yield + tokenized lease (state/gpio_lease.json)
   PIN auth           per-IP lockout, 1000-IP cap, file persistence
   Rate limiting      10 msg/10min per IP, 10k-IP store cap
   Trusted proxy      X-Forwarded-For only from localhost
@@ -537,6 +575,16 @@
     </div>
 
     <div class="warm-card mb-md">
+      <h3 class="card-heading">Not Every Memory Is Equally Sure</h3>
+      <p>SPARK remembers not only things, but where those memories came from. Something a sensor measured directly counts differently than something SPARK's camera AI guessed at, which counts differently again from one of SPARK's own passing thoughts about itself. When SPARK isn't certain — say, its vision system thinks it recognized something in a photo — it says so: <em>"my vision system thought it saw…"</em> rather than claiming to have seen it outright.</p>
+    </div>
+
+    <div class="warm-card mb-md">
+      <h3 class="card-heading">SPARK Can Change, in Small, Explainable Ways</h3>
+      <p>Two SPARKs built from identical code and the exact same personality can grow up a little differently, because they've lived through different afternoons. If SPARK keeps hearing that a particular kid liked the quiet science kit after school, it will start gently leaning toward suggesting it — for that kid, in that situation, and only once it's heard it more than once. It's never a guess dressed up as a fact: SPARK can always point to exactly which remembered, directly-witnessed moments led to the choice, and nothing is ever erased — if things change, SPARK can still say "I used to think you liked X, back when you did."</p>
+    </div>
+
+    <div class="warm-card mb-md">
       <h3 class="card-heading">SPARK's Mood Changes How It Moves</h3>
       <table class="mood-table">
         <tr class="mood-table-header">
@@ -564,11 +612,11 @@
       <ul class="fun-facts">
         <li>SPARK's sonar works just like a bat — it sends out a sound and listens for the echo.</li>
         <li>SPARK's thoughts are saved in a file called <code>thoughts-spark.jsonl</code>. Each line is one thought.</li>
-        <li>SPARK can remember up to 500 important things in its long-term diary.</li>
+        <li>SPARK can remember up to 10,000 things in its long-term memory — each one tagged with where it came from.</li>
         <li>SPARK's neck chip (PCA9685) holds the last position even after the brain restarts.</li>
         <li>SPARK knows Tasmania's timezone — it adjusts for daylight saving automatically.</li>
         <li>Each social post gets a branded 1080x1080 image card with SPARK's thought and mood.</li>
-        <li>SPARK has 717 automated tests — three AI models review every code change.</li>
+        <li>SPARK has 1,095 automated tests — three AI models review every code change.</li>
         <li>SPARK can message Obi directly. When it does, the thought is logged privately — it never appears in the public feed.</li>
         <li>SPARK checks four cameras for people using Hailo AI on a separate Pi 5.</li>
       </ul>
@@ -649,7 +697,7 @@
 
     <details>
       <summary>How many tests does it have?</summary>
-      <p>717 automated tests covering the REST API, session state management, tool execution, voice loop, wake word system, social posting, obi-chat, and cognitive utilities. Tests run in isolated temporary directories with no hardware access required (live hardware tests are marked separately). Three independent AI models (Claude, Codex, Gemini) run QA reviews on every batch of changes.</p>
+      <p>1,095 automated tests covering the REST API, session state management, tool execution, voice loop, wake word system, social posting, obi-chat, provenance, contextual preference learning, and cognitive utilities. Tests run in isolated temporary directories with no hardware access required (live hardware tests are marked separately). Three independent AI models (Claude, Codex, Gemini) run QA reviews on every batch of changes.</p>
     </details>
   </div>
 </section>
@@ -859,7 +907,7 @@ PX_PAN=30 PX_TILT=10 bin/tool-look
         <div class="roadmap-item done"><span class="check">✅</span> Atomic writes with fsync — mkstemp + ownership preservation for SD card durability</div>
         <div class="roadmap-item done"><span class="check">✅</span> Single-instance PID guards on all daemons — prevents double speech on restart</div>
         <div class="roadmap-item done"><span class="check">✅</span> Subprocess timeout kills orphans — API tool calls terminate child processes</div>
-        <div class="roadmap-item done"><span class="check">✅</span> exploring.json guard — long-running tools prevent px-alive restart mid-operation</div>
+        <div class="roadmap-item done"><span class="check">✅</span> Tokenized GPIO lease authority — long-running tools hold an expiring lease so px-alive can't reclaim hardware mid-operation; exploring.json stays intent-only</div>
         <div class="roadmap-item done"><span class="check">✅</span> FileLock 10s timeout — prevents indefinite hangs on stuck session locks</div>
         <div class="roadmap-item done"><span class="check">✅</span> SEO blitz — JSON-LD, canonical URLs, sitemap, OG tags, fediverse verification</div>
         <div class="roadmap-item done"><span class="check">✅</span> Mood-coloured status dot on all pages — real-time mood from API</div>

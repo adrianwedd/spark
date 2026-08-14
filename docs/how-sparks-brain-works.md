@@ -42,7 +42,7 @@ and goes back to waiting for "hey robot"
 
 **How does Spark understand your voice?**
 
-Spark uses a program called Whisper. It's like a really fast person who can listen to sounds and type out what they hear. Spark has three different "listeners" — if the first one doesn't work, it tries the next one, like having backup plans.
+Spark has a chain of speech-to-text listeners — like a really fast person who can listen to sounds and type out what they hear. If the first one doesn't work, it tries the next, then the next, like having backup plans on backup plans.
 
 ---
 
@@ -75,7 +75,7 @@ Spark's neck moves in **four different ways**:
 
 This is the coolest part. Spark's brain works in **three layers**, like a sandwich:
 
-### Layer 1: Noticing Things (every 30 seconds)
+### Layer 1: Noticing Things (every 60 seconds)
 
 Spark checks its senses. No thinking yet — just collecting information:
 
@@ -90,7 +90,7 @@ Then it asks: **"Did anything change?"** Like:
 - "It got really loud!" or "It got quiet"
 - "The sun just came up!"
 
-### Layer 2: Thinking (when something changes, or every 2 minutes)
+### Layer 2: Thinking (when something changes, or every 5 minutes)
 
 When Spark notices something changed, or when it's been quiet for a while, it **actually thinks**.
 
@@ -127,7 +127,30 @@ If Layer 2 decided on an action, Layer 3 makes it happen:
 | `message_obi` | Sends Obi a private message through the dashboard |
 | `wait` | Does nothing (sometimes quiet is best) |
 
-**Memories:** If a thought is really important (salience > 0.7), Spark writes it down in a "diary" file. Next time Spark thinks, it can read its old diary entries — so it actually remembers things across days!
+**Memories, and where they came from:** Spark doesn't just remember *things* — it remembers *how it knows* them. Every memory gets a little tag for where it came from:
+
+- **"I saw this myself"** — something a sensor measured directly, like the sonar or the battery gauge
+- **"someone told me this"** — something you or Dad said to Spark
+- **"a model interpreted this from my sensors"** — Spark's camera AI guessing what's in a picture (a good guess, but still a guess — not the same as seeing it with certainty)
+- **"I worked this out"** — Spark reasoning from other things it already knows
+- **"my own reflection, unverified"** — one of Spark's own thoughts about itself, written down (that's what happens when a thought is important enough, salience > 0.7, to get saved for later)
+- **"checked against something outside me"** — something Spark actually confirmed is true
+
+That matters because a guess and a fact shouldn't be treated the same way. If Spark's camera AI *thinks* it saw a red ball, Spark says "my vision system thought it saw a red ball" — not "I saw a red ball" — because a model's guess can be wrong in a way a direct sensor reading usually isn't.
+
+---
+
+## 3b. Learning From What Actually Happened
+
+Here's something new: two Sparks built from the exact same code, with the exact same rules and the exact same personality, can grow up to make **different small choices** — because they had different afternoons.
+
+Say Spark is trying to figure out what Obi likes to do after school. Every time something actually happens — Obi says "I loved the quiet science kit today" or "that game was too loud, let's not again" — Spark keeps a plain, permanent record of it: who, in what situation, which option, and whether it went well.
+
+It doesn't guess from vibes. It only counts things that were **directly seen or directly said** — not one of Spark's own guesses, not something a picture-AI thought it recognized, not a made-up story. And it needs more than one matching moment before it changes anything, so one weird day can't flip a habit.
+
+So: a Spark who has heard "I loved the quiet science kit" a few afternoons in a row will start quietly leaning toward suggesting the quiet science kit after school — for *that* kid, in *that* situation. A different Spark, raised on afternoons where "let's run around outside" kept going well, leans the other way. Same code. Same safety rules. Same personality. Different lived history, different small habit — and Spark can always explain exactly which remembered moments led to the choice.
+
+If things change — Obi starts saying he's over the science kit — new, more recent moments outweigh the old ones over time, and the habit can shift again. Nothing is ever erased; Spark can still say "I used to think you liked X, back when you did."
 
 ---
 
@@ -213,9 +236,9 @@ When Spark goes into **quiet mode**, it:
 
 - Spark's sonar sensor works just like a bat — it sends out a sound and listens for the echo bouncing back to figure out how far away things are.
 
-- Spark's thoughts are saved in a file called `thoughts.jsonl`. Each line is one thought. It only keeps the last 50 thoughts so the file doesn't get too big (like cleaning out old drawings to make room for new ones).
+- Spark's thoughts are saved in a file called `thoughts.jsonl`. Each line is one thought. It keeps the newest 10,000 so the file doesn't get too big (like cleaning out old drawings to make room for new ones).
 
-- Spark can remember up to 500 important things in its long-term diary (per persona). When it gets full, it forgets the oldest things to make room — just like real memory!
+- Spark can remember up to 10,000 important things in its long-term memory (per persona) — around 50 days' worth. When it gets full, it forgets the oldest things to make room — just like real memory!
 
 - When Spark's brain is working, the ears pause so they don't interrupt each other. Like how you can't listen to someone and think hard about something else at the exact same time.
 

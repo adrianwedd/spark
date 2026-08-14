@@ -481,7 +481,7 @@ source .venv/bin/activate
 # 4. Dry-run a tool to verify the setup
 PX_DRY=1 bin/tool-status
 
-# 5. Run tests (691 dry-run, no hardware needed)
+# 5. Run tests (1070 dry-run, no hardware needed)
 python -m pytest tests/ -m "not live"
 
 # 6. Launch SPARK (Claude voice companion)
@@ -682,8 +682,8 @@ cp state/session.template.json state/session.json
 |------|---------|
 | `session.json` | Core runtime state — persona, listening, motion permission, SPARK routine state |
 | `awareness.json` | Layer 1 output — sonar + temporal state, transition detection |
-| `thoughts.jsonl` | Layer 2 output — last 50 thoughts with mood/action/salience |
-| `notes.jsonl` | Persistent memory — saved by `tool-remember`, auto-saved for high-salience thoughts |
+| `thoughts.jsonl` | Layer 2 output — mood/action/salience, trimmed to the newest 10,000 entries (~50 days) |
+| `notes.jsonl` | Persistent memory — saved by `tool-remember`, auto-saved for high-salience thoughts, trimmed to the newest 10,000 entries |
 | `preference-experiences-<persona>.jsonl` | Append-only, provenance-stamped evidence for exact person/context choices |
 | `battery.json` | Battery voltage — volts, pct, charging flag (written every 30s; plug/unplug detection plays audio sweep tones) |
 | `mood.json` | Current mood from px-mind (written each reflection cycle) |
@@ -704,6 +704,18 @@ The PiCar-X Robot HAT MCU at I2C address `0x14` handles all servos and ADC throu
   intent/state only and never suppresses `px-alive` by itself.
 - **systemd** restarts px-alive after 10s (`Restart=always`, `RestartSec=10`)
 - **`os.getlogin()`** fails under systemd — monkey-patched via `usercustomize.py`
+
+---
+
+## Health & Liveness
+
+"Is the process running" and "is the daemon doing its job" are different questions, so `src/pxh/health.py` tracks three signals separately rather than collapsing them into one flag:
+
+- **Process state** — is the systemd unit up (`systemctl status`)
+- **Functional liveness** — is the daemon's own loop actually completing cycles, tracked per component in `state/health/<component>.json` (one file per daemon, never shared — `px-alive`/`px-battery-poll` run as root while everything else runs as `pi`, and a root-owned shared lock file would deadlock the `pi` daemons)
+- **Sensor freshness** — is the data a component reports (sonar, battery, camera) recent enough to trust
+
+Status (`ok` → `degraded` → `stale` → `failing`/`missing`) is derived at read time from timestamps and consecutive-failure counts, never stored — a dead daemon cannot leave a lying "ok" behind. `GET /api/v1/health` and `px-mind`'s aggregate snapshot (`state/health.json`) expose the rollup; readers that must be correct when `px-mind` itself is down read `state/health/` directly.
 
 ---
 
@@ -737,8 +749,8 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/                           # 716 tests total (25 require live hardware)
-python -m pytest tests/ -m "not live"             # 691 tests (dry-run, no hardware)
+python -m pytest tests/                           # 1095 tests total (25 require live hardware)
+python -m pytest tests/ -m "not live"             # 1070 tests (dry-run, no hardware)
 python -m pytest tests/test_tools.py -v
 python -m pytest tests/test_api.py -v
 sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (require Pi)
@@ -747,6 +759,8 @@ sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (requir
 ---
 
 ## Safety
+
+The trust boundary is fixed: semantic intelligence (Claude, Ollama) proposes actions and interpretations; deterministic, non-LLM machinery decides whether they're allowed to happen. No amount of model-generated narrative, inference, or confidence can grant itself motion, GPIO, or behavioral authority — only code paths like `validate_action()`, `confirm_motion_allowed`, `GpioLeaseStore`, and the contextual-preference activation thresholds can. Self-evolution follows the same rule: SPARK can propose a code change via PR, never merge one.
 
 - **`PX_DRY=1`** skips all motion and audio. Tools default to **live** when unset.
 - **`confirm_motion_allowed: false`** blocks all motion tools.
@@ -807,7 +821,7 @@ picar-x-hacking/
 │   ├── css/colors.css            # Mood colour palette (CSS vars)
 │   ├── js/config.js              # API base URL config
 │   └── workers/og-rewrite.js     # Cloudflare Worker for OG images
-├── tests/                        # 716 tests (25 require live hardware)
+├── tests/                        # 1095 tests (25 require live hardware)
 ├── docs/prompts/
 │   ├── spark-voice-system.md     # SPARK persona (child companion)
 │   ├── claude-voice-system.md    # Default Claude voice loop
