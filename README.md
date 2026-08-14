@@ -370,6 +370,21 @@ The persona is derived at runtime from `session.json → persona` in every proce
 
 **Memory auto-save**: when px-mind generates a thought with `salience > 0.7`, it calls `auto_remember()` which appends to `notes-{persona}.jsonl`. This creates a long-term memory without explicit user instruction — high-salience observations about Obi's wellbeing, interesting facts shared, or significant moments persist across sessions.
 
+Durable claims carry epistemic provenance. Direct sensor values and deterministic
+transforms are `observation`; prose produced by a learned model interpreting
+sensor input is `model_perception`. The latter defaults to confidence `0.65`, is
+capped at `0.75`, and requires a durable evidence reference. During exploration,
+`px-wander` writes the stable `exploration.jsonl` event first and only then may
+save the vision description as a note. If capture, interpretation, event writing,
+or evidence construction fails, no model-perception note is created.
+
+An evidence reference is grounding provenance, not proof of semantic correctness:
+it identifies which perception event produced a description, but does not verify
+that the model described the scene correctly. Raw household JPEG retention remains
+optional. Recall therefore says “my vision system interpreted” rather than “I saw.”
+Future durable claims derived from learned Frigate labels must follow the same
+`model_perception` rule.
+
 ### 9. Session State — The Shared Source of Truth
 
 `state/session.json` is the nervous system of the whole platform. Every process reads and writes it; all writes go through `FileLock` to prevent corruption:

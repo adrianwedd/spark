@@ -57,7 +57,10 @@ ITEM_LEAD = {
 
 
 def model_perception_lead(source: str, *, single: bool) -> str:
-    system = "vision system" if source.startswith("claude_vision:") else "perception system"
+    system = (
+        "vision system" if source.startswith("claude_vision:")
+        else "perception system"
+    )
     if single:
         return f"I remember my {system} interpreting"
     return f"my {system} interpreted"

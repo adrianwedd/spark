@@ -71,7 +71,7 @@ CONFIDENCE_CEILING = {
 }
 
 DEFAULT_CONFIDENCE = {
-    "observation": 0.8,   # a camera plus a vision model is not ground truth
+    "observation": 0.8,   # direct sensor content may still be noisy
     "verification": 0.9,
     "report": 0.7,
     "model_perception": 0.65,
