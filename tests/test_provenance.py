@@ -11,10 +11,10 @@ from pxh import provenance as prov
 
 # --- vocabulary ------------------------------------------------------------
 
-def test_kinds_cover_the_five_distinctions_plus_unknown():
+def test_kinds_cover_the_six_distinctions_plus_unknown():
     assert set(prov.KINDS) == {
-        "observation", "report", "inference", "narrative", "verification",
-        "unknown",
+        "observation", "report", "model_perception", "inference", "narrative",
+        "verification", "unknown",
     }
 
 
@@ -28,10 +28,16 @@ def test_every_kind_has_a_ceiling_a_default_and_a_label():
 
 def test_generated_kinds_are_capped_below_perceived_kinds():
     """The ordering is the safety property, not the exact numbers."""
-    assert prov.CONFIDENCE_CEILING["narrative"] < prov.CONFIDENCE_CEILING["report"]
-    assert prov.CONFIDENCE_CEILING["inference"] < prov.CONFIDENCE_CEILING["report"]
-    assert prov.CONFIDENCE_CEILING["report"] <= prov.CONFIDENCE_CEILING["observation"]
-    assert prov.CONFIDENCE_CEILING["unknown"] < prov.CONFIDENCE_CEILING["narrative"]
+    ceilings = prov.CONFIDENCE_CEILING
+    assert ceilings["unknown"] < ceilings["narrative"] < ceilings["inference"]
+    assert ceilings["inference"] < ceilings["model_perception"] < ceilings["report"]
+    assert ceilings["report"] < ceilings["observation"]
+    assert ceilings["observation"] == ceilings["verification"]
+
+
+def test_model_perception_has_approved_default_and_ceiling():
+    assert prov.DEFAULT_CONFIDENCE["model_perception"] == 0.65
+    assert prov.CONFIDENCE_CEILING["model_perception"] == 0.75
 
 
 # --- make_provenance -------------------------------------------------------
@@ -87,6 +93,22 @@ def test_make_provenance_bounds_evidence_list():
 def test_make_provenance_drops_empty_evidence_entries():
     p = prov.make_provenance("narrative", "consolidation", evidence=["", None, "x"])
     assert p["evidence"] == ["x"]
+
+
+@pytest.mark.parametrize("evidence", [None, [], ["", None, "   "]])
+def test_make_provenance_requires_grounding_evidence_for_model_perception(evidence):
+    with pytest.raises(ValueError, match="requires evidence"):
+        prov.make_provenance("model_perception", "claude_vision:exploration",
+                             evidence=evidence)
+
+
+def test_model_perception_confidence_is_capped_despite_grounding_evidence():
+    p = prov.make_provenance(
+        "model_perception", "claude_vision:exploration",
+        evidence=["exploration:e1:observation:o1"], confidence=1.0,
+    )
+    assert p["confidence"] == 0.75
+    assert p["kind"] == "model_perception", "grounded does not mean verified"
 
 
 # --- read_provenance: legacy records ---------------------------------------
@@ -163,12 +185,41 @@ def test_read_provenance_never_raises_on_junk_input():
         assert prov.read_provenance(junk)["kind"] in prov.KINDS
 
 
+@pytest.mark.parametrize("evidence", [None, "event:o1", [], ["", None, "   "]])
+def test_stored_model_perception_without_valid_evidence_degrades_to_unknown(evidence):
+    record = {"provenance": {
+        "kind": "model_perception",
+        "source": "claude_vision:exploration",
+        "evidence": evidence,
+        "confidence": 1.0,
+    }}
+    p = prov.read_provenance(record)
+    assert p["kind"] == "unknown"
+    assert p["confidence"] <= prov.CONFIDENCE_CEILING["unknown"]
+
+
+def test_stored_grounded_model_perception_retains_bounded_interpretive_kind():
+    record = {"provenance": {
+        "kind": "model_perception",
+        "source": "claude_vision:exploration",
+        "evidence": ["exploration:e1:observation:o1"],
+        "confidence": 1.0,
+    }}
+    p = prov.read_provenance(record)
+    assert p["kind"] == "model_perception"
+    assert p["confidence"] == 0.75
+
+
 # --- describe: the "where did this come from?" answer ----------------------
 
-def test_describe_distinguishes_the_five_kinds():
-    seen = {prov.describe(prov.stamp({}, k, "src")) for k in prov.KINDS
-            if k != "unknown"}
-    assert len(seen) == 5, "each kind must read differently in a prompt"
+def test_describe_distinguishes_the_six_kinds():
+    records = [
+        prov.stamp({}, kind, "src",
+                   evidence=["sensor:event:1"] if kind == "model_perception" else None)
+        for kind in prov.KINDS if kind != "unknown"
+    ]
+    seen = {prov.describe(record) for record in records}
+    assert len(seen) == 6, "each kind must read differently in a prompt"
 
 
 def test_describe_marks_narrative_as_spark_s_own_unverified_prose():
