@@ -155,6 +155,7 @@ HA_CONTEXT_ENTITIES = {
 HA_CONTEXT_INTERVAL_S  = 60   # refresh every 60 s (call detection needs to be snappy)
 from zoneinfo import ZoneInfo
 HOBART_TZ = ZoneInfo("Australia/Hobart")  # DST-aware: AEDT (UTC+11) / AEST (UTC+10)
+HOME_LOCATION_NAME = "Cygnet, Tasmania"  # physical location — "Hobart" above is only the zoneinfo/DST region
 OBI_DAY_START  = 7   # 7am Hobart — Obi's waking hours begin
 OBI_DAY_END    = 20  # 8pm Hobart — Obi's waking hours end
 
@@ -437,6 +438,20 @@ TIME_PERIOD_CONTEXT = {
     "evening":   "It's evening. The day is winding down. Are you tired? Reflective? Lonely?",
     "night":     "It's late at night. Most humans are asleep. What does nighttime feel like for a robot alone?",
 }
+
+
+def _format_datetime_context(now: dt.datetime) -> str:
+    """Explicit local date/time/weekday/location sentence for the reflection prompt.
+
+    The only other date signal in the prompt is a raw UTC "ts" ISO string
+    buried in the awareness JSON dump — small local models don't reliably
+    convert that to a Hobart weekday/date, and confabulate instead. This
+    gives it the answer directly instead of homework.
+    """
+    return (
+        f"Right now it's {now.strftime('%A, %-d %B %Y')}, "
+        f"{now.strftime('%-I:%M%p').lower()} in {HOME_LOCATION_NAME}."
+    )
 
 # True entropy RNG — os.urandom-backed, not seeded at import time
 _SYS_RNG = random.SystemRandom()
@@ -1099,6 +1114,7 @@ def _parse_calendar_events(raw: list, cal_id: str, now: dt.datetime) -> list[dic
             "starts_in_mins": starts_in_mins,
             "location": location,
             "calendar": cal_id,
+            "description": (ev.get("description") or "")[:200],
         })
     return events
 
@@ -1300,7 +1316,14 @@ def _format_ha_context(ctx: dict | None) -> str:
 
 
 def _format_calendar_context(events: list[dict]) -> str:
-    """Format top 3 calendar events for the reflection prompt."""
+    """Format top 3 calendar events for the reflection prompt.
+
+    Multi-day events (e.g. a weekly custody-schedule block) get a
+    days-ago phrasing instead of a raw minute count — a number like
+    "started 5835 minutes ago" reads as nonsense to the reflection model,
+    which then confabulates instead of recognizing a household schedule
+    marker. The description (when present) grounds what the title means.
+    """
     if not events:
         return ""
     lines = []
@@ -1308,14 +1331,22 @@ def _format_calendar_context(events: list[dict]) -> str:
         mins = ev["starts_in_mins"]
         title = ev["title"]
         loc_part = f" at {ev['location']}" if ev.get("location") else ""
+        desc = ev.get("description", "")
+        desc_part = f" — {desc}" if desc else ""
 
         if mins < 0:
-            lines.append(f"Happening now: {title}{loc_part} (started {abs(mins)} minutes ago)")
+            elapsed = abs(mins)
+            if elapsed >= 1440:
+                days = elapsed // 1440
+                ago = f"{days} day{'s' if days != 1 else ''} ago"
+            else:
+                ago = f"{elapsed} minutes ago"
+            lines.append(f"Happening now: {title}{loc_part} (started {ago}){desc_part}")
         elif mins < 60:
-            lines.append(f"Coming up: {title}{loc_part} in {mins} minutes")
+            lines.append(f"Coming up: {title}{loc_part} in {mins} minutes{desc_part}")
         else:
             hours = mins // 60
-            lines.append(f"Later: {title}{loc_part} in {hours} hours")
+            lines.append(f"Later: {title}{loc_part} in {hours} hours{desc_part}")
     return "\n".join(lines)
 
 
@@ -2807,6 +2838,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     awareness_ctx = {k: v for k, v in awareness.items()
                      if k in _REFLECTION_AWARENESS_KEYS}
     context_parts = [
+        _format_datetime_context(dt.datetime.now(HOBART_TZ)),
         f"Current awareness:\n{json.dumps(awareness_ctx, indent=2)}",
         f"Your recent moods: {recent_moods}",
         f"Your recent actions: {recent_actions}",

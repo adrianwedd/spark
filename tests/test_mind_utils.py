@@ -19,6 +19,7 @@ from pxh.mind import (
     _fetch_ha_presence,
     _fetch_ha_sleep,
     _format_calendar_context,
+    _format_datetime_context,
     _format_ha_context,
     _format_introspection,
     _format_routine_context,
@@ -577,6 +578,31 @@ def test_parse_calendar_events_basic():
     parsed = _parse_calendar_events(events, "test@example.com", now)
     assert len(parsed) >= 1
     assert parsed[0]["title"] == "Swimming"
+
+
+def test_parse_calendar_events_includes_description():
+    """Event description survives parsing — the reflection prompt needs it to
+    explain what a bare calendar title like 'Mum's Place' actually means."""
+    now = _dt.datetime(2026, 3, 18, 9, 0, tzinfo=HOBART_TZ)
+    events = [
+        {"summary": "Mum's Place",
+         "start": {"dateTime": "2026-03-16T15:00:00+11:00"},
+         "end": {"dateTime": "2026-03-20T08:45:00+11:00"},
+         "description": "Obi with Mum. Sunday afternoon → Friday school drop-off."},
+    ]
+    parsed = _parse_calendar_events(events, "test@example.com", now)
+    assert parsed[0]["description"] == "Obi with Mum. Sunday afternoon → Friday school drop-off."
+
+
+def test_parse_calendar_events_missing_description_defaults_empty():
+    """No description field → empty string, not a KeyError."""
+    now = _dt.datetime(2026, 3, 18, 9, 0, tzinfo=HOBART_TZ)
+    events = [
+        {"summary": "Swimming", "start": {"dateTime": "2026-03-18T10:00:00+11:00"},
+         "end": {"dateTime": "2026-03-18T11:00:00+11:00"}},
+    ]
+    parsed = _parse_calendar_events(events, "test@example.com", now)
+    assert parsed[0]["description"] == ""
 
 
 def test_parse_calendar_events_empty():
@@ -1187,6 +1213,55 @@ def test_format_calendar_empty_no_output():
     if ctx:
         context_parts.append(ctx)
     assert len(context_parts) == 1
+
+
+def test_format_calendar_context_multiday_event_uses_days_not_raw_minutes():
+    """A multi-day event (e.g. a custody-schedule block) that started days ago
+    must not be rendered as 'started 5835 minutes ago' — that raw number is
+    what led the reflection model to hallucinate it as a song/playlist."""
+    events = [{"title": "Mum's Place", "starts_in_mins": -5835,
+               "location": None, "calendar": "family", "description": ""}]
+    ctx = _format_calendar_context(events)
+    assert "5835" not in ctx
+    assert "4 days ago" in ctx
+
+
+def test_format_calendar_context_includes_description_for_current_event():
+    """The description is what tells the model 'Mum's Place' is a custody
+    marker, not something happening in the room right now."""
+    events = [{"title": "Mum's Place", "starts_in_mins": -5835, "location": None,
+               "calendar": "family",
+               "description": "Obi with Mum. Sunday afternoon → Friday school drop-off."}]
+    ctx = _format_calendar_context(events)
+    assert "Obi with Mum" in ctx
+
+
+def test_format_calendar_context_short_event_still_uses_minutes():
+    """A same-day event that started recently keeps the precise minute count."""
+    events = [{"title": "Assembly", "starts_in_mins": -20, "location": None,
+               "calendar": "family", "description": ""}]
+    ctx = _format_calendar_context(events)
+    assert "started 20 minutes ago" in ctx
+
+
+# ---------------------------------------------------------------------------
+# _format_datetime_context — explicit local date/time/weekday/location cue
+# ---------------------------------------------------------------------------
+
+
+def test_format_datetime_context_includes_weekday_and_date():
+    now = _dt.datetime(2026, 8, 13, 16, 18, tzinfo=HOBART_TZ)
+    ctx = _format_datetime_context(now)
+    assert "Thursday" in ctx
+    assert "13 August 2026" in ctx
+
+
+def test_format_datetime_context_includes_location():
+    """Spark is physically in Cygnet — the timezone name 'Hobart' is a
+    zoneinfo artifact, not where the robot actually lives."""
+    now = _dt.datetime(2026, 8, 13, 16, 18, tzinfo=HOBART_TZ)
+    ctx = _format_datetime_context(now)
+    assert "Cygnet" in ctx
 
 
 # ---------------------------------------------------------------------------
