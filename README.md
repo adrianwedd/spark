@@ -385,6 +385,29 @@ optional. Recall therefore says “my vision system interpreted” rather than �
 Future durable claims derived from learned Frigate labels must follow the same
 `model_perception` rule.
 
+### Lived experience changes bounded choices
+
+SPARK can develop one inspectable kind of relationship-specific behavior:
+contextual preferences over options a caller explicitly offers. Experience is
+append-only and persona-scoped in
+`state/preference-experiences-<persona>.jsonl`. A derived preference is scoped to
+an exact person and context, decays with age, weakens under contradiction, and
+explains its choice with the IDs and provenance of every contributing event.
+Only an eligible superseder in that same exact person/context/option scope may
+discount an earlier event.
+
+Only grounded `observation`, `report`, and `verification` events influence the
+policy; narrative, inference, unknown legacy data, and model-mediated perception
+are inert. Two independently evidenced positive experiences and a fixed score
+margin are required before adaptation activates. Earlier history is never deleted
+when later lived evidence revises the choice.
+
+The regression in `tests/test_contextual_preference.py` holds clock,
+model/version, sensors, randomness, reflection seed, code, and config constant.
+Its predeclared snapshot demonstrates two otherwise identical SPARK instances
+choosing different after-school options solely because their histories differ.
+This is distinct from recalling a fact or changing a prompt, config, or model.
+
 ### 9. Session State — The Shared Source of Truth
 
 `state/session.json` is the nervous system of the whole platform. Every process reads and writes it; all writes go through `FileLock` to prevent corruption:
@@ -641,6 +664,7 @@ Persona routing: checks session `persona` field, then utterance keywords.
 | `logging.py` | Structured JSON log emission to `logs/tool-<event>.log`. Late-imports `rotate_log` from state.py. |
 | `time.py` | `utc_timestamp()` via `datetime.now(timezone.utc)`. |
 | `token_log.py` | LLM token usage accounting — logs prompt/response token counts per call. |
+| `contextual_preference.py` | Append-only lived experience, scoped preference derivation, bounded choice, and causal explanations. |
 | `utils.py` | Shared utilities (`clamp()` for numeric range clamping). |
 | `patch_login.py` | Monkey-patches `os.getlogin()` for systemd environments (no /dev/tty). |
 
@@ -660,6 +684,7 @@ cp state/session.template.json state/session.json
 | `awareness.json` | Layer 1 output — sonar + temporal state, transition detection |
 | `thoughts.jsonl` | Layer 2 output — last 50 thoughts with mood/action/salience |
 | `notes.jsonl` | Persistent memory — saved by `tool-remember`, auto-saved for high-salience thoughts |
+| `preference-experiences-<persona>.jsonl` | Append-only, provenance-stamped evidence for exact person/context choices |
 | `battery.json` | Battery voltage — volts, pct, charging flag (written every 30s; plug/unplug detection plays audio sweep tones) |
 | `mood.json` | Current mood from px-mind (written each reflection cycle) |
 
