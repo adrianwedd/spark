@@ -191,3 +191,68 @@ def test_is_night_silence_delegates_to_policy():
     from pxh import mind
     for hour in range(24):
         assert mind._is_night_silence(hour) == policy.is_night_hour(hour)
+
+
+# ---------------------------------------------------------------------------
+# voice_loop.py effect classification (Task 4)
+# ---------------------------------------------------------------------------
+
+def test_voice_effect_table_is_exhaustive():
+    from pxh import voice_loop
+    assert set(voice_loop.VOICE_EFFECT_TABLE.keys()) == voice_loop.ALLOWED_TOOLS
+    assert all(v in ("audio", "presence", "other")
+               for v in voice_loop.VOICE_EFFECT_TABLE.values())
+
+
+def test_voice_effect_table_classifies_known_audio_tools_as_audio():
+    from pxh import voice_loop
+    for tool in ("tool_voice", "tool_announce", "tool_chat", "tool_chat_vixen",
+                 "tool_play_sound", "tool_time", "tool_gws_calendar",
+                 "tool_gws_sheets_log", "tool_qa", "tool_describe_scene",
+                 "tool_timer", "tool_story", "tool_recall", "tool_routine",
+                 "tool_checkin", "tool_celebrate", "tool_transition",
+                 "tool_breathe", "tool_dopamine_menu", "tool_sensory_check",
+                 "tool_perform", "tool_repair"):
+        assert voice_loop.VOICE_EFFECT_TABLE[tool] == "audio", tool
+
+
+def test_tool_quiet_effect_varies_by_action_param():
+    from pxh import voice_loop
+    assert set(voice_loop.VOICE_EFFECT_OVERRIDES) == {"tool_quiet"}
+    assert voice_loop.classify_effect("tool_quiet", {"action": "start"}) == "audio"
+    assert voice_loop.classify_effect("tool_quiet", {"action": "check"}) == "presence"
+    assert voice_loop.classify_effect("tool_quiet", {"action": "end"}) == "other"
+    # bin/tool-quiet defaults to "start" — the loudest branch — when unset.
+    assert voice_loop.classify_effect("tool_quiet", {}) == "audio"
+
+
+def test_no_non_audio_tool_can_reach_an_audio_sink():
+    """A KNOWN audio sink may not be reachable from a non-audio-classified
+    tool. That is the whole claim — not "audio can never bypass policy".
+
+    This is a text scan over bin/: it catches the common, accidental case (a
+    tool quietly growing a spoken confirmation) and misses runtime-assembled
+    subprocess paths, deeper helper indirection, Python imports into audio
+    helpers, and sinks that don't exist yet. A floor, not a proof.
+    """
+    from pxh import voice_loop
+
+    sinks = re.compile(
+        r"tool-voice\b|tool-voice-persona\b|tool-announce\b|tool-play-sound\b"
+        r"|tool-chat\b|tool-chat-vixen\b|px-perform\b"
+    )
+    bin_dir = Path(__file__).resolve().parents[1] / "bin"
+    offenders = []
+    for tool in sorted(voice_loop.ALLOWED_TOOLS):
+        script = bin_dir / tool.replace("_", "-")
+        if not script.exists():
+            continue
+        if not sinks.search(script.read_text(encoding="utf-8")):
+            continue
+        if tool in voice_loop.VOICE_EFFECT_OVERRIDES:
+            continue  # param-dependent; pinned by its own test above
+        if voice_loop.VOICE_EFFECT_TABLE[tool] != "audio":
+            offenders.append(tool)
+    assert offenders == [], (
+        f"tools reach a known audio sink but are not classified 'audio': {offenders}"
+    )
