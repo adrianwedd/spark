@@ -151,11 +151,11 @@ changes later.
 
 - `voice_loop.py::validate_action()` — maps its own tool name to `effect` via a
   small local table (`tool_voice`/`tool_announce`/`tool_play_sound`/persona chat
-  tools → `"audio"`; `tool_emote`/`tool_look`/etc. → `"presence"`; everything else
-  → `"other"`), then calls `policy.evaluate(..., origin="interactive")` before
-  dispatch. On a blocked verdict, execute the presence substitute (re-evaluated
-  per above, still passing through the rest of `validate_action`'s existing
-  checks) if suggested, otherwise skip the turn.
+  tools → `"audio"`; `tool_emote`/`tool_look`/etc. → `"presence"`), then calls
+  `policy.evaluate(..., origin="interactive")` before dispatch. On a blocked
+  verdict, execute the presence substitute (re-evaluated per above, still passing
+  through the rest of `validate_action`'s existing checks) if suggested,
+  otherwise skip the turn.
 - `mind.py` Layer 3 `expression()` — maps its own action name to `effect` via its
   own local table (`greet`/`comment`/`play_sound`/etc. → `"audio"`;
   `look_around`/`scan`/etc. → `"presence"`), then calls `policy.evaluate(...,
@@ -163,6 +163,15 @@ changes later.
   at `mind.py:3084-3088`. For v1 this only adds the quiet-mode rule on the
   autonomous path, since night/call suppression already exists there via
   `NIGHT_ALLOWED_ACTIONS` and the on-call check.
+
+Each table must be **exhaustive against its own dispatcher's current action
+vocabulary**, not permissive-by-default: an action absent from the table is a
+lookup error, not a silent `"other"`. `"other"` is a value someone can choose
+deliberately for an action, never a fallback. A test in `test_policy.py` asserts
+each table's key set equals the dispatcher's actual known-action set (`ALLOWED_TOOLS`
+for `voice_loop.py`; the equivalent constant/enum for `mind.py`'s autonomous
+actions), so adding a new tool or autonomous action without classifying it fails
+CI immediately rather than silently defaulting to unsuppressed audio.
 
 This also means a future audio-producing action in either vocabulary — a new
 `tool_voice_v2`, or GREMLIN race commentary — only has to be classified as
