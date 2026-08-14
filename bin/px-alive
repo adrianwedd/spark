@@ -461,6 +461,11 @@ def idle_loop(args) -> None:
 
     log(f"idle loop started (persistent Picarx handle, sonar every {PROX_CHECK_S:.0f}s)")
 
+    # systemd starts its watchdog when the service launches. Prove that Python
+    # reached the loop setup before the startup sonar write below, whose fsync
+    # can legitimately take several seconds on the Pi's SD card.
+    write_alive_heartbeat("starting")
+
     # Write a startup heartbeat so px-mind doesn't see a stale file during the
     # Picarx acquisition window (takes ~5s), avoiding the tool-sonar fallback
     # that would immediately send SIGUSR1 and kill us before we do anything useful.

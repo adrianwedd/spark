@@ -129,7 +129,7 @@ def test_charging_loop_advances_heartbeat_without_reading_sonar(monkeypatch):
     with pytest.raises(StopLoop):
         _ALIVE["idle_loop"](args)
 
-    assert modes == ["charging"]
+    assert modes == ["starting", "charging"]
 
 
 def test_running_loop_advances_heartbeat(monkeypatch):
@@ -148,7 +148,7 @@ def test_running_loop_advances_heartbeat(monkeypatch):
     with pytest.raises(StopLoop):
         _ALIVE["idle_loop"](args)
 
-    assert modes == ["running"]
+    assert modes == ["starting", "running"]
 
 
 def test_failed_heartbeat_write_does_not_notify_watchdog(tmp_path, monkeypatch):
