@@ -42,7 +42,7 @@ The voice is **declarative, not commanding**. "The shoes are by the door" — no
 
 ### How often does SPARK make comments?
 
-SPARK's cognitive loop (px-mind) runs Layer 1 (awareness) roughly every 30 seconds. Layer 2 (reflection — actually thinking via an LLM) triggers either when something changes (someone appears, ambient sound shifts, time of day transitions) or every 2 minutes if nothing has changed.
+SPARK's cognitive loop (px-mind) runs Layer 1 (awareness) roughly every 60 seconds. Layer 2 (reflection — actually thinking via an LLM) triggers either when something changes (someone appears, ambient sound shifts, time of day transitions) or every 5 minutes if nothing has changed.
 
 But SPARK doesn't speak every time it thinks. There's a **2-minute cooldown** between spontaneous comments. And SPARK stays quiet when:
 
