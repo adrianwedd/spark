@@ -628,6 +628,8 @@ SLOW_TOOLS = {
     "tool_timer", "tool_research", "tool_compose", "tool_blog", "tool_story",
 }
 SYNC_TIMEOUT_SLOW = float(os.environ.get("PX_API_TIMEOUT_SLOW", "120"))
+ALIVE_LOOP_STALE_S = 10
+SONAR_STALE_S = 60
 
 
 def _resolve_dry(requested: Optional[bool]) -> bool:
@@ -705,18 +707,89 @@ async def health():
     else:
         checks["awareness"] = {"status": "missing"}
 
-    # Per-daemon health. Read live rather than from the px-mind snapshot, so a
-    # dead px-mind reports as stale instead of freezing the last good picture.
-    # Status only — last_error can carry paths and exception text, and this
-    # endpoint is unauthenticated.
+    # px-alive process liveness, loop progress, and sonar freshness are
+    # intentionally separate signals. A fresh charging loop is healthy even
+    # though sonar is expected to remain stale while hardware is frozen.
+    heartbeat_mode = "unknown"
+    heartbeat_file = state_dir / "alive_heartbeat.json"
+    heartbeat_available = heartbeat_file.exists()
+    try:
+        heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+        heartbeat_age_s = max(0.0, _time.time() - float(heartbeat["ts"]))
+        heartbeat_mode = str(heartbeat.get("mode") or "unknown")
+        heartbeat_status = (
+            "ok" if heartbeat_age_s <= ALIVE_LOOP_STALE_S else "stale"
+        )
+        checks["alive_loop"] = {
+            "status": heartbeat_status,
+            "age_s": round(heartbeat_age_s),
+            "mode": heartbeat_mode,
+        }
+        if heartbeat_status != "ok":
+            overall = "degraded"
+    except FileNotFoundError:
+        checks["alive_loop"] = {"status": "missing", "mode": "unknown"}
+        overall = "degraded"
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+        checks["alive_loop"] = {"status": "invalid", "mode": "unknown"}
+        overall = "degraded"
+
+    sonar_file = state_dir / "sonar_live.json"
+    try:
+        sonar = json.loads(sonar_file.read_text(encoding="utf-8"))
+        sonar_age_s = max(0.0, _time.time() - float(sonar["ts"]))
+        if sonar_age_s <= SONAR_STALE_S:
+            sonar_status = "ok"
+            checks["sonar"] = {
+                "status": sonar_status,
+                "age_s": round(sonar_age_s),
+            }
+        elif heartbeat_mode == "charging":
+            checks["sonar"] = {
+                "status": "expected_stale",
+                "age_s": round(sonar_age_s),
+                "reason": "charging",
+            }
+        else:
+            checks["sonar"] = {
+                "status": "stale",
+                "age_s": round(sonar_age_s),
+            }
+            overall = "degraded"
+    except FileNotFoundError:
+        if heartbeat_mode == "charging":
+            checks["sonar"] = {
+                "status": "expected_stale",
+                "reason": "charging",
+            }
+        else:
+            checks["sonar"] = {"status": "missing"}
+            overall = "degraded"
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+        checks["sonar"] = {"status": "invalid"}
+        overall = "degraded"
+
+    # Keep the wider daemon spine, but do not let its legacy px-alive record
+    # override the dedicated functional heartbeat. Only an absent heartbeat
+    # enables compatibility fallback to the old px-alive daemon signal.
     try:
         from pxh import health as _health
         daemons = _health.read_health()
-        checks["daemons"] = {
-            "status": daemons["overall"],
-            "components": {k: v["status"] for k, v in daemons["components"].items()},
+        component_statuses = {
+            k: v["status"] for k, v in daemons["components"].items()
         }
-        if daemons["overall"] != "ok" and overall == "ok":
+        effective = dict(component_statuses)
+        if heartbeat_available:
+            effective.pop("px-alive", None)
+        rank = {"ok": 0, "degraded": 1, "stale": 2,
+                "failing": 3, "missing": 3}
+        daemon_status = max(effective.values(), key=lambda s: rank.get(s, 0),
+                            default="ok")
+        checks["daemons"] = {
+            "status": daemon_status,
+            "components": component_statuses,
+        }
+        if daemon_status != "ok" and overall == "ok":
             overall = "degraded"
     except Exception:
         checks["daemons"] = {"status": "unknown"}

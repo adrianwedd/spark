@@ -466,6 +466,18 @@ sudo bin/px-alive [--gaze-min S] [--gaze-max S] [--prox-cm F] [--no-prox] [--dry
 
 **Log file:** `$LOG_DIR/px-alive.log`
 
+**Functional health:** Each loop iteration atomically replaces
+`state/alive_heartbeat.json` with a timestamp and mode (`starting`, `running`,
+`charging`, or `i2c_backoff`). This is the authoritative loop-progress signal. The systemd
+unit's watchdog is notified only after that write succeeds, so a live process
+that stops making loop progress is restarted. `state/sonar_live.json` remains
+an independent sensor-freshness signal; stale sonar is expected while the
+heartbeat mode is `charging` and does not make overall health degraded.
+
+`GET /api/v1/health` reports `alive_loop` and `sonar` separately. A stale alive
+heartbeat is unhealthy in every mode. Stale sonar is unhealthy while running,
+but is reported as `expected_stale` while charging.
+
 **Note:** Requires sudo because `picarx` needs GPIO. Uses `/usr/bin/python3` (system Python with `robot_hat`/`picarx`).
 
 ---

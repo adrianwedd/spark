@@ -1,11 +1,13 @@
 """Tests for px-alive directional gaze toward Frigate-detected person."""
 from __future__ import annotations
 import datetime as dt
+import json
 import sys
 import types
 from pathlib import Path
 
 from _harness import daemon_load_env
+import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -254,3 +256,59 @@ def test_spark_greet_env_never_routes():
         _ALIVE["_subprocess"].run = orig_run
 
     assert captured.get("env", {}).get("PX_VOICE_NO_ROUTE") == "1"
+
+
+def test_alive_heartbeat_records_loop_mode_atomically(tmp_path, monkeypatch):
+    heartbeat = tmp_path / "alive_heartbeat.json"
+    monkeypatch.setitem(_ALIVE, "ALIVE_HEARTBEAT_FILE", heartbeat)
+    notifications = []
+    monkeypatch.setitem(_ALIVE, "_sd_notify_watchdog", notifications.append)
+
+    assert _ALIVE["write_alive_heartbeat"]("charging", now=123.5) is True
+    assert json.loads(heartbeat.read_text()) == {"ts": 123.5, "mode": "charging"}
+    assert notifications == ["WATCHDOG=1"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_charging_loop_advances_heartbeat_without_reading_sonar(monkeypatch):
+    modes = []
+    monkeypatch.setitem(_ALIVE, "write_alive_heartbeat", lambda mode, now=None: modes.append(mode))
+    monkeypatch.setitem(_ALIVE, "_is_charging", lambda: True)
+    monkeypatch.setitem(_ALIVE, "read_mood", lambda: {})
+    monkeypatch.setitem(_ALIVE, "stop_face_detection", lambda: None)
+
+    class StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(_ALIVE["time"], "sleep", lambda _seconds: (_ for _ in ()).throw(StopLoop()))
+    with pytest.raises(StopLoop):
+        _ALIVE["idle_loop"](types.SimpleNamespace(face=False, no_face=True))
+    assert modes == ["starting", "charging"]
+
+
+def test_running_loop_advances_heartbeat(monkeypatch):
+    modes = []
+    monkeypatch.setitem(_ALIVE, "write_alive_heartbeat", lambda mode, now=None: modes.append(mode))
+    monkeypatch.setitem(_ALIVE, "_is_charging", lambda: False)
+    monkeypatch.setitem(_ALIVE, "read_mood", lambda: {})
+    monkeypatch.setitem(_ALIVE, "stop_face_detection", lambda: None)
+
+    class StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(_ALIVE["time"], "sleep", lambda _seconds: (_ for _ in ()).throw(StopLoop()))
+    with pytest.raises(StopLoop):
+        _ALIVE["idle_loop"](types.SimpleNamespace(face=False, no_face=True))
+    assert modes == ["starting", "running"]
+
+
+def test_failed_heartbeat_write_does_not_notify_watchdog(tmp_path, monkeypatch):
+    notifications = []
+    monkeypatch.setitem(_ALIVE, "LOG_FILE", tmp_path / "px-alive.log")
+    monkeypatch.setitem(_ALIVE, "_heartbeat_err_logged", False)
+    monkeypatch.setitem(_ALIVE, "_sd_notify_watchdog", notifications.append)
+    monkeypatch.setattr(_ALIVE["tempfile"], "mkstemp",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk unavailable")))
+
+    assert _ALIVE["write_alive_heartbeat"]("running", now=123.5) is False
+    assert notifications == []

@@ -118,3 +118,9 @@ def test_live_gpio_lease_suppresses_alive_startup(isolated_project):
     content = (log_dir / "px-alive.log").read_text()
     assert "GPIO lease active" in content
     assert "dry gaze" not in content
+
+
+def test_systemd_service_enables_functional_watchdog():
+    service = (PROJECT_ROOT / "systemd" / "px-alive.service").read_text()
+    assert "WatchdogSec=15" in service
+    assert "NotifyAccess=main" in service

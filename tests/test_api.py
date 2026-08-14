@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unittest.mock
 from pathlib import Path
 
@@ -44,6 +45,37 @@ def auth_headers():
 # -- Health (unauthenticated) --
 
 class TestHealth:
+    @staticmethod
+    def _write_fresh_core_state(state_dir):
+        (state_dir / "thoughts-spark.jsonl").write_text('{"thought":"awake"}\n')
+        (state_dir / "awareness.json").write_text("{}")
+        from pxh import health
+        health._last_success_write.clear()
+        for component in health.KNOWN_COMPONENTS:
+            health.record_success(component)
+
+    @staticmethod
+    def _stale_daemon(component, *, age_s=600):
+        from pxh import health
+        record_path = health._component_path(component)
+        record = json.loads(record_path.read_text())
+        record["updated_ts"] = "2020-01-01T00:00:00Z"
+        record_path.write_text(json.dumps(record))
+
+    @staticmethod
+    def _write_heartbeat(state_dir, *, age_s=0, mode="running"):
+        (state_dir / "alive_heartbeat.json").write_text(json.dumps({
+            "ts": time.time() - age_s,
+            "mode": mode,
+        }))
+
+    @staticmethod
+    def _write_sonar(state_dir, *, age_s=0):
+        (state_dir / "sonar_live.json").write_text(json.dumps({
+            "ts": time.time() - age_s,
+            "distance_cm": 42.0,
+        }))
+
     def test_health_returns_details(self, api_client):
         """Health endpoint returns system details, not just static ok."""
         r = api_client.get("/api/v1/health")
@@ -62,6 +94,111 @@ class TestHealth:
     def test_health_no_auth_required(self, api_client):
         resp = api_client.get("/api/v1/health")
         assert resp.status_code in (200, 503)
+
+    def test_health_reports_fresh_loop_and_fresh_sonar_independently(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "ok"
+        assert checks["alive_loop"]["mode"] == "running"
+        assert checks["sonar"]["status"] == "ok"
+
+    def test_health_treats_stale_sonar_as_expected_while_charging(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, mode="charging")
+        self._write_sonar(state_dir, age_s=120)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "ok"
+        assert checks["alive_loop"]["mode"] == "charging"
+        assert checks["alive_loop"]["age_s"] == pytest.approx(0, abs=2)
+        assert checks["sonar"]["status"] == "expected_stale"
+        assert checks["sonar"]["reason"] == "charging"
+
+    def test_fresh_heartbeat_overrides_legacy_px_alive_staleness(
+            self, api_client, isolated_project):
+        """#175: charging heartbeat is authoritative even when the old daemon
+        record and sonar are both stale."""
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-alive")
+        self._write_heartbeat(state_dir, mode="charging")
+        self._write_sonar(state_dir, age_s=120)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "ok"
+        assert checks["daemons"]["components"]["px-alive"] == "stale"
+        assert checks["daemons"]["status"] == "ok"
+
+    def test_other_stale_daemon_still_degrades_with_fresh_alive_heartbeat(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-mind")
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        assert response.json()["checks"]["daemons"]["status"] == "stale"
+
+    def test_absent_heartbeat_uses_legacy_px_alive_fallback(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._stale_daemon("px-alive")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "missing"
+        assert checks["daemons"]["status"] == "stale"
+
+    def test_health_degrades_on_stale_loop_even_when_sonar_is_fresh(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, age_s=60, mode="running")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "stale"
+        assert checks["sonar"]["status"] == "ok"
+
+    def test_health_degrades_on_stale_sonar_while_running(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir, age_s=120)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 503
+        checks = response.json()["checks"]
+        assert checks["alive_loop"]["status"] == "ok"
+        assert checks["sonar"]["status"] == "stale"
 
 
 # -- Security Headers --
