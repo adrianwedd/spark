@@ -298,6 +298,25 @@ class TestWhitelist:
         from pxh.claude_session import file_in_whitelist
         assert file_in_whitelist("tests/test_new.py")
 
+    def test_policy_module_is_blacklisted(self):
+        """The constitutional rules are not SPARK's to rewrite (#174)."""
+        from pxh.claude_session import file_in_whitelist
+        assert not file_in_whitelist("src/pxh/policy.py")
+
+    def test_policy_invariant_tests_are_blacklisted(self):
+        """Protecting policy.py alone would leave the erosion path open: an
+        evolution PR could delete the call site in voice_loop.py (whitelisted)
+        and adjust its whitelisted tests to match. The integration assertions
+        must be protected too."""
+        from pxh.claude_session import file_in_whitelist
+        assert not file_in_whitelist("tests/test_policy_invariants.py")
+
+    def test_ordinary_policy_tests_remain_whitelisted(self):
+        """Ordinary policy coverage must stay evolvable — only the pinned
+        invariants are frozen."""
+        from pxh.claude_session import file_in_whitelist
+        assert file_in_whitelist("tests/test_policy.py")
+
     def test_env_blacklisted(self):
         from pxh.claude_session import file_in_whitelist
         assert not file_in_whitelist(".env")
