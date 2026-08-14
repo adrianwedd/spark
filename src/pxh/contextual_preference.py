@@ -109,11 +109,13 @@ def load_experiences(*, path: Path | None = None,
     diagnostics = {"total": 0, "valid": 0, "invalid": 0}
     if not target.exists():
         return [], diagnostics
-    records: list[dict] = []
     try:
-        lines = target.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        with FileLock(str(target) + ".lock", timeout=LOCK_TIMEOUT_S):
+            lines = target.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        diagnostics["read_error"] = type(exc).__name__
         return [], diagnostics
+    records: list[dict] = []
     for line in lines:
         diagnostics["total"] += 1
         try:
@@ -133,6 +135,48 @@ def _ignore(counts: dict[str, int], reason: str) -> None:
     counts[reason] = counts.get(reason, 0) + 1
 
 
+def _scoped_supersessions(records: Sequence[dict], *, person: str,
+                          context: str, options: Sequence[str]) -> list[dict]:
+    """Apply only corrections authorized for the same policy scope and option."""
+    originals = {
+        str(record.get("id")): record for record in records
+        if isinstance(record, dict) and record.get("id")
+    }
+    scoped: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        copy = dict(record)
+        raw = record.get("provenance")
+        if isinstance(raw, dict):
+            block = dict(raw)
+            copy["provenance"] = block
+            replacement_p = provenance.read_provenance(record)
+            replacement_authorized = (
+                record.get("person") == person
+                and record.get("context") == context
+                and record.get("option") in options
+                and record.get("outcome") in OUTCOMES
+                and replacement_p["kind"] in ELIGIBLE_KINDS
+                and bool(replacement_p["evidence"])
+            )
+            try:
+                _timestamp(record.get("ts"))
+            except (TypeError, ValueError):
+                replacement_authorized = False
+            allowed: list[str] = []
+            if replacement_authorized:
+                for old_id in replacement_p["supersedes"]:
+                    old = originals.get(old_id)
+                    if (old and old.get("person") == person
+                            and old.get("context") == context
+                            and old.get("option") == record.get("option")):
+                        allowed.append(old_id)
+            block["supersedes"] = allowed
+        scoped.append(copy)
+    return provenance.apply_supersessions(scoped)
+
+
 def derive_preference(records: Sequence[dict], *, person: str, context: str,
                       options: Sequence[str], now: dt.datetime) -> dict:
     """Project append-only evidence into one exact-scope preference view."""
@@ -148,7 +192,9 @@ def derive_preference(records: Sequence[dict], *, person: str, context: str,
     ignored: dict[str, int] = {}
     seen_evidence: set[str] = set()
 
-    for record in provenance.apply_supersessions(list(records)):
+    for record in _scoped_supersessions(
+        records, person=person, context=context, options=offered,
+    ):
         if (record.get("person") != person or record.get("context") != context
                 or record.get("option") not in scores):
             _ignore(ignored, "out_of_scope")
@@ -180,7 +226,7 @@ def derive_preference(records: Sequence[dict], *, person: str, context: str,
         weight = block["confidence"] * decay * sign
         option = record["option"]
         scores[option] += weight
-        if outcome == "positive":
+        if outcome == "positive" and weight > 0.0:
             positives[option] += 1
         cause = {
             "record_id": str(record["id"]),
@@ -203,7 +249,7 @@ def derive_preference(records: Sequence[dict], *, person: str, context: str,
     margin = max(0.0, scores[winner] - runner_score)
     activated = (
         positives[winner] >= MIN_POSITIVE_EXPERIENCES
-        and margin >= ACTIVATION_MARGIN
+        and margin > ACTIVATION_MARGIN
         and (len(ranked) == 1 or scores[winner] != runner_score)
     )
     confidence = margin / (margin + 1.0) if margin else 0.0

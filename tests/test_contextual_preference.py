@@ -218,7 +218,7 @@ def test_superseded_evidence_uses_existing_provenance_discount():
 
     old = _experience(index=0)
     replacement = provenance.mark_supersedes(
-        _experience(index=1, option="quiet_science"), old,
+        _experience(index=1), old,
     )
 
     result = cp.derive_preference(
@@ -227,11 +227,79 @@ def test_superseded_evidence_uses_existing_provenance_discount():
     )
 
     assert result["scores"] == {
-        "quiet_science": 0.7,
-        "active_movement": 0.175,
+        "quiet_science": 0.0,
+        "active_movement": 0.875,
     }
     assert result["explanation"]["contributing"][0]["record_id"] == "experience-0"
     assert result["explanation"]["contributing"][0]["superseded_by"] == "experience-1"
+
+
+@pytest.mark.parametrize(
+    ("person", "context", "kind"),
+    [
+        ("adrian", "after_school", "report"),
+        ("obi", "weekend", "report"),
+        ("obi", "after_school", "narrative"),
+    ],
+)
+def test_out_of_scope_or_ineligible_superseder_cannot_discount_evidence(
+    person, context, kind,
+):
+    from pxh import provenance
+
+    originals = [_experience(index=i, confidence=0.5) for i in range(2)]
+    superseder = provenance.mark_supersedes(
+        _experience(index=10, person=person, context=context, kind=kind),
+        originals[0],
+    )
+
+    result = cp.choose_option(
+        originals + [superseder], person="obi", context="after_school",
+        options=OPTIONS, default="quiet_science", now=NOW,
+    )
+
+    assert result["chosen"] == "active_movement"
+    assert result["scores"]["active_movement"] == 1.0
+
+
+def test_superseder_for_another_option_cannot_discount_exact_option_evidence():
+    from pxh import provenance
+
+    originals = [_experience(index=i, confidence=0.5) for i in range(2)]
+    superseder = provenance.mark_supersedes(
+        _experience(index=10, option="quiet_science"), originals[0],
+    )
+
+    result = cp.derive_preference(
+        originals + [superseder], person="obi", context="after_school",
+        options=OPTIONS, now=NOW,
+    )
+
+    assert result["scores"]["active_movement"] == 1.0
+
+
+def test_exact_activation_margin_does_not_activate():
+    records = [_experience(index=i, confidence=0.375) for i in range(2)]
+    result = cp.choose_option(
+        records, person="obi", context="after_school", options=OPTIONS,
+        default="quiet_science", now=NOW,
+    )
+    assert result["scores"]["active_movement"] == 0.75
+    assert result["adapted"] is False
+    assert result["chosen"] == "quiet_science"
+
+
+def test_zero_confidence_record_does_not_satisfy_corroboration_minimum():
+    records = [
+        _experience(index=0, confidence=0.9),
+        _experience(index=1, confidence=0.0),
+    ]
+    result = cp.choose_option(
+        records, person="obi", context="after_school", options=OPTIONS,
+        default="quiet_science", now=NOW,
+    )
+    assert result["scores"]["active_movement"] == 0.9
+    assert result["adapted"] is False
 
 
 def test_append_and_load_preserve_record_and_provenance(tmp_path):
@@ -258,6 +326,18 @@ def test_load_keeps_valid_history_and_reports_malformed_lines(tmp_path):
 
     assert loaded == [valid]
     assert diagnostics == {"total": 3, "valid": 1, "invalid": 2}
+
+
+def test_load_reports_unicode_read_error_instead_of_looking_empty(tmp_path):
+    path = tmp_path / "experiences.jsonl"
+    path.write_bytes(b"\xff\xfe\x00")
+
+    loaded, diagnostics = cp.load_experiences(path=path)
+
+    assert loaded == []
+    assert diagnostics == {
+        "total": 0, "valid": 0, "invalid": 0, "read_error": "UnicodeDecodeError",
+    }
 
 
 def test_append_rejects_unstamped_or_invalid_record(tmp_path):
