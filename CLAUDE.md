@@ -109,7 +109,7 @@ Three-layer architecture:
 - **Layer 2 — Reflection** (on transition or every 5min idle): all personas use Ollama on M5 as primary (`http://M5:11434` — router DNS name, not `M5.local` mDNS). Four-tier fallback: Ollama M5 → Claude Haiku (SPARK only, via `claude -p` subprocess) → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). Writes to `state/thoughts.jsonl`.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. Thoughts with `action=message_obi` are **redacted** in `thoughts-spark.jsonl` (written as `[private message to Obi]`) so the private DM content never reaches the public `/api/v1/public/thoughts` endpoint.
-- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap (falls back to last-3 notes while empty). Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
+- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
 
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
@@ -117,6 +117,14 @@ Three-layer architecture:
 - Single-instance PID guard via `/proc/{pid}` liveness check
 - Arrival detection uses module-level `_last_known_findmyhub` cache (not awareness snapshot) — survives M5.local→Pi push outages. Do not replace with snapshot diff.
 - `state/thought-images/` cleaned hourly (images >30 days deleted)
+
+### Epistemic Provenance (`src/pxh/provenance.py`)
+
+Every durable claim in `state/notes[-persona].jsonl` and `state/memories-{persona}.jsonl` records where it came from, so retrieved memory can distinguish what SPARK saw, was told, inferred, or wrote itself.
+
+The six kinds have confidence ceilings clamped on write and read: `observation` and `verification` (1.0), `report` (0.9), `inference` (0.6), `narrative` (0.5), and legacy `unknown` (0.3). The ordering is the safety property. The model never chooses a kind: callers set constants, and consolidation allowlists its input fields. Ceilings deliberately live outside `spark_config.py`, which self-evolution can propose editing.
+
+Writes are strict; reads are lenient. Invalid or legacy data remains readable as `unknown`, without promoting a coarse `source` string into a claim type. Corrections mark supersession without deleting history. Relevance retrieval returns only topical matches (never recent padding); explicit `mode="recent"` remains available. A populated store with no relevant hit does not fall back to raw notes.
 
 ### Autonomous Racing (px-race)
 

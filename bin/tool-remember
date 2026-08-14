@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 
 from filelock import FileLock
+from pxh import provenance
 from pxh.logging import log_event
 from pxh.state import load_session, update_session
 from pxh.time import utc_timestamp
@@ -48,7 +49,16 @@ def main() -> int:
     if len(text) > 500:
         text = text[:500]
 
-    record = {"ts": utc_timestamp(), "note": text}
+    # Provenance is declared by the caller, never by the model: voice_loop
+    # stamps `report` (a person is speaking), px-mind stamps `narrative` (its
+    # own reflection). An env value outside the vocabulary degrades to
+    # `unknown` rather than raising — an unlabelled note is better than a lost
+    # one, and better than a flattering guess.
+    kind = os.environ.get("PX_NOTE_KIND", "").strip().lower()
+    if kind not in provenance.KINDS:
+        kind = "unknown"
+    source = os.environ.get("PX_NOTE_SOURCE", "").strip() or f"tool-remember:{persona or 'shared'}"
+    record = provenance.stamp({"ts": utc_timestamp(), "note": text}, kind, source)
     NOTES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with NOTES_LOCK:
         with NOTES_FILE.open("a", encoding="utf-8") as f:

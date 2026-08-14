@@ -338,3 +338,21 @@ def test_mind_loop_uses_should_express():
     src = inspect.getsource(mind.mind_loop)
     assert "_should_express(" in src
     assert "last_greet_arrival_mono" in src
+
+
+def test_mind_remember_dispatch_types_the_note_as_sparks_own_narrative(monkeypatch):
+    """px-mind's `remember` acts on SPARK's reflection, so it is narrative."""
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(mind.subprocess, "run", fake_run)
+    monkeypatch.setattr(mind, "_is_night_silence", lambda h: False)
+    mind.expression({"action": "remember", "text": "the house was quiet today",
+                     "thought": "the house was quiet today", "mood": "calm",
+                     "salience": 0.5}, dry=False)
+
+    assert captured["env"]["PX_NOTE_KIND"] == "narrative"
+    assert captured["env"]["PX_NOTE"] == "the house was quiet today"

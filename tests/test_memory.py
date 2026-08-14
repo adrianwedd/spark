@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from pxh import memory
+from pxh import memory, provenance
 
 
 @pytest.fixture(autouse=True)
@@ -59,44 +59,84 @@ def test_retrieve_tag_hits_boost_score():
     assert out[0]["tags"] == ["obi", "school"]
 
 
-def test_retrieve_pads_with_most_recent_when_few_hits():
+def test_retrieve_does_not_pad_partial_results_with_recent():
+    """One topical hit and n=2 must return one record, not one plus a filler.
+
+    The filler was indistinguishable from a real hit once it reached the
+    reflection prompt, so an unrelated recent memory entered cognition purely
+    because a result slot was free.
+    """
     memory.append_memories([
         _mem("alpha bravo charlie", ts="2026-07-01T00:00:00Z"),
         _mem("delta echo foxtrot", ts="2026-07-09T00:00:00Z"),
         _mem("Obi built a lego tower", ts="2026-07-05T00:00:00Z"),
     ])
     out = memory.retrieve_memories("lego", n=2, now=NOW)
-    assert "lego" in out[0]["text"]
-    assert out[1]["text"] == "delta echo foxtrot"  # newest non-hit pads
-
-
-def test_retrieve_pads_by_timestamp_not_insertion_order():
-    memory.append_memories([
-        _mem("bravo charlie delta", ts="2026-07-10T00:00:00Z"),   # newest ts, index 0
-        _mem("echo foxtrot golf", ts="2026-06-01T00:00:00Z"),     # oldest ts, index 1
-        _mem("Obi built a lego tower", ts="2026-07-05T00:00:00Z"),
-    ])
-    out = memory.retrieve_memories("lego", n=2, now=NOW)
-    assert "lego" in out[0]["text"]
-    assert out[1]["text"] == "bravo charlie delta"  # newest by ts, despite index 0
+    assert [m["text"] for m in out] == ["Obi built a lego tower"]
 
 
 def test_retrieve_empty_store_returns_empty():
     assert memory.retrieve_memories("anything") == []
 
 
-def test_retrieve_zero_topical_match_returns_recent_memories():
+def test_retrieve_zero_topical_match_returns_nothing():
     memory.append_memories([
         _mem("alpha bravo charlie", ts="2026-07-01T00:00:00Z"),
         _mem("delta echo foxtrot", ts="2026-07-10T00:00:00Z"),
     ])
 
-    out = memory.retrieve_memories("unrelated xylophone quartz", n=2, now=NOW)
+    assert memory.retrieve_memories("unrelated xylophone quartz", n=2, now=NOW) == []
 
-    assert [m["text"] for m in out] == [
-        "delta echo foxtrot",
-        "alpha bravo charlie",
-    ]
+
+def test_recent_mode_returns_newest_by_timestamp_not_insertion_order():
+    """Recency-only retrieval is still available, but must be asked for."""
+    memory.append_memories([
+        _mem("bravo charlie delta", ts="2026-07-10T00:00:00Z"),   # newest ts, index 0
+        _mem("echo foxtrot golf", ts="2026-06-01T00:00:00Z"),     # oldest ts, index 1
+        _mem("hotel india juliet", ts="2026-07-05T00:00:00Z"),
+    ])
+    out = memory.retrieve_memories("", n=2, mode="recent", now=NOW)
+    assert [m["text"] for m in out] == ["bravo charlie delta", "hotel india juliet"]
+
+
+def test_recent_mode_ignores_the_query_entirely():
+    memory.append_memories([
+        _mem("Obi built a lego tower", ts="2026-07-01T00:00:00Z"),
+        _mem("alpha bravo charlie", ts="2026-07-10T00:00:00Z"),
+    ])
+    out = memory.retrieve_memories("lego", n=1, mode="recent", now=NOW)
+    assert out[0]["text"] == "alpha bravo charlie"
+
+
+def test_recent_mode_sorts_unparseable_timestamps_last():
+    memory.append_memories([
+        _mem("corrupt clock", ts="not-a-timestamp"),
+        _mem("good clock", ts="2026-01-01T00:00:00Z"),
+    ])
+    out = memory.retrieve_memories("", n=2, mode="recent", now=NOW)
+    assert [m["text"] for m in out] == ["good clock", "corrupt clock"]
+
+
+def test_unknown_retrieval_mode_is_rejected():
+    memory.append_memories([_mem("anything at all")])
+    with pytest.raises(ValueError):
+        memory.retrieve_memories("anything", mode="vibes")
+
+
+def test_has_memory_store_false_when_file_missing():
+    assert memory.has_memory_store() is False
+
+
+def test_has_memory_store_false_for_an_empty_file():
+    f = memory.memories_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("", encoding="utf-8")
+    assert memory.has_memory_store() is False
+
+
+def test_has_memory_store_true_once_a_memory_is_written():
+    memory.append_memories([_mem("something happened")])
+    assert memory.has_memory_store() is True
 
 
 def test_importance_does_not_affect_retrieval_ranking():
@@ -187,15 +227,54 @@ def test_consolidate_success_writes_deduped_memories():
     assert sum("lego tower" in t for t in texts) == 1  # no duplicate
 
 
-def test_consolidation_keeps_only_coarse_source_not_evidence_metadata():
+def test_consolidated_memory_is_stamped_as_generated_narrative():
+    """Consolidation distils SPARK's own thoughts, so its output is narrative —
+    never something SPARK observed, however the sentence is phrased."""
+    _write_thoughts(None, n=8)
+    payload = [{"text": "I watched Obi come through the door", "tags": ["obi"],
+                "importance": 0.9}]
+
+    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+        result = memory.consolidate()
+
+    assert result["status"] == "ok"
+    record = memory.load_memories()[0]
+    assert record["source"] == "consolidation"      # coarse field kept for compat
+    p = provenance.read_provenance(record)
+    assert p["kind"] == "narrative"
+    assert p["confidence"] <= provenance.CONFIDENCE_CEILING["narrative"]
+    assert p["legacy"] is False
+
+
+def test_consolidated_memory_cites_the_thought_window_it_came_from():
+    _write_thoughts(None, n=8)
+    payload = [{"text": "a durable thing happened", "tags": [], "importance": 0.5}]
+
+    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+        memory.consolidate()
+
+    evidence = provenance.read_provenance(memory.load_memories()[0])["evidence"]
+    assert any("thoughts-spark.jsonl" in ref for ref in evidence)
+    assert any("8" in ref for ref in evidence), "cites how many thoughts fed it"
+
+
+def test_model_supplied_provenance_claims_are_ignored():
+    """The consolidating model must not be able to type its own output.
+
+    Letting it set `kind` or `confidence` would hand the writer of a claim the
+    power to declare that claim perceived — the exact confusion #170 closes.
+    """
     _write_thoughts(None, n=8)
     payload = [{
         "text": "I decided the hallway was empty",
         "tags": ["hallway"],
         "importance": 0.7,
-        "kind": "inference",
+        "kind": "observation",
         "evidence_refs": ["thought-123"],
-        "confidence": 0.2,
+        "confidence": 1.0,
+        "provenance": {"kind": "verification", "source": "the world",
+                       "confidence": 1.0},
+        "supersedes": ["some-other-memory"],
     }]
 
     with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
@@ -203,10 +282,71 @@ def test_consolidation_keeps_only_coarse_source_not_evidence_metadata():
 
     assert result["status"] == "ok"
     record = memory.load_memories()[0]
-    assert record["source"] == "consolidation"
     assert "kind" not in record
     assert "evidence_refs" not in record
     assert "confidence" not in record
+    assert record["provenance"]["kind"] == "narrative"
+    assert record["provenance"]["source"] == "consolidation"
+    assert record["provenance"]["supersedes"] == []
+
+
+def test_provenance_survives_the_whole_round_trip_from_consolidation_to_retrieval():
+    """#170's second test bullet, end to end: write it, read it back through
+    the path reflection actually uses, and it still knows what it is."""
+    _write_thoughts(None, n=8)
+    payload = [{"text": "Obi and I built a lego tower", "tags": ["lego"],
+                "importance": 0.6}]
+
+    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+        memory.consolidate()
+
+    out = memory.retrieve_memories("lego tower", n=1)
+
+    assert out and out[0]["text"] == "Obi and I built a lego tower"
+    p = provenance.read_provenance(out[0])
+    assert p["kind"] == "narrative"
+    assert p["source"] == "consolidation"
+    assert p["evidence"]
+
+
+def test_legacy_memories_remain_retrievable_and_read_as_unknown():
+    """Records written before #170 must keep working, at unknown provenance."""
+    memory.append_memories([_mem("Obi built a lego tower")])   # no provenance key
+
+    out = memory.retrieve_memories("lego", n=1, now=NOW)
+
+    assert out[0]["text"] == "Obi built a lego tower"
+    assert provenance.read_provenance(out[0])["kind"] == "unknown"
+    assert provenance.read_provenance(out[0])["legacy"] is True
+
+
+def test_relevance_retrieval_skips_a_superseded_memory():
+    old = provenance.stamp(_mem("the hallway is empty", tags=["hallway"]),
+                           "inference", "mind:reflection")
+    new = provenance.mark_supersedes(
+        provenance.stamp(_mem("Obi was in the hallway", tags=["hallway"]),
+                         "observation", "vision:describe-scene"), old)
+    memory.append_memories([old, new])
+
+    out = memory.retrieve_memories("hallway", n=5, now=NOW)
+
+    assert [m["text"] for m in out] == ["Obi was in the hallway"]
+    assert len(memory.load_memories()) == 2, "the store still holds both"
+
+
+def test_recent_mode_still_shows_superseded_memories_but_marks_them():
+    old = provenance.stamp(_mem("the hallway is empty", ts="2026-07-01T00:00:00Z"),
+                           "inference", "mind:reflection")
+    new = provenance.mark_supersedes(
+        provenance.stamp(_mem("Obi was in the hallway", ts="2026-07-02T00:00:00Z"),
+                         "observation", "vision:describe-scene"), old)
+    memory.append_memories([old, new])
+
+    out = memory.retrieve_memories("", n=5, mode="recent", now=NOW)
+
+    superseded = [m for m in out if m["text"] == "the hallway is empty"]
+    assert len(superseded) == 1
+    assert provenance.is_superseded(superseded[0]) is True
 
 
 def test_consolidate_budget_exhausted_is_failed_not_raised():

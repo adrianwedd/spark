@@ -647,6 +647,11 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         if not isinstance(note, str) or not note.strip():
             raise VoiceLoopError("tool_remember requires a non-empty 'text' parameter")
         sanitized["PX_NOTE"] = note.strip()[:500]
+        # Constants, not params: the model supplies the note's *text* and
+        # nothing about its standing. Reading a `kind` out of params would let
+        # it declare its own speculation observed (#170).
+        sanitized["PX_NOTE_KIND"] = "report"
+        sanitized["PX_NOTE_SOURCE"] = "voice_loop"
     elif tool == "tool_recall":
         limit = int(clamp(_num(params.get("limit", 5), "limit"), 1, 20))
         sanitized["PX_RECALL_LIMIT"] = str(limit)
