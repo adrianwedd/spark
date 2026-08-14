@@ -339,6 +339,28 @@ def test_duplicate_evidence_superseder_cannot_discount_original():
     assert result["chosen"] == "active_movement"
 
 
+def test_zero_weight_record_claims_evidence_consistently_before_superseder():
+    from pxh import provenance
+
+    originals = [_experience(index=i, confidence=0.5) for i in range(2)]
+    zero_weight = _experience(
+        index=10, confidence=0.0, evidence=["interaction:shared"],
+    )
+    later_duplicate = provenance.mark_supersedes(
+        _experience(index=11, confidence=0.5, evidence=["interaction:shared"]),
+        originals[0],
+    )
+
+    result = cp.choose_option(
+        originals + [zero_weight, later_duplicate], person="obi",
+        context="after_school", options=OPTIONS, default="quiet_science", now=NOW,
+    )
+
+    assert result["scores"]["active_movement"] == 1.0
+    assert result["chosen"] == "active_movement"
+    assert result["explanation"]["ignored_by_reason"]["duplicate_evidence"] == 1
+
+
 def test_append_and_load_preserve_record_and_provenance(tmp_path):
     path = tmp_path / "experiences.jsonl"
     record = _experience(index=1)

@@ -153,24 +153,26 @@ def _scoped_supersessions(records: Sequence[dict], *, person: str,
             block = dict(raw)
             copy["provenance"] = block
             replacement_p = provenance.read_provenance(record)
-            replacement_authorized = (
+            policy_shaped = (
                 record.get("person") == person
                 and record.get("context") == context
                 and record.get("option") in options
                 and record.get("outcome") in OUTCOMES
                 and replacement_p["kind"] in ELIGIBLE_KINDS
                 and bool(replacement_p["evidence"])
-                and replacement_p["confidence"] > 0.0
-                and not any(
-                    ref in seen_policy_evidence for ref in replacement_p["evidence"]
-                )
             )
             try:
                 _timestamp(record.get("ts"))
             except (TypeError, ValueError):
-                replacement_authorized = False
-            if replacement_authorized:
+                policy_shaped = False
+            independent = policy_shaped and not any(
+                ref in seen_policy_evidence for ref in replacement_p["evidence"]
+            )
+            if independent:
                 seen_policy_evidence.update(replacement_p["evidence"])
+            replacement_authorized = (
+                independent and replacement_p["confidence"] > 0.0
+            )
             allowed: list[str] = []
             if replacement_authorized:
                 for old_id in replacement_p["supersedes"]:
