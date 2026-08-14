@@ -1,6 +1,10 @@
 """Tests for px-alive idle-alive daemon (dry-run only — no GPIO)."""
+import json
+import os
 import subprocess
 from pathlib import Path
+
+from pxh.gpio_lease import GpioLeaseStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,3 +90,45 @@ def test_systemd_service_enables_functional_watchdog():
 
     assert "WatchdogSec=15" in service
     assert "NotifyAccess=main" in service
+
+
+def test_false_exploration_owner_does_not_suppress_alive(isolated_project):
+    """#176: exploring state from a live unrelated PID is not GPIO authority."""
+    env = isolated_project["env"].copy()
+    state_dir = isolated_project["state_dir"]
+    log_dir = isolated_project["log_dir"]
+    env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
+    env["PX_ALIVE_PID"] = str(log_dir / "px-alive.pid")
+    (state_dir / "exploring.json").write_text(json.dumps({
+        "active": True,
+        "pid": os.getpid(),
+        "started": "2026-08-14T00:00:00Z",
+    }))
+
+    result = run_alive([], env)
+
+    assert result.returncode == 0
+    assert "dry gaze" in (log_dir / "px-alive.log").read_text()
+
+
+def test_live_gpio_owner_suppresses_alive_until_release(isolated_project):
+    """px-alive resumes once the legitimate GPIO owner releases authority."""
+    env = isolated_project["env"].copy()
+    state_dir = isolated_project["state_dir"]
+    log_dir = isolated_project["log_dir"]
+    env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
+    env["PX_ALIVE_PID"] = str(log_dir / "px-alive.pid")
+    lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
+    assert lease is not None
+
+    leased_result = run_alive([], env)
+    leased_log = (log_dir / "px-alive.log").read_text()
+    assert leased_result.returncode == 0
+    assert "GPIO lease active" in leased_log
+    assert "dry gaze" not in leased_log
+
+    assert GpioLeaseStore(state_dir).release(lease.lease_id) is True
+    resumed_result = run_alive([], env)
+    resumed_log = (log_dir / "px-alive.log").read_text()
+    assert resumed_result.returncode == 0
+    assert "dry gaze" in resumed_log

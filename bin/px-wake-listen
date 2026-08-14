@@ -30,10 +30,18 @@ import time
 import wave
 from pathlib import Path
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
+
 LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wake-listen.log"))
 PID_FILE = Path(os.environ.get("PX_WAKE_PID", LOG_DIR / "px-wake-listen.pid"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path.cwd()))
+STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+_gpio_guard = GpioLeaseGuard(
+    GpioLeaseStore(STATE_DIR),
+    "voice",
+    on_lost=lambda: os.kill(os.getpid(), signal.SIGTERM),
+)
 
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
@@ -660,6 +668,9 @@ def _alive_pid() -> int | None:
 
 def _stop_alive() -> int | None:
     """Send SIGTERM to px-alive so it releases GPIO. Returns PID if killed."""
+    if not _gpio_guard.acquire():
+        raise RuntimeError("GPIO already leased by another live owner")
+    os.environ["PX_GPIO_LEASE_ID"] = _gpio_guard.lease.lease_id
     pid = _alive_pid()
     if pid:
         log(f"pausing px-alive (pid={pid}) for voice turn")
@@ -667,15 +678,32 @@ def _stop_alive() -> int | None:
             # px-alive runs as root; use sudo kill so pi user can signal it
             r = subprocess.run(["sudo", "-n", "kill", str(pid)], check=False, capture_output=True)
             if r.returncode != 0:
-                log(f"_stop_alive: sudo kill failed (rc={r.returncode}): {r.stderr.decode(errors='replace').strip()}")
-            time.sleep(2.0)  # wait for Picarx.close() to release GPIO
+                raise RuntimeError(
+                    f"sudo kill failed (rc={r.returncode}): "
+                    f"{r.stderr.decode(errors='replace').strip()}"
+                )
+            deadline = time.monotonic() + 2.0
+            proc_path = Path(f"/proc/{pid}")
+            while proc_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if proc_path.exists():
+                raise RuntimeError("px-alive did not stop within 2 seconds")
+            # The process is gone; allow robot_hat/lgpio teardown to settle.
+            time.sleep(2.0)
         except Exception as exc:
             log(f"_stop_alive: exception: {exc}")
+            _gpio_guard.release()
+            os.environ.pop("PX_GPIO_LEASE_ID", None)
+            raise
     return pid
 
 
-def _restart_alive() -> None:
-    """Restart px-alive in background."""
+def _restart_alive(had_alive: int | None = 1) -> None:
+    """Release voice GPIO authority and restart px-alive when handed off."""
+    _gpio_guard.release()
+    os.environ.pop("PX_GPIO_LEASE_ID", None)
+    if not had_alive:
+        return
     alive_script = PROJECT_ROOT / "bin" / "px-alive"
     if alive_script.exists():
         log("restarting px-alive")
@@ -862,8 +890,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             current_text = follow_text
 
     finally:
-        if had_alive:
-            _restart_alive()
+        _restart_alive(had_alive)
 
 
 def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
@@ -941,8 +968,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
             current_text = follow_text
 
     finally:
-        if had_alive:
-            _restart_alive()
+        _restart_alive(had_alive)
 
 
 def listen_loop(pa, model, args, stt=None, whisper=None, sensevoice=None) -> None:

@@ -8,9 +8,11 @@ from __future__ import annotations
 import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.utils import clamp
 from pxh.time import utc_timestamp
 
@@ -319,7 +321,8 @@ class RaceController:
 
     def __init__(self, px=None, state_dir: Path | None = None,
                  dry: bool = False, max_speed: int = 50,
-                 install_signals: bool = True):
+                 install_signals: bool = True,
+                 gpio_guard: GpioLeaseGuard | None = None):
         self.px = px
         self.dry = dry
         self.max_speed = int(clamp(max_speed, MIN_RACE_SPEED, 60))
@@ -334,6 +337,7 @@ class RaceController:
         self.profile: TrackProfile | None = None
         self.calibration: dict = {}
         self._stop_flag = False
+        self._gpio_guard = gpio_guard
 
         # Battery cache
         self._battery_cache: dict | None = None
@@ -360,12 +364,17 @@ class RaceController:
             signal.signal(signal.SIGTERM, self._handle_signal)
             signal.signal(signal.SIGINT, self._handle_signal)
 
-        # Mark as exploring so px-alive stays away (will be cleared in _handle_signal / run cleanup)
-        self._set_exploring(True)
+        # Racing owns GPIO authority but is not exploration intent.
+        self._set_gpio_owned(True)
 
     # ─── Signal handling ──────────────────────────────────────────────────────
 
     def _handle_signal(self, signum, frame) -> None:
+        self._handle_lease_loss()
+        self._set_gpio_owned(False)
+
+    def _handle_lease_loss(self) -> None:
+        """Stop motion as soon as this process no longer owns GPIO."""
         self._stop_flag = True
         if self.px is not None and not self.dry:
             try:
@@ -373,7 +382,6 @@ class RaceController:
                 self.px.set_dir_servo_angle(0)
             except Exception:
                 pass
-        self._set_exploring(False)
 
     # ─── Calibration ──────────────────────────────────────────────────────────
 
@@ -414,13 +422,22 @@ class RaceController:
         except Exception:
             return None
 
-    def _set_exploring(self, active: bool) -> None:
-        from pxh.state import atomic_write
-        path = self.state_dir / "exploring.json"
-        try:
-            atomic_write(path, json.dumps({"active": active, "pid": os.getpid()}))
-        except Exception:
-            pass
+    def _set_gpio_owned(self, active: bool) -> None:
+        """Acquire or release the race process's GPIO authority."""
+        if self.dry:
+            return
+        if active:
+            if self._gpio_guard is None:
+                guard = GpioLeaseGuard(
+                    GpioLeaseStore(self.state_dir),
+                    "race",
+                    on_lost=self._handle_lease_loss,
+                )
+                if not guard.acquire():
+                    raise RuntimeError("GPIO already leased by another live owner")
+                self._gpio_guard = guard
+        # Do not publish release while this process still owns a Picarx handle:
+        # close() does not relinquish GPIO5. Process death invalidates owner_pid.
 
     def _append_race_log(self, entry: dict) -> None:
         path = self.state_dir / "race_log.jsonl"
@@ -454,7 +471,7 @@ class RaceController:
             except ImportError:
                 pass
 
-        self._set_exploring(True)
+        self._set_gpio_owned(True)
 
         track_ref = self.calibration.get("track_ref", [400, 410, 405])
         track_width_cm = float(self.calibration.get("track_width_cm", 88))
@@ -535,7 +552,7 @@ class RaceController:
             if not self.dry and self.px is not None:
                 self.px.stop()
                 self.px.set_dir_servo_angle(0)
-            self._set_exploring(False)
+            self._set_gpio_owned(False)
 
     def _compress_samples(self, samples: list[dict], track_width_cm: float) -> TrackProfile:
         """Convert raw map samples into a TrackProfile with merged segments."""
@@ -593,7 +610,7 @@ class RaceController:
             except ImportError:
                 pass
 
-        self._set_exploring(True)
+        self._set_gpio_owned(True)
 
         track_ref = self.calibration.get("track_ref", [400, 410, 405])
         barrier_ref = self.calibration.get("barrier_ref", [700, 710, 705])
@@ -876,7 +893,7 @@ class RaceController:
             self.px.stop()
             self.px.set_dir_servo_angle(0)
             self.px.set_cam_pan_angle(0)
-        self._set_exploring(False)
+        self._set_gpio_owned(False)
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
@@ -937,20 +954,44 @@ def main(argv=None) -> int:
         return 0
 
     # ── Live hardware setup ───────────────────────────────────────────────────
+    pre_guard = None
+    pre_guard_lost = threading.Event()
     if dry:
         from unittest.mock import MagicMock
         px = MagicMock()
         px.get_distance.return_value = 90.0
         px.get_grayscale_data.return_value = [400, 410, 405]
     else:
+        pre_guard = GpioLeaseGuard(
+            GpioLeaseStore(state_dir),
+            "race",
+            on_lost=pre_guard_lost.set,
+        )
+        if not pre_guard.acquire():
+            print("ERROR: GPIO already leased by another live owner", file=sys.stderr)
+            return 1
         try:
             from picarx import Picarx
             px = Picarx()
+            if pre_guard_lost.is_set():
+                px.stop()
+                print("ERROR: GPIO lease lost during Picarx init", file=sys.stderr)
+                return 1
         except Exception as exc:
             print(f"ERROR: cannot init Picarx: {exc}", file=sys.stderr)
             return 1
 
-    rc = RaceController(px=px, state_dir=state_dir, dry=dry, max_speed=max_speed)
+    rc = RaceController(
+        px=px,
+        state_dir=state_dir,
+        dry=dry,
+        max_speed=max_speed,
+        gpio_guard=pre_guard,
+    )
+    if pre_guard is not None:
+        pre_guard.on_lost = rc._handle_lease_loss
+        if pre_guard.lost.is_set():
+            rc._handle_lease_loss()
 
     try:
         # ── --calibrate ───────────────────────────────────────────────────────
@@ -1022,7 +1063,6 @@ def main(argv=None) -> int:
         print("\nAborted.")
         return 130
     finally:
-        rc._set_exploring(False)
         if not dry and px is not None:
             try:
                 px.stop()
@@ -1030,6 +1070,7 @@ def main(argv=None) -> int:
                 px.set_cam_pan_angle(0)
             except Exception:
                 pass
+        rc._set_gpio_owned(False)
 
 
 if __name__ == "__main__":

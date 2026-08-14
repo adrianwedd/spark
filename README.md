@@ -658,6 +658,10 @@ The PiCar-X Robot HAT MCU at I2C address `0x14` handles all servos and ADC throu
 
 - **`px-alive`** holds a persistent `Picarx` handle
 - **Tools** call `yield_alive()` (SIGUSR1 to px-alive) before claiming GPIO
+- **`state/gpio_lease.json`** is the tokenized GPIO authority: live owners
+  refresh it, only the matching generation token may release it, and dead or
+  expired owners are rejected. `state/exploring.json` records exploration
+  intent/state only and never suppresses `px-alive` by itself.
 - **systemd** restarts px-alive after 10s (`Restart=always`, `RestartSec=10`)
 - **`os.getlogin()`** fails under systemd — monkey-patched via `usercustomize.py`
 

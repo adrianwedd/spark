@@ -466,6 +466,12 @@ sudo bin/px-alive [--gaze-min S] [--gaze-max S] [--prox-cm F] [--no-prox] [--dry
 
 **Log file:** `$LOG_DIR/px-alive.log`
 
+**GPIO ownership:** Before opening hardware, long-running consumers acquire a
+tokenized lease in `state/gpio_lease.json`. `px-alive` exits cleanly while a
+live, unexpired lease exists and resumes after release/expiry/death. The
+separate `state/exploring.json` file describes wander intent and is not GPIO
+authority.
+
 **Functional health:** Each loop iteration atomically replaces
 `state/alive_heartbeat.json` with a timestamp and mode (`starting`, `running`,
 `charging`, or `i2c_backoff`). This is the authoritative loop-progress signal. The systemd
