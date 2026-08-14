@@ -579,6 +579,8 @@ SLOW_TOOLS = {
     "tool_timer", "tool_research", "tool_compose", "tool_blog", "tool_story",
 }
 SYNC_TIMEOUT_SLOW = float(os.environ.get("PX_API_TIMEOUT_SLOW", "120"))
+ALIVE_LOOP_STALE_S = 10
+SONAR_STALE_S = 60
 
 
 def _resolve_dry(requested: Optional[bool]) -> bool:
@@ -632,6 +634,67 @@ async def health():
             checks["awareness"] = {"status": "ok", "age_s": round(age_s)}
     else:
         checks["awareness"] = {"status": "missing"}
+
+    # px-alive process liveness, loop progress, and sonar freshness are
+    # intentionally separate signals. A fresh charging loop is healthy even
+    # though sonar is expected to remain stale while hardware is frozen.
+    heartbeat_mode = "unknown"
+    heartbeat_file = state_dir / "alive_heartbeat.json"
+    try:
+        heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+        heartbeat_age_s = max(0.0, _time.time() - float(heartbeat["ts"]))
+        heartbeat_mode = str(heartbeat.get("mode") or "unknown")
+        heartbeat_status = (
+            "ok" if heartbeat_age_s <= ALIVE_LOOP_STALE_S else "stale"
+        )
+        checks["alive_loop"] = {
+            "status": heartbeat_status,
+            "age_s": round(heartbeat_age_s),
+            "mode": heartbeat_mode,
+        }
+        if heartbeat_status != "ok":
+            overall = "degraded"
+    except FileNotFoundError:
+        checks["alive_loop"] = {"status": "missing", "mode": "unknown"}
+        overall = "degraded"
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+        checks["alive_loop"] = {"status": "invalid", "mode": "unknown"}
+        overall = "degraded"
+
+    sonar_file = state_dir / "sonar_live.json"
+    try:
+        sonar = json.loads(sonar_file.read_text(encoding="utf-8"))
+        sonar_age_s = max(0.0, _time.time() - float(sonar["ts"]))
+        if sonar_age_s <= SONAR_STALE_S:
+            sonar_status = "ok"
+            checks["sonar"] = {
+                "status": sonar_status,
+                "age_s": round(sonar_age_s),
+            }
+        elif heartbeat_mode == "charging":
+            checks["sonar"] = {
+                "status": "expected_stale",
+                "age_s": round(sonar_age_s),
+                "reason": "charging",
+            }
+        else:
+            checks["sonar"] = {
+                "status": "stale",
+                "age_s": round(sonar_age_s),
+            }
+            overall = "degraded"
+    except FileNotFoundError:
+        if heartbeat_mode == "charging":
+            checks["sonar"] = {
+                "status": "expected_stale",
+                "reason": "charging",
+            }
+        else:
+            checks["sonar"] = {"status": "missing"}
+            overall = "degraded"
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+        checks["sonar"] = {"status": "invalid"}
+        overall = "degraded"
 
     status_code = 200 if overall == "ok" else 503
     return JSONResponse(

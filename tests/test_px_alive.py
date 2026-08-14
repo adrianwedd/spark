@@ -79,3 +79,10 @@ def test_px_alive_no_prox_flag(isolated_project):
 
     result = run_alive(["--no-prox"], env)
     assert result.returncode == 0
+
+
+def test_systemd_service_enables_functional_watchdog():
+    service = (PROJECT_ROOT / "systemd" / "px-alive.service").read_text()
+
+    assert "WatchdogSec=15" in service
+    assert "NotifyAccess=main" in service

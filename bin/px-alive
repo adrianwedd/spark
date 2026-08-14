@@ -27,7 +27,9 @@ import math
 import os
 import random
 import signal
+import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -65,6 +67,7 @@ STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
 SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
+ALIVE_HEARTBEAT_FILE = STATE_DIR / "alive_heartbeat.json"
 BATTERY_FILE    = STATE_DIR / "battery.json"
 FRIGATE_FILE = STATE_DIR / "frigate_presence.json"
 FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
@@ -125,6 +128,61 @@ def log(msg: str) -> None:
             os.replace(tmp, str(LOG_FILE))
     except Exception:
         pass
+
+
+def _sd_notify_watchdog(message: str) -> bool:
+    """Send a systemd notification without requiring python-systemd."""
+    address = os.environ.get("NOTIFY_SOCKET", "")
+    if not address:
+        return False
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_socket:
+            notify_socket.connect(address)
+            notify_socket.sendall(message.encode("utf-8"))
+        return True
+    except OSError as exc:
+        log(f"systemd watchdog notify failed: {exc}")
+        return False
+
+
+_heartbeat_err_logged = False
+
+
+def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
+    """Atomically publish loop progress, then notify systemd's watchdog.
+
+    The notification deliberately follows the durable write: systemd must not
+    consider the loop healthy when its authoritative progress record is stale.
+    """
+    global _heartbeat_err_logged
+    ALIVE_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"ts": time.time() if now is None else now, "mode": mode})
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(ALIVE_HEARTBEAT_FILE.parent), suffix=".tmp"
+        )
+        os.chmod(tmp_path, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as heartbeat_file:
+            heartbeat_file.write(payload)
+            heartbeat_file.flush()
+            os.fsync(heartbeat_file.fileno())
+        os.replace(tmp_path, str(ALIVE_HEARTBEAT_FILE))
+        _heartbeat_err_logged = False
+        _sd_notify_watchdog("WATCHDOG=1")
+        return True
+    except OSError as exc:
+        if not _heartbeat_err_logged:
+            log(f"alive heartbeat write failed: {exc}")
+            _heartbeat_err_logged = True
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        return False
 
 
 def _pan_from_frigate(presence: dict | None) -> int:
@@ -433,6 +491,7 @@ def idle_loop(args) -> None:
 
             # Skip all hardware if in I2C backoff period
             if now < i2c_ok_after:
+                write_alive_heartbeat("i2c_backoff")
                 time.sleep(0.5)
                 continue
 
@@ -444,8 +503,14 @@ def idle_loop(args) -> None:
 
                 # --- Charging check: freeze all servo motion while on charger ---
                 if _is_charging():
+                    write_alive_heartbeat("charging")
                     time.sleep(2)
                     continue
+
+                # Functional liveness is independent of sonar freshness. Publish
+                # progress before hardware calls so a blocked call stops watchdog
+                # notifications and is restarted by systemd.
+                write_alive_heartbeat("running")
 
                 # --- Proximity check (every PROX_CHECK_S — not every loop tick) ---
                 if PROX_THRESH > 0 and now >= next_prox:
