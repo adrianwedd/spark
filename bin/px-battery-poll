@@ -16,6 +16,13 @@ from robot_hat.utils import get_battery_voltage
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 BIN_DIR      = PROJECT_ROOT / "bin"
+
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
 OUT          = STATE_DIR / "battery.json"
 TMP          = STATE_DIR / "battery.tmp"
 
@@ -138,6 +145,10 @@ while True:
         # entirely so we don't write a bogus 0% that triggers emergency shutdown.
         if volts < VOLTAGE_FLOOR:
             print(f"[battery-poll] ADC glitch: {volts}V < {VOLTAGE_FLOOR}V floor — skipping", file=sys.stderr)
+            # One glitch is noise; three in a row is a dead ADC. The streak in
+            # health.json is what tells them apart.
+            _health.record_failure("px-battery-poll",
+                                   f"ADC glitch: {volts}V below {VOLTAGE_FLOOR}V floor")
             time.sleep(POLL_S)
             continue
         pct   = volts_to_pct(volts)
@@ -181,9 +192,12 @@ while True:
         # Write state atomically
         data = {"ts": ts, "volts": volts, "pct": pct, "charging": charging}
         _write_battery(data)
+        _health.record_success("px-battery-poll", detail={"volts": volts, "pct": pct,
+                                                          "charging": charging})
 
     except Exception as exc:
         print(f"[battery-poll] error: {exc}", file=sys.stderr)
+        _health.record_failure("px-battery-poll", str(exc))
 
     time.sleep(POLL_S)
 PY

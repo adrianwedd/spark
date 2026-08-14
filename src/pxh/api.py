@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -284,12 +285,29 @@ def _verify_token(request: Request) -> None:
 from contextlib import asynccontextmanager
 
 
+async def _health_heartbeat(*, sleep=asyncio.sleep) -> None:
+    """Report functional API liveness independently of request traffic."""
+    from pxh import health as _health
+
+    while True:
+        _health.record_success("px-api-server")
+        await sleep(120)
+
+
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
     _load_token()
     _load_pin_state()
     _start_history_worker()
-    yield
+    heartbeat_task = asyncio.create_task(_health_heartbeat())
+    try:
+        yield
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="PiCar-X API", version="0.1.0", lifespan=_lifespan)
@@ -640,9 +658,14 @@ async def health():
     # though sonar is expected to remain stale while hardware is frozen.
     heartbeat_mode = "unknown"
     heartbeat_file = state_dir / "alive_heartbeat.json"
+    heartbeat_available = heartbeat_file.exists()
     try:
         heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
-        heartbeat_age_s = max(0.0, _time.time() - float(heartbeat["ts"]))
+        heartbeat_ts = float(heartbeat["ts"])
+        now = _time.time()
+        if not math.isfinite(heartbeat_ts) or heartbeat_ts > now + 5:
+            raise ValueError("invalid heartbeat timestamp")
+        heartbeat_age_s = max(0.0, now - heartbeat_ts)
         heartbeat_mode = str(heartbeat.get("mode") or "unknown")
         heartbeat_status = (
             "ok" if heartbeat_age_s <= ALIVE_LOOP_STALE_S else "stale"
@@ -694,6 +717,42 @@ async def health():
             overall = "degraded"
     except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
         checks["sonar"] = {"status": "invalid"}
+        overall = "degraded"
+
+    # Read daemon health live rather than from the px-mind snapshot, so a dead
+    # px-mind reports as stale instead of freezing the last good picture.
+    # Status only: error details may contain paths or exception text, and this
+    # endpoint is unauthenticated.
+    try:
+        from pxh import health as _health
+        daemons = _health.read_health()
+        component_statuses = {
+            key: value["status"]
+            for key, value in daemons["components"].items()
+        }
+        effective_statuses = dict(component_statuses)
+        if heartbeat_available:
+            effective_statuses.pop("px-alive", None)
+        status_rank = {
+            "ok": 0,
+            "degraded": 1,
+            "stale": 2,
+            "failing": 3,
+            "missing": 3,
+        }
+        daemon_status = max(
+            effective_statuses.values(),
+            key=lambda status: status_rank.get(status, 0),
+            default="ok",
+        )
+        checks["daemons"] = {
+            "status": daemon_status,
+            "components": component_statuses,
+        }
+        if daemon_status != "ok" and overall == "ok":
+            overall = "degraded"
+    except Exception:
+        checks["daemons"] = {"status": "unknown"}
         overall = "degraded"
 
     status_code = 200 if overall == "ok" else 503

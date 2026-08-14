@@ -356,3 +356,85 @@ def test_mind_remember_dispatch_types_the_note_as_sparks_own_narrative(monkeypat
 
     assert captured["env"]["PX_NOTE_KIND"] == "narrative"
     assert captured["env"]["PX_NOTE"] == "the house was quiet today"
+
+
+# ── Daemon health in the reflection context ─────────────────────────
+
+def _reflection_harness(monkeypatch, captured):
+    """Common stubs so reflection() can run without touching disk or a model."""
+    def _fake_llm(prompt, system, persona=""):
+        captured["prompt"] = prompt
+        return {"response": json.dumps(
+            {"thought": "x", "mood": "content", "action": "wait", "salience": 0.2}),
+            "backend": "ollama-m5"}
+
+    monkeypatch.setattr(mind, "call_llm", _fake_llm)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "append_thought", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "auto_remember", lambda *a, **k: None)
+    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: None)
+
+
+def test_reflection_context_reports_unhealthy_daemons(monkeypatch):
+    """A broken daemon must reach SPARK's inner monologue — that is the whole
+    point of the spine: failures stop being invisible."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    monkeypatch.setattr(mind.health_mod, "summarize",
+                        lambda *a, **k: "px-post: failing after 3 failures (HEALTH-MARKER)")
+    mind.reflection({"persona": "", "health": {"overall": "failing"}}, dry=False)
+    assert "HEALTH-MARKER" in captured["prompt"]
+
+
+def test_reflection_context_silent_when_everything_is_well(monkeypatch):
+    """summarize() returns "" on a healthy system so good days add no noise."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    monkeypatch.setattr(mind.health_mod, "summarize", lambda *a, **k: "")
+    mind.reflection({"persona": "", "health": {"overall": "ok"}}, dry=False)
+    assert "isn't working right" not in captured["prompt"]
+
+
+def test_reflection_prompt_excludes_the_health_block(monkeypatch):
+    """The structured block is for the dashboard. Putting it in the prompt would
+    add hundreds of tokens per reflection to say what summarize() says in one
+    line — and reflection can fall through to a paid tier."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    monkeypatch.setattr(mind.health_mod, "summarize", lambda *a, **k: "")
+    awareness = {"persona": "", "sonar_cm": 42,
+                 "health": {"overall": "ok",
+                            "components": {"px-post": {"status": "ok",
+                                                       "UNIQUE-BLOCK-MARKER": 1}}}}
+    mind.reflection(awareness, dry=False)
+    assert "UNIQUE-BLOCK-MARKER" not in captured["prompt"]
+    assert "42" in captured["prompt"]      # the rest of awareness still arrives
+
+
+def test_reflection_records_the_serving_backend(monkeypatch, tmp_path):
+    """Health carries which tier answered, so paid-tier drift is measurable."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    recorded = {}
+    monkeypatch.setattr(mind.health_mod, "record_success",
+                        lambda comp, detail=None, **k: recorded.update({comp: detail}))
+    mind.reflection({"persona": ""}, dry=False)
+    assert recorded["px-mind-reflection"]["backend"] == "ollama-m5"
+
+
+def test_reflection_records_failure_when_no_json_returned(monkeypatch):
+    """A tier that answers with junk is distinct from all tiers being down —
+    both used to surface to the caller as a bare None."""
+    recorded = {}
+    monkeypatch.setattr(mind, "call_llm",
+                        lambda *a, **k: {"response": "not json at all",
+                                         "backend": "ollama-m5"})
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
+    monkeypatch.setattr(mind, "load_recent_thoughts", lambda *a, **k: [])
+    monkeypatch.setattr(mind, "load_notes", lambda *a, **k: [])
+    monkeypatch.setattr(mind.health_mod, "record_failure",
+                        lambda comp, err, detail=None, **k: recorded.update({comp: err}))
+    assert mind.reflection({"persona": ""}, dry=False) is None
+    assert recorded["px-mind-reflection"] == "no JSON in response"

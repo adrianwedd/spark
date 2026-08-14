@@ -41,6 +41,13 @@ PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent)
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
 
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+
 MIN_SALIENCE_FEED = float(os.environ.get("PX_POST_MIN_SALIENCE", "0.55"))
 MIN_SALIENCE_SOCIAL = float(os.environ.get("PX_POST_MIN_SALIENCE_SOCIAL", "0.7"))
 SPOKEN_ACTIONS = {"comment", "greet", "weather_comment"}
@@ -1138,14 +1145,20 @@ def main(argv: list[str]) -> int:
     try:
         while not _shutdown.is_set():
             poll_count += 1
+            # One verdict per cycle: a crash anywhere below makes the whole
+            # cycle a failure, so a later successful stage can't reset the
+            # streak and hide it.
+            cycle_error: str | None = None
             if _check_watchdog(last_cycle, WATCHDOG_STALE_S):
                 log(f"watchdog: loop stale for {time.monotonic() - last_cycle:.0f}s — exiting for systemd restart")
+                _health.record_failure("px-post", "watchdog: loop stale — exiting for restart")
                 break
             # Poll for new thoughts
             try:
                 new_thoughts = poll_new_thoughts(thoughts_file)
             except Exception as exc:
                 log(f"poll: CRASHED: {exc}")
+                cycle_error = f"poll: {exc}"
                 new_thoughts = []
 
             # Load feed for dedup
@@ -1183,6 +1196,7 @@ def main(argv: list[str]) -> int:
                     log(f"poll: {len(new_thoughts)} new thoughts, {queued_count} queued")
             except Exception as exc:
                 log(f"queue: CRASHED: {exc}")
+                cycle_error = f"queue: {exc}"
 
             # Flush cycle
             now = time.monotonic()
@@ -1195,6 +1209,7 @@ def main(argv: list[str]) -> int:
                     result = flush_queue(bluesky, dry, should_stop=_shutdown.is_set)
                 except Exception as exc:
                     log(f"flush: CRASHED: {exc}")
+                    cycle_error = f"flush: {exc}"
                     result = {"posted": False, "rejected": False, "processed": 0}
                 log(f"flush: done processed={result.get('processed',0)} posted={result.get('posted')} rejected={result.get('rejected')}")
                 if result.get("posted"):
@@ -1214,6 +1229,15 @@ def main(argv: list[str]) -> int:
                 except Exception as exc:
                     log(f"health status: CRASHED: {exc}")
                 last_flush = now
+
+            if cycle_error:
+                _health.record_failure("px-post", cycle_error)
+            else:
+                _health.record_success("px-post", detail={
+                    "queue_depth": len(_load_queue()),
+                    "bluesky_ok": bluesky.available(),
+                    "total_posted": total_posted,
+                })
 
             last_cycle = time.monotonic()
             _shutdown.wait(timeout=args.poll_interval)

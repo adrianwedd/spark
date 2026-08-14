@@ -33,8 +33,14 @@ def _state_dir() -> Path:
     return Path(os.environ.get("PX_STATE_DIR", root / "state"))
 
 
-def log_usage(input_text: str, output_text: str) -> None:
-    """Accumulate estimated token counts into state/token_usage.json."""
+def log_usage(input_text: str, output_text: str, backend: str = "unknown") -> None:
+    """Accumulate estimated token counts into state/token_usage.json.
+
+    `backend` splits the totals per tier under ``by_backend``. The top-level
+    totals mix free (Ollama) and paid (Claude) calls, so they cannot answer
+    "what am I spending" — only the per-backend breakdown can. Pass the tier
+    that actually served, not the one that was configured.
+    """
     state_dir = _state_dir()
     usage_file = state_dir / "token_usage.json"
     lock = FileLock(str(usage_file) + ".lock", timeout=3)
@@ -44,9 +50,24 @@ def log_usage(input_text: str, output_text: str) -> None:
                 existing = json.loads(usage_file.read_text())
             except Exception:
                 existing = {"input_tokens": 0, "output_tokens": 0, "call_count": 0}
-            existing["input_tokens"] = existing.get("input_tokens", 0) + _est(input_text)
-            existing["output_tokens"] = existing.get("output_tokens", 0) + _est(output_text)
+            in_tok, out_tok = _est(input_text), _est(output_text)
+            existing["input_tokens"] = existing.get("input_tokens", 0) + in_tok
+            existing["output_tokens"] = existing.get("output_tokens", 0) + out_tok
             existing["call_count"] = existing.get("call_count", 0) + 1
+
+            by_backend = existing.get("by_backend")
+            if not isinstance(by_backend, dict):
+                by_backend = {}
+            slot = by_backend.get(backend)
+            if not isinstance(slot, dict):
+                slot = {"input_tokens": 0, "output_tokens": 0, "call_count": 0}
+            slot["input_tokens"] = slot.get("input_tokens", 0) + in_tok
+            slot["output_tokens"] = slot.get("output_tokens", 0) + out_tok
+            slot["call_count"] = slot.get("call_count", 0) + 1
+            slot["last_ts"] = utc_timestamp()
+            by_backend[backend] = slot
+            existing["by_backend"] = by_backend
+
             existing["ts"] = utc_timestamp()
             fd, tmp = tempfile.mkstemp(dir=str(usage_file.parent), suffix=".tmp")
             try:
