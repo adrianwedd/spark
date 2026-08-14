@@ -233,6 +233,30 @@ branches account for it. A future tool that grows a TTS confirmation therefore
 fails CI rather than silently acquiring a bypass. Sink-level enforcement remains
 available as a follow-up if nested audio ever becomes widespread.
 
+**State the invariant at its real strength.** What the scanner establishes is:
+
+> A *known* audio sink may not be reachable from a tool classified non-`"audio"`.
+
+Not "audio can never bypass policy". It is a text scan over `bin/`, so it sees
+direct references to the sinks it knows about. It does not see a subprocess path
+assembled at runtime, a new helper that wraps a sink one level deeper, a Python
+import into an audio helper rather than a `bin/` shell-out, or a sink that
+doesn't exist yet. Each of those is a real evasion route, and none of them is
+"caught by CI". The scanner is a floor — the cheapest check that makes the
+common, accidental case (a tool quietly growing a spoken confirmation) loud —
+not a proof. Anyone adding an audio path by a mechanism the scanner can't see is
+responsible for the classification themselves, and sink-level enforcement is the
+answer if that stops being rare.
+
+**Keep the override mechanism narrow.** `VOICE_EFFECT_OVERRIDES` is justified by
+exactly one thing: `bin/tool-quiet` is three programs sharing a name, with a
+state machine whose branches have genuinely different effects. It is not an
+extension point. If it starts accumulating predicates for other tools, that is
+the signal that classification is turning into a rules DSL by accretion — stop
+and redesign (most likely by splitting the offending compound tool, as Task 3
+does, rather than by describing it more cleverly). A test pins the key set to
+`{"tool_quiet"}` so growth requires a deliberate edit, not a drift.
+
 Each table must be **exhaustive against its own dispatcher's current action
 vocabulary**, not permissive-by-default: an action absent from the table is a
 lookup error, not a silent `"other"`. `"other"` is a value someone can choose

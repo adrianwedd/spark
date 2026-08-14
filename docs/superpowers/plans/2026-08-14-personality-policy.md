@@ -17,7 +17,8 @@
 - Effect-classification tables must be **exhaustive** against their dispatcher's real action set (`ALLOWED_TOOLS` for `voice_loop.py`, `VALID_ACTIONS` for `mind.py`) and **fail loudly** (`KeyError`, not a default) on an unclassified action.
 - **No tool gets an audio exception.** A classification is a claim about what the script actually does, verified against its source — not about how innocent its name sounds. `tool_repair` and `tool_quiet` both shell out to `bin/tool-voice`, so both must be honestly classified; Task 3 refactors them so that honest classification doesn't lock SPARK in quiet mode.
 - Effect classification is param-aware where the real effect is: `VOICE_EFFECT_OVERRIDES` (consulted before `VOICE_EFFECT_TABLE`) exists only for tools with distinct, separately-verifiable effect branches. `tool_quiet` is the only member in v1.
-- A static test must scan every `bin/tool-*` for a reference to an audio-emitting tool (`tool-voice`, `tool-voice-persona`, `tool-announce`, `tool-play-sound`, `tool-chat*`, `px-perform`) and fail if any such tool is classified non-`"audio"` without an override that accounts for it.
+- A static test must scan every `bin/tool-*` for a reference to an audio-emitting tool (`tool-voice`, `tool-voice-persona`, `tool-announce`, `tool-play-sound`, `tool-chat*`, `px-perform`) and fail if any such tool is classified non-`"audio"` without an override that accounts for it. The invariant it establishes is **"a known audio sink may not be reachable from a non-audio-classified tool"** — not "audio can never bypass policy". A text scan cannot see runtime-assembled subprocess paths, deeper helper indirection, Python imports into audio helpers, or sinks that don't exist yet. Write the docstring at that strength; do not overclaim it.
+- `VOICE_EFFECT_OVERRIDES` stays at exactly one member. It exists because `bin/tool-quiet` is three programs under one name, not as an extension point. If a second tool wants an override, stop and split that tool instead (as Task 3 does) — a mini policy DSL hiding inside classification defeats the purpose of the module.
 - Preserve existing autonomous night-silence (`mind.py::_is_night_silence`, `NIGHT_ALLOWED_ACTIONS`) and autonomous on-call suppression (`mind.py:3084-3088`) exactly as they are — only their shared clock helper moves, not the enforcement rule.
 - No volume control, no general rules engine, no changes to `docs/prompts/*.md` conversational style.
 - `src/pxh/policy.py` and `tests/test_policy_invariants.py` must be added to `claude_session.BLACKLIST_FILES`.
@@ -546,10 +547,13 @@ def test_tool_quiet_effect_varies_by_action_param():
 
 
 def test_no_non_audio_tool_can_reach_an_audio_sink():
-    """The enforcement boundary is at the dispatcher, so a tool classified
-    non-audio must not be able to shell out to one that emits sound. Scans
-    real bin/ sources, so a future tool that grows a TTS confirmation fails
-    here rather than silently acquiring a bypass."""
+    """A KNOWN audio sink may not be reachable from a non-audio-classified
+    tool. That is the whole claim — not "audio can never bypass policy".
+    This is a text scan over bin/: it catches the common, accidental case
+    (a tool quietly growing a spoken confirmation) and misses
+    runtime-assembled subprocess paths, deeper helper indirection, Python
+    imports into audio helpers, and sinks that don't exist yet. A floor,
+    not a proof."""
     import re
     from pathlib import Path
     from pxh import voice_loop
@@ -701,9 +705,13 @@ def _quiet_effect(params: Dict[str, Any]) -> str:
     return {"start": "audio", "check": "presence", "end": "other"}.get(action, "audio")
 
 
-# Param-aware classification, consulted before VOICE_EFFECT_TABLE. Only for
-# tools with distinct, separately-verifiable effect branches — this is not a
-# general predicate mechanism, and its key set is pinned by a test.
+# Param-aware classification, consulted before VOICE_EFFECT_TABLE.
+#
+# THIS IS NOT AN EXTENSION POINT. It has exactly one member because
+# bin/tool-quiet is three programs under one name. If a second tool wants an
+# override, split that tool instead — classification accreting predicates is
+# a rules DSL in disguise, which is the thing pxh.policy exists to avoid.
+# The key set is pinned by test_tool_quiet_effect_varies_by_action_param.
 VOICE_EFFECT_OVERRIDES: Dict[str, Callable[[Dict[str, Any]], str]] = {
     "tool_quiet": _quiet_effect,
 }
@@ -988,9 +996,10 @@ def test_tool_repair_is_suppressed_during_quiet_mode(monkeypatch):
 
 
 def test_no_tool_can_speak_under_an_innocent_name():
-    """The whole point of #174: an outer tool name never buys nested audio a
-    bypass. Duplicated from tests/test_policy.py deliberately — that file is
-    whitelisted for self-evolution and this one is not."""
+    """An outer tool name never buys a KNOWN audio sink a bypass. Bounded
+    exactly as the whitelisted copy in tests/test_policy.py is — see its
+    docstring for what a text scan cannot see. Duplicated deliberately: that
+    file is whitelisted for self-evolution and this one is not."""
     import re
     from pathlib import Path
 
