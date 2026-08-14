@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest.mock
 from pathlib import Path
@@ -34,8 +35,8 @@ def api_client(isolated_project, monkeypatch):
     api._load_token()
 
     from fastapi.testclient import TestClient
-    client = TestClient(api.app, raise_server_exceptions=False)
-    return client
+    with TestClient(api.app, raise_server_exceptions=False) as client:
+        yield client
 
 
 @pytest.fixture
@@ -110,6 +111,27 @@ class TestHealth:
             asyncio.run(api._health_heartbeat(sleep=stop_after_first_tick))
 
         assert recorded == ["px-api-server"]
+
+    def test_testclient_lifespan_stops_history_worker(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        from pxh import api
+
+        monkeypatch.setenv("PX_API_TOKEN", "test-token-abc123")
+        before = {
+            thread.ident for thread in threading.enumerate()
+            if thread.name == "history-worker"
+        }
+
+        with TestClient(api.app):
+            pass
+
+        leaked = [
+            thread for thread in threading.enumerate()
+            if thread.name == "history-worker"
+            and thread.ident not in before
+            and thread.is_alive()
+        ]
+        assert leaked == []
 
     def test_health_reports_fresh_loop_and_fresh_sonar_independently(
             self, api_client, isolated_project):

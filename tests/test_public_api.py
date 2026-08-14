@@ -30,7 +30,8 @@ def public_client(isolated_project, monkeypatch):
     api._load_token()
 
     from fastapi.testclient import TestClient
-    return TestClient(api.app, raise_server_exceptions=False)
+    with TestClient(api.app, raise_server_exceptions=False) as client:
+        yield client
 
 
 @pytest.fixture

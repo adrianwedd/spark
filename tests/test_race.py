@@ -425,6 +425,8 @@ class TestSafety:
         from pxh.race import RaceController, TrackProfile
         from unittest.mock import MagicMock, patch
         import tempfile
+        import time as stdlib_time
+        from types import SimpleNamespace
         from pathlib import Path
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,7 +453,13 @@ class TestSafety:
             def tracking_sleep(duration):
                 sleep_calls.append(duration)
 
-            with patch("pxh.race.time.sleep", side_effect=tracking_sleep):
+            original_sleep = stdlib_time.sleep
+            isolated_time = SimpleNamespace(
+                sleep=tracking_sleep,
+                time=stdlib_time.time,
+            )
+            with patch("pxh.race.time", isolated_time):
+                assert stdlib_time.sleep is original_sleep
                 rc.run_race(max_laps=0, max_iterations=2)
 
             # The e-stop recovery sleep must be <= 0.5 s (post-fix: 0.3 s)

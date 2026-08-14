@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time as stdlib_time
 import types
 from pathlib import Path
 
@@ -123,7 +124,12 @@ def test_charging_loop_advances_heartbeat_without_reading_sonar(monkeypatch):
     class StopLoop(Exception):
         pass
 
-    monkeypatch.setattr(_ALIVE["time"], "sleep", lambda _seconds: (_ for _ in ()).throw(StopLoop()))
+    isolated_time = types.SimpleNamespace(
+        sleep=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
+        monotonic=stdlib_time.monotonic,
+        time=stdlib_time.time,
+    )
+    monkeypatch.setitem(_ALIVE, "time", isolated_time)
     args = types.SimpleNamespace(no_face=True)
 
     with pytest.raises(StopLoop):
@@ -142,7 +148,12 @@ def test_running_loop_advances_heartbeat(monkeypatch):
     class StopLoop(Exception):
         pass
 
-    monkeypatch.setattr(_ALIVE["time"], "sleep", lambda _seconds: (_ for _ in ()).throw(StopLoop()))
+    isolated_time = types.SimpleNamespace(
+        sleep=lambda _seconds: (_ for _ in ()).throw(StopLoop()),
+        monotonic=stdlib_time.monotonic,
+        time=stdlib_time.time,
+    )
+    monkeypatch.setitem(_ALIVE, "time", isolated_time)
     args = types.SimpleNamespace(no_face=True)
 
     with pytest.raises(StopLoop):
