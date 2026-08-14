@@ -10,8 +10,11 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
+from filelock import Timeout as FileLockTimeout
+
+from pxh import policy
 from pxh.utils import clamp
 from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
@@ -69,6 +72,135 @@ ALLOWED_TOOLS = {
     "tool_story",
     "tool_announce",
 }
+
+# Semantic effect of each tool, for pxh.policy. Exhaustive per ALLOWED_TOOLS
+# and deliberately without a default, so a new tool fails
+# test_voice_effect_table_is_exhaustive until someone classifies it.
+#
+# Every entry is a claim about what bin/tool-<name> actually does, verified
+# against its source — not about how innocent the name sounds. Any script that
+# can reach tool-voice, tool-announce, tool-play-sound, tool-chat* or
+# px-perform is "audio", with no exceptions; several of these are compound
+# tools that emote, speak and mutate state under one dispatcher-visible name,
+# and policy only ever sees the outer name.
+# test_no_non_audio_tool_can_reach_an_audio_sink pins this against bin/.
+VOICE_EFFECT_TABLE: Dict[str, str] = {
+    "tool_status":          "other",
+    "tool_circle":          "other",
+    "tool_figure8":         "other",
+    "tool_stop":            "other",
+    "tool_voice":           "audio",
+    "tool_weather":         "other",
+    "tool_look":            "presence",
+    "tool_emote":           "presence",
+    "tool_sonar":           "other",
+    "tool_perform":         "audio",
+    "tool_drive":           "other",
+    "tool_time":            "audio",
+    "tool_remember":        "other",
+    "tool_recall":          "audio",
+    "tool_photograph":      "other",
+    "tool_qa":              "audio",
+    "tool_play_sound":      "audio",
+    "tool_face":            "presence",
+    "tool_describe_scene":  "audio",
+    "tool_frigate_events":  "other",
+    "tool_wander":          "other",
+    "tool_wander_calibrate": "other",
+    "tool_timer":           "audio",
+    "tool_api_start":       "other",
+    "tool_api_stop":        "other",
+    "tool_chat":            "audio",
+    "tool_chat_vixen":      "audio",
+    "tool_routine":         "audio",
+    "tool_checkin":         "audio",
+    "tool_celebrate":       "audio",
+    "tool_transition":      "audio",
+    "tool_breathe":         "audio",
+    "tool_dopamine_menu":   "audio",
+    "tool_sensory_check":   "audio",
+    "tool_repair":          "audio",
+    "tool_gws_calendar":    "audio",
+    "tool_gws_sheets_log":  "audio",
+    "tool_research":        "other",
+    "tool_compose":         "other",
+    "tool_blog":            "other",
+    "tool_story":           "audio",
+    "tool_announce":        "audio",
+    # tool_quiet is param-dependent — see VOICE_EFFECT_OVERRIDES. Listed here
+    # at its loudest branch so exhaustiveness still holds, and so removing the
+    # override fails safe rather than open.
+    "tool_quiet":           "audio",
+}
+
+
+def _quiet_effect(params: Dict[str, Any]) -> str:
+    """bin/tool-quiet is three programs under one name:
+
+        start -> emote + one spoken line + set flag   (audio)
+        check -> emote only                           (presence)
+        end   -> clear flag, emote, say nothing       (other)
+
+    Classifying the whole tool by its name would either gag the entry line or
+    hand the whole script an audio bypass. The script defaults to "start" when
+    PX_QUIET_ACTION is unset, so an absent param classifies as the loudest
+    branch.
+    """
+    action = str(params.get("action", "start")).lower()
+    return {"start": "audio", "check": "presence", "end": "other"}.get(action, "audio")
+
+
+# Param-aware classification, consulted before VOICE_EFFECT_TABLE.
+#
+# THIS IS NOT AN EXTENSION POINT. It has exactly one member because
+# bin/tool-quiet is three programs under one name. If a second tool wants an
+# override, split that tool instead — classification accreting predicates is a
+# rules DSL in disguise, which is the thing pxh.policy exists to avoid. The key
+# set is pinned by test_tool_quiet_effect_varies_by_action_param.
+VOICE_EFFECT_OVERRIDES: Dict[str, Callable[[Dict[str, Any]], str]] = {
+    "tool_quiet": _quiet_effect,
+}
+
+
+def classify_effect(tool: str, params: Dict[str, Any]) -> str:
+    """Map a requested tool to the semantic effect policy reasons about."""
+    override = VOICE_EFFECT_OVERRIDES.get(tool)
+    if override is not None:
+        return override(params or {})
+    return VOICE_EFFECT_TABLE[tool]
+
+
+def _policy_now() -> float:
+    """Clock seam for the policy check.
+
+    Exists so tests can pin the time of day without patching time.time()
+    globally — otherwise every validate_action test for an audio tool passes
+    by day and fails after 19:00 Hobart, which is the kind of flake that
+    teaches people to distrust the suite.
+    """
+    return time.time()
+
+
+def _load_awareness_for_policy() -> Dict[str, Any]:
+    """Best-effort awareness read for policy's on-call/hot-mic check.
+
+    Fails open, deliberately and narrowly: an unreadable awareness.json means
+    the on-call/hot-mic rule cannot fire, and SPARK stays audible during a turn
+    Obi initiated. Failing closed would mute SPARK entirely whenever px-mind is
+    down — the more common failure, and the worse one. Quiet mode and night
+    silence read nothing from this file, so the two rules that must hold
+    unconditionally are unaffected either way.
+    """
+    path = _state_dir() / "awareness.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[voice-loop] policy: awareness read failed ({exc}) — "
+              f"on-call rule inactive this turn", file=sys.stderr)
+        return {}
+
 
 TOOL_COMMANDS = {
     "tool_status":         BIN_DIR / "tool-status",
@@ -591,13 +723,54 @@ def _num(value: Any, name: str) -> float:
 
 
 def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    tool = action.get("tool")
-    if tool not in ALLOWED_TOOLS:
-        raise VoiceLoopError(f"unsupported tool requested: {tool}")
+    requested_tool = action.get("tool")
+    if requested_tool not in ALLOWED_TOOLS:
+        raise VoiceLoopError(f"unsupported tool requested: {requested_tool}")
 
     params = action.get("params", {})
     if not isinstance(params, dict):
         params = {}
+
+    # Behavioural policy (#174) — the interactive chokepoint. Personas share
+    # this path (voice_loop replaces the system prompt but not the dispatcher),
+    # so a persona cannot talk its way past quiet mode, night silence, or
+    # on-call suppression. A blocked action is downgraded to a presence-safe
+    # substitute, which is re-evaluated before use and then falls through the
+    # ordinary sanitization below exactly as if the model had proposed it.
+    tool = requested_tool
+    try:
+        session = load_session()
+    except FileLockTimeout:
+        session = {}
+    awareness = _load_awareness_for_policy()
+    now = _policy_now()
+    verdict = policy.evaluate(
+        requested_tool, params, effect=classify_effect(requested_tool, params),
+        origin="interactive", session=session, awareness=awareness, now=now,
+    )
+    if not verdict.allowed:
+        substitute_tool = "tool_emote"
+        substitute_params = {"name": "idle"}
+        # Raises rather than returning a blocked verdict at _depth=1, so a
+        # substitute can never itself be suppressed or recurse.
+        policy.evaluate(
+            substitute_tool, substitute_params,
+            effect=classify_effect(substitute_tool, substitute_params),
+            origin="interactive", session=session, awareness=awareness,
+            now=now, _depth=1,
+        )
+        print(f"[voice-loop] requested={requested_tool} verdict=blocked "
+              f"reason={verdict.reason} substituted={substitute_tool}",
+              file=sys.stderr)
+        log_event("policy_block", {
+            "requested": requested_tool,
+            "reason": verdict.reason,
+            "substituted": substitute_tool,
+            "ts": utc_timestamp(),
+        })
+        tool = substitute_tool
+        params = substitute_params
+
     sanitized: Dict[str, Any] = {}
 
     if tool in ("tool_status", "tool_stop", "tool_weather"):

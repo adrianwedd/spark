@@ -33,6 +33,7 @@ import wave as _wave
 from pathlib import Path
 
 from filelock import FileLock, Timeout as FileLockTimeout
+from pxh import policy                  # constitutional behavioural rules (#174)
 from pxh import spark_config            # module handle (flag read at call time, monkeypatchable)
 from pxh.spark_config import (
     _pick_spark_angles, _pick_reflection_seed,
@@ -161,8 +162,13 @@ OBI_DAY_END    = 20  # 8pm Hobart — Obi's waking hours end
 
 
 def _is_night_silence(hour: int) -> bool:
-    """True during the unconditional night-silence window (Hobart hour-of-day)."""
-    return hour >= NIGHT_SILENCE_START_H or hour < NIGHT_SILENCE_END_H
+    """True during the unconditional night-silence window (Hobart hour-of-day).
+
+    Delegates to pxh.policy so the clock semantics live in one place. The
+    autonomous enforcement rule stays here (see expression() and
+    NIGHT_ALLOWED_ACTIONS) — only the helper is shared.
+    """
+    return policy.is_night_hour(hour)
 
 
 _ANNOUNCE_META_FILE = STATE_DIR / "announce_meta.json"  # persisted cap: a px-mind restart must not reset the 1/hour limit
@@ -385,6 +391,44 @@ VALID_ACTIONS = {"wait", "greet", "greet_arrival", "comment", "remember", "look_
                  "research", "compose", "self_debug", "blog_essay",
                  "message_obi", "announce",
                  "set_goal", "update_goal", "complete_goal"}
+
+# Semantic effect of each autonomous action, for pxh.policy. Exhaustive per
+# VALID_ACTIONS and deliberately without a default, so a new action fails
+# test_mind_effect_table_is_exhaustive until someone classifies it rather than
+# silently defaulting to unsuppressed audio.
+#
+# Classification follows the real dispatch in expression(), not the name:
+# scan, look_at and look_around are "audio" because their branches call
+# _run_voice — they narrate while they move.
+MIND_EFFECT_TABLE: dict[str, str] = {
+    "wait":           "presence",
+    "greet":          "audio",
+    "greet_arrival":  "audio",
+    "comment":        "audio",
+    "remember":       "other",
+    "look_at":        "audio",
+    "weather_comment": "audio",
+    "scan":           "audio",
+    "explore":        "presence",
+    "play_sound":     "audio",
+    "photograph":     "presence",
+    "emote":          "presence",
+    "look_around":    "audio",
+    "time_check":     "audio",
+    "calendar_check": "audio",
+    "morning_fact":   "audio",
+    "introspect":     "other",
+    "evolve":         "other",
+    "research":       "other",
+    "compose":        "other",
+    "self_debug":     "other",
+    "blog_essay":     "other",
+    "message_obi":    "audio",
+    "announce":       "audio",
+    "set_goal":       "other",
+    "update_goal":    "other",
+    "complete_goal":  "other",
+}
 
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 # Deliberately NOT absence-gated: "greet_arrival". Arrivals are the one moment
@@ -3503,6 +3547,28 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
             log(f"expression: suppressed {action} — Adrian on call/mic active")
             return False
 
+    # Behavioural policy (#174). For the autonomous path this adds quiet mode;
+    # night silence and on-call suppression are already enforced above and stay
+    # there, so one invariant does not live in two places. Loaded here rather
+    # than at its previous later use site so this check can see the session.
+    try:
+        session = load_session()
+    except FileLockTimeout:
+        session = {}
+    # Unknown actions classify as "audio": the most restrictive value, not a
+    # permissive default. expression() must not crash on a malformed thought
+    # (see test_unknown_action_logged), so the fail-loud guarantee lives in
+    # test_mind_effect_table_is_exhaustive, which pins the table against
+    # VALID_ACTIONS at test time rather than crashing the daemon at runtime.
+    _verdict = policy.evaluate(
+        action, {}, effect=MIND_EFFECT_TABLE.get(action, "audio"), origin="autonomous",
+        session=session, awareness=_aw, now=time.time(),
+    )
+    if not _verdict.allowed:
+        log(f"expression: requested={action} verdict=blocked "
+            f"reason={_verdict.reason} substituted=none")
+        return False
+
     # Gate on charging: suppress servo-related actions when plugged in
     try:
         _batt = json.loads(BATTERY_FILE.read_text(encoding="utf-8"))
@@ -3525,10 +3591,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     # prompt already produces persona-voiced text — skip Ollama rephrase to
     # avoid double "FUCK YEAH!" or other duplication.
     # For weather_comment, the raw weather data needs rephrasing.
-    try:
-        session = load_session()
-    except FileLockTimeout:
-        session = {}
+    # `session` was loaded above for the policy check — reused here.
     persona = (session.get("persona") or "").lower().strip()
     needs_rephrase = action in ("weather_comment",)
     if persona and persona in PERSONA_VOICE_ENV:

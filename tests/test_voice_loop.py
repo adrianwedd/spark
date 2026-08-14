@@ -1,5 +1,27 @@
+import datetime as dt
+from zoneinfo import ZoneInfo
+
 import pytest
+from pxh import voice_loop
 from pxh.voice_loop import build_model_prompt, validate_action, VoiceLoopError
+
+HOBART_TZ = ZoneInfo("Australia/Hobart")
+DAY_TS = dt.datetime(2026, 1, 1, 12, 0, tzinfo=HOBART_TZ).timestamp()
+NIGHT_TS = dt.datetime(2026, 1, 1, 22, 0, tzinfo=HOBART_TZ).timestamp()
+
+
+@pytest.fixture(autouse=True)
+def _daytime_no_suppression(monkeypatch):
+    """Neutralize behavioural policy (#174) for tests that aren't about it.
+
+    validate_action() now consults pxh.policy, which reads the wall clock and
+    the live session. Without this, every audio-tool test in this file would
+    pass by day and fail after 19:00 Hobart. Policy tests below override these
+    deliberately.
+    """
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: DAY_TS)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
 
 
 def test_build_model_prompt_includes_highlights():
@@ -217,3 +239,62 @@ def test_the_model_cannot_choose_the_provenance_of_its_own_note():
                                          "supersedes": ["some-id"]}})
     assert env["PX_NOTE_KIND"] == "report"
     assert not any(k.lower().endswith(("confidence", "supersedes")) for k in env)
+
+
+# ── behavioural policy (#174) ────────────────────────────────────────────────
+
+def _no_policy_blockers(monkeypatch, **session):
+    """Daytime, no on-call, no quiet mode unless the test asks for it."""
+    monkeypatch.setattr(voice_loop, "load_session", lambda: session)
+
+
+def test_validate_action_downgrades_tool_voice_in_quiet_mode(monkeypatch):
+    _no_policy_blockers(monkeypatch, spark_quiet_mode=True)
+    tool, env = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool == "tool_emote"
+    assert env["PX_EMOTE"] == "idle"
+
+
+def test_validate_action_allows_tool_voice_when_not_quiet(monkeypatch):
+    _no_policy_blockers(monkeypatch, spark_quiet_mode=False)
+    tool, env = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool == "tool_voice"
+
+
+def test_validate_action_allows_tool_quiet_end_during_quiet_mode(monkeypatch):
+    """The one permitted exit — permitted because it emits nothing after the
+    Task 3 refactor, not because it is exempt."""
+    _no_policy_blockers(monkeypatch, spark_quiet_mode=True)
+    tool, env = voice_loop.validate_action({"tool": "tool_quiet", "params": {"action": "end"}})
+    assert tool == "tool_quiet"
+
+
+def test_validate_action_downgrades_tool_repair_in_quiet_mode(monkeypatch):
+    _no_policy_blockers(monkeypatch, spark_quiet_mode=True)
+    tool, env = voice_loop.validate_action({"tool": "tool_repair", "params": {}})
+    assert tool == "tool_emote"
+
+
+def test_validate_action_downgrades_tool_quiet_start_when_already_quiet(monkeypatch):
+    _no_policy_blockers(monkeypatch, spark_quiet_mode=True)
+    tool, env = voice_loop.validate_action({"tool": "tool_quiet", "params": {"action": "start"}})
+    assert tool == "tool_emote"
+
+
+def test_validate_action_blocks_audio_at_night(monkeypatch):
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: NIGHT_TS)
+    tool, env = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool == "tool_emote"
+
+
+def test_validate_action_blocks_audio_when_adrian_on_call(monkeypatch):
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy",
+                        lambda: {"ha_context": {"adrian_on_call": True}})
+    tool, env = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool == "tool_emote"
+
+
+def test_validate_action_leaves_presence_tools_alone_in_quiet_mode(monkeypatch):
+    _no_policy_blockers(monkeypatch, spark_quiet_mode=True)
+    tool, env = voice_loop.validate_action({"tool": "tool_look", "params": {}})
+    assert tool == "tool_look"

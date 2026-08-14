@@ -2,7 +2,7 @@
 import inspect
 import json
 import subprocess
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from filelock import Timeout as FileLockTimeout
 from pxh import mind
 
@@ -801,7 +801,10 @@ def test_mind_dispatch_does_not_write_cooldown(tmp_path, monkeypatch):
     monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})
     monkeypatch.setattr(mind, "_can_explore", lambda session, awareness: True)
     monkeypatch.setattr(mind, "append_thought", lambda *a, **k: None)
-    monkeypatch.setattr(mind, "time", type("_T", (), {"sleep": staticmethod(lambda s: None)}))
+    monkeypatch.setattr(mind, "time", type("_T", (), {
+        "sleep": staticmethod(lambda s: None),
+        "time": staticmethod(lambda: 1_700_000_000.0),
+    }))
     monkeypatch.setattr(mind.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a, 0, "active", ""))
 
@@ -1143,3 +1146,27 @@ def test_mind_remember_dispatch_types_the_note_as_sparks_own_narrative(monkeypat
 
     assert captured["env"]["PX_NOTE_KIND"] == "narrative"
     assert captured["env"]["PX_NOTE"] == "the house was quiet today"
+def test_expression_suppresses_audio_in_quiet_mode(monkeypatch):
+    """Quiet mode is constitutional (pxh.policy rule 1) — it applies to the
+    autonomous loop too, not just Obi-initiated turns."""
+    _quiet_daytime(monkeypatch)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": "", "spark_quiet_mode": True})
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    result = mind.expression({"action": "greet", "thought": "hello"}, dry=True, awareness=aw)
+    assert result is False
+    assert calls == []
+
+
+def test_expression_allows_presence_action_in_quiet_mode(monkeypatch):
+    """Staying present is the point of the Three S's — only audio is blocked."""
+    _quiet_daytime(monkeypatch)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": "", "spark_quiet_mode": True})
+    mock_run = Mock(return_value=subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="{}", stderr=""))
+    monkeypatch.setattr(mind.subprocess, "run", mock_run)
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    result = mind.expression({"action": "emote", "thought": "curious"}, dry=True, awareness=aw)
+    assert result is True
+    assert mock_run.called

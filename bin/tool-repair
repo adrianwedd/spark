@@ -73,8 +73,15 @@ def main() -> int:
     speak(repair, dry)
     speak(reconnect, dry)
 
+    # Repair does not exit quiet mode (#174). It used to clear the flag as a
+    # side effect of speaking, which made it an undeclared escape hatch from
+    # the dysregulation protocol — relationship repair and leaving
+    # dysregulation are different things. bin/tool-quiet end is the one exit.
+    # This tool speaks, so it is classified effect="audio" and is suppressed
+    # during quiet mode, which is the intended behaviour: a repair phrase
+    # spoken into an active meltdown is what the Three S's exist to prevent.
     update_session(
-        fields={"spark_quiet_mode": False, "last_action": "tool_repair"},
+        fields={"last_action": "tool_repair"},
         history_entry={"event": "repair", "ts": utc_timestamp()},
     )
     # Context logged privately but not spoken

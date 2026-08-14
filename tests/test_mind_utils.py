@@ -940,7 +940,7 @@ def _thought(action, mood="curious", text="test thought", salience=0.5):
 
 
 @pytest.fixture(autouse=False)
-def _mock_awareness_and_battery(tmp_path):
+def _mock_awareness_and_battery(tmp_path, monkeypatch):
     """Stub AWARENESS_FILE, BATTERY_FILE, LOG_FILE, and datetime so expression() gates
     don't block and log output stays isolated from the production px-mind.log.
     Time is fixed to 12:00 Hobart to stay clear of the 19:00–07:00 night gate."""
@@ -957,6 +957,11 @@ def _mock_awareness_and_battery(tmp_path):
     pxh.mind.AWARENESS_FILE = aw_file
     pxh.mind.BATTERY_FILE = bat_file
     pxh.mind.LOG_FILE = tmp_path / "px-mind.log"
+
+    # The policy layer (#174) reads the session to decide quiet mode. Without a
+    # stub these tests read the live robot session, so the verdict depends on
+    # whether SPARK happens to be in quiet mode right now.
+    monkeypatch.setattr(pxh.mind, "load_session", lambda: {"persona": ""})
 
     # Fix the clock to midday Hobart so the night gate (19:00–07:00) never fires.
     _noon = _dt.datetime(2025, 1, 1, 12, 0, 0, tzinfo=pxh.mind.HOBART_TZ)
