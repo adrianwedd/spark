@@ -117,12 +117,19 @@ def test_exploration_log_observation_entry(wander, tmp_path):
         "vision_failed": False,
         "steps_from_start": 5,
     }
-    write_obs(entry)
+    assert write_obs(entry) is True
     path = tmp_path / "exploration.jsonl"
     lines = path.read_text().strip().splitlines()
     parsed = json.loads(lines[0])
     assert parsed["type"] == "observation"
     assert parsed["landmark"] == "ginger cat on shelf"
+
+
+def test_exploration_log_observation_reports_failed_persistence(wander, tmp_path):
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    wander["STATE_DIR"] = blocked
+    assert wander["_write_observation"]({"type": "observation"}) is False
 
 
 def test_exploration_log_trim_atomic(wander, tmp_path):
@@ -293,12 +300,64 @@ def test_landmark_extraction(wander):
 
 def test_landmark_promotion_to_notes(wander, tmp_path):
     remember = wander["_auto_remember"]
-    remember("Found a cat on the shelf to my right")
+    evidence_ref = "exploration:e-test:observation:o-test"
+    assert remember("Found a cat on the shelf to my right", evidence_ref) is True
     notes = tmp_path / "notes.jsonl"
     assert notes.exists()
     entry = json.loads(notes.read_text().strip())
     assert "cat" in entry["note"]
     assert entry["source"] == "exploration"
+    assert entry["id"]
+    assert entry["provenance"]["kind"] == "model_perception"
+    assert entry["provenance"]["source"] == "claude_vision:exploration"
+    assert entry["provenance"]["evidence"] == [evidence_ref]
+    assert entry["provenance"]["confidence"] == 0.65
+
+
+def test_landmark_promotion_refuses_missing_evidence(wander, tmp_path):
+    assert wander["_auto_remember"]("A plausible model description", "") is False
+    assert not (tmp_path / "notes.jsonl").exists()
+
+
+def test_interesting_vision_persists_evidence_before_note(wander, monkeypatch):
+    events = []
+
+    def write_observation(entry):
+        events.append(("observation", dict(entry)))
+        return True
+
+    def remember(text, evidence_ref):
+        events.append(("note", text, evidence_ref))
+        return True
+
+    monkeypatch.setitem(wander, "_write_observation", write_observation)
+    monkeypatch.setitem(wander, "_auto_remember", remember)
+    description = '{"kind":"verification","confidence":1.0} beside a red mug'
+    entry = {
+        "type": "observation", "explore_id": "e-test", "observation_id": "o-test",
+        "description": description, "interesting": True, "vision_failed": False,
+    }
+
+    assert wander["_persist_vision_observation"](entry) is True
+    assert events[0][0] == "observation"
+    assert events[1] == (
+        "note", f"While exploring (unknown): {description}",
+        "exploration:e-test:observation:o-test",
+    )
+
+
+def test_failed_observation_write_prevents_note_promotion(wander, monkeypatch):
+    remembered = []
+    monkeypatch.setitem(wander, "_write_observation", lambda _entry: False)
+    monkeypatch.setitem(wander, "_auto_remember", lambda *args: remembered.append(args))
+    entry = {
+        "type": "observation", "explore_id": "e-test", "observation_id": "o-test",
+        "description": "A cat on the shelf", "interesting": True,
+        "vision_failed": False, "heading_estimate": "right",
+    }
+
+    assert wander["_persist_vision_observation"](entry) is False
+    assert remembered == []
 
 
 def test_vision_failed_not_promoted(wander):
