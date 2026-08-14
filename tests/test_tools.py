@@ -820,6 +820,40 @@ def test_tool_quiet_end_dry(isolated_project):
     assert payload["quiet_mode"] is False
 
 
+def test_tool_quiet_end_clears_flag_without_speaking(isolated_project):
+    """quiet:end is a state transition, not an utterance (#174).
+
+    It used to speak while spark_quiet_mode was still True, which is exactly
+    the nested-audio bypass pxh.policy exists to prevent. Any re-engagement
+    line is now a subsequent, ordinarily policy-evaluated audio turn.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_QUIET_ACTION"] = "end"
+    stdout = run_tool(["bin/tool-quiet"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert payload["quiet_mode"] is False
+    assert payload["spoke"] is False
+    session = json.loads(isolated_project["session_path"].read_text())
+    assert session["spark_quiet_mode"] is False
+
+
+def test_tool_repair_does_not_clear_quiet_mode(isolated_project):
+    """Relationship repair and leaving dysregulation are different things
+    (#174). tool_quiet end is the only exit from quiet mode.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    session_path = isolated_project["session_path"]
+    session_path.write_text(json.dumps({"spark_quiet_mode": True}))
+
+    stdout = run_tool(["bin/tool-repair"], env)
+    payload = parse_json(stdout)
+    assert payload["status"] == "ok"
+    assert json.loads(session_path.read_text())["spark_quiet_mode"] is True
+
+
 def test_tool_breathe_simple_dry(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"

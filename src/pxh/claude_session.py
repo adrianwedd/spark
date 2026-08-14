@@ -362,6 +362,14 @@ BLACKLIST_FILES = {
     "bin/tool-chat-vixen",
     "bin/px-evolve",
     ".env",
+    # Constitutional layer (#174). policy.py holds the behavioural invariants
+    # SPARK must obey regardless of prompt or persona; the invariants file
+    # pins both those rules AND that each dispatcher actually calls them.
+    # Both are blacklisted explicitly rather than relying on policy.py simply
+    # not matching a whitelist pattern today — a future broader pattern (e.g.
+    # "src/pxh/") must not silently unprotect them.
+    "src/pxh/policy.py",
+    "tests/test_policy_invariants.py",
 }
 
 BLACKLIST_PATTERNS = [

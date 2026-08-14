@@ -78,14 +78,24 @@ def main() -> int:
             payload = {"status": "ok", "action": "check", "quiet_mode": False, "dry": dry}
 
     elif action == "end":
-        # Gentle re-engagement — one soft offer, no pressure
-        emote("curious", dry)
-        speak("We're okay. No rush. Whenever you're ready.", dry)
+        # State transition only, and deliberately silent (#174).
+        #
+        # This used to speak a re-engagement line *before* clearing the flag,
+        # i.e. audio emitted while spark_quiet_mode was still True. Behavioural
+        # policy evaluates the dispatched tool, so it cannot see a tool-voice
+        # call nested inside this script — speaking here would be a bypass, and
+        # classifying the whole tool "other" to permit it would be a worse one.
+        #
+        # Clear the flag first, so nothing at all runs under a stale True. Any
+        # gentle re-engagement is a separate turn, which now passes policy
+        # normally because quiet mode is already false.
         update_session(
             fields={"spark_quiet_mode": False, "last_action": "tool_quiet"},
             history_entry={"event": "quiet_end", "ts": utc_timestamp()},
         )
-        payload = {"status": "ok", "action": "end", "quiet_mode": False, "dry": dry}
+        emote("curious", dry)
+        payload = {"status": "ok", "action": "end", "quiet_mode": False,
+                   "spoke": False, "dry": dry}
 
     else:
         payload = {"status": "error", "error": f"unknown action '{action}'"}
