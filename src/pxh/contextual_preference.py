@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import os
+import re
 from collections.abc import Iterable, Sequence
+from pathlib import Path
+
+from filelock import FileLock
 
 from pxh import provenance
 
@@ -13,6 +19,8 @@ MAX_FIELD_LENGTH = 100
 HALF_LIFE_DAYS = 90.0
 ACTIVATION_MARGIN = 0.75
 MIN_POSITIVE_EXPERIENCES = 2
+LOCK_TIMEOUT_S = 10
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _field(name: str, value: object) -> str:
@@ -54,6 +62,71 @@ def make_experience(*, ts: str, person: str, context: str, option: str,
         record, kind, _field("source", source), evidence=refs,
         confidence=confidence,
     )
+
+
+def experience_file(persona: str = "spark") -> Path:
+    """Return the persona-scoped append-only experience store."""
+    name = str(persona or "spark").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError("persona may contain only letters, numbers, _ and -")
+    state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+    return state_dir / f"preference-experiences-{name}.jsonl"
+
+
+def _is_valid_record(record: object) -> bool:
+    if not isinstance(record, dict) or not record.get("id"):
+        return False
+    try:
+        _timestamp(record.get("ts"))
+        for name in ("person", "context", "option"):
+            _field(name, record.get(name))
+    except (TypeError, ValueError):
+        return False
+    if record.get("outcome") not in OUTCOMES:
+        return False
+    block = provenance.read_provenance(record)
+    return bool(not block["legacy"] and block["source"] != "unrecorded"
+                and block["evidence"])
+
+
+def append_experience(record: dict, *, path: Path | None = None,
+                      persona: str = "spark") -> None:
+    """Append one intact experience; never updates an earlier line."""
+    if not _is_valid_record(record):
+        raise ValueError("experience must be a valid stamped record")
+    target = Path(path) if path is not None else experience_file(persona)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(target) + ".lock", timeout=LOCK_TIMEOUT_S):
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, separators=(",", ":"), sort_keys=True))
+            handle.write("\n")
+
+
+def load_experiences(*, path: Path | None = None,
+                     persona: str = "spark") -> tuple[list[dict], dict]:
+    """Load valid experience lines and report corruption without rewriting."""
+    target = Path(path) if path is not None else experience_file(persona)
+    diagnostics = {"total": 0, "valid": 0, "invalid": 0}
+    if not target.exists():
+        return [], diagnostics
+    records: list[dict] = []
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return [], diagnostics
+    for line in lines:
+        diagnostics["total"] += 1
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            diagnostics["invalid"] += 1
+            continue
+        if not _is_valid_record(record):
+            diagnostics["invalid"] += 1
+            continue
+        records.append(record)
+        diagnostics["valid"] += 1
+    return records, diagnostics
 
 
 def _ignore(counts: dict[str, int], reason: str) -> None:

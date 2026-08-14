@@ -1,5 +1,6 @@
 """Behavioral tests for lived-experience adaptation — issue #172."""
 import datetime as dt
+import json
 
 import pytest
 
@@ -229,3 +230,59 @@ def test_superseded_evidence_uses_existing_provenance_discount():
     }
     assert result["explanation"]["contributing"][0]["record_id"] == "experience-0"
     assert result["explanation"]["contributing"][0]["superseded_by"] == "experience-1"
+
+
+def test_append_and_load_preserve_record_and_provenance(tmp_path):
+    path = tmp_path / "experiences.jsonl"
+    record = _experience(index=1)
+
+    cp.append_experience(record, path=path)
+    loaded, diagnostics = cp.load_experiences(path=path)
+
+    assert loaded == [record]
+    assert diagnostics == {"total": 1, "valid": 1, "invalid": 0}
+    assert loaded[0]["provenance"]["evidence"] == ["interaction:report:1"]
+
+
+def test_load_keeps_valid_history_and_reports_malformed_lines(tmp_path):
+    path = tmp_path / "experiences.jsonl"
+    valid = _experience(index=1)
+    path.write_text(
+        json.dumps(valid) + "\n{not json}\n" + json.dumps({"person": "obi"}) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded, diagnostics = cp.load_experiences(path=path)
+
+    assert loaded == [valid]
+    assert diagnostics == {"total": 3, "valid": 1, "invalid": 2}
+
+
+def test_append_rejects_unstamped_or_invalid_record(tmp_path):
+    path = tmp_path / "experiences.jsonl"
+    with pytest.raises(ValueError, match="valid stamped"):
+        cp.append_experience(
+            {"person": "obi", "context": "after_school"}, path=path,
+        )
+    assert not path.exists()
+
+
+def test_contradiction_appends_without_rewriting_prior_bytes(tmp_path):
+    path = tmp_path / "experiences.jsonl"
+    original = _experience(index=1)
+    contradiction = _experience(index=2, outcome="negative")
+    cp.append_experience(original, path=path)
+    prior_bytes = path.read_bytes()
+
+    cp.append_experience(contradiction, path=path)
+
+    assert path.read_bytes().startswith(prior_bytes)
+    loaded, diagnostics = cp.load_experiences(path=path)
+    assert loaded == [original, contradiction]
+    assert diagnostics["valid"] == 2
+
+
+def test_experience_file_is_persona_scoped(tmp_path, monkeypatch):
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    assert cp.experience_file("spark") == tmp_path / "preference-experiences-spark.jsonl"
+    assert cp.experience_file("vixen") == tmp_path / "preference-experiences-vixen.jsonl"
