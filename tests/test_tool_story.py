@@ -75,6 +75,37 @@ def test_story_finish(isolated_project):
     assert "saved" in out or "title" in out
 
 
+def _finished_story_record(isolated_project):
+    """Run a whole story and return the record it appended to notes-spark."""
+    env = dict(isolated_project["env"])
+    _run_story("start", extra_env=env)
+    _run_story("add", extra_env=env, text="The robot found a treasure map.")
+    _run_story("finish", extra_env=env)
+    notes = isolated_project["state_dir"] / "notes-spark.jsonl"
+    return json.loads(notes.read_text(encoding="utf-8").strip().splitlines()[-1])
+
+
+def test_finished_story_is_visible_to_note_readers(isolated_project):
+    """The record is keyed `note`, like every other notes.jsonl writer.
+
+    `mind.load_notes` and `bin/tool-recall` both read `record["note"]`, so a
+    story stored under `text` was write-only — saved to long-term memory and
+    then invisible to everything that reads it.
+    """
+    record = _finished_story_record(isolated_project)
+    assert record.get("note"), f"story record has no 'note' key: {record}"
+    assert "treasure map" in record["note"]
+
+
+def test_finished_story_is_typed_as_narrative(isolated_project):
+    """A story SPARK invented with Obi is narrative — made up, by design, and
+    it must not read back later as something that happened (#170)."""
+    from pxh import provenance
+    p = provenance.read_provenance(_finished_story_record(isolated_project))
+    assert p["kind"] == "narrative"
+    assert p["confidence"] <= provenance.CONFIDENCE_CEILING["narrative"]
+
+
 def test_story_add_without_start(isolated_project):
     """Add without start returns error."""
     env = dict(isolated_project["env"])

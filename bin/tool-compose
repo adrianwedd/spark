@@ -94,6 +94,11 @@ def main():
         "type": "compose",
         "note": f"Composed: {topic} — {result.stdout.strip()[:150]}",
     }
+    # SPARK's own writing about a topic it chose — narrative, and capped as
+    # such, so a composed image never reads back as a remembered event.
+    from pxh import provenance
+    provenance.stamp(note_entry, "narrative", "compose",
+                     evidence=[f"topic:{topic[:120]}"])
     notes_file = STATE_DIR / "notes-spark.jsonl"
     try:
         _lock = _FL(str(notes_file) + ".lock", timeout=5) if _FL else None

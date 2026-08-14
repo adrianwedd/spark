@@ -186,6 +186,18 @@ def test_landmark_promotion_to_notes(wander, tmp_path):
     assert entry["source"] == "exploration"
 
 
+def test_promoted_landmark_is_typed_as_something_spark_saw(wander, tmp_path):
+    """A scene description comes from SPARK's own camera — the one durable
+    writer that genuinely produces an `observation` (#170). It is capped below
+    certainty all the same: a vision model can be wrong about what it sees."""
+    from pxh import provenance
+    wander["_auto_remember"]("Found a cat on the shelf to my right")
+    entry = json.loads((tmp_path / "notes.jsonl").read_text().strip())
+    p = provenance.read_provenance(entry)
+    assert p["kind"] == "observation"
+    assert p["confidence"] < 1.0
+
+
 def test_vision_failed_not_promoted(wander):
     assert wander["FALLBACK_DESCRIPTION"] == "I couldn't see anything right now."
 

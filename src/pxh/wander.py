@@ -440,6 +440,15 @@ def _auto_remember(text: str) -> None:
                 "note": text[:500],
                 "source": "exploration",
             }
+            # The only durable writer that records genuine perception: this is
+            # what the camera saw, via tool-describe-scene. Still capped below
+            # certainty — a vision model can be confidently wrong (#170).
+            try:
+                from pxh import provenance
+                provenance.stamp(entry, "observation", "vision:describe-scene")
+            except Exception:
+                pass  # an unlabelled landmark beats a lost one
+
             with notes_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
     except Exception as exc:
