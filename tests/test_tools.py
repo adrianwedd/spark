@@ -530,6 +530,65 @@ def test_tool_recall_dry_run(isolated_project):
     assert "spoken" in payload
 
 
+def _seed_note(state_dir, text, kind=None, source="test"):
+    """Append one note, optionally carrying #170 provenance."""
+    from pxh import provenance
+    record = {"ts": "2026-08-14T00:00:00+00:00", "note": text}
+    if kind is not None:
+        record["provenance"] = provenance.make_provenance(kind, source)
+    with (state_dir / "notes.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def _recall(isolated_project):
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    return parse_json(run_tool(["bin/tool-recall"], env))
+
+
+def test_recall_speaks_an_observation_as_something_seen(isolated_project):
+    _seed_note(isolated_project["state_dir"], "a cat on the shelf", "observation")
+    payload = _recall(isolated_project)
+    assert "seeing" in payload["spoken"]
+    assert "a cat on the shelf" in payload["spoken"]
+
+
+def test_recall_speaks_a_report_as_something_it_was_told(isolated_project):
+    _seed_note(isolated_project["state_dir"], "the bins go out Tuesday", "report")
+    assert "told me" in _recall(isolated_project)["spoken"]
+
+
+def test_recall_speaks_narrative_as_its_own_thinking(isolated_project):
+    _seed_note(isolated_project["state_dir"], "the hallway feels friendly", "narrative")
+    assert "thinking" in _recall(isolated_project)["spoken"]
+
+
+def test_recall_speaks_a_legacy_note_plainly_claiming_nothing(isolated_project):
+    _seed_note(isolated_project["state_dir"], "something from before", None)
+    payload = _recall(isolated_project)
+    assert "I remember" in payload["spoken"]
+    for borrowed in ("seeing", "told me", "thinking"):
+        assert borrowed not in payload["spoken"]
+
+
+def test_recall_qualifies_each_note_when_kinds_are_mixed(isolated_project):
+    state_dir = isolated_project["state_dir"]
+    _seed_note(state_dir, "a cat", "observation")
+    _seed_note(state_dir, "bins Tuesday", "report")
+    _seed_note(state_dir, "hallways are nice", "narrative")
+    spoken = _recall(isolated_project)["spoken"]
+    assert "saw" in spoken
+    assert "told me" in spoken
+    assert "thought" in spoken
+
+
+def test_recall_payload_reports_provenance_without_breaking_notes(isolated_project):
+    _seed_note(isolated_project["state_dir"], "a cat on the shelf", "observation")
+    payload = _recall(isolated_project)
+    assert payload["notes"] == ["a cat on the shelf"]
+    assert payload["provenance"][0]["kind"] == "observation"
+
+
 def test_tool_api_start_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
@@ -1293,6 +1352,7 @@ _TOOLS_ROOT = _Path(__file__).parent.parent
 def _load_tool_heredoc(name, monkeypatch, tmp_path, extra_env=None):
     """Exec a bin/tool-* embedded Python heredoc into a namespace with a fake
     pxh.claude_session so main() can run without a live Claude CLI."""
+    monkeypatch.setenv("PROJECT_ROOT", str(_TOOLS_ROOT))
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("PX_DRY", "0")
     for k, v in (extra_env or {}).items():
@@ -1337,3 +1397,62 @@ def test_tool_compose_writes_note_record(tmp_path, monkeypatch, capsys):
     # and a note summary lands in notes
     note_rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
     assert note_rec.get("note", "").startswith("Composed: the wind in the eucalyptus")
+
+
+# --- provenance on durable notes (issue #170) -------------------------------
+
+def test_tool_remember_stamps_the_kind_its_caller_declares(tmp_path, monkeypatch, capsys):
+    from pxh import provenance
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    ns = _load_tool_heredoc("tool-remember", monkeypatch, tmp_path,
+                            {"PX_NOTE": "Obi said he wants to build a robot",
+                             "PX_NOTE_KIND": "report",
+                             "PX_NOTE_SOURCE": "voice:obi"})
+    ns["main"]()
+    capsys.readouterr()
+    rec = json.loads((tmp_path / "notes.jsonl").read_text().strip())
+    p = provenance.read_provenance(rec)
+    assert p["kind"] == "report"
+    assert p["source"] == "voice:obi"
+
+
+def test_tool_remember_without_a_declared_kind_records_unknown(tmp_path, monkeypatch, capsys):
+    from pxh import provenance
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    ns = _load_tool_heredoc("tool-remember", monkeypatch, tmp_path,
+                            {"PX_NOTE": "something happened"})
+    ns["main"]()
+    capsys.readouterr()
+    rec = json.loads((tmp_path / "notes.jsonl").read_text().strip())
+    assert provenance.read_provenance(rec)["kind"] == "unknown"
+
+
+def test_tool_remember_rejects_a_kind_outside_the_vocabulary(tmp_path, monkeypatch, capsys):
+    from pxh import provenance
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    ns = _load_tool_heredoc("tool-remember", monkeypatch, tmp_path,
+                            {"PX_NOTE": "x", "PX_NOTE_KIND": "certainty"})
+    ns["main"]()
+    capsys.readouterr()
+    rec = json.loads((tmp_path / "notes.jsonl").read_text().strip())
+    assert provenance.read_provenance(rec)["kind"] == "unknown"
+
+
+def test_tool_research_note_is_stamped_as_an_external_report(tmp_path, monkeypatch, capsys):
+    from pxh import provenance
+    ns = _load_tool_heredoc("tool-research", monkeypatch, tmp_path,
+                            {"PX_RESEARCH_QUERY": "why is the sky blue"})
+    ns["main"]()
+    capsys.readouterr()
+    rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
+    assert provenance.read_provenance(rec)["kind"] == "report"
+
+
+def test_tool_compose_note_is_stamped_as_sparks_own_narrative(tmp_path, monkeypatch, capsys):
+    from pxh import provenance
+    ns = _load_tool_heredoc("tool-compose", monkeypatch, tmp_path,
+                            {"PX_COMPOSE_TOPIC": "the hallway at night"})
+    ns["main"]()
+    capsys.readouterr()
+    rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
+    assert provenance.read_provenance(rec)["kind"] == "narrative"

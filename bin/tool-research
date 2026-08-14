@@ -74,6 +74,11 @@ def main():
         # records without it are invisible to SPARK's memory.
         "note": f"Research: {query} — {result.stdout.strip()[:200]}",
     }
+    # A lookup relays what sources outside SPARK assert: a report, not
+    # something SPARK observed, and not its own reflection either.
+    from pxh import provenance
+    provenance.stamp(entry, "report", "research:claude",
+                     evidence=[f"query:{query[:120]}", f"model:{result.model_used}"])
 
     notes_file = STATE_DIR / "notes-spark.jsonl"
     STATE_DIR.mkdir(parents=True, exist_ok=True)

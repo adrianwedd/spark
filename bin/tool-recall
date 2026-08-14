@@ -9,6 +9,13 @@ python - "$@" <<'PY'
 """Tool: recall recent notes from state/notes[-persona].jsonl and speak them.
 
 Notes are persona-scoped — SPARK only recalls SPARK notes, VIXEN only VIXEN notes.
+
+This is the one place a durable claim is spoken to a human, so it is also the
+one place the claim's provenance must survive into speech (#170). A note SPARK
+generated about itself and a note a person told it read identically once they
+are prose; saying "I remember: X" for both borrows the authority of perception
+for something that may be invention. Every kind gets its own lead-in, and
+`unknown` (every pre-#170 note) deliberately claims nothing beyond "I remember".
 """
 from __future__ import annotations
 
@@ -19,11 +26,34 @@ from collections import deque
 from pathlib import Path
 
 from filelock import FileLock
+from pxh import provenance
 from pxh.logging import log_event
 from pxh.state import load_session, update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
+
+# Spoken lead-in for a single recalled note.
+RECALL_LEAD = {
+    "observation":  "I remember seeing",
+    "report":       "I remember you told me",
+    "inference":    "I remember working out",
+    "narrative":    "I remember thinking",
+    "verification": "I remember checking",
+    "unknown":      "I remember",
+}
+
+# Per-item lead-in when several notes are recalled at once. One shared
+# qualifier would relabel every note with a single kind, so each claim carries
+# its own distance. `unknown` renders bare — it has no distance to report.
+ITEM_LEAD = {
+    "observation":  "I saw",
+    "report":       "you told me",
+    "inference":    "I worked out",
+    "narrative":    "I thought",
+    "verification": "I checked",
+    "unknown":      "",
+}
 
 
 def notes_file_for_persona(persona: str) -> Path:
@@ -32,10 +62,11 @@ def notes_file_for_persona(persona: str) -> Path:
     return STATE_DIR / "notes.jsonl"
 
 
-def load_notes(limit: int, notes_file: Path) -> list[str]:
+def load_notes(limit: int, notes_file: Path) -> list[dict]:
+    """Return whole records, not bare text — the caller needs provenance."""
     if not notes_file.exists():
         return []
-    rows: deque[str] = deque(maxlen=limit)
+    rows: deque[dict] = deque(maxlen=limit)
     lock = FileLock(str(notes_file) + ".lock", timeout=10)
     with lock:
         with notes_file.open("r", encoding="utf-8") as f:
@@ -44,10 +75,30 @@ def load_notes(limit: int, notes_file: Path) -> list[str]:
                 if not line:
                     continue
                 try:
-                    rows.append(json.loads(line)["note"])
-                except (json.JSONDecodeError, KeyError):
+                    record = json.loads(line)
+                    if not isinstance(record, dict) or not record.get("note"):
+                        continue
+                except json.JSONDecodeError:
                     continue
+                rows.append(record)
     return list(rows)
+
+
+def compose_speech(records: list[dict]) -> str:
+    """Render notes for speech without erasing where each one came from."""
+    if not records:
+        return "I don't have any notes saved yet."
+    kinds = [provenance.read_provenance(r)["kind"] for r in records]
+    if len(records) == 1:
+        lead = RECALL_LEAD.get(kinds[0], RECALL_LEAD["unknown"])
+        return f"{lead}: {records[0]['note'][:200]}"
+    items = []
+    for record, kind in zip(records, kinds):
+        # Truncate each note for speech — full text stays in the JSON payload
+        short = record["note"][:120]
+        lead = ITEM_LEAD.get(kind, "")
+        items.append(f"{lead}: {short}" if lead else short)
+    return f"I remember {len(records)} things: {'; '.join(items)}."[:500]
 
 
 def main() -> int:
@@ -60,24 +111,19 @@ def main() -> int:
     except ValueError:
         limit = 5
 
-    notes = load_notes(limit, notes_file)
-
-    if not notes:
-        spoken = "I don't have any notes saved yet."
-    elif len(notes) == 1:
-        spoken = f"I remember: {notes[0][:200]}"
-    else:
-        # Truncate each note for speech — full text stays in JSON payload
-        short = [n[:120] for n in notes]
-        items = "; ".join(short)
-        spoken = f"I remember {len(notes)} things: {items}."[:500]
+    records = load_notes(limit, notes_file)
+    notes = [r["note"] for r in records]
+    spoken = compose_speech(records)
 
     update_session(
         fields={"last_action": "tool_recall"},
         history_entry={"event": "recall", "count": len(notes)},
     )
 
+    # `notes` stays a list of strings for existing consumers; provenance rides
+    # alongside it rather than replacing it (#170 is backwards-compatible).
     payload = {"status": "ok", "dry": dry_mode, "notes": notes, "spoken": spoken,
+               "provenance": [provenance.read_provenance(r) for r in records],
                "persona_scope": persona or "shared"}
 
     if not dry_mode:

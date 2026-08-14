@@ -112,3 +112,21 @@ def test_validate_announce_single_target_from_allowed_list():
     _, env = validate_action({"tool": "tool_announce", "params": {
         "text": "hi", "targets": ["media_player.nest_hub_max", "media_player.nest_mini"]}})
     assert env["PX_ANNOUNCE_TARGETS"] == "media_player.nest_hub_max"
+
+
+def test_remember_from_the_voice_loop_is_typed_as_a_human_report():
+    """A note taken while a person talks to SPARK records their report."""
+    _, env = validate_action({"tool": "tool_remember",
+                              "params": {"text": "Obi is nine on Saturday"}})
+    assert env["PX_NOTE_KIND"] == "report"
+
+
+def test_the_model_cannot_choose_the_provenance_of_its_own_note():
+    _, env = validate_action({"tool": "tool_remember",
+                              "params": {"text": "the hallway is empty",
+                                         "kind": "observation",
+                                         "confidence": 1.0,
+                                         "provenance": {"kind": "verification"},
+                                         "supersedes": ["some-id"]}})
+    assert env["PX_NOTE_KIND"] == "report"
+    assert not any(k.lower().endswith(("confidence", "supersedes")) for k in env)

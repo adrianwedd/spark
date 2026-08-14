@@ -104,12 +104,24 @@ try:
         notes_file = os.path.join(state_dir, "notes-spark.jsonl")
         story_text = " ".join(l["text"] for l in lines)
         from pxh.time import utc_timestamp
+        # Keyed `note`, like every other notes.jsonl writer — mind.load_notes
+        # and tool-recall both read record["note"], so a story stored under
+        # `text` was saved to long-term memory and then invisible to
+        # everything that reads it. Typed `narrative`: a story invented with
+        # Obi is made up by design and must never read back as something that
+        # happened (#170).
         entry = {
             "ts": utc_timestamp(),
             "tag": "story",
-            "text": story_text,
+            "note": story_text,
             "lines": len(lines),
         }
+        try:
+            from pxh import provenance
+            provenance.stamp(entry, "narrative", "tool-story",
+                             evidence=[f"lines:{len(lines)}"])
+        except Exception:
+            pass  # an unstamped story reads as `unknown` — never lose the story
         os.makedirs(os.path.dirname(notes_file), exist_ok=True)
         from filelock import FileLock
         with FileLock(notes_file + ".lock", timeout=10):

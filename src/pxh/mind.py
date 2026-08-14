@@ -45,6 +45,7 @@ from pxh.spark_config import (
 )
 from pxh import intention as intention_mod
 from pxh import memory as spark_memory
+from pxh import provenance as prov
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -1576,8 +1577,14 @@ def calendar_context(events: list[dict]) -> dict:
     return ctx
 
 
-def load_notes(n: int = 5, persona: str = "") -> list[str]:
-    """Read last N notes from persona-scoped long-term memory."""
+def load_notes(n: int = 5, persona: str = "",
+               with_provenance: bool = False) -> list[str]:
+    """Read last N notes from persona-scoped long-term memory.
+
+    with_provenance=True appends each note's origin — "someone told me this",
+    "my own reflection, unverified", "source unknown, an older record". Off by
+    default so the plain-text contract other callers rely on is unchanged.
+    """
     notes_file = notes_file_for_persona(persona)
     if not notes_file.exists():
         return []
@@ -1595,7 +1602,8 @@ def load_notes(n: int = 5, persona: str = "") -> list[str]:
                 continue
             note = (record.get("note") or "").strip()
             if note:
-                notes.append(note)
+                notes.append(f"{note} [{prov.describe(record)}]"
+                             if with_provenance else note)
         notes.reverse()
         return notes
     except Exception:
@@ -2082,7 +2090,12 @@ def auto_remember(thought: dict, persona: str = "") -> None:
     """Save high-salience thought to persona-scoped long-term memory."""
     notes_file = notes_file_for_persona(persona)
     lock = FileLock(str(notes_file) + ".lock", timeout=10)
-    record = {"ts": utc_timestamp(), "note": f"[mind] {thought['thought'][:450]}"}
+    # A salient thought is SPARK's own prose, not something it witnessed —
+    # stamped `narrative` so retrieval can never present it as perception.
+    record = prov.stamp(
+        {"ts": utc_timestamp(), "note": f"[mind] {thought['thought'][:450]}"},
+        "narrative", "mind:auto_remember",
+        evidence=[f"thought:{thought.get('ts', '')}"] if thought.get("ts") else None)
     notes_file.parent.mkdir(parents=True, exist_ok=True)
     with lock:
         with notes_file.open("a", encoding="utf-8") as f:
@@ -2422,7 +2435,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     persona = (awareness.get("persona") or session.get("persona") or "").lower().strip()
     recent_thoughts = load_recent_thoughts(5, persona=persona)
     recent_history = (session.get("history") or [])[-5:]
-    notes = load_notes(3, persona=persona)
+    notes = load_notes(3, persona=persona, with_provenance=True)
 
     # Pick a topic seed (or None = free-will mode) using OS entropy RNG
     topic_seed = _pick_reflection_seed()
@@ -2468,14 +2481,30 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     query_bits.append(awareness.get("time_period", ""))
     query_bits.append(((awareness.get("calendar") or {}).get("current_event")) or "")
     query_bits.extend((awareness.get("frigate") or {}).get("rooms_with_people") or [])
+    # A store that returned nothing relevant is NOT the same as no store: only
+    # the second earns the raw-notes fallback. Falling back on a zero-match
+    # search would smuggle whatever SPARK happened to note down last into
+    # reflection about something unrelated — the same leak #171 closed inside
+    # retrieve_memories(). A retrieval *failure* still falls back, since a
+    # broken read tells us nothing about whether the store is populated.
+    has_store = False
     try:
+        has_store = spark_memory.has_memory_store(persona or "spark")
         relevant = spark_memory.retrieve_memories(
             " ".join(b for b in query_bits if b), n=3, persona=persona or "spark")
     except Exception:
-        relevant = []
+        relevant, has_store = [], False
     if relevant:
-        context_parts.append("Memories that feel relevant right now:\n"
-                             + "\n".join(f"  - {m['text']}" for m in relevant))
+        # Each memory carries where it came from. SPARK's durable store is
+        # mostly its own generated prose, and unlabelled it reads back exactly
+        # like something witnessed — the confusion #170 exists to end.
+        context_parts.append(
+            "Memories that feel relevant right now (each marked with where it "
+            "came from — treat your own reflections as less reliable than "
+            "things you saw or were told):\n"
+            + "\n".join(f"  - {m['text']} [{prov.describe(m)}]" for m in relevant))
+    elif has_store:
+        pass  # nothing relevant today — say nothing rather than pad
     elif notes:
         context_parts.append("Your long-term memories:\n" + "\n".join(f"  - {n}" for n in notes))
 
@@ -3094,6 +3123,11 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
 
         elif action == "remember":
             env["PX_NOTE"] = text[:500]
+            # px-mind acts on its own reflection, so what it writes down is
+            # SPARK's prose about SPARK — narrative, not a report of anything
+            # said or a record of anything seen.
+            env["PX_NOTE_KIND"] = "narrative"
+            env["PX_NOTE_SOURCE"] = "mind:remember"
             subprocess.run(
                 [str(BIN_DIR / "tool-remember")],
                 capture_output=True, text=True, check=False, env=env, timeout=10,

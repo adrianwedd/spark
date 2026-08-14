@@ -1,11 +1,17 @@
 """Consolidated long-term memory for SPARK — QA roadmap item 5.
 
 Store: state/memories-{persona}.jsonl, one record per line:
-  {"ts", "date", "text", "tags": [...], "importance": 0-1, "source": "consolidation"}
+  {"ts", "date", "text", "tags": [...], "importance": 0-1, "source": "consolidation",
+   "id", "provenance": {...}}
+
+`provenance` (see pxh.provenance) types the claim — everything consolidation
+writes is `narrative`, SPARK's own prose about its own thoughts. Records
+written before it existed carry no such key and read back as `unknown`.
 
 Retrieval is deliberately deterministic and free (token/tag overlap + recency)
 so the per-reflection path costs nothing; the nightly consolidation pass
-(consolidate(), Task 4) is where the one daily LLM call goes.
+(consolidate(), Task 4) is where the one daily LLM call goes. Recency ranks
+matches, it never manufactures one — see retrieve_memories().
 """
 from __future__ import annotations
 
@@ -20,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from filelock import FileLock
 
+from pxh import provenance
 from pxh.state import atomic_write
 from pxh.time import utc_timestamp
 
@@ -53,6 +60,21 @@ def _state_dir() -> Path:
 
 def memories_file(persona: str = "spark") -> Path:
     return _state_dir() / f"memories-{persona or 'spark'}.jsonl"
+
+
+def has_memory_store(persona: str = "spark") -> bool:
+    """True if this persona has a consolidated memory store at all.
+
+    Distinct from "retrieval found nothing": callers with a raw-notes fallback
+    need to tell "no store yet" (fall back) from "a store that holds nothing
+    relevant" (inject nothing). Stats the file rather than parsing it — the
+    question is about the store's existence, not its contents.
+    """
+    try:
+        f = memories_file(persona)
+        return f.exists() and f.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def load_memories(persona: str = "spark") -> list[dict]:
@@ -118,31 +140,60 @@ def score_memory(memory: dict, query_tokens: set[str],
     return base + recency
 
 
+RETRIEVAL_MODES = ("relevance", "recent")
+
+
+def _recency_key(memory: dict, index: int) -> tuple[int, float, int]:
+    """Sort key for newest-first ordering. Unparseable timestamps sort last."""
+    try:
+        ts = dt.datetime.fromisoformat(
+            str(memory.get("ts", "")).replace("Z", "+00:00"))
+        return (0, -ts.timestamp(), -index)
+    except (ValueError, TypeError):
+        return (1, 0.0, -index)
+
+
 def retrieve_memories(query: str, n: int = 3, persona: str = "spark",
-                      now: dt.datetime | None = None) -> list[dict]:
-    memories = load_memories(persona)
+                      now: dt.datetime | None = None,
+                      mode: str = "relevance") -> list[dict]:
+    """Return at most n memories.
+
+    mode="relevance" (default): only records with a non-zero topical score.
+    Fewer than n matches returns fewer than n records — a free result slot is
+    never filled with an unrelated recent memory. Padding used to do exactly
+    that, and by the time the records reached the reflection prompt a filler
+    was indistinguishable from a genuine hit, so whatever SPARK happened to
+    consolidate last night got pulled into cognition about anything at all.
+
+    mode="recent": newest-first by `ts`, ignoring the query entirely. Recency
+    alone is a legitimate thing to ask for (a "what happened lately" digest);
+    it just must never be the silent consolation prize for a failed search.
+
+    `importance` deliberately does not affect ranking. It is assigned by the
+    consolidating model to its own output, so ranking on it would let the
+    writer decide what it gets to be reminded of later, and a memory rated
+    important in one context is not thereby relevant in another. It stays a
+    stored annotation for humans and for future retention policy (e.g. what to
+    drop first at MEMORIES_LIMIT), not a retrieval signal.
+    """
+    if mode not in RETRIEVAL_MODES:
+        raise ValueError(f"unknown retrieval mode {mode!r}; "
+                         f"expected one of {RETRIEVAL_MODES}")
+    memories = provenance.apply_supersessions(load_memories(persona))
     if not memories:
         return []
+    if mode == "recent":
+        # Superseded records are shown here, marked: "recent" is a raw digest of
+        # what SPARK wrote down, including the beliefs it has since corrected.
+        order = sorted(range(len(memories)),
+                       key=lambda i: _recency_key(memories[i], i))
+        return [memories[i] for i in order[:n]]
     q = _tokenize(query)
     scored = sorted(
-        ((score_memory(m, q, now=now), i) for i, m in enumerate(memories)),
+        ((score_memory(m, q, now=now), i) for i, m in enumerate(memories)
+         if not provenance.is_superseded(m)),
         key=lambda t: (-t[0], -t[1]))
-    chosen = [i for s, i in scored if s > 0][:n]
-    if len(chosen) < n:  # pad with the most-recent memories (by parsed ts) not already chosen
-        chosen_set = set(chosen)
-
-        def _pad_key(i: int) -> tuple[int, float, int]:
-            try:
-                ts = dt.datetime.fromisoformat(
-                    str(memories[i].get("ts", "")).replace("Z", "+00:00"))
-                return (0, -ts.timestamp(), -i)
-            except (ValueError, TypeError):
-                return (1, 0.0, -i)
-
-        remaining = sorted(
-            (i for i in range(len(memories)) if i not in chosen_set), key=_pad_key)
-        chosen.extend(remaining[:n - len(chosen)])
-    return [memories[i] for i in chosen[:n]]
+    return [memories[i] for s, i in scored if s > 0][:n]
 
 
 CONSOLIDATION_PROMPT = """You are SPARK's memory consolidation process. SPARK is a small
@@ -289,8 +340,24 @@ def consolidate(dry: bool = False, persona: str = "spark",
                     "error": f"no parseable memories in response: {result.stdout[:200]!r}"}
         fresh = _dedupe(candidates, existing, now=now)
         ts = utc_timestamp()
-        records = [{"ts": ts, "date": ts[:10], "text": c["text"], "tags": c["tags"],
-                    "importance": c["importance"], "source": "consolidation"} for c in fresh]
+        # Provenance is assigned by us, never by the model. Consolidation reads
+        # SPARK's own thoughts and writes prose about them, so every record it
+        # produces is `narrative` however observational the sentence sounds —
+        # "I watched Obi come in" distilled from a thought is still the thought.
+        # Confidence is narrative's default rather than anything derived from
+        # the model's `importance`, which would let the writer of a claim raise
+        # its own standing.
+        evidence = [f"thoughts-{persona or 'spark'}.jsonl",
+                    f"thought_count:{len(thoughts)}"]
+        window = [str(t.get("ts") or "") for t in thoughts if t.get("ts")]
+        if window:
+            evidence.append(f"window:{min(window)}..{max(window)}")
+        records = [
+            provenance.stamp(
+                {"ts": ts, "date": ts[:10], "text": c["text"], "tags": c["tags"],
+                 "importance": c["importance"], "source": "consolidation"},
+                "narrative", "consolidation", evidence=evidence)
+            for c in fresh]
         append_memories(records, persona)
         return {"status": "ok", "written": len(records), "candidates": len(candidates)}
     except Exception as exc:
