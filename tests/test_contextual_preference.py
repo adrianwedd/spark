@@ -1,6 +1,7 @@
 """Behavioral tests for lived-experience adaptation — issue #172."""
 import datetime as dt
 import json
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +10,7 @@ from pxh import contextual_preference as cp
 
 NOW = dt.datetime(2026, 8, 14, 6, 0, tzinfo=dt.timezone.utc)
 OPTIONS = ["quiet_science", "active_movement"]
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _experience(*, option="active_movement", outcome="positive", kind="report",
@@ -286,3 +288,66 @@ def test_experience_file_is_persona_scoped(tmp_path, monkeypatch):
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     assert cp.experience_file("spark") == tmp_path / "preference-experiences-spark.jsonl"
     assert cp.experience_file("vixen") == tmp_path / "preference-experiences-vixen.jsonl"
+
+
+def _snapshot_result(result):
+    return {
+        "chosen": result["chosen"],
+        "adapted": result["adapted"],
+        "confidence": result["confidence"],
+        "scores": result["scores"],
+        "cited_record_ids": [
+            cause["record_id"] for cause in result["explanation"]["contributing"]
+        ],
+    }
+
+
+def test_longitudinal_snapshot_proves_history_only_deterministic_divergence():
+    controls = {
+        "clock": "2026-08-14T06:00:00Z",
+        "model_version": "controlled-model@1",
+        "sensor_snapshot": {
+            "period": "after_school", "location": "indoors", "safe_to_move": True,
+        },
+        "randomness_seed": 172,
+        "reflection_seed": "controlled-reflection-172",
+        "code_version": "issue-172-baseline-v1",
+        "config_version": "issue-172-baseline-v1",
+    }
+    history_a = [
+        _experience(index=i, option="quiet_science") for i in range(3)
+    ]
+    history_b = [
+        _experience(index=10 + i, option="active_movement") for i in range(3)
+    ]
+    common = {
+        "person": "obi", "context": "after_school", "options": OPTIONS,
+        "default": "quiet_science", "now": NOW, "controls": controls,
+    }
+    replay_a = {**common, "records": history_a}
+    replay_b = {**common, "records": history_b}
+    assert {k: v for k, v in replay_a.items() if k != "records"} == {
+        k: v for k, v in replay_b.items() if k != "records"
+    }
+
+    baseline = cp.choose_option([], **common)
+    result_a = cp.choose_option(**replay_a)
+    result_b = cp.choose_option(**replay_b)
+    repeated_b = cp.choose_option(**replay_b)
+
+    assert baseline["chosen"] == "quiet_science" and not baseline["adapted"]
+    assert result_a["chosen"] == "quiet_science" and result_a["adapted"]
+    assert result_b["chosen"] == "active_movement" and result_b["adapted"]
+    assert result_b == repeated_b
+    assert baseline["controls"] == result_a["controls"] == result_b["controls"]
+
+    observed = {
+        "controls": controls,
+        "baseline": _snapshot_result(baseline),
+        "history_a": _snapshot_result(result_a),
+        "history_b": _snapshot_result(result_b),
+    }
+    expected = json.loads(
+        (FIXTURES / "lived_experience_baseline.json").read_text(encoding="utf-8")
+    )
+    assert observed == expected

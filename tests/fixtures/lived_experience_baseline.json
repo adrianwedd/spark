@@ -1,0 +1,53 @@
+{
+  "controls": {
+    "clock": "2026-08-14T06:00:00Z",
+    "model_version": "controlled-model@1",
+    "sensor_snapshot": {
+      "period": "after_school",
+      "location": "indoors",
+      "safe_to_move": true
+    },
+    "randomness_seed": 172,
+    "reflection_seed": "controlled-reflection-172",
+    "code_version": "issue-172-baseline-v1",
+    "config_version": "issue-172-baseline-v1"
+  },
+  "baseline": {
+    "chosen": "quiet_science",
+    "adapted": false,
+    "confidence": 0.0,
+    "scores": {
+      "quiet_science": 0.0,
+      "active_movement": 0.0
+    },
+    "cited_record_ids": []
+  },
+  "history_a": {
+    "chosen": "quiet_science",
+    "adapted": true,
+    "confidence": 0.677419,
+    "scores": {
+      "quiet_science": 2.1,
+      "active_movement": 0.0
+    },
+    "cited_record_ids": [
+      "experience-0",
+      "experience-1",
+      "experience-2"
+    ]
+  },
+  "history_b": {
+    "chosen": "active_movement",
+    "adapted": true,
+    "confidence": 0.677419,
+    "scores": {
+      "quiet_science": 0.0,
+      "active_movement": 2.1
+    },
+    "cited_record_ids": [
+      "experience-10",
+      "experience-11",
+      "experience-12"
+    ]
+  }
+}
