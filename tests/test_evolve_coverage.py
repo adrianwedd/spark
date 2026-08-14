@@ -285,18 +285,19 @@ class TestEnrichedStatusParsing:
 
 class TestPublicServicesExpansion:
 
-    def test_has_all_ten_services(self):
+    def test_has_all_ten_services(self, monkeypatch):
         """Public services endpoint should return all 10 boot services."""
         from pxh import api
+        monkeypatch.setenv("PX_API_TOKEN", "test-token")
+        api._public_rate_store.clear()
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout="active\n")
 
             from starlette.testclient import TestClient
-            client = TestClient(api.app)
-
-            resp = client.get("/api/v1/public/services")
+            with TestClient(api.app) as client:
+                resp = client.get("/api/v1/public/services")
             assert resp.status_code == 200
             data = resp.json()
 

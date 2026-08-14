@@ -298,11 +298,13 @@ async def _health_heartbeat(*, sleep=asyncio.sleep) -> None:
 async def _lifespan(application: FastAPI):
     _load_token()
     _load_pin_state()
-    _start_history_worker()
+    history_thread, history_stop = _start_history_worker()
     heartbeat_task = asyncio.create_task(_health_heartbeat())
     try:
         yield
     finally:
+        history_stop.set()
+        history_thread.join(timeout=1)
         heartbeat_task.cancel()
         try:
             await heartbeat_task
@@ -517,12 +519,9 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
 _FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct", "wifi_dbm", "rain_24h_mm", "mood")
 
 
-def _history_worker() -> None:
+def _history_worker(stop_event: threading.Event) -> None:
     """Background daemon thread: appends a reading every 30s to _history_buf."""
-    import time as _time
-
-    while True:
-        _time.sleep(30)
+    while not stop_event.wait(30):
         try:
             # Always sample SPARK — public history must not reflect gremlin/vixen state.
             sample = _collect_history_sample(_public_state_dir(), "spark")
@@ -541,10 +540,17 @@ def _history_worker() -> None:
             )
 
 
-def _start_history_worker() -> None:
+def _start_history_worker() -> tuple[threading.Thread, threading.Event]:
     """Start the history worker thread. Called from lifespan, not at import."""
-    t = threading.Thread(target=_history_worker, daemon=True, name="history-worker")
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_history_worker,
+        args=(stop_event,),
+        daemon=True,
+        name="history-worker",
+    )
     t.start()
+    return t, stop_event
 
 
 # ---------------------------------------------------------------------------

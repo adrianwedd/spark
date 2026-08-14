@@ -12,7 +12,8 @@ def client(isolated_project, monkeypatch):
     from pxh import api as api_mod
     if hasattr(api_mod, '_rate_limit_store'):
         api_mod._rate_limit_store.clear()
-    return TestClient(app)
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 def test_valid_request_returns_reply(client):
