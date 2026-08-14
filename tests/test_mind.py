@@ -2,7 +2,7 @@
 import inspect
 import json
 import subprocess
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from filelock import Timeout as FileLockTimeout
 from pxh import mind
 
@@ -438,3 +438,29 @@ def test_reflection_records_failure_when_no_json_returned(monkeypatch):
                         lambda comp, err, detail=None, **k: recorded.update({comp: err}))
     assert mind.reflection({"persona": ""}, dry=False) is None
     assert recorded["px-mind-reflection"] == "no JSON in response"
+
+
+def test_expression_suppresses_audio_in_quiet_mode(monkeypatch):
+    """Quiet mode is constitutional (pxh.policy rule 1) — it applies to the
+    autonomous loop too, not just Obi-initiated turns."""
+    _quiet_daytime(monkeypatch)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": "", "spark_quiet_mode": True})
+    calls = []
+    monkeypatch.setattr(mind, "_run_voice", lambda env, label="": calls.append(label))
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    result = mind.expression({"action": "greet", "thought": "hello"}, dry=True, awareness=aw)
+    assert result is False
+    assert calls == []
+
+
+def test_expression_allows_presence_action_in_quiet_mode(monkeypatch):
+    """Staying present is the point of the Three S's — only audio is blocked."""
+    _quiet_daytime(monkeypatch)
+    monkeypatch.setattr(mind, "load_session", lambda: {"persona": "", "spark_quiet_mode": True})
+    mock_run = Mock(return_value=subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="{}", stderr=""))
+    monkeypatch.setattr(mind.subprocess, "run", mock_run)
+    aw = {"obi_mode": "active", "calendar": {}, "ha_context": {}}
+    result = mind.expression({"action": "emote", "thought": "curious"}, dry=True, awareness=aw)
+    assert result is True
+    assert mock_run.called

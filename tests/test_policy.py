@@ -164,3 +164,30 @@ def test_depth_1_is_fine_when_nothing_blocks():
         session={"spark_quiet_mode": True}, awareness={}, now=NIGHT_TS, _depth=1,
     )
     assert verdict.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# mind.py effect classification (Task 2)
+# ---------------------------------------------------------------------------
+
+def test_mind_effect_table_is_exhaustive():
+    from pxh import mind
+    assert set(mind.MIND_EFFECT_TABLE.keys()) == mind.VALID_ACTIONS
+    assert all(v in ("audio", "presence", "other") for v in mind.MIND_EFFECT_TABLE.values())
+
+
+def test_mind_effect_table_classifies_known_audio_actions_as_audio():
+    """Classified from real dispatch, not from names: scan/look_at/look_around
+    each call _run_voice in expression()."""
+    from pxh import mind
+    for action in ("greet", "greet_arrival", "comment", "weather_comment",
+                   "morning_fact", "scan", "look_at", "look_around",
+                   "play_sound", "time_check", "calendar_check", "announce",
+                   "message_obi"):
+        assert mind.MIND_EFFECT_TABLE[action] == "audio", action
+
+
+def test_is_night_silence_delegates_to_policy():
+    from pxh import mind
+    for hour in range(24):
+        assert mind._is_night_silence(hour) == policy.is_night_hour(hour)
