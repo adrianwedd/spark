@@ -1124,3 +1124,22 @@ def test_battery_emergency_env_carries_no_route_and_urgent(monkeypatch):
     mind.battery_emergency_shutdown(5, dry=True)
     assert captured["env"]["PX_VOICE_NO_ROUTE"] == "1"
     assert captured["env"]["PX_VOICE_URGENT"] == "1"
+
+
+def test_mind_remember_dispatch_types_the_note_as_sparks_own_narrative(monkeypatch):
+    """px-mind's `remember` acts on SPARK's own reflection, so the note it
+    writes is narrative — not a report of anything anyone said (#170)."""
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(mind.subprocess, "run", fake_run)
+    monkeypatch.setattr(mind, "_is_night_silence", lambda h: False)
+    mind.expression({"action": "remember", "text": "the house was quiet today",
+                     "thought": "the house was quiet today", "mood": "calm",
+                     "salience": 0.5}, dry=False)
+
+    assert captured["env"]["PX_NOTE_KIND"] == "narrative"
+    assert captured["env"]["PX_NOTE"] == "the house was quiet today"

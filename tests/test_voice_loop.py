@@ -196,3 +196,24 @@ def test_backend_labels_match_the_tiers_mind_already_reports():
     known = {"claude", "ollama-m5", "ollama-local", "ollama-cloud", "codex", "unknown"}
     for spec in ("claude-voice-bridge", "codex-ollama", "codex exec", ""):
         assert backend_label(spec) in known
+
+
+def test_remember_from_the_voice_loop_is_typed_as_a_human_report():
+    """A note taken while a person is talking to SPARK records what they said."""
+    _, env = validate_action({"tool": "tool_remember",
+                              "params": {"text": "Obi is nine on Saturday"}})
+    assert env["PX_NOTE_KIND"] == "report"
+
+
+def test_the_model_cannot_choose_the_provenance_of_its_own_note():
+    """Provenance is assigned by the code path, not by the LLM. A model able to
+    stamp its own claims `observation` could launder speculation into
+    perception — the failure #170 exists to prevent."""
+    _, env = validate_action({"tool": "tool_remember",
+                              "params": {"text": "the hallway is empty",
+                                         "kind": "observation",
+                                         "confidence": 1.0,
+                                         "provenance": {"kind": "verification"},
+                                         "supersedes": ["some-id"]}})
+    assert env["PX_NOTE_KIND"] == "report"
+    assert not any(k.lower().endswith(("confidence", "supersedes")) for k in env)

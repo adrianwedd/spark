@@ -1600,6 +1600,51 @@ def test_load_notes_skips_records_without_note(tmp_path, monkeypatch):
     assert notes == ["older real memory", "newest real memory"]
 
 
+def test_load_notes_with_provenance_labels_where_each_note_came_from(tmp_path, monkeypatch):
+    from pxh import provenance
+    nf = tmp_path / "notes-spark.jsonl"
+    nf.write_text("\n".join([
+        _json.dumps(provenance.stamp({"ts": "t1", "note": "Obi likes lego"},
+                                     "report", "voice:obi")),
+        _json.dumps(provenance.stamp({"ts": "t2", "note": "I felt quiet today"},
+                                     "narrative", "mind:auto_remember")),
+    ]) + "\n")
+    monkeypatch.setattr(pxh.mind, "notes_file_for_persona", lambda p: nf)
+
+    notes = pxh.mind.load_notes(2, "spark", with_provenance=True)
+
+    assert "Obi likes lego" in notes[0] and "told me" in notes[0]
+    assert "I felt quiet today" in notes[1] and "own reflection" in notes[1]
+
+
+def test_load_notes_with_provenance_marks_a_legacy_note_unknown(tmp_path, monkeypatch):
+    nf = tmp_path / "notes-spark.jsonl"
+    nf.write_text(_json.dumps({"ts": "t1", "note": "an old note"}) + "\n")
+    monkeypatch.setattr(pxh.mind, "notes_file_for_persona", lambda p: nf)
+
+    notes = pxh.mind.load_notes(1, "spark", with_provenance=True)
+
+    assert "an old note" in notes[0]
+    assert "unknown" in notes[0].lower()
+
+
+def test_auto_remember_stamps_the_note_as_generated_narrative(tmp_path, monkeypatch):
+    """A high-salience thought saved to notes is SPARK's own prose, and must
+    not later be readable as something it observed."""
+    from pxh import provenance
+    nf = tmp_path / "notes-spark.jsonl"
+    monkeypatch.setattr(pxh.mind, "notes_file_for_persona", lambda p: nf)
+
+    pxh.mind.auto_remember({"thought": "the house feels empty tonight",
+                            "ts": "2026-08-14T09:00:00Z"}, persona="spark")
+
+    record = _json.loads(nf.read_text().strip())
+    p = provenance.read_provenance(record)
+    assert p["kind"] == "narrative"
+    assert p["confidence"] <= provenance.CONFIDENCE_CEILING["narrative"]
+    assert "the house feels empty tonight" in record["note"]
+
+
 # ---------------------------------------------------------------------------
 # Continuity sprint: goal actions
 # ---------------------------------------------------------------------------
@@ -1675,10 +1720,73 @@ def test_reflection_injects_relevant_memories(tmp_path, monkeypatch):
     assert "lego tower" in ctx
 
 
+def test_reflection_labels_each_memory_with_where_it_came_from(tmp_path, monkeypatch):
+    """#170's acceptance: a retrieved claim reaching cognition must carry its
+    own answer to "where did this come from?"."""
+    from pxh import memory, provenance
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    memory.append_memories([provenance.stamp(
+        {"ts": "2026-07-10T12:00:00Z", "date": "2026-07-10",
+         "text": "Obi and I built a lego tower", "tags": ["obi", "lego"],
+         "importance": 0.8, "source": "consolidation"},
+        "narrative", "consolidation")])
+    awareness = {"persona": "spark", "time_period": "afternoon",
+                 "recent_conversations": [
+                     {"who": "Obi", "text": "can we do lego again", "minutes_ago": 5}]}
+
+    ctx = _capture_reflection_context(monkeypatch, awareness)
+
+    assert "lego tower" in ctx
+    assert "own reflection" in ctx
+
+
+def test_reflection_labels_a_legacy_memory_as_unknown_provenance(tmp_path, monkeypatch):
+    from pxh import memory
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    memory.append_memories([{
+        "ts": "2026-07-10T12:00:00Z", "date": "2026-07-10",
+        "text": "Obi and I built a lego tower", "tags": ["obi", "lego"],
+        "importance": 0.8, "source": "consolidation"}])   # pre-#170 record
+    awareness = {"persona": "spark", "time_period": "afternoon",
+                 "recent_conversations": [
+                     {"who": "Obi", "text": "can we do lego again", "minutes_ago": 5}]}
+
+    ctx = _capture_reflection_context(monkeypatch, awareness)
+
+    assert "lego tower" in ctx
+    assert "unknown" in ctx.lower()
+
+
+def test_reflection_omits_memories_when_nothing_is_topically_relevant(tmp_path, monkeypatch):
+    """A populated store with no relevant record must inject no memories at all.
+
+    The raw-notes fallback exists for a persona that has no consolidated store
+    yet. Letting it fire on a zero-match search would re-open the hole #171
+    closes: unrelated recent material entering cognition because the relevant
+    slot came back empty.
+    """
+    from pxh import memory
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    memory.append_memories([{
+        "ts": "2026-07-10T12:00:00Z", "date": "2026-07-10",
+        "text": "Obi and I built a lego tower on the kitchen floor",
+        "tags": ["obi", "lego"], "importance": 0.8, "source": "consolidation"}])
+    monkeypatch.setattr(pxh.mind, "load_notes",
+                        lambda *a, **k: ["an old raw note"])
+    ctx = _capture_reflection_context(
+        monkeypatch, {"persona": "spark", "time_period": "afternoon",
+                      "recent_conversations": [
+                          {"who": "Adrian", "text": "xylophone quartz",
+                           "minutes_ago": 5}]})
+    assert "lego tower" not in ctx
+    assert "an old raw note" not in ctx
+    assert "Your long-term memories" not in ctx
+
+
 def test_reflection_falls_back_to_notes_when_no_memories(tmp_path, monkeypatch):
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(pxh.mind, "load_notes",
-                        lambda n, persona="": ["an old raw note"])
+                        lambda *a, **k: ["an old raw note"])
     ctx = _capture_reflection_context(
         monkeypatch, {"persona": "spark", "time_period": "afternoon"})
     assert "Your long-term memories" in ctx
@@ -1737,7 +1845,7 @@ def test_reflection_survives_memory_retrieval_failure(tmp_path, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("retrieval broke")
     monkeypatch.setattr(pxh.mind.spark_memory, "retrieve_memories", boom)
-    monkeypatch.setattr(pxh.mind, "load_notes", lambda n, persona="": ["a raw note"])
+    monkeypatch.setattr(pxh.mind, "load_notes", lambda *a, **k: ["a raw note"])
     ctx = _capture_reflection_context(
         monkeypatch, {"persona": "spark", "time_period": "afternoon"})
     assert "Your long-term memories" in ctx  # fallback still fires
