@@ -127,7 +127,10 @@ existing safety gates before executing an option.
 
 No historical record is deleted, superseded, or rewritten by preference derivation.
 Provenance supersession remains honored: records discounted by the existing
-provenance system carry the discounted confidence in the derived view.
+provenance system carry the discounted confidence in the derived view. A
+superseder can affect the view only when it is itself eligible evidence for the
+same exact person, context, and option; an out-of-scope, cross-option, or
+ineligible record cannot indirectly change a preference.
 
 ## Files and verification
 
@@ -139,4 +142,3 @@ provenance system carry the discounted confidence in the derived view.
 - Update operator/developer documentation with the record and replay contract.
 - Run the focused test file first, then the complete pytest suite with the mandated
   non-privileged environment.
-

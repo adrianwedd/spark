@@ -53,3 +53,40 @@ capture/vision, failed event persistence, or invalid evidence prevents promotion
 `tool-recall` voices these records as model interpretations. Learned Frigate
 detections must also use `model_perception` if a future writer promotes them into
 durable claims.
+
+## Lived-experience contextual preferences
+
+`pxh.contextual_preference` is SPARK's one deliberately narrow adaptation
+mechanism. System code records append-only experience events in
+`state/preference-experiences-<persona>.jsonl`; each event names one person,
+context, offered option, positive/negative outcome, and its existing provenance
+record. The current preference is computed from the event history on demand, so
+contradiction and age can revise it without rewriting or deleting experience.
+
+Only `observation`, `report`, and `verification` records have behavioral weight.
+Every record must cite a non-empty evidence reference, and repeated references
+count once. `narrative`, `inference`, `unknown`, and `model_perception` have zero
+weight: generated prose or a model's interpretation of a sensor cannot bootstrap
+itself into relationship authority. Scoping is exact—an Obi/after-school result
+cannot affect Adrian or a weekend choice—and selection is bounded to options the
+caller supplied. Existing motion and expression safety gates still apply after a
+choice. Supersession is equally scoped: only eligible evidence for the same
+person, context, and option may discount an earlier event.
+
+Confidence derives from signed provenance confidence with a 90-day half-life.
+Two independent positive experiences and a `0.75` margin over the next option are
+required to activate adaptation. Results include every contributing record ID,
+kind, source, evidence reference, age, and signed weight, plus ignored-record
+diagnostics.
+
+The controlled longitudinal regression freezes clock, model/version, sensor
+snapshot, randomness, reflection seed, code, and config while varying history:
+
+```bash
+PX_BYPASS_SUDO=1 LOG_DIR=logs_test .venv/bin/python -m pytest \
+  tests/test_contextual_preference.py -k longitudinal -v
+```
+
+Its checked-in baseline is `tests/fixtures/lived_experience_baseline.json`.
+Recall, random variation, prompt/config edits, and model upgrades do not satisfy
+this development test.

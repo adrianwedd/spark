@@ -191,9 +191,10 @@ Expected: all pass without warnings.
 
 - [ ] **Step 3: Run full non-live suite**
 
-Run: `PX_BYPASS_SUDO=1 LOG_DIR=logs_test .venv/bin/python -m pytest -m 'not live'`
+Run: `PX_BYPASS_SUDO=1 LOG_DIR=logs_test .venv/bin/python -m pytest tests m5/announce-relay/tests -m 'not live'`
 
-Expected: all tests pass.
+Expected: all repository test roots pass. Explicit roots avoid collecting the
+repository's existing nested `.worktrees` checkouts as duplicate test modules.
 
 - [ ] **Step 4: Check repository hygiene**
 
@@ -207,4 +208,3 @@ Expected: no whitespace errors; only intended files are changed/committed.
 git add docs/TOOLS.md README.md
 git commit -m "docs: explain measurable lived development (#172)"
 ```
-
