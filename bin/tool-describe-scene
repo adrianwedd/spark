@@ -15,12 +15,12 @@ import os
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.logging import log_event
 from pxh.state import update_session
 
@@ -159,26 +159,6 @@ def call_claude_vision(image_path: Path) -> str:
     return result.stdout.strip()[:300]
 
 
-def _set_exploring(active: bool) -> None:
-    """Write exploring.json so px-alive yields GPIO."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    path = STATE_DIR / "exploring.json"
-    data = {"active": active}
-    if active:
-        data["pid"] = os.getpid()
-        data["started"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
 def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
 
@@ -198,7 +178,27 @@ def main() -> int:
         print(json.dumps(payload))
         return 0
 
-    _set_exploring(True)
+    store = GpioLeaseStore(STATE_DIR)
+    inherited_token = os.environ.get("PX_GPIO_LEASE_ID")
+    current = store.current()
+    borrowed = bool(
+        current
+        and inherited_token
+        and current.get("lease_id") == inherited_token
+    )
+    gpio_guard = None
+    if current and not borrowed:
+        print(json.dumps({"status": "error", "error": "GPIO already leased"}))
+        return 1
+    if not borrowed:
+        gpio_guard = GpioLeaseGuard(
+            store,
+            "describe-scene",
+            on_lost=lambda: os.kill(os.getpid(), signal.SIGTERM),
+        )
+        if not gpio_guard.acquire():
+            print(json.dumps({"status": "error", "error": "GPIO already leased"}))
+            return 1
     try:
         timestamp = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
         photo_path = PROJECT_ROOT / "photos" / f"{timestamp}.jpg"
@@ -270,7 +270,8 @@ def main() -> int:
         print(json.dumps(payload))
         return 0
     finally:
-        _set_exploring(False)
+        if gpio_guard is not None:
+            gpio_guard.release()
 
 
 if __name__ == "__main__":

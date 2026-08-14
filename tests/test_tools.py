@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from pxh.gpio_lease import GpioLeaseStore
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -261,6 +263,31 @@ def test_tool_describe_scene_dry_run(isolated_project):
     assert payload["status"] == "ok"
     assert payload["dry"] is True
     assert len(payload["description"]) > 0
+
+
+def test_tool_describe_scene_rejects_another_gpio_owner(isolated_project):
+    """A camera request cannot replace another process's live GPIO authority."""
+    state_dir = isolated_project["state_dir"]
+    lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
+    assert lease is not None
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+
+    result = subprocess.run(
+        ["bin/tool-describe-scene"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=10,
+    )
+
+    payload = parse_json(result.stdout)
+    assert result.returncode == 1
+    assert payload == {"status": "error", "error": "GPIO already leased"}
+    assert GpioLeaseStore(state_dir).current()["lease_id"] == lease.lease_id
+    assert not (state_dir / "exploring.json").exists()
 
 
 def test_tool_frigate_events_dry_run(isolated_project):
@@ -1153,6 +1180,39 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     paths = [p for (_, p, _) in _StubHandler.captured]
     assert any(p.endswith("/announce") for p in paths)
     assert any("/api/services/media_player/play_media" in p for p in paths)
+    assert not (isolated_project["state_dir"] / "exploring.json").exists()
+    assert not (isolated_project["state_dir"] / "gpio_lease.json").exists()
+
+
+def test_tool_announce_borrows_matching_parent_gpio_lease(isolated_project):
+    """A nested voice tool may use, but must not clear, its inherited authority."""
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    state_dir = isolated_project["state_dir"]
+    lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
+    assert lease is not None
+    env = isolated_project["env"].copy()
+    env.update({
+        "PX_DRY": "0",
+        "PX_ANNOUNCE_TEXT": "Dinner is ready",
+        "PX_BYPASS_SUDO": "1",
+        "PX_ANNOUNCE_RELAY_URL": base,
+        "PX_HA_HOST": base,
+        "ANNOUNCE_RELAY_TOKEN": "t",
+        "PX_HA_TOKEN": "t",
+        "PX_NIGHT_SILENCE_START_H": "99",
+        "PX_NIGHT_SILENCE_END_H": "0",
+        "PX_GPIO_LEASE_ID": lease.lease_id,
+    })
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+
+    assert payload["status"] == "ok"
+    assert GpioLeaseStore(state_dir).current()["lease_id"] == lease.lease_id
+    assert not (state_dir / "exploring.json").exists()
 
 
 def _run_announce_against_stub(isolated_project, text, *, private):

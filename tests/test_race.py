@@ -504,16 +504,14 @@ class TestRaceControllerCalibrate:
         assert rc2.calibration["track_ref"] == [500, 510, 505]
         assert rc2.calibration["gate_threshold"] == 40
 
-    def test_exploring_json_written_on_init(self, tmp_path):
+    def test_dry_race_claims_neither_exploration_nor_gpio(self, tmp_path):
         from pxh.race import RaceController
         mock_px = MagicMock()
         mock_px.get_distance.return_value = 90.0
         mock_px.get_grayscale_data.return_value = [400, 410, 405]
         RaceController(px=mock_px, state_dir=tmp_path, dry=True)
-        exploring_path = tmp_path / "exploring.json"
-        assert exploring_path.exists()
-        data = json.loads(exploring_path.read_text())
-        assert data["active"] is True
+        assert not (tmp_path / "exploring.json").exists()
+        assert not (tmp_path / "gpio_lease.json").exists()
 
 
 class TestRaceControllerMap:

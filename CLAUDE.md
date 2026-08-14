@@ -96,7 +96,7 @@ Speech: `espeak --stdout` → WAV bytes → `aplay -D pulse` → PulseAudio → 
 
 Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not refactor to create/destroy per-action (`reset_mcu` leaks GPIO5 and `close()` doesn't release it).
 
-**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Tools set `state/exploring.json` to prevent restart mid-operation.
+**GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Long-running owners hold and refresh the tokenized `state/gpio_lease.json` authority while using hardware. `state/exploring.json` describes wander intent/state only.
 
 ### Cognitive Loop (px-mind)
 

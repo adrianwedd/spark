@@ -30,6 +30,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseMonitor, GpioLeaseStore
+
 LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-wander.log"))
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parent.parent))
@@ -463,11 +465,56 @@ def main(argv: list[str]) -> int:
     duration = int(clamp(args.duration, 30, 300)) if mode == "explore" else 0
 
     px = None
+    gpio_guard = None
+    gpio_monitor = None
+    borrowed_gpio = False
+
+    def _gpio_lost() -> None:
+        _sigterm_flag.set()
+        if px is not None:
+            try:
+                px.stop()
+            except Exception:
+                pass
+
+    def _require_gpio() -> None:
+        if _sigterm_flag.is_set():
+            raise RuntimeError("GPIO lease lost")
 
     if not dry:
+        # Own hardware before Picarx construction. Exploration state is
+        # published separately below only for actual explore-mode runs.
+        store = GpioLeaseStore(STATE_DIR)
+        current = store.current()
+        inherited_token = os.environ.get("PX_GPIO_LEASE_ID")
+        borrowed_gpio = bool(
+            current
+            and inherited_token
+            and current.get("lease_id") == inherited_token
+        )
+        if current and not borrowed_gpio:
+            log("abort: GPIO is leased by another live owner")
+            print(json.dumps({"status": "error", "error": "GPIO already leased"}))
+            return 1
+        if not borrowed_gpio:
+            gpio_guard = GpioLeaseGuard(store, "wander", on_lost=_gpio_lost)
+            if not gpio_guard.acquire():
+                log("abort: GPIO is leased by another live owner")
+                print(json.dumps({"status": "error", "error": "GPIO already leased"}))
+                return 1
+            os.environ["PX_GPIO_LEASE_ID"] = gpio_guard.lease.lease_id
+        else:
+            gpio_monitor = GpioLeaseMonitor(
+                store, inherited_token, on_lost=_gpio_lost
+            )
+            gpio_monitor.start()
         try:
             from picarx import Picarx
             px = Picarx()
+            if _sigterm_flag.is_set():
+                px.stop()
+                print(json.dumps({"status": "error", "error": "GPIO lease lost"}))
+                return 1
         except Exception as exc:
             log(f"picarx import error: {exc}")
             print(json.dumps({"status": "error", "error": str(exc)}))
@@ -481,6 +528,9 @@ def main(argv: list[str]) -> int:
             log(f"wander start steps={steps} dry={dry}")
 
             for step in range(steps):
+                if _sigterm_flag.is_set():
+                    log("wander abort: GPIO lease lost")
+                    break
                 log(f"step {step + 1}/{steps}")
 
                 if dry:
@@ -508,11 +558,13 @@ def main(argv: list[str]) -> int:
                         log("blocked all around — reversing")
                         if not quiet:
                             speak("Hmm, I'm stuck. Backing up.")
+                        _require_gpio()
                         px.backward(FORWARD_SPEED)
                         time.sleep(0.6)
                         px.stop()
                         turn = 30 if best_angle >= 0 else -30
                         px.set_dir_servo_angle(turn)
+                        _require_gpio()
                         px.forward(TURN_SPEED)
                         time.sleep(TURN_S)
                         px.stop()
@@ -525,6 +577,7 @@ def main(argv: list[str]) -> int:
                         # Steer toward best direction
                         steer = clamp(best_angle, -35, 35)
                         px.set_dir_servo_angle(steer)
+                        _require_gpio()
                         px.forward(TURN_SPEED)
                         time.sleep(TURN_S)
                         px.stop()
@@ -536,6 +589,7 @@ def main(argv: list[str]) -> int:
                         speak("Exploring!")
                     steps_driven += 1
                     px.set_dir_servo_angle(0)
+                    _require_gpio()
                     px.forward(FORWARD_SPEED)
                     time.sleep(FORWARD_S)
                     px.stop()
@@ -559,7 +613,7 @@ def main(argv: list[str]) -> int:
             start_time = time.time()
             if not _write_exploring_state(True, pid=os.getpid(),
                                           started=dt.datetime.now(dt.timezone.utc).isoformat()):
-                log("explore abort: cannot write exploring.json — px-alive coordination broken")
+                log("explore abort: cannot publish exploring.json")
                 print(json.dumps({"status": "error", "error": "exploring.json write failed"}))
                 return 1
 
@@ -647,11 +701,13 @@ def main(argv: list[str]) -> int:
                             if best_dist < OBSTACLE_CM:
                                 stuck_count += 1
                                 nav_action = "reverse"
+                                _require_gpio()
                                 px.backward(FORWARD_SPEED)
                                 time.sleep(0.6)
                                 px.stop()
                                 turn = 30 if best_angle >= 0 else -30
                                 px.set_dir_servo_angle(turn)
+                                _require_gpio()
                                 px.forward(TURN_SPEED)
                                 time.sleep(TURN_S)
                                 px.stop()
@@ -662,6 +718,7 @@ def main(argv: list[str]) -> int:
                                 nav_action = "turned"
                                 steer = clamp(best_angle, -35, 35)
                                 px.set_dir_servo_angle(steer)
+                                _require_gpio()
                                 px.forward(TURN_SPEED)
                                 time.sleep(TURN_S)
                                 px.stop()
@@ -671,6 +728,7 @@ def main(argv: list[str]) -> int:
                             stuck_count = 0
                             nav_action = "forward"
                             px.set_dir_servo_angle(0)
+                            _require_gpio()
                             px.forward(FORWARD_SPEED)
                             time.sleep(FORWARD_S)
                             px.stop()
@@ -849,7 +907,8 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 1
     finally:
-        _write_exploring_state(False)
+        if mode == "explore":
+            _write_exploring_state(False)
         if px is not None:
             try:
                 px.stop()
@@ -866,6 +925,8 @@ def main(argv: list[str]) -> int:
                     bus.close()
                 except Exception as exc2:
                     log(f"I2C fallback also failed: {exc2}")
+        if gpio_monitor is not None:
+            gpio_monitor.stop()
 
 
 if __name__ == "__main__":

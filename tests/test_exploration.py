@@ -4,9 +4,13 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
+
+from pxh.gpio_lease import GpioLeaseStore
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
@@ -172,6 +176,97 @@ def test_exploring_state_file_written(wander, tmp_path):
     write(False)
     data = json.loads(path.read_text())
     assert data["active"] is False
+
+
+def test_live_wander_acquires_gpio_before_publishing_exploration(
+    wander, monkeypatch
+):
+    """Hardware authority must exist before exploration intent becomes active."""
+    events = []
+
+    class FakePicarx:
+        def stop(self):
+            pass
+
+        def set_dir_servo_angle(self, _angle):
+            pass
+
+        def set_cam_pan_angle(self, _angle):
+            pass
+
+        def set_cam_tilt_angle(self, _angle):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeLease:
+        lease_id = "lease-123"
+
+    class FakeGuard:
+        def __init__(self, _store, owner_kind, **_kwargs):
+            assert owner_kind == "wander"
+            self.lease = None
+
+        def acquire(self):
+            events.append("acquire")
+            self.lease = FakeLease()
+            return True
+
+        def release(self):
+            events.append("release")
+            return True
+
+    def fail_publish(active, **_kwargs):
+        events.append("publish" if active else "clear")
+        return not active
+
+    monkeypatch.setitem(sys.modules, "picarx", types.SimpleNamespace(Picarx=FakePicarx))
+    monkeypatch.setitem(wander, "GpioLeaseGuard", FakeGuard)
+    class EmptyStore:
+        def current(self):
+            return None
+
+    monkeypatch.setitem(wander, "GpioLeaseStore", lambda _path: EmptyStore())
+    monkeypatch.setitem(wander, "_write_exploring_state", fail_publish)
+
+    result = wander["main"](["--mode", "explore", "--quiet"])
+
+    assert result == 1
+    assert events == ["acquire", "publish", "clear"]
+
+
+def test_live_wander_borrows_matching_inherited_gpio_lease(wander, monkeypatch):
+    """A nested wander run uses its parent's token without releasing it."""
+    events = []
+
+    class FakePicarx:
+        def stop(self): pass
+        def set_dir_servo_angle(self, _angle): pass
+        def set_cam_pan_angle(self, _angle): pass
+        def set_cam_tilt_angle(self, _angle): pass
+        def close(self): pass
+
+    store = GpioLeaseStore(wander["STATE_DIR"])
+    lease = store.acquire("voice", ttl_s=60)
+    assert lease is not None
+    monkeypatch.setenv("PX_GPIO_LEASE_ID", lease.lease_id)
+    monkeypatch.setitem(sys.modules, "picarx", types.SimpleNamespace(Picarx=FakePicarx))
+    monkeypatch.setitem(
+        wander,
+        "GpioLeaseGuard",
+        lambda *_args, **_kwargs: pytest.fail("borrowed authority was reacquired"),
+    )
+
+    def fail_publish(active, **_kwargs):
+        events.append("publish" if active else "clear")
+        return not active
+
+    monkeypatch.setitem(wander, "_write_exploring_state", fail_publish)
+
+    assert wander["main"](["--mode", "explore", "--quiet"]) == 1
+    assert store.current()["lease_id"] == lease.lease_id
+    assert events == ["publish", "clear"]
 
 
 def test_sonar_none_vs_999(wander):

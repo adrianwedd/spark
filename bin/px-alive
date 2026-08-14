@@ -704,24 +704,19 @@ def main(argv) -> int:
         return 0
     PID_FILE.write_text(str(os.getpid()))
 
-    # Check if exploration is active — exit cleanly to avoid GPIO contention
-    exploring_file = STATE_DIR / "exploring.json"
+    # Hardware authority is separate from exploration intent. A live,
+    # unexpired tokenized lease is the only state that keeps a systemd
+    # respawn away from GPIO owned by another process.
     try:
-        if exploring_file.exists():
-            exploring = json.loads(exploring_file.read_text(encoding="utf-8"))
-            if exploring.get("active"):
-                age = time.time() - exploring_file.stat().st_mtime
-                if age > 60:
-                    log(f"exploring.json stale ({age:.0f}s old) — ignoring")
-                else:
-                    exp_pid = exploring.get("pid")
-                    if exp_pid and Path(f"/proc/{exp_pid}").is_dir():
-                        log("exploration active (PID %d) — exiting cleanly" % exp_pid)
-                        sys.exit(0)
-                    else:
-                        log(f"exploring.json active but PID {exp_pid} dead — ignoring")
-    except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
-        pass  # expected on missing/corrupt exploring.json
+        from pxh.gpio_lease import GpioLeaseStore
+        lease = GpioLeaseStore(STATE_DIR).current()
+        if lease is not None:
+            log("GPIO lease active (%s PID %d) — exiting cleanly" % (
+                lease["owner_kind"], lease["owner_pid"]))
+            sys.exit(0)
+    except (ImportError, OSError, ValueError) as exc:
+        log(f"GPIO lease check failed — refusing hardware startup: {exc}")
+        return 1
 
     def _safe_unlink_pid() -> None:
         """Only delete the PID file if it still contains our own PID."""

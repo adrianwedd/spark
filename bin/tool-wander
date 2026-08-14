@@ -59,7 +59,11 @@ def main() -> int:
     command = []
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
         python_path = os.environ.get("PYTHONPATH", "")
-        command.extend(["sudo", "-n", "env", f"PYTHONPATH={python_path}"])
+        lease_id = os.environ.get("PX_GPIO_LEASE_ID", "")
+        command.extend([
+            "sudo", "-n", "env", f"PYTHONPATH={python_path}",
+            f"PX_GPIO_LEASE_ID={lease_id}",
+        ])
     command.extend([str(PX_WANDER), "--steps", str(steps)])
     if mode == "explore":
         duration = int(clamp(float(os.environ.get("PX_WANDER_DURATION_S", "180")), 30, 300))
