@@ -34,7 +34,6 @@ state/ambient_sound.json
 state/battery.json
 state/frigate_presence.json
 state/sonar_live.json
-state/alive_heartbeat.json
 state/*.lock
 state/exploring.json
 state/feed.json
