@@ -15,7 +15,9 @@
 - `src/pxh/policy.py` must not import anything from `pxh.mind` or `pxh.voice_loop` — dependency direction is `mind.py`/`voice_loop.py` → `policy.py`, never the reverse.
 - `evaluate()` never inspects tool/action names itself — only the caller-supplied `effect` and `origin`.
 - Effect-classification tables must be **exhaustive** against their dispatcher's real action set (`ALLOWED_TOOLS` for `voice_loop.py`, `VALID_ACTIONS` for `mind.py`) and **fail loudly** (`KeyError`, not a default) on an unclassified action.
-- `tool_quiet` and `tool_repair` are classified `effect="other"` despite producing speech — they are the state-transition tools that clear `spark_quiet_mode`; classifying them `"audio"` would lock SPARK in quiet mode permanently. This is a deliberate, narrow, two-tool exception, not a general carve-out.
+- **No tool gets an audio exception.** A classification is a claim about what the script actually does, verified against its source — not about how innocent its name sounds. `tool_repair` and `tool_quiet` both shell out to `bin/tool-voice`, so both must be honestly classified; Task 3 refactors them so that honest classification doesn't lock SPARK in quiet mode.
+- Effect classification is param-aware where the real effect is: `VOICE_EFFECT_OVERRIDES` (consulted before `VOICE_EFFECT_TABLE`) exists only for tools with distinct, separately-verifiable effect branches. `tool_quiet` is the only member in v1.
+- A static test must scan every `bin/tool-*` for a reference to an audio-emitting tool (`tool-voice`, `tool-voice-persona`, `tool-announce`, `tool-play-sound`, `tool-chat*`, `px-perform`) and fail if any such tool is classified non-`"audio"` without an override that accounts for it.
 - Preserve existing autonomous night-silence (`mind.py::_is_night_silence`, `NIGHT_ALLOWED_ACTIONS`) and autonomous on-call suppression (`mind.py:3084-3088`) exactly as they are — only their shared clock helper moves, not the enforcement rule.
 - No volume control, no general rules engine, no changes to `docs/prompts/*.md` conversational style.
 - `src/pxh/policy.py` and `tests/test_policy_invariants.py` must be added to `claude_session.BLACKLIST_FILES`.
@@ -248,7 +250,7 @@ git commit -m "feat(policy): add constitutional evaluate()/is_night_hour core (#
 
 **Interfaces:**
 - Consumes: `pxh.policy.is_night_hour(hour: int) -> bool`, `pxh.policy.evaluate(...) -> PolicyVerdict` from Task 1.
-- Produces: `mind.MIND_EFFECT_TABLE: dict[str, Literal["audio","presence","other"]]` (module-level, one entry per member of `VALID_ACTIONS`), used by Task 5's integration tests.
+- Produces: `mind.MIND_EFFECT_TABLE: dict[str, Literal["audio","presence","other"]]` (module-level, one entry per member of `VALID_ACTIONS`), used by Task 6's integration tests.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -326,9 +328,10 @@ Add the effect table near `VALID_ACTIONS` (after line 353, right after the `VALI
 
 ```python
 # Exhaustive per action name in VALID_ACTIONS — deliberately not a default,
-# so a new autonomous action fails test_mind_effect_table_is_exhaustive
-# until someone classifies it. tool_quiet/tool_repair have no autonomous
-# equivalent action name, so no exception is needed here (contrast voice_loop.py).
+# so a new autonomous action fails test_mind_effect_table_is_exhaustive until
+# someone classifies it. Classification follows the real dispatch: scan,
+# look_at and look_around are "audio" because their branches call _run_voice
+# (mind.py:3174, 3193, 3355), not because of what their names suggest.
 MIND_EFFECT_TABLE: dict[str, str] = {
     "wait": "presence",
     "greet": "audio",
@@ -397,7 +400,110 @@ git commit -m "feat(policy): wire autonomous quiet-mode suppression into mind.py
 
 ---
 
-### Task 3: Wire `policy.py` into `voice_loop.py` — interactive suppression + substitution
+### Task 3: Make the compound tools honest — separate state transition from expression
+
+**Files:**
+- Modify: `bin/tool-quiet` (the `end` branch), `bin/tool-repair`
+- Test: `tests/test_tools.py`
+
+**Why:** both tools shell out to `bin/tool-voice` while `spark_quiet_mode` is
+still `True`, and `tool-repair` clears the flag as a side effect of speaking.
+Classifying either as `"other"` to preserve that would hand every nested audio
+call a bypass. Refactoring first means Task 4 can classify them truthfully.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_tools.py (add near the existing child-companion tool tests)
+def test_tool_quiet_end_clears_flag_without_speaking(isolated_project):
+    """quiet:end is a state transition, not an utterance. Any re-engagement
+    line is a subsequent, ordinarily policy-evaluated audio turn."""
+    env = {**isolated_project.env, "PX_DRY": "1", "PX_QUIET_ACTION": "end"}
+    result = _run_tool("tool-quiet", env)
+    assert result["status"] == "ok"
+    assert result["quiet_mode"] is False
+    assert result.get("spoke") is False
+    assert load_session()["spark_quiet_mode"] is False
+
+
+def test_tool_repair_does_not_clear_quiet_mode(isolated_project):
+    """Relationship repair and leaving dysregulation are different things.
+    Only tool-quiet end exits quiet mode."""
+    update_session(fields={"spark_quiet_mode": True})
+    env = {**isolated_project.env, "PX_DRY": "1"}
+    result = _run_tool("tool-repair", env)
+    assert result["status"] == "ok"
+    assert load_session()["spark_quiet_mode"] is True
+```
+
+(Adapt `_run_tool`/`isolated_project` usage to the helpers already in
+`tests/test_tools.py` — the assertions, not the harness, are what matters here.)
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python -m pytest tests/test_tools.py -k "quiet_end_clears_flag or repair_does_not_clear" -v`
+Expected: FAIL — `tool-quiet end` currently speaks and reports no `spoke` key;
+`tool-repair` currently sets `spark_quiet_mode: False`.
+
+- [ ] **Step 3: Write the implementation**
+
+In `bin/tool-quiet`, replace the `end` branch (currently lines 80-88):
+
+```python
+    elif action == "end":
+        # State transition only. Deliberately silent: policy evaluates the
+        # dispatched action, so speaking here would be speech emitted while
+        # spark_quiet_mode is still True. Re-engagement is a separate turn.
+        update_session(
+            fields={"spark_quiet_mode": False, "last_action": "tool_quiet"},
+            history_entry={"event": "quiet_end", "ts": utc_timestamp()},
+        )
+        emote("curious", dry)
+        payload = {"status": "ok", "action": "end", "quiet_mode": False,
+                   "spoke": False, "dry": dry}
+```
+
+Note the ordering: clear the flag *before* the emote, so nothing at all runs
+under a stale `True`.
+
+In `bin/tool-repair`, drop the `spark_quiet_mode` mutation (line 77):
+
+```python
+    update_session(
+        fields={"last_action": "tool_repair"},
+        history_entry={"event": "repair", "ts": utc_timestamp()},
+    )
+```
+
+`bin/tool-quiet`'s `start` and `check` branches are unchanged — `start` speaks
+one line while quiet mode is still `False` (so it evaluates normally as audio),
+and `check` only emotes.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `python -m pytest tests/test_tools.py -v`
+Expected: PASS — including any existing `tool-quiet`/`tool-repair` tests, which
+may need updating for the changed payload/session effects. Update them to the
+new contract; do not restore the old behaviour.
+
+- [ ] **Step 5: Update the tool docs**
+
+`tool_repair` and `tool_quiet` appear in `docs/prompts/claude-voice-system.md`,
+`codex-voice-system.md`, `persona-gremlin.md`, `persona-vixen.md` and
+`docs/TOOLS.md`. Update any wording that implies repair ends quiet mode, or that
+`quiet end` speaks. This is a factual correction to tool descriptions, not a
+conversational-style change, so it is in scope despite the spec's Non-goals.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add bin/tool-quiet bin/tool-repair tests/test_tools.py docs/prompts docs/TOOLS.md
+git commit -m "refactor(tools): separate quiet-mode state transition from speech (#174)"
+```
+
+---
+
+### Task 4: Wire `policy.py` into `voice_loop.py` — interactive suppression + substitution
 
 **Files:**
 - Modify: `src/pxh/voice_loop.py` imports (top, near line 19), `src/pxh/voice_loop.py::validate_action()` (starts at line 564)
@@ -405,7 +511,7 @@ git commit -m "feat(policy): wire autonomous quiet-mode suppression into mind.py
 
 **Interfaces:**
 - Consumes: `pxh.policy.evaluate(...)`, `pxh.policy.PolicyVerdict` from Task 1.
-- Produces: `voice_loop.VOICE_EFFECT_TABLE: dict[str, Literal["audio","presence","other"]]` (module-level, one entry per member of `ALLOWED_TOOLS`), used by Task 5's integration tests. `validate_action()`'s return contract is unchanged (`Tuple[str, Dict[str, Any]]`), but on a blocked verdict it now returns the substitute tool/env instead of raising.
+- Produces: `voice_loop.VOICE_EFFECT_TABLE: dict[str, Literal["audio","presence","other"]]` (module-level, one entry per member of `ALLOWED_TOOLS`), used by Task 6's integration tests. `validate_action()`'s return contract is unchanged (`Tuple[str, Dict[str, Any]]`), but on a blocked verdict it now returns the substitute tool/env instead of raising.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -417,20 +523,56 @@ def test_voice_effect_table_is_exhaustive():
     assert all(v in ("audio", "presence", "other") for v in voice_loop.VOICE_EFFECT_TABLE.values())
 
 
-def test_voice_effect_table_exempts_quiet_and_repair_from_audio():
-    from pxh import voice_loop
-    assert voice_loop.VOICE_EFFECT_TABLE["tool_quiet"] == "other"
-    assert voice_loop.VOICE_EFFECT_TABLE["tool_repair"] == "other"
-
-
 def test_voice_effect_table_classifies_known_audio_tools_as_audio():
     from pxh import voice_loop
     for tool in ("tool_voice", "tool_announce", "tool_chat", "tool_chat_vixen",
-                 "tool_play_sound", "tool_time", "tool_gws_calendar", "tool_qa",
-                 "tool_describe_scene", "tool_timer", "tool_story", "tool_recall",
-                 "tool_routine", "tool_checkin", "tool_celebrate", "tool_transition",
-                 "tool_breathe", "tool_dopamine_menu", "tool_sensory_check", "tool_perform"):
+                 "tool_play_sound", "tool_time", "tool_gws_calendar",
+                 "tool_gws_sheets_log", "tool_qa", "tool_describe_scene",
+                 "tool_timer", "tool_story", "tool_recall", "tool_routine",
+                 "tool_checkin", "tool_celebrate", "tool_transition",
+                 "tool_breathe", "tool_dopamine_menu", "tool_sensory_check",
+                 "tool_perform", "tool_repair"):
         assert voice_loop.VOICE_EFFECT_TABLE[tool] == "audio", tool
+
+
+def test_tool_quiet_effect_varies_by_action_param():
+    from pxh import voice_loop
+    assert set(voice_loop.VOICE_EFFECT_OVERRIDES) == {"tool_quiet"}
+    assert voice_loop.classify_effect("tool_quiet", {"action": "start"}) == "audio"
+    assert voice_loop.classify_effect("tool_quiet", {"action": "check"}) == "presence"
+    assert voice_loop.classify_effect("tool_quiet", {"action": "end"}) == "other"
+    # bin/tool-quiet defaults to "start" — the loudest branch — when unset.
+    assert voice_loop.classify_effect("tool_quiet", {}) == "audio"
+
+
+def test_no_non_audio_tool_can_reach_an_audio_sink():
+    """The enforcement boundary is at the dispatcher, so a tool classified
+    non-audio must not be able to shell out to one that emits sound. Scans
+    real bin/ sources, so a future tool that grows a TTS confirmation fails
+    here rather than silently acquiring a bypass."""
+    import re
+    from pathlib import Path
+    from pxh import voice_loop
+
+    SINKS = re.compile(
+        r"tool-voice\b|tool-voice-persona\b|tool-announce\b|tool-play-sound\b"
+        r"|tool-chat\b|tool-chat-vixen\b|px-perform\b"
+    )
+    bin_dir = Path(__file__).resolve().parents[1] / "bin"
+    offenders = []
+    for tool in sorted(voice_loop.ALLOWED_TOOLS):
+        script = bin_dir / tool.replace("_", "-")
+        if not script.exists():
+            continue
+        if not SINKS.search(script.read_text(encoding="utf-8")):
+            continue
+        if tool in voice_loop.VOICE_EFFECT_OVERRIDES:
+            continue  # effect is param-dependent; pinned by its own test above
+        if voice_loop.VOICE_EFFECT_TABLE[tool] != "audio":
+            offenders.append(tool)
+    assert offenders == [], (
+        f"tools reach an audio sink but are not classified 'audio': {offenders}"
+    )
 ```
 
 ```python
@@ -453,11 +595,29 @@ def test_validate_action_allows_tool_voice_when_not_quiet(monkeypatch):
 
 
 def test_validate_action_allows_tool_quiet_end_during_quiet_mode(monkeypatch):
+    """The one permitted exit — and it is permitted because after Task 3 it
+    emits nothing, not because it is exempt."""
     from pxh import voice_loop
     monkeypatch.setattr(voice_loop, "load_session", lambda: {"spark_quiet_mode": True})
     monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
     tool, env = voice_loop.validate_action({"tool": "tool_quiet", "params": {"action": "end"}})
     assert tool == "tool_quiet"
+
+
+def test_validate_action_downgrades_tool_repair_in_quiet_mode(monkeypatch):
+    from pxh import voice_loop
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {"spark_quiet_mode": True})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    tool, env = voice_loop.validate_action({"tool": "tool_repair", "params": {}})
+    assert tool == "tool_emote"
+
+
+def test_validate_action_downgrades_tool_quiet_start_when_already_quiet(monkeypatch):
+    from pxh import voice_loop
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {"spark_quiet_mode": True})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    tool, env = voice_loop.validate_action({"tool": "tool_quiet", "params": {"action": "start"}})
+    assert tool == "tool_emote"
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -478,21 +638,33 @@ Add a small awareness loader (mirroring `mind.py`'s pattern of tolerating a miss
 ```python
 def _load_awareness_for_policy() -> Dict[str, Any]:
     """Best-effort awareness read for policy's on-call/hot-mic check.
-    voice_loop.py has no other reason to read awareness.json; a missing or
-    corrupt file just means the on-call/hot-mic rule can't fire, which is
-    the same fail-open behaviour mind.py already accepts elsewhere."""
+
+    Fails open, deliberately and narrowly: an unreadable awareness.json means
+    the on-call/hot-mic rule cannot fire, and SPARK stays audible during an
+    interactive turn Obi initiated. Failing closed would mute SPARK entirely
+    whenever px-mind is down, which is the more common failure and the worse
+    one. Quiet mode and night silence do not depend on this file, so the two
+    rules that must hold unconditionally are unaffected either way.
+
+    The read is logged on failure rather than swallowed silently, so a
+    persistently missing awareness.json is visible instead of quietly
+    disabling a rule.
+    """
     try:
         return json.loads((_state_dir() / "awareness.json").read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        log(f"policy: awareness read failed ({exc}) — on-call rule inactive this turn")
         return {}
 
 
 # Exhaustive per tool name in ALLOWED_TOOLS — deliberately not a default, so
 # a new tool fails test_voice_effect_table_is_exhaustive until someone
-# classifies it. tool_quiet/tool_repair are classified "other" despite
-# speaking fixed text: they are the only tools that clear
-# spark_quiet_mode, so classifying them "audio" would lock SPARK in quiet
-# mode permanently (see plan Task 3 / spec Global Constraints).
+# classifies it. Every entry is a claim about what bin/tool-<name> actually
+# does, verified against its source: any script that can reach tool-voice,
+# tool-announce, tool-play-sound, tool-chat* or px-perform is "audio", with
+# no exceptions (test_no_non_audio_tool_can_reach_an_audio_sink pins this).
 VOICE_EFFECT_TABLE: Dict[str, str] = {
     "tool_status": "other", "tool_circle": "other", "tool_figure8": "other",
     "tool_stop": "other", "tool_voice": "audio", "tool_weather": "other",
@@ -504,14 +676,47 @@ VOICE_EFFECT_TABLE: Dict[str, str] = {
     "tool_wander": "other", "tool_timer": "audio", "tool_api_start": "other",
     "tool_api_stop": "other", "tool_chat": "audio", "tool_chat_vixen": "audio",
     "tool_routine": "audio", "tool_checkin": "audio", "tool_celebrate": "audio",
-    "tool_transition": "audio", "tool_quiet": "other", "tool_breathe": "audio",
+    "tool_transition": "audio", "tool_breathe": "audio",
     "tool_dopamine_menu": "audio", "tool_sensory_check": "audio",
-    "tool_repair": "other", "tool_gws_calendar": "audio",
-    "tool_gws_sheets_log": "other", "tool_research": "other",
+    "tool_repair": "audio", "tool_gws_calendar": "audio",
+    "tool_gws_sheets_log": "audio", "tool_research": "other",
     "tool_compose": "other", "tool_blog": "other", "tool_story": "audio",
     "tool_announce": "audio",
+    # tool_quiet is param-dependent — see VOICE_EFFECT_OVERRIDES. It is listed
+    # here at its loudest branch so the exhaustiveness test still passes if the
+    # override is ever removed.
+    "tool_quiet": "audio",
 }
+
+
+def _quiet_effect(params: Dict[str, Any]) -> str:
+    """bin/tool-quiet is three programs under one name:
+      start -> emote + one spoken line + set flag   (audio)
+      check -> emote only                           (presence)
+      end   -> clear flag, emote, say nothing       (other)
+    Classifying the whole tool by its name would either gag the entry line or
+    hand the whole script an audio bypass.
+    """
+    action = str(params.get("action", "start")).lower()
+    return {"start": "audio", "check": "presence", "end": "other"}.get(action, "audio")
+
+
+# Param-aware classification, consulted before VOICE_EFFECT_TABLE. Only for
+# tools with distinct, separately-verifiable effect branches — this is not a
+# general predicate mechanism, and its key set is pinned by a test.
+VOICE_EFFECT_OVERRIDES: Dict[str, Callable[[Dict[str, Any]], str]] = {
+    "tool_quiet": _quiet_effect,
+}
+
+
+def classify_effect(tool: str, params: Dict[str, Any]) -> str:
+    override = VOICE_EFFECT_OVERRIDES.get(tool)
+    if override is not None:
+        return override(params or {})
+    return VOICE_EFFECT_TABLE[tool]
 ```
+
+`Callable` must be added to the existing `typing` import in `voice_loop.py`.
 
 At the top of `validate_action()` (right after the existing `if tool not in ALLOWED_TOOLS:` check, before `params = action.get("params", {})`), insert the policy check. Because a blocked verdict must still produce a valid `(tool, sanitized_env)` return for `tool_emote`, and `tool_emote`'s own branch further down does the `PX_EMOTE` sanitization, restructure `validate_action()` to compute the *effective tool* up front, then run the same `if/elif` chain against that effective tool:
 
@@ -526,7 +731,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         params = {}
 
     tool = requested_tool
-    effect = VOICE_EFFECT_TABLE[requested_tool]
+    effect = classify_effect(requested_tool, params)
     try:
         session = load_session()
     except FileLockTimeout:
@@ -539,7 +744,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         substitute_tool = "tool_emote"
         substitute_params = {"name": "idle"}
         sub_verdict = policy.evaluate(
-            substitute_tool, substitute_params, effect=VOICE_EFFECT_TABLE[substitute_tool],
+            substitute_tool, substitute_params,
+            effect=classify_effect(substitute_tool, substitute_params),
             origin="interactive", session=session,
             awareness=_load_awareness_for_policy(), now=time.time(), _depth=1,
         )
@@ -573,7 +779,7 @@ git commit -m "feat(policy): wire interactive quiet/night/call suppression into 
 
 ---
 
-### Task 4: Blacklist the constitutional files from self-evolution
+### Task 5: Blacklist the constitutional files from self-evolution
 
 **Files:**
 - Modify: `src/pxh/claude_session.py:359-364` (`BLACKLIST_FILES`)
@@ -636,13 +842,13 @@ git commit -m "chore(policy): blacklist policy.py and its invariant tests from s
 
 ---
 
-### Task 5: Protected constitutional integration suite — `tests/test_policy_invariants.py`
+### Task 6: Protected constitutional integration suite — `tests/test_policy_invariants.py`
 
 **Files:**
 - Create: `tests/test_policy_invariants.py`
 
 **Interfaces:**
-- Consumes: `pxh.policy.evaluate`, `pxh.voice_loop.validate_action`, `pxh.voice_loop.VOICE_EFFECT_TABLE`, `pxh.mind.expression`, `pxh.mind.MIND_EFFECT_TABLE`, `pxh.mind._is_night_silence`, `pxh.policy.is_night_hour` (all from Tasks 1-3).
+- Consumes: `pxh.policy.evaluate`, `pxh.voice_loop.validate_action`, `pxh.voice_loop.VOICE_EFFECT_TABLE`, `pxh.mind.expression`, `pxh.mind.MIND_EFFECT_TABLE`, `pxh.mind._is_night_silence`, `pxh.policy.is_night_hour` (all from Tasks 1-4).
 
 This file is the erosion guard: it is blacklisted (Task 4), and each assertion below drives a real chokepoint entry point, not `policy.evaluate()` alone, so an evolution PR that deletes a call site fails this suite even if `policy.py` itself is untouched.
 
@@ -759,33 +965,60 @@ def test_recursion_guard_raises_if_a_presence_effect_were_ever_blocked():
 
 
 # ---------------------------------------------------------------------------
-# quiet_mode-exit tools are exempt, so SPARK can never be locked in quiet
-# mode by its own suppression rule.
+# Quiet mode has exactly one exit, and that exit is silent. No tool holds an
+# audio carve-out — the escape hatch is a state transition that emits nothing,
+# not a speaking tool that policy has been told to ignore.
 # ---------------------------------------------------------------------------
 
-def test_tool_quiet_end_not_suppressed_during_quiet_mode(monkeypatch):
+def test_tool_quiet_end_is_the_one_exit_and_is_not_audio(monkeypatch):
     monkeypatch.setattr(voice_loop, "load_session", lambda: {"spark_quiet_mode": True})
     monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    assert voice_loop.classify_effect("tool_quiet", {"action": "end"}) != "audio"
     tool, env = voice_loop.validate_action({"tool": "tool_quiet", "params": {"action": "end"}})
     assert tool == "tool_quiet"
 
 
-def test_tool_repair_not_suppressed_during_quiet_mode(monkeypatch):
+def test_tool_repair_is_suppressed_during_quiet_mode(monkeypatch):
+    """Repair speaks (bin/tool-repair), so it obeys quiet mode like anything
+    else that speaks. It is not a quiet-mode exit."""
     monkeypatch.setattr(voice_loop, "load_session", lambda: {"spark_quiet_mode": True})
     monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
     tool, env = voice_loop.validate_action({"tool": "tool_repair", "params": {}})
-    assert tool == "tool_repair"
+    assert tool == "tool_emote"
+
+
+def test_no_tool_can_speak_under_an_innocent_name():
+    """The whole point of #174: an outer tool name never buys nested audio a
+    bypass. Duplicated from tests/test_policy.py deliberately — that file is
+    whitelisted for self-evolution and this one is not."""
+    import re
+    from pathlib import Path
+
+    SINKS = re.compile(
+        r"tool-voice\b|tool-voice-persona\b|tool-announce\b|tool-play-sound\b"
+        r"|tool-chat\b|tool-chat-vixen\b|px-perform\b"
+    )
+    bin_dir = Path(__file__).resolve().parents[1] / "bin"
+    for tool in sorted(voice_loop.ALLOWED_TOOLS):
+        script = bin_dir / tool.replace("_", "-")
+        if not script.exists() or not SINKS.search(script.read_text(encoding="utf-8")):
+            continue
+        if tool in voice_loop.VOICE_EFFECT_OVERRIDES:
+            # Param-dependent: every branch that can reach a sink must be audio.
+            assert voice_loop.classify_effect(tool, {}) == "audio", tool
+            continue
+        assert voice_loop.VOICE_EFFECT_TABLE[tool] == "audio", tool
 ```
 
 - [ ] **Step 2: Run the full file**
 
 Run: `python -m pytest tests/test_policy_invariants.py -v`
-Expected: PASS (10 tests). If any fail, the failure is in Task 2/3's wiring, not in this file — fix the wiring, not the assertion.
+Expected: PASS (11 tests). If any fail, the failure is in Task 2/4's wiring, not in this file — fix the wiring, not the assertion.
 
 - [ ] **Step 3: Run the full project test suite**
 
 Run: `python -m pytest`
-Expected: PASS, full suite (confirms nothing in Tasks 1-4 regressed unrelated tests, e.g. `test_voice_loop.py`'s existing `validate_action` coverage still holds against the restructured function).
+Expected: PASS, full suite (confirms nothing in Tasks 1-5 regressed unrelated tests, e.g. `test_voice_loop.py`'s existing `validate_action` coverage still holds against the restructured function).
 
 - [ ] **Step 4: Commit**
 

@@ -109,8 +109,9 @@ substitute in its own vocabulary.
 ### v1 rules
 
 Each rule is `(condition) → block effect="audio"`. No rule currently distinguishes
-by `effect="other"`; that value exists for future non-audio, non-presence actions
-(e.g. servo motion) so the type is honest rather than a placeholder.
+by `effect="other"`; it is the residual value for actions that neither make sound
+nor place SPARK bodily in front of someone (writing a note, starting the API
+server). What else may deserve its own effect later is deliberately left open.
 
 1. `session.get("spark_quiet_mode") is True` → applies to **both** origins.
 2. `is_night_hour(...)` (Hobart time, the shared pure helper — see below) →
@@ -155,7 +156,13 @@ changes later.
   `policy.evaluate(..., origin="interactive")` before dispatch. On a blocked
   verdict, execute the presence substitute (re-evaluated per above, still passing
   through the rest of `validate_action`'s existing checks) if suggested,
-  otherwise skip the turn.
+  otherwise skip the turn. `voice_loop.py` has no other reason to read
+  `awareness.json`, so it gets a small best-effort loader that **fails open**:
+  an unreadable file leaves the on-call/hot-mic rule inactive for that turn,
+  rather than muting SPARK entirely whenever px-mind is down — the more common
+  and worse failure. Quiet mode and night silence read nothing from that file,
+  so the two unconditional rules are unaffected. The failure is logged, not
+  swallowed.
 - `mind.py` Layer 3 `expression()` — maps its own action name to `effect` via its
   own local table (`greet`/`comment`/`play_sound`/etc. → `"audio"`;
   `look_around`/`scan`/etc. → `"presence"`), then calls `policy.evaluate(...,
@@ -163,6 +170,68 @@ changes later.
   at `mind.py:3084-3088`. For v1 this only adds the quiet-mode rule on the
   autonomous path, since night/call suppression already exists there via
   `NIGHT_ALLOWED_ACTIONS` and the on-call check.
+
+### Compound tools: classify by real effect, not by name
+
+Several `bin/tool-*` scripts are compound programs — they emote, shell out to
+`bin/tool-voice` one or more times, and mutate session state, all under one
+dispatcher-visible name. `tool-repair` is the clearest case: emote, speak a
+repair phrase, speak a reconnect offer, *then* clear `spark_quiet_mode`
+(`bin/tool-repair:72-79`). `tool-quiet end` likewise speaks before clearing the
+flag (`bin/tool-quiet:83-87`).
+
+Policy sits at `validate_action()`, so it only ever sees the outer name. That
+makes the classification load-bearing: a compound tool classified `"other"`
+carries a silent licence for every audio call nested inside it. **No tool may be
+classified non-`"audio"` because its own name sounds harmless — the
+classification is a claim about what the script actually does, verified against
+its source.**
+
+Two consequences for v1:
+
+1. **Classification is param-aware where the real effect is.** The static
+   `VOICE_EFFECT_TABLE` is joined by `VOICE_EFFECT_OVERRIDES: dict[str,
+   Callable[[dict], Effect]]`, consulted first, for the tools whose effect
+   genuinely varies by parameter. Only `tool_quiet` qualifies today
+   (`start` → `"audio"`, `check` → `"presence"`, `end` → `"other"`). This is not
+   a general predicate mechanism: an override exists only where the script has
+   distinct, separately-verifiable effect branches, and a test pins the override
+   key set.
+
+2. **State transition is separated from expression.** Two small `bin/` refactors
+   make the classifications above true rather than aspirational:
+   - `tool-quiet end` clears `spark_quiet_mode` and returns. It no longer
+     speaks. Any re-engagement line is a subsequent, ordinarily policy-evaluated
+     audio turn — which now passes, because quiet mode is already false.
+   - `tool-repair` no longer clears `spark_quiet_mode` at all. Relationship
+     repair and leaving dysregulation are different things, and using repair as
+     the implicit quiet-mode exit is what forced the bypass. Repair becomes
+     honestly `"audio"`, and is therefore suppressed during quiet mode, at
+     night, and on-call — which is the intended behaviour, not a regression:
+     speaking a repair phrase into an active meltdown is precisely what the
+     Three S's protocol exists to prevent.
+
+   `tool-quiet start` keeps its one calm line ("It's okay. I'm here.") and is
+   classified `"audio"`; it is dispatched while quiet mode is still false, so it
+   passes, and it is correctly suppressed at night or on-call.
+
+The result is that quiet mode has exactly one exit — `tool_quiet end`, a
+`"other"`-effect state transition that emits nothing — and no tool retains an
+audio carve-out.
+
+#### Enforcement boundary (deliberate, and its limit)
+
+Enforcement stays at the two dispatchers. It is *not* pushed down into
+`bin/tool-voice`/`tool-announce`/`tool-play-sound` themselves, which would be
+true defence in depth but requires threading origin and session context through
+nested subprocess calls that today receive no such signal. Instead, the boundary
+is held statically: a test scans every `bin/tool-*` script for a reference to an
+audio-emitting tool (`tool-voice`, `tool-voice-persona`, `tool-announce`,
+`tool-play-sound`, `tool-chat*`, `px-perform`) and asserts that any tool which
+can reach one is classified `"audio"`, or has a param-aware override whose
+branches account for it. A future tool that grows a TTS confirmation therefore
+fails CI rather than silently acquiring a bypass. Sink-level enforcement remains
+available as a follow-up if nested audio ever becomes widespread.
 
 Each table must be **exhaustive against its own dispatcher's current action
 vocabulary**, not permissive-by-default: an action absent from the table is a
@@ -234,6 +303,11 @@ call-site deletion, since `pytest` must pass before a PR is created.
   implementable invariant is binary suppression.
 - No changes to `docs/prompts/*.md` conversational style — connection-before-
   direction, "we" language, tone, etc. stay exactly where they are.
+- No policy enforcement inside the audio sinks themselves (`bin/tool-voice` and
+  friends). The static reachability test above holds that boundary for now; see
+  "Enforcement boundary".
+- No exceptions to the audio rule for any tool, on any grounds. The two
+  compound-tool refactors exist precisely so that none is needed.
 
 ## Testing
 
@@ -247,7 +321,9 @@ call-site deletion, since `pytest` must pass before a PR is created.
   satisfying the issue's acceptance criterion directly.
 - `tests/test_policy.py` (whitelisted): ordinary coverage — effect-mapping table
   completeness per caller, non-matching conditions return `allowed=True`, reason
-  strings present on every block, `is_night_hour()` boundary cases.
+  strings present on every block, `is_night_hour()` boundary cases, the
+  `VOICE_EFFECT_OVERRIDES` key set, and the static audio-reachability scan over
+  `bin/tool-*` described under "Compound tools".
 - `tests/test_voice_loop.py` / `tests/test_mind.py`: may separately grow their own
   ordinary coverage of the new behaviour; not relied upon for the erosion
   guarantee, since only the blacklisted file is protected from evolution.
