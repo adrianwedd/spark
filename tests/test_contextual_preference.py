@@ -302,6 +302,43 @@ def test_zero_confidence_record_does_not_satisfy_corroboration_minimum():
     assert result["adapted"] is False
 
 
+@pytest.mark.parametrize("superseder_confidence", [0.0])
+def test_zero_weight_superseder_cannot_discount_contributing_evidence(
+    superseder_confidence,
+):
+    from pxh import provenance
+
+    originals = [_experience(index=i, confidence=0.5) for i in range(2)]
+    superseder = provenance.mark_supersedes(
+        _experience(index=10, confidence=superseder_confidence), originals[0],
+    )
+
+    result = cp.choose_option(
+        originals + [superseder], person="obi", context="after_school",
+        options=OPTIONS, default="quiet_science", now=NOW,
+    )
+
+    assert result["scores"]["active_movement"] == 1.0
+    assert result["chosen"] == "active_movement"
+
+
+def test_duplicate_evidence_superseder_cannot_discount_original():
+    from pxh import provenance
+
+    originals = [_experience(index=i, confidence=0.5) for i in range(2)]
+    superseder = provenance.mark_supersedes(
+        _experience(index=10, evidence=["interaction:report:0"]), originals[0],
+    )
+
+    result = cp.choose_option(
+        originals + [superseder], person="obi", context="after_school",
+        options=OPTIONS, default="quiet_science", now=NOW,
+    )
+
+    assert result["scores"]["active_movement"] == 1.0
+    assert result["chosen"] == "active_movement"
+
+
 def test_append_and_load_preserve_record_and_provenance(tmp_path):
     path = tmp_path / "experiences.jsonl"
     record = _experience(index=1)

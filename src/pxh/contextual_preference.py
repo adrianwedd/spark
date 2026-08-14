@@ -143,6 +143,7 @@ def _scoped_supersessions(records: Sequence[dict], *, person: str,
         if isinstance(record, dict) and record.get("id")
     }
     scoped: list[dict] = []
+    seen_policy_evidence: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -159,11 +160,17 @@ def _scoped_supersessions(records: Sequence[dict], *, person: str,
                 and record.get("outcome") in OUTCOMES
                 and replacement_p["kind"] in ELIGIBLE_KINDS
                 and bool(replacement_p["evidence"])
+                and replacement_p["confidence"] > 0.0
+                and not any(
+                    ref in seen_policy_evidence for ref in replacement_p["evidence"]
+                )
             )
             try:
                 _timestamp(record.get("ts"))
             except (TypeError, ValueError):
                 replacement_authorized = False
+            if replacement_authorized:
+                seen_policy_evidence.update(replacement_p["evidence"])
             allowed: list[str] = []
             if replacement_authorized:
                 for old_id in replacement_p["supersedes"]:
