@@ -530,12 +530,14 @@ def test_tool_recall_dry_run(isolated_project):
     assert "spoken" in payload
 
 
-def _seed_note(state_dir, text, kind=None, source="test"):
+def _seed_note(state_dir, text, kind=None, source="test", evidence=None):
     """Append one note, optionally carrying #170 provenance."""
     from pxh import provenance
     record = {"ts": "2026-08-14T00:00:00+00:00", "note": text}
     if kind is not None:
-        record["provenance"] = provenance.make_provenance(kind, source)
+        record["provenance"] = provenance.make_provenance(
+            kind, source, evidence=evidence,
+        )
     with (state_dir / "notes.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record) + "\n")
 
@@ -551,6 +553,26 @@ def test_recall_speaks_an_observation_as_something_seen(isolated_project):
     payload = _recall(isolated_project)
     assert "seeing" in payload["spoken"]
     assert "a cat on the shelf" in payload["spoken"]
+
+
+def test_recall_speaks_single_vision_interpretation_honestly(isolated_project):
+    _seed_note(
+        isolated_project["state_dir"], "a cat on the shelf", "model_perception",
+        source="claude_vision:exploration",
+        evidence=["exploration:e1:observation:o1"],
+    )
+    spoken = _recall(isolated_project)["spoken"]
+    assert "I remember my vision system interpreting" in spoken
+    assert "seeing" not in spoken
+
+
+def test_recall_uses_generic_wording_for_other_model_perception(isolated_project):
+    _seed_note(
+        isolated_project["state_dir"], "a steady hum", "model_perception",
+        source="audio_model:ambient",
+        evidence=["audio:event:1"],
+    )
+    assert "my perception system interpreting" in _recall(isolated_project)["spoken"]
 
 
 def test_recall_speaks_a_report_as_something_it_was_told(isolated_project):
@@ -576,10 +598,16 @@ def test_recall_qualifies_each_note_when_kinds_are_mixed(isolated_project):
     _seed_note(state_dir, "a cat", "observation")
     _seed_note(state_dir, "bins Tuesday", "report")
     _seed_note(state_dir, "hallways are nice", "narrative")
+    _seed_note(
+        state_dir, "a red mug", "model_perception",
+        source="claude_vision:exploration",
+        evidence=["exploration:e1:observation:o1"],
+    )
     spoken = _recall(isolated_project)["spoken"]
     assert "saw" in spoken
     assert "told me" in spoken
     assert "thought" in spoken
+    assert "my vision system interpreted" in spoken
 
 
 def test_recall_payload_reports_provenance_without_breaking_notes(isolated_project):

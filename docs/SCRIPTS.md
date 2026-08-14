@@ -593,6 +593,24 @@ bin/px-race --max-speed 40    # cap top speed (PWM duty cycle, default 50, hard 
 
 ---
 
+## Exploration perception provenance
+
+`bin/px-wander` records exploration events with event vocabulary
+`type: "observation"`; this does not assign epistemic authority. For every successful
+vision interpretation it creates a stable `observation_id`, appends the event, and
+checks that append succeeded before calling the durable-note writer. The note's
+system-constructed provenance is `model_perception` with source
+`claude_vision:exploration` and evidence
+`exploration:<explore_id>:observation:<observation_id>`. Model output supplies only
+the description text and cannot select kind, confidence, or evidence.
+
+Evidence traces the producing event; it is not semantic verification. Consequently
+the kind defaults to `0.65`, cannot exceed `0.75`, and `tool-recall` says the vision
+system “interpreted” the scene. Raw JPEG retention is not required. Any failure in
+capture, non-fallback interpretation, event persistence, or evidence construction
+prevents durable promotion while safe exploration continues. Existing records are
+not retyped, and older exploration events without `observation_id` remain readable.
+
 ## Speech and Audio
 
 ### bin/tool-voice

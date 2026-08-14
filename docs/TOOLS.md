@@ -37,3 +37,19 @@ All helper scripts live in `~/picar-x-hacking/bin`. Each script is designed to b
 | `claude-voice-bridge` | Thin adapter that pipes the voice loop prompt into `claude -p` with no tools and plain-text output, allowing Claude Code to serve as the LLM backend for the voice loop. |
 
 All motion-capable helpers include `--dry-run` (or honour `PX_DRY`) so you can review planned actions before spinning the wheels. Always confirm the car is on blocks prior to running live motion. Use `sudo -E bin/<script>` to ensure the virtualenv and path configuration remain intact under sudo.
+
+## Durable perception provenance
+
+`px-wander` treats Claude vision descriptions as `model_perception`, not direct
+`observation`. A successful interesting description is promoted to a durable note
+only after its exploration observation—with stable `explore_id` and
+`observation_id`—has been appended successfully. The note references that event as
+`exploration:<explore_id>:observation:<observation_id>` and remains bounded to the
+kind's `0.65` default and `0.75` ceiling.
+
+That reference proves which perception event grounded the note; it does not prove
+the description is semantically correct. Keeping the raw JPEG is optional. Failed
+capture/vision, failed event persistence, or invalid evidence prevents promotion.
+`tool-recall` voices these records as model interpretations. Learned Frigate
+detections must also use `model_perception` if a future writer promotes them into
+durable claims.

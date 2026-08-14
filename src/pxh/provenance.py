@@ -8,12 +8,13 @@ at retrieval time, from something SPARK had actually seen or been told. This
 module attaches the minimum metadata needed to answer, of any durable claim,
 *where did this come from?*
 
-Five kinds, derived from what the existing writers actually produce:
+Six kinds, derived from the epistemic distinctions durable claims require:
 
 | kind           | means                                     | who writes it today            |
 |----------------|-------------------------------------------|--------------------------------|
-| `observation`  | SPARK perceived it via its own sensors    | wander's scene descriptions    |
+| `observation`  | direct/deterministic sensor content       | direct sensor writers          |
 | `report`       | a person or external source asserted it   | voice-loop remember, research  |
+| `model_perception` | a model interpreted sensor evidence   | wander's scene descriptions    |
 | `inference`    | SPARK worked it out from other records    | (available; no writer yet)     |
 | `narrative`    | SPARK's own generated prose about itself  | consolidation, compose, mind   |
 | `verification` | checked against something outside SPARK   | (available; no writer yet)     |
@@ -55,23 +56,25 @@ import uuid
 
 from pxh.time import utc_timestamp
 
-KINDS = ("observation", "report", "inference", "narrative", "verification",
-         "unknown")
+KINDS = ("observation", "report", "model_perception", "inference", "narrative",
+         "verification", "unknown")
 
 # Ceilings, not suggestions: clamped on write and again on read.
 CONFIDENCE_CEILING = {
     "observation": 1.0,
     "verification": 1.0,
     "report": 0.9,        # people misremember and speak loosely
+    "model_perception": 0.75,  # grounded interpretation, not verification
     "inference": 0.6,
     "narrative": 0.5,     # SPARK's own prose about SPARK
     "unknown": 0.3,       # legacy — never silently trusted
 }
 
 DEFAULT_CONFIDENCE = {
-    "observation": 0.8,   # a camera plus a vision model is not ground truth
+    "observation": 0.8,   # direct sensor content may still be noisy
     "verification": 0.9,
     "report": 0.7,
+    "model_perception": 0.65,
     "inference": 0.5,
     "narrative": 0.4,
     "unknown": 0.2,
@@ -82,6 +85,7 @@ DEFAULT_CONFIDENCE = {
 KIND_LABELS = {
     "observation": "I saw this myself",
     "report": "someone told me this",
+    "model_perception": "a model interpreted this from my sensors",
     "inference": "I worked this out",
     "narrative": "my own reflection, unverified",
     "verification": "checked against something outside me",
@@ -133,10 +137,13 @@ def make_provenance(kind: str, source: str, evidence: object = None,
     src = str(source or "").strip()
     if not src:
         raise ValueError("provenance requires a non-empty source")
+    refs = _clean_refs(evidence)
+    if kind == "model_perception" and not refs:
+        raise ValueError("model_perception provenance requires evidence")
     return {
         "kind": kind,
         "source": src[:MAX_REF_LEN],
-        "evidence": _clean_refs(evidence),
+        "evidence": refs,
         "confidence": _clamp_confidence(kind, confidence),
         "recorded_at": recorded_at or utc_timestamp(),
         "supersedes": [],
@@ -197,6 +204,9 @@ def read_provenance(record: object) -> dict:
     kind = raw.get("kind")
     if kind not in KINDS:
         kind = "unknown"
+    evidence = _clean_refs(raw.get("evidence"))
+    if kind == "model_perception" and not evidence:
+        kind = "unknown"
     source = str(raw.get("source") or "").strip()[:MAX_REF_LEN]
     confidence = _clamp_confidence(kind, raw.get("confidence"))
     # Derived at read time, like health.py's status: a discount that lived in
@@ -206,7 +216,7 @@ def read_provenance(record: object) -> dict:
     return {
         "kind": kind,
         "source": source or "unrecorded",
-        "evidence": _clean_refs(raw.get("evidence")),
+        "evidence": evidence,
         "confidence": confidence,
         "recorded_at": str(raw.get("recorded_at") or record.get("ts") or ""),
         "supersedes": _clean_refs(raw.get("supersedes")),
