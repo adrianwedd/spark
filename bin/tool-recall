@@ -56,6 +56,13 @@ ITEM_LEAD = {
 }
 
 
+def model_perception_lead(source: str, *, single: bool) -> str:
+    system = "vision system" if source.startswith("claude_vision:") else "perception system"
+    if single:
+        return f"I remember my {system} interpreting"
+    return f"my {system} interpreted"
+
+
 def notes_file_for_persona(persona: str) -> Path:
     if persona:
         return STATE_DIR / f"notes-{persona}.jsonl"
@@ -88,15 +95,22 @@ def compose_speech(records: list[dict]) -> str:
     """Render notes for speech without erasing where each one came from."""
     if not records:
         return "I don't have any notes saved yet."
-    kinds = [provenance.read_provenance(r)["kind"] for r in records]
+    provenance_blocks = [provenance.read_provenance(r) for r in records]
     if len(records) == 1:
-        lead = RECALL_LEAD.get(kinds[0], RECALL_LEAD["unknown"])
+        block = provenance_blocks[0]
+        if block["kind"] == "model_perception":
+            lead = model_perception_lead(block["source"], single=True)
+        else:
+            lead = RECALL_LEAD.get(block["kind"], RECALL_LEAD["unknown"])
         return f"{lead}: {records[0]['note'][:200]}"
     items = []
-    for record, kind in zip(records, kinds):
+    for record, block in zip(records, provenance_blocks):
         # Truncate each note for speech — full text stays in the JSON payload
         short = record["note"][:120]
-        lead = ITEM_LEAD.get(kind, "")
+        if block["kind"] == "model_perception":
+            lead = model_perception_lead(block["source"], single=False)
+        else:
+            lead = ITEM_LEAD.get(block["kind"], "")
         items.append(f"{lead}: {short}" if lead else short)
     return f"I remember {len(records)} things: {'; '.join(items)}."[:500]
 
