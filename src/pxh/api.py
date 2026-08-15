@@ -32,6 +32,7 @@ from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from .runtime_paths import resolve_heartbeat_read_path
 from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
@@ -663,7 +664,7 @@ async def health():
     # intentionally separate signals. A fresh charging loop is healthy even
     # though sonar is expected to remain stale while hardware is frozen.
     heartbeat_mode = "unknown"
-    heartbeat_file = state_dir / "alive_heartbeat.json"
+    heartbeat_file = resolve_heartbeat_read_path(state_dir)
     heartbeat_available = heartbeat_file.exists()
     try:
         heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))

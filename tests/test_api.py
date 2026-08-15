@@ -181,6 +181,31 @@ class TestHealth:
         assert checks["daemons"]["components"]["px-alive"] == "stale"
         assert checks["daemons"]["status"] == "ok"
 
+    def test_heartbeat_read_from_runtime_dir(
+            self, api_client, isolated_project, monkeypatch, tmp_path):
+        """px-alive writes its heartbeat to tmpfs; health must follow it there.
+
+        The heartbeat moved off the SD card to escape a 21.5s fsync tail that
+        was tripping WatchdogSec=15. A reader still pointed at the state dir
+        would report a live daemon as permanently missing.
+        """
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_sonar(state_dir)
+        runtime_dir = tmp_path / "runtime"
+        runtime_dir.mkdir()
+        monkeypatch.setenv("PX_ALIVE_HEARTBEAT_DIR", str(runtime_dir))
+        (runtime_dir / "alive_heartbeat.json").write_text(json.dumps({
+            "ts": time.time(),
+            "mode": "lease_wait",
+        }))
+        assert not (state_dir / "alive_heartbeat.json").exists()
+
+        checks = api_client.get("/api/v1/health").json()["checks"]
+
+        assert checks["alive_loop"]["status"] == "ok"
+        assert checks["alive_loop"]["mode"] == "lease_wait"
+
     def test_other_stale_daemon_still_degrades_with_fresh_alive_heartbeat(
             self, api_client, isolated_project):
         state_dir = isolated_project["state_dir"]

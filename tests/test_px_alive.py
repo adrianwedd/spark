@@ -1,8 +1,16 @@
 """Tests for px-alive idle-alive daemon (dry-run only — no GPIO)."""
+import contextlib
 import json
 import os
+import shutil
+import socket
 import subprocess
+import tempfile
+import time
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 from pxh.gpio_lease import GpioLeaseStore
 
@@ -92,6 +100,18 @@ def test_systemd_service_enables_functional_watchdog():
     assert "NotifyAccess=main" in service
 
 
+def test_systemd_service_provides_tmpfs_runtime_dir():
+    """/run/spark must exist before the daemon starts, or it falls back to SD.
+
+    RuntimeDirectory= makes systemd create (and clean up) the tmpfs dir. Without
+    it the heartbeat silently lands back on the SD card and the 21.5s fsync tail
+    that trips WatchdogSec=15 comes straight back.
+    """
+    service = (PROJECT_ROOT / "systemd" / "px-alive.service").read_text()
+
+    assert "RuntimeDirectory=spark" in service
+
+
 def test_false_exploration_owner_does_not_suppress_alive(isolated_project):
     """#176: exploring state from a live unrelated PID is not GPIO authority."""
     env = isolated_project["env"].copy()
@@ -111,24 +131,236 @@ def test_false_exploration_owner_does_not_suppress_alive(isolated_project):
     assert "dry gaze" in (log_dir / "px-alive.log").read_text()
 
 
-def test_live_gpio_owner_suppresses_alive_until_release(isolated_project):
-    """px-alive resumes once the legitimate GPIO owner releases authority."""
+# test_live_gpio_owner_suppresses_alive_until_release was retired here.
+#
+# It asserted the old contract — that a foreign lease makes px-alive exit
+# cleanly and stay gone until systemd respawns it ("dry gaze" not in the log).
+# That exit-under-Restart=always is precisely the 15s respawn loop this module
+# now prevents, so the assertion encoded the bug. Its real intent (yield, then
+# resume once the owner releases authority) is covered end-to-end by
+# test_foreign_lease_keeps_daemon_alive_in_lease_wait below, which additionally
+# proves the process stays alive while parked.
+
+
+# --- heartbeat runtime location (#190-adjacent: SD fsync tail kills the watchdog) ---
+#
+# Measured on the live Pi: a 169-byte fsync+replace into state/ on the SD card
+# has a p50 of 12 ms but a tail reaching 21.5 s — past WatchdogSec=15, so systemd
+# SIGABRTs a perfectly healthy daemon. The same write to tmpfs is 0.63 ms with no
+# tail. The heartbeat is disposable liveness data, so it belongs on tmpfs.
+
+
+def load_alive_module(env_overrides):
+    """Exec px-alive's embedded python body as a module namespace.
+
+    bin/px-alive is bash wrapping a `<<'PY' ... PY` heredoc, so there is nothing
+    importable. Extracting the body lets the ordering invariant be tested
+    directly instead of inferred from subprocess side effects.
+    """
+    source = (PROJECT_ROOT / "bin" / "px-alive").read_text()
+    body = source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    ns = {"__name__": "px_alive_under_test"}
+    with mock.patch.dict(os.environ, env_overrides, clear=False):
+        exec(compile(body, "px-alive", "exec"), ns)
+    return ns
+
+
+@contextlib.contextmanager
+def _notify_socket():
+    """A bound systemd-style notify socket.
+
+    Bound under /tmp rather than pytest's tmp_path: AF_UNIX paths cap at ~104
+    bytes and pytest's nested tmp dirs blow straight past that on macOS.
+    """
+    sock_dir = tempfile.mkdtemp(prefix="pxa", dir="/tmp")
+    sock_path = os.path.join(sock_dir, "n.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock.bind(sock_path)
+    sock.settimeout(0.5)
+    try:
+        yield sock, sock_path
+    finally:
+        sock.close()
+        shutil.rmtree(sock_dir, ignore_errors=True)
+
+
+def _drain(sock):
+    received = []
+    while True:
+        try:
+            received.append(sock.recv(256))
+        except socket.timeout:
+            return received
+
+
+def _alive_env(isolated_project, heartbeat_dir=None):
     env = isolated_project["env"].copy()
-    state_dir = isolated_project["state_dir"]
     log_dir = isolated_project["log_dir"]
     env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
     env["PX_ALIVE_PID"] = str(log_dir / "px-alive.pid")
+    if heartbeat_dir is not None:
+        env["PX_ALIVE_HEARTBEAT_DIR"] = str(heartbeat_dir)
+    return env
+
+
+def test_heartbeat_written_to_configured_runtime_dir(isolated_project, tmp_path):
+    """PX_ALIVE_HEARTBEAT_DIR relocates the heartbeat off the state dir entirely."""
+    runtime_dir = tmp_path / "runtime"
+    env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+
+    result = run_alive([], env)
+
+    assert result.returncode == 0, f"stderr: {result.stderr[:500]}"
+    beat = runtime_dir / "alive_heartbeat.json"
+    assert beat.exists(), "heartbeat not written to configured runtime dir"
+    assert json.loads(beat.read_text())["mode"]
+    assert not (isolated_project["state_dir"] / "alive_heartbeat.json").exists(), \
+        "heartbeat must not also land on the state dir (SD card)"
+
+
+def test_heartbeat_falls_back_to_state_dir_when_runtime_dir_unusable(
+    isolated_project, tmp_path
+):
+    """Non-systemd hosts and tests must still get a heartbeat, not a crash."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    env = _alive_env(isolated_project, heartbeat_dir=blocked / "spark")
+
+    result = run_alive([], env)
+
+    assert result.returncode == 0, f"stderr: {result.stderr[:500]}"
+    assert (isolated_project["state_dir"] / "alive_heartbeat.json").exists(), \
+        "unusable runtime dir should fall back to the state dir"
+
+
+def test_watchdog_not_notified_when_heartbeat_write_fails(isolated_project, tmp_path):
+    """Ordering invariant: systemd must never see healthy on a stale record.
+
+    Makes persistence fail and asserts no WATCHDOG=1 datagram is sent. This is
+    the property the write-then-notify ordering exists to guarantee.
+    """
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+
+    try:
+        with _notify_socket() as (notify_sock, sock_path):
+            alive = load_alive_module({
+                "PX_ALIVE_HEARTBEAT_DIR": str(readonly),
+                "NOTIFY_SOCKET": sock_path,
+                "PX_STATE_DIR": str(isolated_project["state_dir"]),
+                "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+            })
+            # Break persistence *after* the dir was resolved, so this exercises a
+            # runtime write failure rather than the startup fallback.
+            readonly.chmod(0o500)
+
+            assert alive["write_alive_heartbeat"]("running") is False
+
+            received = _drain(notify_sock)
+            assert not any(b"WATCHDOG=1" in msg for msg in received), \
+                f"watchdog notified despite failed heartbeat persistence: {received}"
+    finally:
+        readonly.chmod(0o700)
+
+
+def test_watchdog_notified_after_successful_heartbeat(isolated_project, tmp_path):
+    """The happy path still pings systemd once the record is durable."""
+    runtime_dir = tmp_path / "runtime"
+    with _notify_socket() as (notify_sock, sock_path):
+        env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+        env["NOTIFY_SOCKET"] = sock_path
+
+        result = run_alive([], env)
+        assert result.returncode == 0, f"stderr: {result.stderr[:500]}"
+
+        received = _drain(notify_sock)
+        assert any(b"WATCHDOG=1" in msg for msg in received), \
+            f"no watchdog notification after successful heartbeat: {received}"
+        assert (runtime_dir / "alive_heartbeat.json").exists()
+
+
+# --- lease_wait: yielding GPIO is not a reason to die ---
+#
+# Observed on the Pi: 47 of 111 px-alive restarts in 6h were *clean* exits
+# because px-wake-listen held the GPIO lease. Restart=always turned a correct
+# yield into a 15s respawn loop, re-initialising Picarx each time.
+
+
+def test_foreign_lease_keeps_daemon_alive_in_lease_wait(isolated_project, tmp_path):
+    """An active foreign lease parks the loop; it must not return from main()."""
+    runtime_dir = tmp_path / "runtime"
+    env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+    state_dir = isolated_project["state_dir"]
+
     lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
     assert lease is not None
 
-    leased_result = run_alive([], env)
-    leased_log = (log_dir / "px-alive.log").read_text()
-    assert leased_result.returncode == 0
-    assert "GPIO lease active" in leased_log
-    assert "dry gaze" not in leased_log
+    proc = subprocess.Popen(
+        [str(PROJECT_ROOT / "bin" / "px-alive"), "--dry-run"],
+        cwd=PROJECT_ROOT, text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        beat = runtime_dir / "alive_heartbeat.json"
+        deadline = time.time() + 15
+        mode = None
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(
+                    f"px-alive exited (rc={proc.returncode}) instead of waiting "
+                    f"for the lease to clear"
+                )
+            if beat.exists():
+                try:
+                    mode = json.loads(beat.read_text())["mode"]
+                except (json.JSONDecodeError, KeyError):
+                    mode = None
+                if mode == "lease_wait":
+                    break
+            time.sleep(0.2)
 
-    assert GpioLeaseStore(state_dir).release(lease.lease_id) is True
-    resumed_result = run_alive([], env)
-    resumed_log = (log_dir / "px-alive.log").read_text()
-    assert resumed_result.returncode == 0
-    assert "dry gaze" in resumed_log
+        assert mode == "lease_wait", f"expected lease_wait heartbeat, got {mode!r}"
+        assert proc.poll() is None, "daemon must stay alive while parked"
+
+        # Releasing the lease lets it resume a normal loop on its own.
+        assert GpioLeaseStore(state_dir).release(lease.lease_id) is True
+        proc.wait(timeout=30)
+        assert proc.returncode == 0
+        assert "dry gaze" in (isolated_project["log_dir"] / "px-alive.log").read_text()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_lease_wait_does_not_touch_foreign_lease(isolated_project, tmp_path):
+    """While parked the loop is passive: it must not refresh or steal the token."""
+    runtime_dir = tmp_path / "runtime"
+    env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+    state_dir = isolated_project["state_dir"]
+
+    lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
+    assert lease is not None
+    lease_file = state_dir / "gpio_lease.json"
+    before = json.loads(lease_file.read_text())
+
+    proc = subprocess.Popen(
+        [str(PROJECT_ROOT / "bin" / "px-alive"), "--dry-run"],
+        cwd=PROJECT_ROOT, text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        beat = runtime_dir / "alive_heartbeat.json"
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if beat.exists() and json.loads(beat.read_text()).get("mode") == "lease_wait":
+                break
+            time.sleep(0.2)
+        time.sleep(2)  # let it take several passive re-check passes
+
+        assert proc.poll() is None, "daemon must still be parked for this to mean anything"
+        after = json.loads(lease_file.read_text())
+        assert after == before, f"lease mutated while parked: {before} -> {after}"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)

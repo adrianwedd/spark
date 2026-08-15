@@ -12,7 +12,12 @@ ExecStart=/home/pi/picar-x-hacking/bin/px-alive --no-face
 Restart=always
 RestartSec=15
 NotifyAccess=main
+# WatchdogSec is deliberately tight and stays that way: it was doing its job.
+# The heartbeat that feeds it now lives on tmpfs (RuntimeDirectory below), so it
+# is no longer gated behind SD-card fsync latency that tailed out to 21.5s.
 WatchdogSec=15
+# Creates /run/spark (tmpfs, 0755 root) before ExecStart and removes it on stop.
+RuntimeDirectory=spark
 KillSignal=SIGTERM
 TimeoutStopSec=10
 StandardOutput=journal
