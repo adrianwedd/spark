@@ -89,6 +89,10 @@ SPARK_GREET_COOLDOWN_S = 120   # minimum seconds between SPARK proximity greetin
 # WatchdogSec=15 so the heartbeat keeps flowing while we wait.
 LEASE_RECHECK_S = 2.0
 
+# Target spacing between heartbeats during a long blocking servo motion. Well
+# under WatchdogSec=15, and cheap now the write lands on tmpfs.
+HEARTBEAT_EVERY_S = 2.0
+
 # The heartbeat is disposable liveness state and does NOT belong on the SD card
 # — see pxh/runtime_paths.py for the measurements that moved it to tmpfs. The
 # location is shared with pxh.api (the reader) so the two cannot drift apart.
@@ -224,10 +228,20 @@ def _pan_from_frigate(presence: dict | None) -> int:
     return max(-40, min(40, int((0.5 - x) * 80)))
 
 
-def ease(px, from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration: float) -> None:
+def ease(px, from_pan: int, from_tilt: int, to_pan: int, to_tilt: int,
+         duration: float, mode: str = "running") -> None:
     steps = max(2, int(duration * EASE_SPEED))
+    # Servo motion is the one place the loop legitimately blocks for longer than
+    # WatchdogSec. An idle scan sweep eases through ~17 targets plus a recentre —
+    # over 30s of motion — and without a beat inside it systemd kills a perfectly
+    # healthy daemon. Beat on entry and roughly every HEARTBEAT_EVERY_S after.
+    steps_per_beat = (
+        max(1, int(steps * HEARTBEAT_EVERY_S / duration)) if duration > 0 else 1
+    )
     prev_pan, prev_tilt = from_pan, from_tilt
     for i in range(steps + 1):
+        if i % steps_per_beat == 0:
+            write_alive_heartbeat(mode)
         # Sine ease-in-out: smooth acceleration/deceleration
         t = 0.5 - 0.5 * math.cos(math.pi * i / steps)
         new_pan  = int(round(from_pan  + (to_pan  - from_pan)  * t))
@@ -647,10 +661,10 @@ def idle_loop(args) -> None:
                     for a in angles:
                         if _yield_requested:
                             break
-                        ease(p, cur_pan, cur_tilt, a, cur_tilt, 1.5)
+                        ease(p, cur_pan, cur_tilt, a, cur_tilt, 1.5, mode="scanning")
                         cur_pan = a
                         time.sleep(0.3)
-                    ease(p, cur_pan, cur_tilt, 0, 0, 2.0)
+                    ease(p, cur_pan, cur_tilt, 0, 0, 2.0, mode="scanning")
                     cur_pan, cur_tilt = 0, 0
                     log("idle scan: sweep complete")
                     next_scan = now + random.uniform(SCAN_MIN_S, SCAN_MAX_S)

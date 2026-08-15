@@ -7,6 +7,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import types
 from pathlib import Path
 from unittest import mock
 
@@ -277,6 +278,44 @@ def test_watchdog_notified_after_successful_heartbeat(isolated_project, tmp_path
         assert any(b"WATCHDOG=1" in msg for msg in received), \
             f"no watchdog notification after successful heartbeat: {received}"
         assert (runtime_dir / "alive_heartbeat.json").exists()
+
+
+def test_long_servo_motion_keeps_heartbeating(isolated_project, tmp_path):
+    """A single ease() must not outlast WatchdogSec without a heartbeat.
+
+    Observed live after the tmpfs move: the idle scan sweep still tripped the
+    watchdog. It eases through ~17 angles at 1.5s each plus a 2s recentre — over
+    30s of servo motion with no heartbeat between the log lines that bracket it:
+
+        10:45:32  idle scan: sweeping pan
+        10:45:48  Watchdog timeout (limit 15s)!
+
+    This is legitimate worst-case loop work exceeding the deadline, so the fix
+    belongs in heartbeat placement, not in WatchdogSec.
+    """
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+
+    beats = []
+    alive["write_alive_heartbeat"] = lambda mode, now=None: beats.append(mode)
+    # Keep the test fast: real sleeps would make this a 20s test.
+    alive["time"] = types.SimpleNamespace(
+        sleep=lambda _s: None, time=time.time, monotonic=time.monotonic,
+    )
+
+    class FakePx:
+        def set_cam_pan_angle(self, _a): pass
+        def set_cam_tilt_angle(self, _a): pass
+
+    alive["ease"](FakePx(), 0, 0, 60, 0, 20.0, mode="scanning")
+
+    assert beats, "long ease() produced no heartbeat at all"
+    assert set(beats) == {"scanning"}, f"unexpected heartbeat modes: {set(beats)}"
+    # 20s of motion must yield beats comfortably inside the 15s deadline.
+    assert len(beats) >= 4, f"only {len(beats)} heartbeats across a 20s ease"
 
 
 # --- lease_wait: yielding GPIO is not a reason to die ---
