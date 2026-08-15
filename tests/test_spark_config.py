@@ -66,10 +66,12 @@ def test_pick_reflection_seed_returns_string_or_none():
 def test_announce_constants_present_and_safe():
     from pxh import spark_config as cfg
 
-    # Ships OFF until the relay is live on M5
-    assert cfg.ANNOUNCE_ENABLED is False
-    # IP-based, never M5.local (Nest can't resolve mDNS)
-    assert "192.168.0.100" in cfg.ANNOUNCE_RELAY_URL
+    # Flipped ON 2026-08-01 after G1/G2 passed (relay live on M5, casts verified)
+    assert cfg.ANNOUNCE_ENABLED is True
+    # IP-based, never M5.local (Nest can't resolve mDNS). Exact IP deliberately
+    # not pinned — M5's lease already moved .100→.249 once (2026-08-05).
+    import re
+    assert re.fullmatch(r"http://\d{1,3}(?:\.\d{1,3}){3}:\d+", cfg.ANNOUNCE_RELAY_URL)
     assert "M5.local" not in cfg.ANNOUNCE_RELAY_URL
     assert cfg.ANNOUNCE_VOICE == "data"
     # v1 casts to exactly one default entity (no speaker group -> echo)

@@ -32,6 +32,25 @@ def _isolate_health_writes(tmp_path, monkeypatch):
     health._last_success_write.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_alive_heartbeat(tmp_path, monkeypatch):
+    """Keep heartbeat reads off the live robot's /run/spark.
+
+    Same hazard as _isolate_health_writes, one layer down. #192 moved the
+    px-alive heartbeat to tmpfs, and resolve_heartbeat_read_path() prefers
+    /run/spark unconditionally — correct in production, but on a host where
+    px-alive is actually running it means an isolated test reads the *live*
+    robot's heartbeat instead of the one it just wrote to tmp_path. Every
+    TestHealth heartbeat assertion then sees a permanently fresh "running"
+    beat: eight tests that pass on CI fail on the robot, and worse, they would
+    pass there for the wrong reason if the fixture were ever inverted.
+
+    PX_ALIVE_HEARTBEAT_DIR is the documented override, so point it at a
+    per-test tmp dir rather than repointing PX_STATE_DIR globally.
+    """
+    monkeypatch.setenv("PX_ALIVE_HEARTBEAT_DIR", str(tmp_path / "run-spark"))
+
+
 @pytest.fixture
 def isolated_project(tmp_path):
     """Creates an isolated project directory for testing."""

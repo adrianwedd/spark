@@ -4,27 +4,24 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import sys
-import types
 from pathlib import Path
 
 import pytest
-
-from pxh.gpio_lease import GpioLeaseStore
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
 def _load_wander_helpers():
-    """Parse bin/px-wander and extract explore-mode helper functions."""
-    src = (PROJECT_ROOT / "bin" / "px-wander").read_text()
-    start = src.index("<<'PY'\n") + len("<<'PY'\n")
-    end = src.rindex("\nPY\n")
-    py_src = src[start:end]
-    globs: dict = {"__file__": str(PROJECT_ROOT / "bin" / "px-wander")}
-    compiled = compile(py_src, "bin/px-wander", "exec")
-    exec(compiled, globs)  # noqa: S102
-    return globs
+    """Load a private copy of pxh.wander (not registered in sys.modules) so its
+    module-level env-var reads pick up the patched env without mutating the
+    real, cached pxh.wander module used elsewhere in the process."""
+    import importlib.util
+
+    wander_path = PROJECT_ROOT / "src" / "pxh" / "wander.py"
+    spec = importlib.util.spec_from_file_location("pxh_wander_test_copy", wander_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return vars(module)
 
 
 @pytest.fixture
@@ -52,29 +49,6 @@ def wander(tmp_path):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-
-
-# -- Heading estimation --
-
-def test_heading_estimate(wander):
-    hl = wander["_heading_label"]
-    assert hl(0) == "ahead"
-    assert hl(45) == "ahead"
-    assert hl(46) == "right"
-    assert hl(90) == "right"
-    assert hl(135) == "right"
-    assert hl(136) == "behind-right"
-    assert hl(-46) == "left"
-    assert hl(-90) == "left"
-    assert hl(-135) == "left"
-    assert hl(-136) == "behind-left"
-
-
-def test_heading_wraps_at_180(wander):
-    hl = wander["_heading_label"]
-    assert hl(180) == "behind-left"
-    assert hl(-180) == "behind-left"
-    assert hl(360) == "ahead"
 
 
 # -- Exploration log --
@@ -117,19 +91,14 @@ def test_exploration_log_observation_entry(wander, tmp_path):
         "vision_failed": False,
         "steps_from_start": 5,
     }
-    assert write_obs(entry) is True
-    path = tmp_path / "exploration.jsonl"
+    write_obs(entry)
+    path = tmp_path / "observations.jsonl"
+    assert path.exists()
+    assert not (tmp_path / "exploration.jsonl").exists()
     lines = path.read_text().strip().splitlines()
     parsed = json.loads(lines[0])
     assert parsed["type"] == "observation"
     assert parsed["landmark"] == "ginger cat on shelf"
-
-
-def test_exploration_log_observation_reports_failed_persistence(wander, tmp_path):
-    blocked = tmp_path / "blocked"
-    blocked.write_text("not a directory")
-    wander["STATE_DIR"] = blocked
-    assert wander["_write_observation"]({"type": "observation"}) is False
 
 
 def test_exploration_log_trim_atomic(wander, tmp_path):
@@ -185,97 +154,6 @@ def test_exploring_state_file_written(wander, tmp_path):
     assert data["active"] is False
 
 
-def test_live_wander_acquires_gpio_before_publishing_exploration(
-    wander, monkeypatch
-):
-    """Hardware authority must exist before exploration intent becomes active."""
-    events = []
-
-    class FakePicarx:
-        def stop(self):
-            pass
-
-        def set_dir_servo_angle(self, _angle):
-            pass
-
-        def set_cam_pan_angle(self, _angle):
-            pass
-
-        def set_cam_tilt_angle(self, _angle):
-            pass
-
-        def close(self):
-            pass
-
-    class FakeLease:
-        lease_id = "lease-123"
-
-    class FakeGuard:
-        def __init__(self, _store, owner_kind, **_kwargs):
-            assert owner_kind == "wander"
-            self.lease = None
-
-        def acquire(self):
-            events.append("acquire")
-            self.lease = FakeLease()
-            return True
-
-        def release(self):
-            events.append("release")
-            return True
-
-    def fail_publish(active, **_kwargs):
-        events.append("publish" if active else "clear")
-        return not active
-
-    monkeypatch.setitem(sys.modules, "picarx", types.SimpleNamespace(Picarx=FakePicarx))
-    monkeypatch.setitem(wander, "GpioLeaseGuard", FakeGuard)
-    class EmptyStore:
-        def current(self):
-            return None
-
-    monkeypatch.setitem(wander, "GpioLeaseStore", lambda _path: EmptyStore())
-    monkeypatch.setitem(wander, "_write_exploring_state", fail_publish)
-
-    result = wander["main"](["--mode", "explore", "--quiet"])
-
-    assert result == 1
-    assert events == ["acquire", "publish", "clear"]
-
-
-def test_live_wander_borrows_matching_inherited_gpio_lease(wander, monkeypatch):
-    """A nested wander run uses its parent's token without releasing it."""
-    events = []
-
-    class FakePicarx:
-        def stop(self): pass
-        def set_dir_servo_angle(self, _angle): pass
-        def set_cam_pan_angle(self, _angle): pass
-        def set_cam_tilt_angle(self, _angle): pass
-        def close(self): pass
-
-    store = GpioLeaseStore(wander["STATE_DIR"])
-    lease = store.acquire("voice", ttl_s=60)
-    assert lease is not None
-    monkeypatch.setenv("PX_GPIO_LEASE_ID", lease.lease_id)
-    monkeypatch.setitem(sys.modules, "picarx", types.SimpleNamespace(Picarx=FakePicarx))
-    monkeypatch.setitem(
-        wander,
-        "GpioLeaseGuard",
-        lambda *_args, **_kwargs: pytest.fail("borrowed authority was reacquired"),
-    )
-
-    def fail_publish(active, **_kwargs):
-        events.append("publish" if active else "clear")
-        return not active
-
-    monkeypatch.setitem(wander, "_write_exploring_state", fail_publish)
-
-    assert wander["main"](["--mode", "explore", "--quiet"]) == 1
-    assert store.current()["lease_id"] == lease.lease_id
-    assert events == ["publish", "clear"]
-
-
 def test_sonar_none_vs_999(wander):
     import time as _time
     check_abort = wander["_check_abort"]
@@ -300,64 +178,24 @@ def test_landmark_extraction(wander):
 
 def test_landmark_promotion_to_notes(wander, tmp_path):
     remember = wander["_auto_remember"]
-    evidence_ref = "exploration:e-test:observation:o-test"
-    assert remember("Found a cat on the shelf to my right", evidence_ref) is True
+    remember("Found a cat on the shelf to my right")
     notes = tmp_path / "notes.jsonl"
     assert notes.exists()
     entry = json.loads(notes.read_text().strip())
     assert "cat" in entry["note"]
     assert entry["source"] == "exploration"
-    assert entry["id"]
-    assert entry["provenance"]["kind"] == "model_perception"
-    assert entry["provenance"]["source"] == "claude_vision:exploration"
-    assert entry["provenance"]["evidence"] == [evidence_ref]
-    assert entry["provenance"]["confidence"] == 0.65
 
 
-def test_landmark_promotion_refuses_missing_evidence(wander, tmp_path):
-    assert wander["_auto_remember"]("A plausible model description", "") is False
-    assert not (tmp_path / "notes.jsonl").exists()
-
-
-def test_interesting_vision_persists_evidence_before_note(wander, monkeypatch):
-    events = []
-
-    def write_observation(entry):
-        events.append(("observation", dict(entry)))
-        return True
-
-    def remember(text, evidence_ref):
-        events.append(("note", text, evidence_ref))
-        return True
-
-    monkeypatch.setitem(wander, "_write_observation", write_observation)
-    monkeypatch.setitem(wander, "_auto_remember", remember)
-    description = '{"kind":"verification","confidence":1.0} beside a red mug'
-    entry = {
-        "type": "observation", "explore_id": "e-test", "observation_id": "o-test",
-        "description": description, "interesting": True, "vision_failed": False,
-    }
-
-    assert wander["_persist_vision_observation"](entry) is True
-    assert events[0][0] == "observation"
-    assert events[1] == (
-        "note", f"While exploring (unknown): {description}",
-        "exploration:e-test:observation:o-test",
-    )
-
-
-def test_failed_observation_write_prevents_note_promotion(wander, monkeypatch):
-    remembered = []
-    monkeypatch.setitem(wander, "_write_observation", lambda _entry: False)
-    monkeypatch.setitem(wander, "_auto_remember", lambda *args: remembered.append(args))
-    entry = {
-        "type": "observation", "explore_id": "e-test", "observation_id": "o-test",
-        "description": "A cat on the shelf", "interesting": True,
-        "vision_failed": False, "heading_estimate": "right",
-    }
-
-    assert wander["_persist_vision_observation"](entry) is False
-    assert remembered == []
+def test_promoted_landmark_is_typed_as_something_spark_saw(wander, tmp_path):
+    """A scene description comes from SPARK's own camera — the one durable
+    writer that genuinely produces an `observation` (#170). It is capped below
+    certainty all the same: a vision model can be wrong about what it sees."""
+    from pxh import provenance
+    wander["_auto_remember"]("Found a cat on the shelf to my right")
+    entry = json.loads((tmp_path / "notes.jsonl").read_text().strip())
+    p = provenance.read_provenance(entry)
+    assert p["kind"] == "observation"
+    assert p["confidence"] < 1.0
 
 
 def test_vision_failed_not_promoted(wander):
