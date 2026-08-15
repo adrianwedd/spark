@@ -413,6 +413,40 @@ def test_reflection_prompt_excludes_the_health_block(monkeypatch):
     assert "42" in captured["prompt"]      # the rest of awareness still arrives
 
 
+def test_reflection_prompt_excludes_all_location_coordinates(monkeypatch):
+    """awareness carries raw GPS twice — findmyhub tracker coords and
+    ha_presence per-person lat/lon (the house, to 5 m). Neither may reach the
+    reflection prompt: thoughts feed the public feed and Bluesky. The prose
+    "Who's home" section (names + home/away) is the only presence allowed."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    awareness = {
+        "persona": "", "sonar_cm": 42,
+        "ha_presence": {"people": [
+            {"name": "Adrian", "state": "home", "home": True,
+             "lat": -43.13558, "lon": 147.11829, "gps_accuracy_m": 5.0}]},
+        "findmyhub": {"obi-bag": {"lat": -42.88372, "lon": 147.32941,
+                                  "place": "school", "age_min": 3}},
+    }
+    mind.reflection(awareness, dry=False)
+    prompt = captured["prompt"]
+    for leak in ("-43.13", "147.11", "-42.88", "147.32",
+                 "gps_accuracy", "findmyhub", '"lat"', '"lon"'):
+        assert leak not in prompt, f"location leak in reflection prompt: {leak}"
+    assert "42" in prompt  # the rest of awareness still arrives
+
+
+def test_reflection_awareness_json_is_allowlisted(monkeypatch):
+    """New awareness keys must not reach the prompt until deliberately added —
+    a denylist is how the GPS leak happened in the first place."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    mind.reflection({"persona": "", "sonar_cm": 42,
+                     "some_future_key": "NOVEL-KEY-MARKER"}, dry=False)
+    assert "NOVEL-KEY-MARKER" not in captured["prompt"]
+    assert "42" in captured["prompt"]
+
+
 def test_reflection_records_the_serving_backend(monkeypatch, tmp_path):
     """Health carries which tier answered, so paid-tier drift is measurable."""
     captured = {}
