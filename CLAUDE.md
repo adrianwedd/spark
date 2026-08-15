@@ -19,7 +19,7 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 ## Running Tests
 
 ```bash
-python -m pytest                          # full suite (716 tests)
+python -m pytest                          # full suite (~1235 tests)
 python -m pytest tests/test_state.py     # single file
 python -m pytest -k test_name            # single test
 python -m pytest -m "not live"           # skip hardware tests
@@ -79,6 +79,12 @@ bin/run-wake [--wake-word "hey robot"] [--dry-run]
 
 STT priority chain: SenseVoice (primary, ~5s) → faster-whisper (best AU accent) → sherpa-onnx Zipformer → Vosk (wake word grammar only). Models gitignored, must be downloaded separately.
 
+**Capture is `arecord`, never PyAudio** (`src/pxh/mic_stream.py`). PortAudio's ALSA backend sits in a permanent overrun-recovery loop on the C-Media USB mic: opened at 44100 Hz it delivers ~29,900 samples/sec, and since the listener must pass `exception_on_overflow=False`, ~32% of every utterance is silently spliced out. There is no clipping, no zero-run and no envelope anomaly, so **every offline metric on the recorded WAV looks clean** — only listening reveals it. Do not reintroduce PyAudio.
+
+`ArecordStream` mirrors `pyaudio.Stream.read/start_stream/close`, so call sites are unchanged. A reader thread drains the pipe into a bounded deque; this is load-bearing, not decoration — the listener stops reading for seconds at a time (STT, then the LLM call) and a 64 KB pipe holds only ~0.37 s, so without it arecord would block and overrun its own ALSA buffer, rebuilding the original bug. Drops are counted and logged (`dropped_chunks`), never silent.
+
+**Regression test:** `bin/px-mic-check` — chirp-train loopback through SPARK's own speaker. Healthy: 18/18 chirps, ≤3 ms deviation, 0 drops. The broken PyAudio path scored 13/18 with the timeline compressed by seconds. Needs the mic free (`systemctl stop px-wake-listen` first).
+
 **Whisper anti-hallucination**: `temperature=0`, `condition_on_previous_text=False`, `no_speech_threshold=0.6`. Post-filters: non-ASCII dominant, phantom phrases, repetitive text → reject.
 
 **Critical:** `bpe_model` kwarg is **not** supported by the installed sherpa-onnx — do not add it to `load_stt_model()`.
@@ -117,6 +123,18 @@ Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not ref
 
 **GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Long-running owners hold and refresh the tokenized `state/gpio_lease.json` authority while using hardware. `state/exploring.json` describes wander intent/state only.
 
+### Wander (px-wander / pxh.wander)
+
+`bin/px-wander` is a thin bash wrapper (yield_alive + calibration guard) around `src/pxh/wander.py`; the engine is a module, not a script, so it can be imported and tested directly.
+
+**Calibrate before wandering on a new floor:** place all grayscale sensors over that surface and run `bin/px-wander --calibrate-cliff` (`--accumulate` keeps the darkest floor across spots). The launcher self-elevates for GPIO and writes `exploring.json` before yielding px-alive; do not replace it with a direct Python invocation. The ADC power-on latch is rejected — including a *partially* latched read — so calibration fails closed until live sensor values appear.
+
+**The cliff guard is deliberately layered**, because motor noise tripped every early live run: median-of-3 sampling, confirmation by persistence rather than one stationary read, a stationary re-read to confirm an in-motion trip, sonar echo-timeout retries before counting a sensor failure, and board-gap-vs-drop discrimination by *width*, not depth. Do not simplify any one of these away — each was added after a specific live failure.
+
+**GPIO**: every live wander writes `exploring.json` *before* constructing Picarx and runs a 20s `_ExploringRefresher` thread for the whole run — px-alive ignores the file once its mtime is >60s old, so a single start-of-run write only protects the first minute. `wander.py` acquires a `GpioLeaseGuard` and **exports `PX_GPIO_LEASE_ID`**, which is how `tool-describe-scene` and `tool-announce` borrow the lease instead of aborting. Probe-turn arc recovery reverses with the SAME steer angle as the probe (bicycle model — mirrored steer doubles the heading change instead of undoing it).
+
+**Vision timeouts are a strict ordering, not three independent numbers:** `wander.DESCRIBE_SCENE_TIMEOUT` (150s) must outlive `tool-describe-scene`'s whole run — its 45s Claude call plus photo capture plus its **bounded** 60s tool-voice step. `tool-voice` blocks indefinitely when another process holds the audio device, so that bound is what stops wander killing the tool mid-run. The relationship is pinned by `test_describe_scene_timeout_has_margin_over_claude`, which reads the tool's real constant rather than a literal.
+
 ### Cognitive Loop (px-mind)
 
 ```bash
@@ -125,7 +143,7 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer architecture:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session + calendar + Frigate → `state/awareness.json`
-- **Layer 2 — Reflection** (on transition or every 5min idle): all personas use Ollama on M5 as primary (`http://M5:11434` — router DNS name, not `M5.local` mDNS). Four-tier fallback: Ollama M5 → Claude Haiku (SPARK only, via `claude -p` subprocess) → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). Writes to `state/thoughts.jsonl`.
+- **Layer 2 — Reflection** (on transition or every 5min idle): all personas use Ollama on M5 as primary (`http://M5.local:11434` — the UDR7 stopped serving the bare `M5` hostname; verified live 2026-08-15, `getent hosts M5` returns nothing while `M5.local` resolves to 192.168.0.249. A bare `M5` makes tier 1 fail instantly and silently spends money on tier 2). Four-tier fallback: Ollama M5 → Claude Haiku (SPARK only, via `claude -p` subprocess) → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). Writes to `state/thoughts.jsonl`.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. Thoughts with `action=message_obi` are **redacted** in `thoughts-spark.jsonl` (written as `[private message to Obi]`) so the private DM content never reaches the public `/api/v1/public/thoughts` endpoint.
 - **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
@@ -133,6 +151,7 @@ Three-layer architecture:
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
 - Battery emergency shutdown at ≤10% (speaks warning → `sudo shutdown -h now`)
+- **Charging detection (`pxh/battery_trend.py`) cannot use adjacent polls.** The pack gains ~0.004V per 30s poll while readings swing up to 0.17V, so differencing measures noise — that bug read `charging: false` through a whole afternoon on the charger. Most of the swing is px-alive's servo load dragging the rail, and load only pulls *down*, so a rolling max recovers resting voltage before a least-squares slope over the window. Thresholds are bootstrapped from a measured trace (0.6% false-charging, 85% detection), deliberately skewed because a false `charging` **suppresses the emergency shutdown**. Detection costs ~10 min, so the plug-in chime lags. Re-tune against a fresh measured trace, never against intuition.
 - Single-instance PID guard via `/proc/{pid}` liveness check
 - Arrival detection uses module-level `_last_known_findmyhub` cache (not awareness snapshot) — survives M5.local→Pi push outages. Do not replace with snapshot diff.
 - `state/thought-images/` cleaned hourly (images >30 days deleted)
@@ -207,6 +226,8 @@ Cron on M5.local (every 5min): queries three Chipolo trackers → SSH-pushes `st
 
 **Privacy rule:** Location data excluded from reflection context — never appears in SPARK's thoughts or social posts. Only available in direct conversation (`where's dad?`).
 
+**Enforced by an allowlist, not a denylist.** `mind._REFLECTION_AWARENESS_KEYS` names the keys permitted into the reflection prompt's JSON dump; everything else is dropped. The previous denylist (`if k != "health"`) leaked raw GPS **twice** — findmyhub tracker coords and `ha_presence` per-person lat/lon, the house to 5 m — into every reflection, and thoughts feed `/api/v1/public/thoughts`, the site feed and Bluesky. Deliberately absent: `findmyhub`, `ha_presence` (presence reaches the prompt only via the coordinate-free "Who's home" prose) and `health`. **A new awareness key stays out of the prompt until someone adds it here** — that default is the whole point. Pinned by `test_reflection_prompt_excludes_all_location_coordinates` and `test_reflection_awareness_json_is_allowlisted`.
+
 **Arrival detection:** Uses module-level `_last_known_findmyhub` cache (not awareness snapshot diff) — survives transient push outages.
 
 ### MCP Server
@@ -220,12 +241,12 @@ SPARK speaks through the Nest Mini/Hub Max via a two-hop chain: `bin/tool-announ
 **Architecture:**
 - M5 relay (`m5/announce-relay/`) runs on port **7862**, fronting afterwords on `127.0.0.1:7860`. Afterwords never listens on LAN.
 - `POST /announce` pre-synthesizes text to a WAV file; `GET /audio/{key}` serves it unauthed so HA can fetch by URL.
-- Always address the relay by IP (`192.168.0.100`, the M5 DHCP reservation — see `ANNOUNCE_RELAY_URL` in `spark_config.py`) — never `M5.local`. Nest speakers fetch the audio URL themselves and can't resolve mDNS.
+- Always address the relay by IP (`192.168.0.249`, M5-wifi's DHCP reservation — see `ANNOUNCE_RELAY_URL` in `spark_config.py`) — never `M5.local`. Nest speakers fetch the audio URL themselves and can't resolve mDNS. (M5's wired leg is pinned `.100` but its adapter is unplugged; the relay moved to `.249` on 2026-08-05. The relay's own `RELAY_PUBLIC_BASE_URL` in `~/announce-relay/.env` on M5 must match, or every audio URL it hands out points at the wrong address.)
 - `data` voice only (afterwords `data` model); single target in v1 (no speaker groups → no echo).
 
 **Night silence:** Enforced inside `bin/tool-announce` using `NIGHT_SILENCE_START_H`/`NIGHT_SILENCE_END_H` from `spark_config` (default 19:00–07:00 Hobart time, via `ZoneInfo`). All trigger paths (voice loop, px-mind `announce` action, `message_obi` private audio) pass through the tool, so the gate is a single chokepoint — a suppressed call returns `{"status":"suppressed","reason":"night_silence"}`. The same bounds also gate the px-mind `announce` action in `mind.py` (`_is_night_silence`). Tests force the window deterministically via the `PX_NIGHT_SILENCE_START_H`/`PX_NIGHT_SILENCE_END_H` env overrides.
 
-**`ANNOUNCE_ENABLED` flag:** Defined in `src/pxh/spark_config.py`, ships `False`. Gates whether the autonomous paths (`_dispatch_announce` in `mind.py` → px-mind `announce` action and `message_obi` audio) fire the tool at all; a user-initiated voice-loop announce is independent of it. Flip to `True` only after the relay is live on M5 and the manual pre-flight gates have been run by hand: G1 (a static WAV actually plays when cast to a Nest, else transcode to MP3) and G2 (which `media_player.*` entity casts + the working `media_content_type`, pinned into `ANNOUNCE_DEFAULT_TARGETS`/`ANNOUNCE_MEDIA_CONTENT_TYPE`). Confirm reachability first: `curl http://192.168.0.100:7862/health` from the Pi.
+**`ANNOUNCE_ENABLED` flag:** Defined in `src/pxh/spark_config.py`, **`True` since 2026-08-01** — pre-flight gates G1/G2 passed: WAV casts natively to both the Office Mini and the Hub Max, `media_content_type` pinned to `"music"`. Gates whether the autonomous paths (`_dispatch_announce` in `mind.py` → px-mind `announce` action and `message_obi` audio) fire the tool at all; a user-initiated voice-loop announce is independent of it. Check relay health first: `curl http://192.168.0.249:7862/health` from the Pi.
 
 **Private audio (`message_obi`):** Uses the relay's `priv/` namespace with a 3-minute TTL (vs. 7-day for public audio). The DM text itself is still redacted from `thoughts-spark.jsonl` as `[private message to Obi]`; only the audio is ephemeral on-relay.
 
