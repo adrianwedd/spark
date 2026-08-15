@@ -113,6 +113,8 @@ Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every
 
 Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not refactor to create/destroy per-action (`reset_mcu` leaks GPIO5 and `close()` doesn't release it).
 
+**Readiness vs. liveness**: the unit is `Type=notify`. `WatchdogSec=15` only arms after the daemon sends `READY=1`, which it does from `notify_ready()` at the first state where it is actually working — holding the Picarx handle, or deliberately not holding it (on charger, in I2C backoff). Hardware acquisition therefore runs under `TimeoutStartSec=60`, because `Picarx.__init__` can block past 15s contending for I2C with a tool that just took GPIO (normal acquisition is ~6s). Pre-`READY` heartbeats also send `EXTEND_TIMEOUT_USEC`, which covers an unbounded park behind a foreign lease. **Do not add heartbeats inside initialisation instead** — that would keep the watchdog fed while wedged, blinding it to the thing it exists to catch.
+
 **GPIO exclusivity**: One process holds the Picarx handle. Tools call `yield_alive` (defined in `bin/px-env`) to send SIGUSR1 to px-alive; systemd restarts it after 10s. Long-running owners hold and refresh the tokenized `state/gpio_lease.json` authority while using hardware. `state/exploring.json` describes wander intent/state only.
 
 ### Cognitive Loop (px-mind)

@@ -4,7 +4,14 @@ After=network.target px-mind.service px-api-server.service
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# Type=notify, not simple: startup and steady state need different deadlines.
+# The daemon sends READY=1 only once it is operational (holding the Picarx
+# handle, or deliberately not holding it while charging / in I2C backoff), so
+# hardware acquisition is governed by TimeoutStartSec below while WatchdogSec
+# stays strict for the loop. A start immediately after a yield_alive contends
+# for I2C with the tool that just took GPIO and has been observed blocking past
+# 15s inside Picarx.__init__ — a healthy daemon killed before it ever ran.
+Type=notify
 User=root
 WorkingDirectory=/home/pi/picar-x-hacking
 Environment=HOME=/home/pi
@@ -16,6 +23,12 @@ NotifyAccess=main
 # The heartbeat that feeds it now lives on tmpfs (RuntimeDirectory below), so it
 # is no longer gated behind SD-card fsync latency that tailed out to 21.5s.
 WatchdogSec=15
+# Bounds the pre-READY phase. Normal acquisition is ~6s; contention after a
+# yield has been seen past 15s. Finite on purpose — a start that never reaches
+# READY should fail, not hang. Each pre-READY heartbeat sends
+# EXTEND_TIMEOUT_USEC, which is what covers an unbounded park behind a foreign
+# GPIO lease without loosening this baseline.
+TimeoutStartSec=60
 # Creates /run/spark (tmpfs, 0755 root) before ExecStart and removes it on stop.
 RuntimeDirectory=spark
 KillSignal=SIGTERM

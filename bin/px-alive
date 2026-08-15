@@ -160,7 +160,7 @@ def log(msg: str) -> None:
         pass
 
 
-def _sd_notify_watchdog(message: str) -> bool:
+def _sd_notify(message: str) -> bool:
     """Send a systemd notification without requiring python-systemd."""
     address = os.environ.get("NOTIFY_SOCKET", "")
     if not address:
@@ -173,8 +173,44 @@ def _sd_notify_watchdog(message: str) -> bool:
             notify_socket.sendall(message.encode("utf-8"))
         return True
     except OSError as exc:
-        log(f"systemd watchdog notify failed: {exc}")
+        log(f"systemd notify failed: {exc}")
         return False
+
+
+# --- systemd readiness ------------------------------------------------------
+#
+# Under Type=notify the WatchdogSec clock only starts once READY=1 arrives, so
+# everything before that is governed by TimeoutStartSec instead. That split is
+# the point: startup and steady state have genuinely different deadlines.
+#
+# A normal start acquires the Picarx handle in ~6s, but a start immediately
+# after a yield_alive contends for I2C with the tool that just took GPIO and
+# can block past 15s inside Picarx.__init__ — observed live, SIGABRTed mid-init
+# having never reached the loop. Killing a daemon that is patiently waiting for
+# hardware buys nothing: the watchdog exists to catch a *wedged loop*, and the
+# loop has not started yet. Faking heartbeats through initialisation would
+# "fix" it only by blinding the watchdog to the thing it is there to detect.
+_ready = False
+
+# How far each pre-READY heartbeat pushes out TimeoutStartSec. Must exceed the
+# heartbeat spacing (HEARTBEAT_EVERY_S / LEASE_RECHECK_S) so the extensions
+# overlap, and covers an unbounded park behind a foreign GPIO lease.
+START_EXTEND_S = 30.0
+
+
+def notify_ready(status: str) -> None:
+    """Declare the daemon operational. Idempotent — the first call wins.
+
+    Called only from states where px-alive is actually doing its job: holding
+    the Picarx handle, or deliberately not holding it (on charger, in I2C
+    backoff). From here on the 15s watchdog governs, strictly.
+    """
+    global _ready
+    if _ready:
+        return
+    _ready = True
+    _sd_notify(f"READY=1\nSTATUS={status}")
+    log(f"systemd: ready ({status})")
 
 
 _heartbeat_err_logged = False
@@ -201,7 +237,15 @@ def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
             os.fsync(heartbeat_file.fileno())
         os.replace(tmp_path, str(ALIVE_HEARTBEAT_FILE))
         _heartbeat_err_logged = False
-        _sd_notify_watchdog("WATCHDOG=1")
+        if _ready:
+            _sd_notify("WATCHDOG=1")
+        else:
+            # Pre-READY the watchdog is not yet armed; what can kill us is
+            # TimeoutStartSec. Push it out on every beat so a slow acquisition
+            # (or a long lease park) survives, while still proving liveness.
+            _sd_notify(
+                "WATCHDOG=1\nEXTEND_TIMEOUT_USEC=%d" % int(START_EXTEND_S * 1_000_000)
+            )
         return True
     except OSError as exc:
         if not _heartbeat_err_logged:
@@ -482,6 +526,10 @@ def idle_loop(args) -> None:
             px = make_px(force_reset=_force_next_reset)
             log(f"acquired Picarx handle (reset={'hard' if _force_next_reset else 'skipped'})")
             _force_next_reset = False
+            # The acquisition that just returned is the one that can overrun
+            # WatchdogSec under I2C contention. Now that it has, the loop is
+            # operational and the strict watchdog is the right instrument.
+            notify_ready("holding Picarx handle")
         return px
 
     def drop_px(force_reset_on_reacquire: bool = False):
@@ -536,6 +584,10 @@ def idle_loop(args) -> None:
 
             # Skip all hardware if in I2C backoff period
             if now < i2c_ok_after:
+                # Backoff is a working state, not a failed start — on a bus that
+                # never comes back the daemon would otherwise sit in `activating`
+                # forever, waiting for an acquisition it is deliberately skipping.
+                notify_ready("I2C backoff")
                 write_alive_heartbeat("i2c_backoff")
                 time.sleep(0.5)
                 continue
@@ -548,6 +600,9 @@ def idle_loop(args) -> None:
 
                 # --- Charging check: freeze all servo motion while on charger ---
                 if _is_charging():
+                    # A robot parked on the charger at boot never opens Picarx,
+                    # so readiness cannot wait on the handle here either.
+                    notify_ready("on charger — servo motion frozen")
                     write_alive_heartbeat("charging")
                     time.sleep(2)
                     continue
@@ -788,6 +843,11 @@ def main(argv) -> int:
         lease = _foreign_lease()
         if lease is not None:
             log("GPIO lease active (%s PID %d) — parking in lease_wait" % (
+                lease["owner_kind"], lease["owner_pid"]))
+            # Parked is pre-READY: `systemctl status` would otherwise show a
+            # bare `activating` with no reason. The park is bounded by lease
+            # expiry, and each heartbeat below extends TimeoutStartSec.
+            _sd_notify("STATUS=parked: GPIO lease held by %s PID %d" % (
                 lease["owner_kind"], lease["owner_pid"]))
         parked = lease is not None
         while lease is not None:

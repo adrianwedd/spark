@@ -101,6 +101,42 @@ def test_systemd_service_enables_functional_watchdog():
     assert "NotifyAccess=main" in service
 
 
+def test_systemd_service_defers_watchdog_until_ready():
+    """Startup and steady state need different deadlines.
+
+    With Type=simple the 15s watchdog armed at exec, so a Picarx acquisition
+    that contended for I2C with the tool that had just taken GPIO was killed
+    mid-init (observed live: started 11:13:38, SIGABRTed at 15s, handle never
+    acquired, against a ~6s normal start). Type=notify moves that window under
+    TimeoutStartSec and leaves WatchdogSec strict for the loop that follows.
+    """
+    service = (PROJECT_ROOT / "systemd" / "px-alive.service").read_text()
+
+    assert "Type=notify" in service
+    assert "Type=simple" not in service
+    assert "TimeoutStartSec=" in service
+    assert "WatchdogSec=15" in service
+
+
+def test_alive_signals_ready_only_after_acquiring_hardware():
+    """READY=1 must not be sent from a path that hasn't reached working state.
+
+    Sending it early would re-arm the 15s watchdog over the acquisition this
+    change exists to protect.
+    """
+    body = (PROJECT_ROOT / "bin" / "px-alive").read_text()
+    ready_calls = [
+        line.strip() for line in body.splitlines() if "notify_ready(" in line
+        and not line.strip().startswith("def ")
+    ]
+
+    assert ready_calls, "no readiness notification found"
+    assert all(
+        any(state in call for state in ("Picarx handle", "charger", "I2C backoff"))
+        for call in ready_calls
+    ), ready_calls
+
+
 def test_systemd_service_provides_tmpfs_runtime_dir():
     """/run/spark must exist before the daemon starts, or it falls back to SD.
 
