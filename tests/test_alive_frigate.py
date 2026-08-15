@@ -105,13 +105,49 @@ def test_alive_heartbeat_records_loop_mode_atomically(tmp_path, monkeypatch):
     heartbeat = tmp_path / "alive_heartbeat.json"
     monkeypatch.setitem(_ALIVE, "ALIVE_HEARTBEAT_FILE", heartbeat)
     notifications = []
-    monkeypatch.setitem(_ALIVE, "_sd_notify_watchdog", notifications.append)
+    monkeypatch.setitem(_ALIVE, "_sd_notify", notifications.append)
+    monkeypatch.setitem(_ALIVE, "_ready", True)
 
     assert _ALIVE["write_alive_heartbeat"]("charging", now=123.5) is True
 
     assert json.loads(heartbeat.read_text()) == {"ts": 123.5, "mode": "charging"}
     assert notifications == ["WATCHDOG=1"]
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_pre_ready_heartbeat_extends_start_timeout(tmp_path, monkeypatch):
+    """Before READY=1 the killer is TimeoutStartSec, not the watchdog.
+
+    Picarx acquisition can legitimately outrun WatchdogSec when it contends for
+    I2C with a tool that just took GPIO, so every beat sent while starting has
+    to push the start deadline out as well as prove liveness.
+    """
+    monkeypatch.setitem(_ALIVE, "ALIVE_HEARTBEAT_FILE", tmp_path / "alive_heartbeat.json")
+    notifications = []
+    monkeypatch.setitem(_ALIVE, "_sd_notify", notifications.append)
+    monkeypatch.setitem(_ALIVE, "_ready", False)
+
+    assert _ALIVE["write_alive_heartbeat"]("starting", now=1.0) is True
+
+    assert len(notifications) == 1
+    assert "WATCHDOG=1" in notifications[0]
+    assert "EXTEND_TIMEOUT_USEC=%d" % int(_ALIVE["START_EXTEND_S"] * 1_000_000) \
+        in notifications[0]
+
+
+def test_notify_ready_is_idempotent(tmp_path, monkeypatch):
+    """READY=1 must be sent once: repeat notifies would reset the start timeout."""
+    monkeypatch.setitem(_ALIVE, "LOG_FILE", tmp_path / "px-alive.log")
+    notifications = []
+    monkeypatch.setitem(_ALIVE, "_sd_notify", notifications.append)
+    monkeypatch.setitem(_ALIVE, "_ready", False)
+
+    _ALIVE["notify_ready"]("holding Picarx handle")
+    _ALIVE["notify_ready"]("on charger — servo motion frozen")
+
+    assert len(notifications) == 1
+    assert notifications[0].startswith("READY=1\n")
+    assert "holding Picarx handle" in notifications[0]
 
 
 def test_charging_loop_advances_heartbeat_without_reading_sonar(monkeypatch):
@@ -166,7 +202,7 @@ def test_failed_heartbeat_write_does_not_notify_watchdog(tmp_path, monkeypatch):
     notifications = []
     monkeypatch.setitem(_ALIVE, "LOG_FILE", tmp_path / "px-alive.log")
     monkeypatch.setitem(_ALIVE, "_heartbeat_err_logged", False)
-    monkeypatch.setitem(_ALIVE, "_sd_notify_watchdog", notifications.append)
+    monkeypatch.setitem(_ALIVE, "_sd_notify", notifications.append)
 
     def fail_mkstemp(*_args, **_kwargs):
         raise OSError("disk unavailable")
