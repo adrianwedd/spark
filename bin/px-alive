@@ -5,6 +5,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+# Ignore SIGUSR1 across the exec, until Python arms its own handler.
+#
+# Belt-and-braces, not a fix for an observed failure. 2e875e5c already closed
+# the failure we actually saw (status=10/USR1 during the lease park: 17 kills
+# in the 7 days before it deployed at 14:20 on 2026-08-16, zero in the 46
+# restarts after). What it cannot cover is everything *before* main() runs: the
+# program arrives on stdin as a heredoc, so Python reads ~1000 lines off a pipe,
+# compiles them and runs argparse before reaching signal.signal(). A yield
+# landing in there would still hit Python's default SIGUSR1 disposition and
+# terminate the daemon. No instance of that has been observed — the window is
+# just narrow, not closed.
+#
+# SIG_IGN survives exec (handlers do not — they reset to default), so Python
+# inherits it and holds it until signal.signal() replaces it. A yield lost in
+# this window is correctly lost: pre-main px-alive holds no Picarx handle, so
+# there is nothing to yield. Must be set before the exec — this shell is gone
+# after it.
+trap '' USR1
+
 # Use system python3 explicitly — the venv has include-system-site-packages=false
 # so the venv python3 cannot see robot_hat/picarx which live in system site-packages.
 exec /usr/bin/python3 - "$@" <<'PY'
