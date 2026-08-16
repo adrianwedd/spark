@@ -49,6 +49,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -94,6 +95,51 @@ except ImportError:                                   # pxh not on PYTHONPATH
 # The loop ticks twice a second; coalesce successes so health reporting doesn't
 # fsync the SD card 172,800 times a day.
 HEALTH_INTERVAL_S = 60
+
+# Throttle state lives here rather than relying on health.record_success's own
+# min_interval_s, because the throttle has to happen *before* a thread is
+# spawned — otherwise the 2 Hz loop would start 172,800 threads a day just to
+# have almost all of them return immediately.
+_last_health_report: float | None = None
+
+
+def _report_health_success(now: float) -> None:
+    """Report loop health without ever blocking the loop.
+
+    health.record_success() already promises never to raise, on the grounds
+    that reporting must not take down the daemon it reports on. Blocking
+    breaks that promise just as effectively: the write is an fsync into
+    state/health/ on the SD card, and a /proc sampler caught px-alive parked
+    in jbd2_log_wait_commit on state/health/tmp<rand>.tmp across 17
+    consecutive samples — seconds inside one fsync, against WatchdogSec=15.
+
+    It is invisible in the log because it bites hardest on the night path
+    (OBI_DAY_END=20), where no scan or gaze drift runs and this is the only
+    SD write left on the loop; the daemon simply goes quiet and is SIGABRTed.
+
+    A daemon thread is the right shape here: the record is advisory, and
+    losing an in-flight one at exit costs nothing (the next tick rewrites it),
+    whereas making the watchdog-fed thread wait on the SD card costs the
+    process. record_failure stays synchronous and is deliberately left alone —
+    failures are rare, carry the streak that separates a glitch from a dead
+    sensor, and a daemon that is genuinely failing to talk to its hardware
+    should not also be racing its own exit to record that.
+    """
+    global _last_health_report
+    if _last_health_report is not None and (now - _last_health_report) < HEALTH_INTERVAL_S:
+        return
+    _last_health_report = now
+
+    def _write() -> None:
+        try:
+            _health.record_success("px-alive")
+        except Exception:  # pragma: no cover — reporting is never load-bearing
+            pass
+
+    try:
+        threading.Thread(target=_write, name="px-alive-health", daemon=True).start()
+    except RuntimeError:  # out of threads — reporting is not worth dying for
+        pass
 
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
@@ -938,7 +984,7 @@ def idle_loop(args) -> None:
                 next_scan = i2c_ok_after + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
                 next_prox = i2c_ok_after + PROX_CHECK_S
             else:
-                _health.record_success("px-alive", min_interval_s=HEALTH_INTERVAL_S)
+                _report_health_success(now)
 
             time.sleep(0.5)
     finally:

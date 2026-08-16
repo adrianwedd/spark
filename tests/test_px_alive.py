@@ -333,6 +333,59 @@ def test_sonar_live_readers_resolve_the_path_px_alive_writes(
     assert json.loads(resolved.read_text())["distance_cm"] == 42.0
 
 
+def test_health_reporting_never_blocks_the_loop(isolated_project, tmp_path):
+    """Health reporting must not be able to kill the daemon it reports on.
+
+    health.record_success() already promises "never raises" for this reason,
+    but the loop can be killed by a report that *blocks* just as easily as by
+    one that throws. It fsyncs into state/health/ on the SD card, and a /proc
+    sampler caught px-alive in uninterruptible sleep on
+    state/health/tmp<rand>.tmp in 18 samples — 17 of them consecutive on a
+    single temp file, parked in jbd2_log_wait_commit — against WatchdogSec=15.
+
+    That stall is invisible in the log because it happens on the night path
+    (OBI_DAY_END=20), where no scan or gaze drift runs and the health write is
+    the only SD write left on the loop.
+    """
+    import threading as _threading
+
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+
+    entered = _threading.Event()
+    release = _threading.Event()
+
+    class _BlockingHealth:
+        @staticmethod
+        def record_success(*_a, **_k):
+            entered.set()
+            release.wait(10)
+
+        @staticmethod
+        def record_failure(*_a, **_k):
+            pass
+
+    # Replace in the module namespace, not on the real pxh.health module, so
+    # this cannot leak into other tests in the session.
+    alive["_health"] = _BlockingHealth
+
+    try:
+        start = time.monotonic()
+        alive["_report_health_success"](start)
+        elapsed = time.monotonic() - start
+
+        assert entered.wait(5), "health success was never dispatched at all"
+        assert elapsed < 0.5, (
+            f"loop blocked {elapsed:.2f}s on a health write; it must be "
+            "dispatched off the watchdog-fed thread"
+        )
+    finally:
+        release.set()
+
+
 def test_watchdog_not_notified_when_heartbeat_write_fails(isolated_project, tmp_path):
     """Ordering invariant: systemd must never see healthy on a stale record.
 
