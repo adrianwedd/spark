@@ -229,15 +229,128 @@ def _on_yield(_sig, _frame) -> None:
     _yield_requested = True
 
 
+# --- watchdog margin telemetry ----------------------------------------------
+#
+# The loop stalls constantly and invisibly. Sampled on the live Pi over 34min:
+# 41 in-process stalls (same PID, so not restarts), 5.07s min / 7.06s median /
+# 14.93s max against WatchdogSec=15 — a 70ms margin, as the daemon's ordinary
+# state rather than an exceptional event. Nothing in the journal distinguished
+# that from a restart, which is how two confident and wrong root-cause theories
+# got as far as they did.
+#
+# These observations are owned here and ride the existing heartbeat record at
+# the existing cadence: no new writer, no new file, no tighter loop. health.py
+# only interprets them.
+#
+# Everything is in-process and resets with the process, so these numbers can
+# never mix a stall together with a restart gap — the distinction the sampler
+# has to reconstruct from PIDs is structural here.
+_hb_last_ts: float | None = None
+_hb_last_mode = ""
+_hb_gap_last_ms = 0.0
+_hb_gap_max_ms = 0.0
+_hb_gap_max_mode = ""
+_hb_window_started_at: float | None = None
+# A single extremum is a known-lossy summary of the measured spread, which is
+# continuous and heavy-tailed rather than clustered. Coarse buckets cost one
+# small dict and keep the shape.
+_hb_gap_buckets: dict[str, int] = {}
+_loop_last_ms = 0.0
+_loop_max_ms = 0.0
+
+# systemd exports this for Type=notify units with WatchdogSec set, so the
+# margin is computed against the deadline actually in force rather than a
+# constant duplicated from the unit file.
+try:
+    WATCHDOG_LIMIT_MS = int(os.environ.get("WATCHDOG_USEC", "0")) / 1000.0
+except ValueError:
+    WATCHDOG_LIMIT_MS = 0.0
+
+
+def _gap_bucket(gap_ms: float) -> str:
+    """2s buckets, saturating at 16s+ (past the watchdog, the exact value moot)."""
+    seconds = int(gap_ms // 1000)
+    if seconds >= 16:
+        return "16s+"
+    low = (seconds // 2) * 2
+    return f"{low}-{low + 2}s"
+
+
+def note_loop_duration(duration_s: float) -> None:
+    """Record one top-of-loop-to-top-of-loop interval. Never raises."""
+    global _loop_last_ms, _loop_max_ms
+    _loop_last_ms = duration_s * 1000.0
+    _loop_max_ms = max(_loop_max_ms, _loop_last_ms)
+
+
+def _observe_beat(ts: float, mode: str) -> None:
+    """Fold this beat into the window's timing observations."""
+    global _hb_last_ts, _hb_gap_last_ms, _hb_gap_max_ms, _hb_gap_max_mode
+    global _hb_window_started_at
+    if _hb_window_started_at is None:
+        _hb_window_started_at = ts
+    if _hb_last_ts is not None and ts > _hb_last_ts:
+        _hb_gap_last_ms = (ts - _hb_last_ts) * 1000.0
+        bucket = _gap_bucket(_hb_gap_last_ms)
+        _hb_gap_buckets[bucket] = _hb_gap_buckets.get(bucket, 0) + 1
+        if _hb_gap_last_ms > _hb_gap_max_ms:
+            _hb_gap_max_ms = _hb_gap_last_ms
+            # The phase that was live when the loop went quiet is the mode of
+            # the *earlier* beat: the stall follows it, it does not precede it.
+            _hb_gap_max_mode = _hb_last_mode
+    _hb_last_ts = ts
+
+
+def reset_watchdog_window(now: float | None = None) -> None:
+    """Start a fresh observation window.
+
+    Extrema are windowed, never lifetime: a permanent max=14.93s stops being a
+    signal the moment it stops moving.
+    """
+    global _hb_gap_max_ms, _hb_gap_max_mode, _hb_window_started_at, _loop_max_ms
+    global _hb_gap_buckets, _hb_last_ts, _hb_gap_last_ms
+    _hb_gap_max_ms = 0.0
+    _hb_gap_max_mode = ""
+    _loop_max_ms = 0.0
+    _hb_gap_buckets = {}
+    _hb_gap_last_ms = 0.0
+    # Also drop the last-beat mark: leaving it set makes the first beat of the
+    # new window measure a gap spanning the reset itself, which is not a stall.
+    _hb_last_ts = None
+    _hb_window_started_at = time.time() if now is None else now
+
+
 def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
     """Atomically publish loop progress, then notify systemd's watchdog.
 
     The notification deliberately follows the durable write: systemd must not
     consider the loop healthy when its authoritative progress record is stale.
     """
-    global _heartbeat_err_logged
+    global _heartbeat_err_logged, _hb_last_mode
     ALIVE_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"ts": time.time() if now is None else now, "mode": mode})
+    ts = time.time() if now is None else now
+    _observe_beat(ts, mode)
+    record = {"ts": ts, "mode": mode}
+    # Reporting must never be able to kill the daemon it reports on, so the
+    # observations are attached defensively and the beat goes out regardless.
+    try:
+        record.update({
+            "loop_duration_last_ms": round(_loop_last_ms, 1),
+            "loop_duration_max_ms": round(_loop_max_ms, 1),
+            "heartbeat_gap_last_ms": round(_hb_gap_last_ms, 1),
+            "heartbeat_gap_max_ms": round(_hb_gap_max_ms, 1),
+            "heartbeat_gap_max_mode": _hb_gap_max_mode,
+            "heartbeat_gap_buckets": dict(_hb_gap_buckets),
+            "window_started_at": _hb_window_started_at,
+        })
+        if WATCHDOG_LIMIT_MS > 0:
+            record["watchdog_margin_min_ms"] = round(
+                WATCHDOG_LIMIT_MS - _hb_gap_max_ms, 1
+            )
+    except Exception:  # pragma: no cover — telemetry is never load-bearing
+        pass
+    _hb_last_mode = mode
+    payload = json.dumps(record)
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(
@@ -430,7 +543,7 @@ def do_ease(from_pan: int, from_tilt: int, to_pan: int, to_tilt: int, duration: 
     px = None
     try:
         px = make_px()
-        ease(px, from_pan, from_tilt, to_pan, to_tilt, duration)
+        ease(px, from_pan, from_tilt, to_pan, to_tilt, duration, mode="ease_oneshot")
     finally:
         if px is not None:
             release_px(px)
@@ -575,6 +688,11 @@ def idle_loop(args) -> None:
     except Exception as _se:
         log(f"startup sonar_live.json write failed: {_se}")
 
+    # A fresh window per idle_loop entry: the observations describe this run of
+    # the loop, and a restart must not inherit the previous run's extrema.
+    reset_watchdog_window()
+    _loop_prev_tick = None
+
     try:
         while True:
             # Check yield flag — clean exit between iterations (not mid-I2C)
@@ -585,6 +703,13 @@ def idle_loop(args) -> None:
                 sys.exit(0)
 
             now = time.monotonic()
+            # Iteration-to-iteration wall time. Distinct from the heartbeat gap:
+            # a long iteration that beats from inside ease() is healthy, whereas
+            # a long gap is not — so the two must be observed separately or a
+            # legitimate 30s scan sweep looks identical to a wedged I2C write.
+            if _loop_prev_tick is not None:
+                note_loop_duration(now - _loop_prev_tick)
+            _loop_prev_tick = now
             is_night = not (OBI_DAY_START <= dt.datetime.now().hour < OBI_DAY_END)
 
             # Skip all hardware if in I2C backoff period
@@ -664,7 +789,8 @@ def idle_loop(args) -> None:
                                 _fp = None
                             target_pan = _pan_from_frigate(_fp)
                             log(f"proximity react: {dist:.1f}cm — facing pan={target_pan}")
-                            ease(get_px(), cur_pan, cur_tilt, target_pan, 5, 0.5)
+                            ease(get_px(), cur_pan, cur_tilt, target_pan, 5, 0.5,
+                                 mode="ease_proximity")
                             cur_pan, cur_tilt = target_pan, 5
                             prox_near_since = None
                             prox_last_react = now
@@ -751,7 +877,8 @@ def idle_loop(args) -> None:
                         target_tilt = random.randint(tilt_lo, tilt_hi)
                         duration    = random.uniform(3.5, 7.0)
                         log(f"gaze drift: ({cur_pan},{cur_tilt}) → ({target_pan},{target_tilt}) over {duration:.1f}s")
-                        ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt, duration)
+                        ease(get_px(), cur_pan, cur_tilt, target_pan, target_tilt,
+                             duration, mode="ease_gaze")
                         cur_pan, cur_tilt = target_pan, target_tilt
                         next_gaze = now + random.uniform(gaze_min, gaze_max)
 

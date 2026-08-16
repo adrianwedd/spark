@@ -1,6 +1,7 @@
 """Tests for pxh.health — per-component daemon health reporting."""
 import datetime as dt
 import json
+from pathlib import Path
 
 import pytest
 
@@ -259,3 +260,62 @@ def test_summary_reports_silence_in_minutes():
 
 def test_summary_reports_never_reported():
     assert "never reported" in health.summarize()
+
+
+# --- watchdog margin interpretation (#194) ----------------------------------
+#
+# health.py interprets px-alive's self-reported timing; it never writes it.
+# The heartbeat record stays the single source.
+
+
+def _write_heartbeat(state_dir, record):
+    path = Path(state_dir) / "alive_heartbeat.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def test_watchdog_margin_absent_when_daemon_predates_the_fields(tmp_path):
+    """An old px-alive must read as "no opinion", not as a clean bill."""
+    _write_heartbeat(tmp_path, {"ts": 1.0, "mode": "running"})
+
+    assert health.read_watchdog_margin(tmp_path) == {}
+
+
+def test_watchdog_margin_absent_when_heartbeat_unreadable(tmp_path):
+    assert health.read_watchdog_margin(tmp_path) == {}
+
+
+def test_watchdog_near_miss_is_surfaced_before_a_kill(tmp_path):
+    """14.93s against a 15s deadline is the state nothing else can see."""
+    _write_heartbeat(tmp_path, {
+        "ts": 1.0, "mode": "running",
+        "heartbeat_gap_max_ms": 14930.0,
+        "heartbeat_gap_max_mode": "ease_gaze",
+        "watchdog_margin_min_ms": 70.0,
+    })
+
+    out = health.read_watchdog_margin(tmp_path)
+
+    assert out["watchdog_status"] == "near_miss"
+    assert out["heartbeat_gap_max_mode"] == "ease_gaze"
+
+
+def test_watchdog_status_ok_when_the_margin_is_comfortable(tmp_path):
+    _write_heartbeat(tmp_path, {
+        "ts": 1.0, "mode": "running",
+        "heartbeat_gap_max_ms": 2000.0,
+        "watchdog_margin_min_ms": 13000.0,
+    })
+
+    assert health.read_watchdog_margin(tmp_path)["watchdog_status"] == "ok"
+
+
+def test_watchdog_status_exceeded_when_the_margin_is_gone(tmp_path):
+    _write_heartbeat(tmp_path, {
+        "ts": 1.0, "mode": "running",
+        "heartbeat_gap_max_ms": 15400.0,
+        "watchdog_margin_min_ms": -400.0,
+    })
+
+    assert health.read_watchdog_margin(tmp_path)["watchdog_status"] == "exceeded"
