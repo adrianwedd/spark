@@ -86,3 +86,19 @@ state/state
 # Afterwords TTS voice override
 .afterwords
 .superpowers/
+
+# Runtime state that leaked into `git status` on the live robot. Extracted from
+# feat/intelligent-wander f2f3d56e during the master cutover — without these,
+# five files that exist on every running robot show up as untracked forever.
+state/blog_failures.json
+state/wander_calibration.json
+state/observations.jsonl
+state/last_heard.json
+state/announce_meta.json
+state/wake-debug/
+state/notes-*.jsonl.bak-*
+# Rotation backups (.env.bak-YYYYMMDD-rotate), .env.local, and anything else
+# derived from .env — all hold live secrets. The negation must stay last:
+# .env.* matches .env.example, which is tracked and must remain so.
+.env.*
+!.env.example

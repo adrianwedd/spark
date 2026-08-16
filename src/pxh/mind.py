@@ -284,9 +284,12 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 # PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
 
 # Ollama config (same host as tool-chat)
-# "M5" (router DNS via UDR7) not "M5.local" (mDNS) — plain hostname tracks the
-# box across wired/wifi and avoids the mDNS hangs that trip the fallback cascade.
-OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5:11434")
+# "M5.local" (mDNS), not "M5" — the UDR7 stopped serving the bare hostname.
+# Verified on the Pi at cutover: `getent hosts M5` returns nothing while
+# `getent hosts M5.local` resolves to 192.168.0.249 and answers /api/tags with
+# HTTP 200 in 28ms. A bare "M5" makes tier 1 fail instantly, and reflection
+# then falls through to *paid* Claude Haiku without anything looking broken.
+OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
 _MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
 OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
 OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
@@ -2494,6 +2497,19 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
     return result
 
 
+# Awareness keys allowed into the reflection prompt's JSON dump. See the
+# comment at the filter site in reflection() for why this is an allowlist.
+_REFLECTION_AWARENESS_KEYS = frozenset({
+    "ts", "sonar_cm", "frigate", "someone_nearby", "time_period", "hour",
+    "minutes_since_interaction", "minutes_since_speech", "period_duration_min",
+    "battery_pct", "battery_volts", "battery_charging", "listening", "persona",
+    "transitions", "system", "weather", "calendar", "ha_calendar", "next_event",
+    "ha_sleep", "ha_routines", "ha_context", "ambient_sound", "obi_mode",
+    "recent_moods", "mood_momentum", "recent_conversations",
+    "recent_exploration", "reflection_status",
+})
+
+
 def reflection(awareness: dict, dry: bool) -> dict | None:
     """Layer 2: produce a thought via Ollama."""
     global _last_spoken_text
@@ -2511,10 +2527,16 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     recent_moods = [t.get("mood", "?") for t in recent_thoughts]
     recent_actions = [t.get("action", "?") for t in recent_thoughts]
     momentum = awareness.get("mood_momentum", {})
-    # The health block is for the dashboard, not the prompt — it would add a few
-    # hundred tokens of ops telemetry to every reflection, and summarize() says
-    # the same thing in one sentence further down.
-    awareness_ctx = {k: v for k, v in awareness.items() if k != "health"}
+    # Allowlist, not denylist: awareness carries raw GPS twice (findmyhub
+    # tracker coords, ha_presence per-person lat/lon — the house, to 5 m) and
+    # thoughts feed the public feed and Bluesky. A new awareness key stays out
+    # of the prompt until someone decides it belongs. Deliberately absent:
+    #   findmyhub, ha_presence — presence reaches the prompt only via the
+    #     coordinate-free "Who's home" prose section below
+    #   health — dashboard-only ops telemetry; summarize() says the same
+    #     thing in one sentence further down
+    awareness_ctx = {k: v for k, v in awareness.items()
+                     if k in _REFLECTION_AWARENESS_KEYS}
     context_parts = [
         f"Current awareness:\n{json.dumps(awareness_ctx, indent=2)}",
         f"Your recent moods: {recent_moods}",

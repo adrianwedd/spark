@@ -1235,6 +1235,44 @@ class TestPublicBudget:
         assert "sessions" in data
         assert isinstance(data["sessions"], list)
 
+
+class TestPublicThoughtsPrivacy:
+    """A3, second chokepoint. The reflection allowlist stops coordinates
+    reaching the prompt; this stops them reaching the wire even if a thought
+    record ever carries them. Defence in depth is the point — the two failures
+    are independent, and this endpoint feeds the site and the Bluesky poster."""
+
+    def _write_thought(self, extra: dict) -> None:
+        state_dir = Path(os.environ["PX_STATE_DIR"])
+        state_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": "2026-08-15T06:00:00Z", "thought": "The afternoon is quiet.",
+            "mood": "content", "salience": 0.8, "action": "wait",
+        }
+        record.update(extra)
+        (state_dir / "thoughts-spark.jsonl").write_text(
+            json.dumps(record) + "\n", encoding="utf-8")
+
+    def test_public_thoughts_projects_only_the_safe_fields(self, api_client):
+        """The endpoint must project an explicit field list, never echo the
+        record. A pass-through would publish whatever px-mind happened to
+        write — the same class of mistake as the awareness denylist."""
+        self._write_thought({
+            "awareness": {"ha_presence": {"people": [
+                {"name": "Adrian", "lat": -43.13558, "lon": 147.11829}]}},
+            "findmyhub": {"adrian": {"lat": -42.88372, "lon": 147.32941}},
+        })
+        r = api_client.get("/api/v1/public/thoughts")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body) == 1
+        assert set(body[0]) == {"thought", "mood", "ts", "salience", "action"}
+
+        blob = json.dumps(body)
+        for leak in ("-43.13", "147.11", "-42.88", "147.32",
+                     "findmyhub", "ha_presence", '"lat"', '"lon"', "awareness"):
+            assert leak not in blob, f"public thoughts leaked {leak}"
+
     def test_authenticated_budget_requires_auth(self, api_client):
         """GET /api/v1/budget without auth must be rejected."""
         r = api_client.get("/api/v1/budget")

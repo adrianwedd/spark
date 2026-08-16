@@ -2,6 +2,7 @@
 import inspect
 import json
 import subprocess
+import pytest
 from unittest.mock import Mock, patch
 from filelock import Timeout as FileLockTimeout
 from pxh import mind
@@ -411,6 +412,166 @@ def test_reflection_prompt_excludes_the_health_block(monkeypatch):
     mind.reflection(awareness, dry=False)
     assert "UNIQUE-BLOCK-MARKER" not in captured["prompt"]
     assert "42" in captured["prompt"]      # the rest of awareness still arrives
+
+
+def test_reflection_prompt_excludes_all_location_coordinates(monkeypatch):
+    """awareness carries raw GPS twice — findmyhub tracker coords and
+    ha_presence per-person lat/lon (the house, to 5 m). Neither may reach the
+    reflection prompt: thoughts feed the public feed and Bluesky. The prose
+    "Who's home" section (names + home/away) is the only presence allowed."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    awareness = {
+        "persona": "", "sonar_cm": 42,
+        "ha_presence": {"people": [
+            {"name": "Adrian", "state": "home", "home": True,
+             "lat": -43.13558, "lon": 147.11829, "gps_accuracy_m": 5.0}]},
+        "findmyhub": {"obi-bag": {"lat": -42.88372, "lon": 147.32941,
+                                  "place": "school", "age_min": 3}},
+    }
+    mind.reflection(awareness, dry=False)
+    prompt = captured["prompt"]
+    for leak in ("-43.13", "147.11", "-42.88", "147.32",
+                 "gps_accuracy", "findmyhub", '"lat"', '"lon"'):
+        assert leak not in prompt, f"location leak in reflection prompt: {leak}"
+    assert "42" in prompt  # the rest of awareness still arrives
+
+
+def test_reflection_awareness_json_is_allowlisted(monkeypatch):
+    """New awareness keys must not reach the prompt until deliberately added —
+    a denylist is how the GPS leak happened in the first place."""
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    mind.reflection({"persona": "", "sonar_cm": 42,
+                     "some_future_key": "NOVEL-KEY-MARKER"}, dry=False)
+    assert "NOVEL-KEY-MARKER" not in captured["prompt"]
+    assert "42" in captured["prompt"]
+
+
+# --- A3: the allowlist must fail closed, and must still hold against the -----
+# --- awareness snapshot the robot is actually producing right now. -----------
+
+# Top-level awareness keys that carry household location or per-person presence.
+# Naming one here is a claim that it must NEVER reach the reflection prompt,
+# because the prompt determines the thought text and the thought text is what
+# /api/v1/public/thoughts, site/data/feed.json and Bluesky publish.
+SENSITIVE_AWARENESS_KEYS = ("findmyhub", "ha_presence")
+
+# Key-name segments that mark a value as a coordinate. Matching is on `_`-split
+# segments, not substrings, so "translate"/"latency" do not trip it. A new
+# innocent key called e.g. "accuracy" WILL fail this test — that is deliberate:
+# widening this set should be a conscious review, not a silent default.
+_COORD_SEGMENTS = frozenset({
+    "lat", "latitude", "lon", "lng", "longitude", "gps", "coord", "coords",
+    "coordinate", "coordinates", "altitude", "geo", "accuracy",
+})
+
+# The subset that is an actual position. Searching the prompt for a *value*
+# only makes sense for these: an accuracy radius like 21 is not a location, and
+# looking for "21" in a prompt containing "cpu_pct": 21.4 finds a phantom leak.
+_POSITION_SEGMENTS = frozenset({"lat", "latitude", "lon", "lng", "longitude"})
+
+
+def _is_coord_key(key: str) -> bool:
+    return any(seg in _COORD_SEGMENTS for seg in str(key).lower().split("_"))
+
+
+def _is_position_key(key: str) -> bool:
+    return any(seg in _POSITION_SEGMENTS for seg in str(key).lower().split("_"))
+
+
+def _coord_leaves(obj, path=()):
+    """Yield (path, value) for every leaf whose key name marks a coordinate."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if _is_coord_key(k) and not isinstance(v, (dict, list)):
+                yield path + (str(k),), v
+            else:
+                yield from _coord_leaves(v, path + (str(k),))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _coord_leaves(v, path + (f"[{i}]",))
+
+
+def _live_awareness():
+    """The robot's real state/awareness.json, or None when not on the robot."""
+    import os
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    path = Path(os.environ.get("PX_STATE_DIR", str(root / "state"))) / "awareness.json"
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, NotADirectoryError, json.JSONDecodeError, OSError):
+        return None
+
+
+@pytest.mark.parametrize("key", SENSITIVE_AWARENESS_KEYS)
+def test_allowlist_omits_every_known_sensitive_key(key):
+    """Fail closed by construction: the sensitive keys must be absent from the
+    allowlist itself, not merely filtered somewhere downstream. Asserting on the
+    frozenset catches a well-meaning "the prompt lacks context" edit that adds
+    one back, which no prompt-output test would notice until it shipped."""
+    assert key not in mind._REFLECTION_AWARENESS_KEYS
+
+
+def test_no_coordinate_hides_under_an_allowlisted_key():
+    """The allowlist filters TOP-LEVEL keys only, so it is sufficient only while
+    every coordinate lives under a key it excludes. If Home Assistant ever nests
+    a lat/lon inside an allowed key (ha_context, ha_routines, weather...), the
+    filter silently stops protecting anything. This converts that from an
+    invisible leak into a test failure."""
+    awareness = _live_awareness() or _SYNTHETIC_AWARENESS
+    offenders = [
+        "/".join(path) for path, _ in _coord_leaves(awareness)
+        if path and path[0] in mind._REFLECTION_AWARENESS_KEYS
+    ]
+    assert not offenders, (
+        "coordinate-valued fields sit under allowlisted awareness keys and will "
+        f"reach the reflection prompt: {offenders}")
+
+
+def test_live_awareness_snapshot_leaks_no_coordinates_into_the_prompt(monkeypatch):
+    """End-to-end against the snapshot this robot is producing right now, rather
+    than a hand-written dict that can drift from reality. Every coordinate value
+    is read out of the file itself, so the test cannot go stale by hardcoding
+    the wrong numbers — and it strengthens automatically as awareness grows."""
+    awareness = _live_awareness()
+    if awareness is None:
+        pytest.skip("no live state/awareness.json (not running on the robot)")
+    positions = [(p, v) for p, v in _coord_leaves(awareness) if _is_position_key(p[-1])]
+    assert positions, "live awareness carries no lat/lon — test proves nothing"
+
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    mind.reflection(dict(awareness, persona=""), dry=False)
+    prompt = captured["prompt"]
+
+    for path, value in positions:
+        # Match on the significant prefix too: a rounded or reformatted render
+        # of the same fix is still the house. 8 chars covers "-43.1355".
+        for needle in {str(value), str(value)[:8]}:
+            assert needle not in prompt, (
+                f"live coordinate {'/'.join(path)}={value} reached the reflection prompt")
+    # Match the JSON-key form, not the bare word: SPARK talks about its own
+    # feeds, so "the findmyhub silence" can legitimately appear in a logged
+    # conversation. `"findmyhub":` can only come from dumping the block.
+    for key in SENSITIVE_AWARENESS_KEYS:
+        assert f'"{key}":' not in prompt, (
+            f"the {key!r} block was dumped into the reflection prompt")
+
+
+# Shape-faithful stand-in used when state/awareness.json is absent (CI), so the
+# nesting invariant is still exercised off-robot. Coordinates are fabricated.
+_SYNTHETIC_AWARENESS = {
+    "ts": "2026-08-15T06:00:00Z", "sonar_cm": 42, "battery_pct": 74,
+    "ha_context": {"lights_on": 3}, "ha_routines": {"school_run": False},
+    "weather": {"temp_c": 11.2}, "frigate": {"rooms_with_people": ["kitchen"]},
+    "ha_presence": {"people": [
+        {"name": "Adrian", "state": "home", "home": True,
+         "lat": -43.13558, "lon": 147.11829, "gps_accuracy_m": 5.0}]},
+    "findmyhub": {"adrian": {"lat": -42.88372, "lon": 147.32941, "accuracy_m": 12}},
+    "health": {"overall": "ok"},
+}
 
 
 def test_reflection_records_the_serving_backend(monkeypatch, tmp_path):
