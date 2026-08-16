@@ -272,6 +272,120 @@ def test_heartbeat_falls_back_to_state_dir_when_runtime_dir_unusable(
         "unusable runtime dir should fall back to the state dir"
 
 
+def test_sonar_live_is_not_written_to_the_state_dir(isolated_project, tmp_path):
+    """sonar_live.json is runtime state and must not fsync the SD card.
+
+    Caught live with a /proc sampler while px-alive was in uninterruptible
+    sleep: syscall 82 (fsync) on fd 18 -> state/tmp<rand>.tmp, wchan
+    jbd2_log_wait_commit, still blocked 5s later in the next sample. The only
+    5s-cadence mkstemp directly into state/ on the loop path is this write
+    (health goes to state/health/, the heartbeat is already on tmpfs). That
+    stall runs against WatchdogSec=15 and accounted for 66 of 86 watchdog
+    kills in a measured 6h window.
+
+    Same argument as the heartbeat: rewritten every PROX_CHECK_S, meaningless
+    after a power cut, and every reader is age-gated. os.replace gives readers
+    atomicity; fsync only bought durability nobody wanted.
+    """
+    runtime_dir = tmp_path / "runtime"
+    env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(runtime_dir),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": env["PX_LOG_FILE"],
+    })
+
+    assert alive["SONAR_LIVE_FILE"].parent == runtime_dir, (
+        "sonar_live.json still lands on the state dir (SD card): "
+        f"{alive['SONAR_LIVE_FILE']}"
+    )
+
+
+def test_sonar_live_readers_resolve_the_path_px_alive_writes(
+    isolated_project, tmp_path
+):
+    """Writer and readers must not drift apart across the tmpfs move.
+
+    px-alive runs as root and writes; pxh.api, pxh.mind and pxh.mcp_server run
+    as pi and read. There is no test that would catch them disagreeing except
+    this one — the readers all swallow FileNotFoundError and report
+    "unavailable", so a split would look exactly like a stopped daemon.
+    """
+    from pxh.runtime_paths import resolve_runtime_read_path
+
+    runtime_dir = tmp_path / "runtime"
+    state_dir = isolated_project["state_dir"]
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(runtime_dir),
+        "PX_STATE_DIR": str(state_dir),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+    written = alive["SONAR_LIVE_FILE"]
+    written.parent.mkdir(parents=True, exist_ok=True)
+    written.write_text(json.dumps({"ts": 1.0, "distance_cm": 42.0}))
+
+    with mock.patch.dict(
+        os.environ, {"PX_ALIVE_HEARTBEAT_DIR": str(runtime_dir)}, clear=False
+    ):
+        resolved = resolve_runtime_read_path(state_dir, "sonar_live.json")
+
+    assert resolved == written
+    assert json.loads(resolved.read_text())["distance_cm"] == 42.0
+
+
+def test_health_reporting_never_blocks_the_loop(isolated_project, tmp_path):
+    """Health reporting must not be able to kill the daemon it reports on.
+
+    health.record_success() already promises "never raises" for this reason,
+    but the loop can be killed by a report that *blocks* just as easily as by
+    one that throws. It fsyncs into state/health/ on the SD card, and a /proc
+    sampler caught px-alive in uninterruptible sleep on
+    state/health/tmp<rand>.tmp in 18 samples — 17 of them consecutive on a
+    single temp file, parked in jbd2_log_wait_commit — against WatchdogSec=15.
+
+    That stall is invisible in the log because it happens on the night path
+    (OBI_DAY_END=20), where no scan or gaze drift runs and the health write is
+    the only SD write left on the loop.
+    """
+    import threading as _threading
+
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+
+    entered = _threading.Event()
+    release = _threading.Event()
+
+    class _BlockingHealth:
+        @staticmethod
+        def record_success(*_a, **_k):
+            entered.set()
+            release.wait(10)
+
+        @staticmethod
+        def record_failure(*_a, **_k):
+            pass
+
+    # Replace in the module namespace, not on the real pxh.health module, so
+    # this cannot leak into other tests in the session.
+    alive["_health"] = _BlockingHealth
+
+    try:
+        start = time.monotonic()
+        alive["_report_health_success"](start)
+        elapsed = time.monotonic() - start
+
+        assert entered.wait(5), "health success was never dispatched at all"
+        assert elapsed < 0.5, (
+            f"loop blocked {elapsed:.2f}s on a health write; it must be "
+            "dispatched off the watchdog-fed thread"
+        )
+    finally:
+        release.set()
+
+
 def test_watchdog_not_notified_when_heartbeat_write_fails(isolated_project, tmp_path):
     """Ordering invariant: systemd must never see healthy on a stale record.
 
@@ -303,7 +417,19 @@ def test_watchdog_not_notified_when_heartbeat_write_fails(isolated_project, tmp_
 
 
 def test_watchdog_notified_after_successful_heartbeat(isolated_project, tmp_path):
-    """The happy path still pings systemd once the record is durable."""
+    """The happy path still pings systemd once the record is durable.
+
+    This run never reaches READY=1, so the correct datagram is
+    EXTEND_TIMEOUT_USEC alone. Asserting the *absence* of WATCHDOG=1 here is
+    the point: systemd arms WatchdogSec the moment it sees that keyword,
+    regardless of unit state, so a pre-READY beat carrying it starts a 15s
+    clock during an acquisition that cannot feed it. The monkeypatched
+    equivalent lives in test_alive_frigate.py; this one proves it on the wire,
+    through the real script and a real notify socket.
+
+    Post-READY WATCHDOG=1 is covered by
+    test_alive_heartbeat_records_loop_mode_atomically.
+    """
     runtime_dir = tmp_path / "runtime"
     with _notify_socket() as (notify_sock, sock_path):
         env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
@@ -313,8 +439,10 @@ def test_watchdog_notified_after_successful_heartbeat(isolated_project, tmp_path
         assert result.returncode == 0, f"stderr: {result.stderr[:500]}"
 
         received = _drain(notify_sock)
-        assert any(b"WATCHDOG=1" in msg for msg in received), \
-            f"no watchdog notification after successful heartbeat: {received}"
+        assert any(b"EXTEND_TIMEOUT_USEC=" in msg for msg in received), \
+            f"no start-timeout extension after successful heartbeat: {received}"
+        assert not any(b"WATCHDOG=1" in msg for msg in received), \
+            f"pre-READY beat armed the watchdog on the wire: {received}"
         assert (runtime_dir / "alive_heartbeat.json").exists()
 
 

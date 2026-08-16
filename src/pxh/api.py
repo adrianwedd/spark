@@ -32,7 +32,7 @@ from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from .runtime_paths import resolve_heartbeat_read_path
+from .runtime_paths import resolve_heartbeat_read_path, resolve_sonar_live_read_path
 from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
@@ -452,7 +452,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
 
     # Sonar — age gate: null if > 60s
     try:
-        sdata = json.loads((state_dir / "sonar_live.json").read_text())
+        sdata = json.loads(resolve_sonar_live_read_path(state_dir).read_text())
         age = _time.time() - float(sdata["ts"])
         sample["sonar_cm"] = sdata["distance_cm"] if age <= 60 else None
     except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
@@ -691,7 +691,7 @@ async def health():
         checks["alive_loop"] = {"status": "invalid", "mode": "unknown"}
         overall = "degraded"
 
-    sonar_file = state_dir / "sonar_live.json"
+    sonar_file = resolve_sonar_live_read_path(state_dir)
     try:
         sonar = json.loads(sonar_file.read_text(encoding="utf-8"))
         sonar_age_s = max(0.0, _time.time() - float(sonar["ts"]))
@@ -892,7 +892,7 @@ async def public_sonar() -> Dict[str, Any]:
     """Latest sonar reading from sonar_live.json. No auth required."""
     import time as _time
 
-    sonar_path = _public_state_dir() / "sonar_live.json"
+    sonar_path = resolve_sonar_live_read_path(_public_state_dir())
     try:
         data = json.loads(sonar_path.read_text())
         ts_float = float(data["ts"])

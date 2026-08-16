@@ -97,6 +97,9 @@ state/last_heard.json
 state/announce_meta.json
 state/wake-debug/
 state/notes-*.jsonl.bak-*
+# Tokenized GPIO hardware authority — written by whichever process currently
+# owns the Picarx handle. Pure runtime state, never meaningful in a commit.
+state/gpio_lease.json
 # Rotation backups (.env.bak-YYYYMMDD-rotate), .env.local, and anything else
 # derived from .env — all hold live secrets. The negation must stay last:
 # .env.* matches .env.example, which is tracked and must remain so.
