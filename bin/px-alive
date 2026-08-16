@@ -215,6 +215,19 @@ def notify_ready(status: str) -> None:
 
 _heartbeat_err_logged = False
 
+# Yielding GPIO is module-level state, not idle_loop's, because the handler must
+# be armed from the moment main() starts — before the lease park, which idle_loop
+# is never reached from. Left inside idle_loop, SIGUSR1 kept Python's default
+# disposition during the park and *terminated* the daemon: a tool calling
+# yield_alive killed the very process the park was protecting. Parked we hold no
+# Picarx handle, so there is nothing to yield and the correct answer is a no-op.
+_yield_requested = False
+
+
+def _on_yield(_sig, _frame) -> None:
+    global _yield_requested
+    _yield_requested = True
+
 
 def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
     """Atomically publish loop progress, then notify systemd's watchdog.
@@ -539,14 +552,6 @@ def idle_loop(args) -> None:
             px = None
         _force_next_reset = force_reset_on_reacquire
 
-    _yield_requested = False
-
-    def _on_yield(sig, _frame):
-        nonlocal _yield_requested
-        _yield_requested = True
-
-    signal.signal(signal.SIGUSR1, _on_yield)
-
     log(f"idle loop started (persistent Picarx handle, sonar every {PROX_CHECK_S:.0f}s)")
 
     # systemd starts its watchdog when the service launches. Prove that Python
@@ -821,6 +826,9 @@ def main(argv) -> int:
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
+    # Armed here, not in idle_loop: the park below runs first and must survive a
+    # yield rather than be killed by Python's default SIGUSR1 disposition.
+    signal.signal(signal.SIGUSR1, _on_yield)
 
     # Start the watchdog clock immediately: systemd begins counting from the
     # moment the unit starts, not from when the loop gets going.
@@ -851,6 +859,13 @@ def main(argv) -> int:
                 lease["owner_kind"], lease["owner_pid"]))
         parked = lease is not None
         while lease is not None:
+            # A yield arriving while parked is already satisfied — we hold no
+            # handle. Consume it, so it cannot leak into idle_loop and make a
+            # freshly-resumed daemon exit on its first iteration.
+            global _yield_requested
+            if _yield_requested:
+                log("SIGUSR1 while parked — no GPIO held, nothing to yield")
+                _yield_requested = False
             write_alive_heartbeat("lease_wait")
             time.sleep(LEASE_RECHECK_S)
             lease = _foreign_lease()

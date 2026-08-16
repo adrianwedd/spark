@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -398,6 +399,60 @@ def test_foreign_lease_keeps_daemon_alive_in_lease_wait(isolated_project, tmp_pa
         assert proc.poll() is None, "daemon must stay alive while parked"
 
         # Releasing the lease lets it resume a normal loop on its own.
+        assert GpioLeaseStore(state_dir).release(lease.lease_id) is True
+        proc.wait(timeout=30)
+        assert proc.returncode == 0
+        assert "dry gaze" in (isolated_project["log_dir"] / "px-alive.log").read_text()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_sigusr1_while_parked_is_a_noop(isolated_project, tmp_path):
+    """Yielding to a tool must be harmless while parked, not fatal.
+
+    The park exists so a foreign GPIO lease doesn't turn into a respawn loop.
+    But SIGUSR1's handler used to be installed inside idle_loop(), which the
+    park never reaches — so during the park the signal kept Python's default
+    disposition and terminated the process. A tool calling yield_alive against
+    a parked daemon killed the very thing the park was protecting, and we hold
+    no GPIO while parked, so there is nothing to yield in the first place.
+    """
+    runtime_dir = tmp_path / "runtime"
+    env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+    state_dir = isolated_project["state_dir"]
+
+    lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
+    assert lease is not None
+
+    proc = subprocess.Popen(
+        [str(PROJECT_ROOT / "bin" / "px-alive"), "--dry-run"],
+        cwd=PROJECT_ROOT, text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        beat = runtime_dir / "alive_heartbeat.json"
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if beat.exists() and json.loads(beat.read_text()).get("mode") == "lease_wait":
+                break
+            time.sleep(0.2)
+        assert proc.poll() is None, "daemon died before we could park it"
+
+        proc.send_signal(signal.SIGUSR1)
+        time.sleep(2)  # several park re-check passes
+
+        assert proc.poll() is None, (
+            f"SIGUSR1 killed the parked daemon (rc={proc.returncode}) — a yield "
+            f"against a parked px-alive must be a no-op"
+        )
+
+        # And it must still be genuinely parked, not limping on in some other mode.
+        assert json.loads(beat.read_text())["mode"] == "lease_wait"
+
+        # Once the lease clears it resumes normally: the ignored yield must not
+        # leave a latent flag that makes the loop exit the moment it starts.
         assert GpioLeaseStore(state_dir).release(lease.lease_id) is True
         proc.wait(timeout=30)
         assert proc.returncode == 0
