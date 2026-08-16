@@ -97,7 +97,6 @@ HEALTH_INTERVAL_S = 60
 
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
-SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
 BATTERY_FILE    = STATE_DIR / "battery.json"
 FRIGATE_FILE = STATE_DIR / "frigate_presence.json"
 FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
@@ -112,16 +111,24 @@ LEASE_RECHECK_S = 2.0
 # under WatchdogSec=15, and cheap now the write lands on tmpfs.
 HEARTBEAT_EVERY_S = 2.0
 
-# The heartbeat is disposable liveness state and does NOT belong on the SD card
-# — see pxh/runtime_paths.py for the measurements that moved it to tmpfs. The
-# location is shared with pxh.api (the reader) so the two cannot drift apart.
+# The heartbeat and the live sonar reading are disposable runtime state and do
+# NOT belong on the SD card — see pxh/runtime_paths.py for the measurements
+# that moved them to tmpfs. Both locations are shared with the readers
+# (pxh.api, pxh.health, pxh.mind, pxh.mcp_server) so they cannot drift apart.
 try:
-    from pxh.runtime_paths import resolve_heartbeat_write_dir
-    HEARTBEAT_DIR = resolve_heartbeat_write_dir(STATE_DIR)
+    from pxh.runtime_paths import resolve_runtime_write_dir
+    RUNTIME_DIR = resolve_runtime_write_dir(STATE_DIR)
 except ImportError:                                   # pxh not on PYTHONPATH
-    HEARTBEAT_DIR = STATE_DIR
+    RUNTIME_DIR = STATE_DIR
 
-ALIVE_HEARTBEAT_FILE = HEARTBEAT_DIR / "alive_heartbeat.json"
+HEARTBEAT_DIR = RUNTIME_DIR  # retained: referenced by the test suite
+ALIVE_HEARTBEAT_FILE = RUNTIME_DIR / "alive_heartbeat.json"
+# Every PROX_CHECK_S this is rewritten with a fresh distance. Its fsync into
+# state/ was caught holding px-alive in uninterruptible sleep for seconds at a
+# time against WatchdogSec=15 — 66 of 86 watchdog kills in a measured 6h
+# window. os.replace is what gives readers a torn-free view; the fsync only
+# bought power-loss durability for a value that is stale 5s later anyway.
+SONAR_LIVE_FILE = RUNTIME_DIR / "sonar_live.json"
 
 MOOD_BEHAVIOR = {
     "excited":       {"gaze_min": 5,  "gaze_max": 12, "tilt_bias": 10},
@@ -385,12 +392,20 @@ def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
         if _ready:
             _sd_notify("WATCHDOG=1")
         else:
-            # Pre-READY the watchdog is not yet armed; what can kill us is
-            # TimeoutStartSec. Push it out on every beat so a slow acquisition
-            # (or a long lease park) survives, while still proving liveness.
-            _sd_notify(
-                "WATCHDOG=1\nEXTEND_TIMEOUT_USEC=%d" % int(START_EXTEND_S * 1_000_000)
-            )
+            # Pre-READY the only deadline is TimeoutStartSec, so push it out on
+            # every beat and send NOTHING ELSE.
+            #
+            # This branch used to also send WATCHDOG=1, on the belief that the
+            # watchdog "is not yet armed" so the keyword was inert. It is not:
+            # systemd routes WATCHDOG=1 through service_notify_message() into
+            # service_reset_watchdog() -> service_start_watchdog(), with no
+            # SERVICE_RUNNING guard. The beat meant to buy startup time was
+            # itself arming WatchdogSec=15 — mid Picarx.__init__, which blocks
+            # for seconds at a stretch and cannot feed a 15s watchdog. That is
+            # 20 of the 86 watchdog kills in a measured 6h window, each logged
+            # by systemd as "Failed to start" because the start job was still
+            # open. Adding WATCHDOG=1 back here re-arms the trap.
+            _sd_notify("EXTEND_TIMEOUT_USEC=%d" % int(START_EXTEND_S * 1_000_000))
         return True
     except OSError as exc:
         if not _heartbeat_err_logged:
@@ -690,6 +705,19 @@ def idle_loop(args) -> None:
     # reached the loop setup before the startup sonar write below, whose fsync
     # can legitimately take several seconds on the Pi's SD card.
     write_alive_heartbeat("starting")
+
+    # One-time migration sweep: sonar_live.json used to live on the state dir.
+    # resolve_runtime_read_path() falls back there when the runtime copy is
+    # absent, so a leftover would be found during every restart gap and read as
+    # a permanently-stale value. Age gates make that harmless but confusing;
+    # deleting it makes "missing" mean missing. Guarded on the two dirs being
+    # distinct, so a host that already fell back to state/ doesn't delete the
+    # file it is about to write.
+    if RUNTIME_DIR != STATE_DIR:
+        try:
+            (STATE_DIR / "sonar_live.json").unlink(missing_ok=True)
+        except OSError as _me:
+            log(f"legacy sonar_live.json cleanup skipped: {_me}")
 
     # Write a startup heartbeat so px-mind doesn't see a stale file during the
     # Picarx acquisition window (takes ~5s), avoiding the tool-sonar fallback

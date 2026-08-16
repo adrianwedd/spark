@@ -631,7 +631,8 @@ def read_sonar(dry: bool) -> float | None:
     if dry:
         return None
     state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
-    sonar_live = state_dir / "sonar_live.json"
+    from .runtime_paths import resolve_sonar_live_read_path
+    sonar_live = resolve_sonar_live_read_path(state_dir)
     try:
         data = json.loads(sonar_live.read_text())
         age = time.time() - float(data.get("ts", 0))

@@ -135,9 +135,33 @@ def test_pre_ready_heartbeat_extends_start_timeout(tmp_path, monkeypatch):
     assert _ALIVE["write_alive_heartbeat"]("starting", now=1.0) is True
 
     assert len(notifications) == 1
-    assert "WATCHDOG=1" in notifications[0]
     assert "EXTEND_TIMEOUT_USEC=%d" % int(_ALIVE["START_EXTEND_S"] * 1_000_000) \
         in notifications[0]
+
+
+def test_pre_ready_heartbeat_does_not_arm_the_watchdog(tmp_path, monkeypatch):
+    """A pre-READY WATCHDOG=1 *starts* the watchdog it claims not to touch.
+
+    systemd's ``service_notify_message()`` routes ``WATCHDOG=1`` into
+    ``service_reset_watchdog()`` -> ``service_start_watchdog()`` with no
+    SERVICE_RUNNING guard, so sending it during startup arms WatchdogSec=15
+    immediately — in the middle of a Picarx acquisition that beats far too
+    sparsely to feed it. Observed live: instance 82 started 19:50:30, never
+    reached READY, and was watchdog-killed at 19:51:03; systemd logged
+    "Failed to start", which it only emits while the start job is still open.
+
+    Pre-READY the sole deadline must be TimeoutStartSec, extended by
+    EXTEND_TIMEOUT_USEC. Nothing here may arm the watchdog early.
+    """
+    monkeypatch.setitem(_ALIVE, "ALIVE_HEARTBEAT_FILE", tmp_path / "alive_heartbeat.json")
+    notifications = []
+    monkeypatch.setitem(_ALIVE, "_sd_notify", notifications.append)
+    monkeypatch.setitem(_ALIVE, "_ready", False)
+
+    assert _ALIVE["write_alive_heartbeat"]("lease_wait", now=1.0) is True
+
+    assert not any("WATCHDOG=1" in msg for msg in notifications), \
+        "pre-READY beat sent WATCHDOG=1, which arms WatchdogSec during startup"
 
 
 def test_notify_ready_is_idempotent(tmp_path, monkeypatch):
