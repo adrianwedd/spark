@@ -2,4 +2,10 @@
 markers = [
     "live: tests that require PiCar-X hardware (run with sudo, deselect with -m 'not live')",
 ]
-norecursedirs = ["picar-x-hacking", ".venv", "node_modules"]
+# Bare `pytest` from the repo root must be correct: the local run is this
+# project's real gate (there is no pytest CI workflow). Without testpaths it
+# collected the .worktrees/ checkouts and died with 229 `import file mismatch`
+# errors, because pytest does not honour .gitignore (.worktrees/ is ignored at
+# .gitignore:82) and every worktree carries a same-named tests/ tree.
+testpaths = ["tests"]
+norecursedirs = ["picar-x-hacking", ".venv", "node_modules", ".worktrees"]
