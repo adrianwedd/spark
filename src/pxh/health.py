@@ -209,6 +209,57 @@ def _derive_status(rec: dict[str, Any], component: str, now: dt.datetime) -> tup
     return "ok", age
 
 
+# A stall this close to the deadline is a near-miss worth reporting before it
+# becomes a kill. Measured on the live Pi, the loop's ordinary max sits around
+# 14.9s against a 15s watchdog, so anything above this is the normal-but-bad
+# state that `systemctl status` and consecutive_failures both call healthy.
+WATCHDOG_NEAR_MISS_RATIO = 0.66
+
+
+def read_watchdog_margin(state_dir: Path | str | None = None) -> dict[str, Any]:
+    """Interpret px-alive's self-reported timing. Never a second writer.
+
+    px-alive owns these observations and publishes them in its existing
+    heartbeat record; this only reads and classifies. Returns ``{}`` when the
+    daemon predates the fields or the heartbeat is unreadable, so a missing
+    record degrades to "no opinion" rather than a false clean bill.
+
+    The values are in-process and reset with the process, so they describe
+    stalls *within* one run of the loop. A restart gap can never be folded in —
+    the distinction an external sampler must reconstruct from PIDs is
+    structural here.
+    """
+    from .runtime_paths import resolve_heartbeat_read_path
+
+    base = Path(state_dir) if state_dir is not None else _state_dir()
+    try:
+        rec = json.loads(resolve_heartbeat_read_path(base).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(rec, dict) or "heartbeat_gap_max_ms" not in rec:
+        return {}
+
+    out: dict[str, Any] = {}
+    for key in ("heartbeat_gap_last_ms", "heartbeat_gap_max_ms",
+                "heartbeat_gap_max_mode", "heartbeat_gap_buckets",
+                "loop_duration_last_ms", "loop_duration_max_ms",
+                "watchdog_margin_min_ms", "window_started_at"):
+        if key in rec:
+            out[key] = rec[key]
+
+    gap_max = rec.get("heartbeat_gap_max_ms")
+    margin = rec.get("watchdog_margin_min_ms")
+    status = "ok"
+    if isinstance(margin, (int, float)) and isinstance(gap_max, (int, float)):
+        limit = margin + gap_max          # reconstruct the deadline in force
+        if margin <= 0:
+            status = "exceeded"
+        elif limit > 0 and gap_max >= limit * WATCHDOG_NEAR_MISS_RATIO:
+            status = "near_miss"
+    out["watchdog_status"] = status
+    return out
+
+
 def read_health(components: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Aggregate every component record into a single live view.
 
@@ -237,6 +288,17 @@ def read_health(components: tuple[str, ...] | None = None) -> dict[str, Any]:
                     "consecutive_failures", "success_count", "failure_count"):
             if key in rec:
                 entry[key] = rec[key]
+        if name == "px-alive":
+            # A daemon can be stalling to within 70ms of a watchdog kill while
+            # every field above reads clean — that is the exact blind spot this
+            # module is documented as having. Attach the timing verdict where a
+            # reader of px-alive's health cannot miss it.
+            margin = read_watchdog_margin()
+            if margin:
+                entry["watchdog"] = margin
+                if margin.get("watchdog_status") != "ok" and status == "ok":
+                    status = "degraded"
+                    entry["status"] = status
         out[name] = entry
         if _STATUS_RANK.get(status, 0) > _STATUS_RANK.get(overall, 0):
             overall = status

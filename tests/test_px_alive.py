@@ -1,4 +1,5 @@
 """Tests for px-alive idle-alive daemon (dry-run only — no GPIO)."""
+import ast
 import contextlib
 import json
 import os
@@ -494,3 +495,147 @@ def test_lease_wait_does_not_touch_foreign_lease(isolated_project, tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=10)
+
+
+# --- watchdog margin telemetry (#194) ---------------------------------------
+#
+# Sampled on the live Pi over 34 min of post-#192 tmpfs-era code: 41 in-process
+# stalls (same PID, so not restarts), 5.07s min / 7.06s median / 14.93s max
+# against WatchdogSec=15. That is a 70ms margin as the daemon's ordinary state,
+# and nothing in the journal, systemctl status, or consecutive_failures could
+# see it. These tests pin the observation semantics rather than the numbers.
+
+
+def _alive_ns(tmp_path, watchdog_usec="15000000"):
+    return load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(tmp_path / "state"),
+        "LOG_DIR": str(tmp_path / "logs"),
+        "PX_LOG_FILE": str(tmp_path / "logs" / "px-alive.log"),
+        "WATCHDOG_USEC": watchdog_usec,
+    })
+
+
+def test_heartbeat_gap_and_margin_are_computed_from_the_live_deadline(tmp_path):
+    """Margin is measured against WATCHDOG_USEC, not a constant copied from the unit."""
+    ns = _alive_ns(tmp_path)
+    assert ns["WATCHDOG_LIMIT_MS"] == 15000.0
+
+    ns["write_alive_heartbeat"]("running", now=1000.0)
+    ns["write_alive_heartbeat"]("running", now=1012.5)   # a 12.5s stall
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert rec["heartbeat_gap_last_ms"] == 12500.0
+    assert rec["heartbeat_gap_max_ms"] == 12500.0
+    # 15000 - 12500: the margin left before systemd would have killed it
+    assert rec["watchdog_margin_min_ms"] == 2500.0
+
+
+def test_gap_mode_names_the_phase_the_loop_stalled_in(tmp_path):
+    """The stall follows the earlier beat, so its mode is the one to report.
+
+    Without distinct modes at the ease() call sites this field is inert: the
+    loop-top beat and three of five ease() sites all published "running", so
+    all 39 sampled "running" stalls were unattributable.
+    """
+    ns = _alive_ns(tmp_path)
+    ns["write_alive_heartbeat"]("ease_gaze", now=2000.0)
+    ns["write_alive_heartbeat"]("running", now=2009.0)
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert rec["heartbeat_gap_max_ms"] == 9000.0
+    assert rec["heartbeat_gap_max_mode"] == "ease_gaze", (
+        "reported the mode after the stall instead of the one that was live "
+        "when the loop went quiet"
+    )
+
+
+def test_ease_call_sites_publish_distinguishable_modes():
+    """Precondition for the mode field: four paths must not share one label."""
+    body = (PROJECT_ROOT / "bin" / "px-alive").read_text()
+
+    for mode in ("ease_oneshot", "ease_proximity", "ease_gaze", "scanning"):
+        assert f'mode="{mode}"' in body, f"{mode} call site lost its label"
+
+    # Every ease() call must pass an explicit mode; a bare call silently
+    # inherits the "running" default and becomes indistinguishable from the
+    # loop-top beat again. Parsed rather than grepped: a substring search also
+    # matches _foreign_lease() and can't see a mode= on a continuation line.
+    source = body.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    tree = ast.parse(source)
+    bare = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "ease"
+        and not any(kw.arg == "mode" for kw in node.keywords)
+        and len(node.args) < 7          # mode passed positionally is fine too
+    ]
+    assert not bare, (
+        f"ease() calls with no explicit mode at lines {bare} — these inherit "
+        f'the "running" default and become indistinguishable from the loop-top beat'
+    )
+
+
+def test_gap_buckets_keep_the_distribution_a_single_extremum_discards(tmp_path):
+    """The measured spread is continuous 5-15s; one max cannot represent it."""
+    ns = _alive_ns(tmp_path)
+    t = 3000.0
+    for gap in (5.1, 7.0, 7.5, 13.0):
+        ns["write_alive_heartbeat"]("running", now=t)
+        t += gap
+    ns["write_alive_heartbeat"]("running", now=t)
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert rec["heartbeat_gap_buckets"] == {"4-6s": 1, "6-8s": 2, "12-14s": 1}
+
+
+def test_window_reset_clears_extrema_but_not_the_live_reading(tmp_path):
+    """Extrema are windowed, never lifetime.
+
+    A permanent max=14.93s stops being a signal the moment it stops moving, so
+    a reader cannot tell an ongoing problem from a historical one.
+    """
+    ns = _alive_ns(tmp_path)
+    ns["write_alive_heartbeat"]("running", now=4000.0)
+    ns["write_alive_heartbeat"]("ease_gaze", now=4014.0)
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert rec["heartbeat_gap_max_ms"] == 14000.0
+
+    ns["reset_watchdog_window"](now=5000.0)
+    ns["write_alive_heartbeat"]("running", now=5001.0)
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert rec["heartbeat_gap_max_ms"] == 0.0, "extrema survived the window reset"
+    assert rec["heartbeat_gap_max_mode"] == ""
+    assert rec["heartbeat_gap_buckets"] == {}
+    assert rec["window_started_at"] == 5000.0
+    assert rec["watchdog_margin_min_ms"] == 15000.0
+
+
+def test_loop_duration_is_tracked_separately_from_heartbeat_gap(tmp_path):
+    """A 30s scan sweep that beats from inside ease() is healthy; a 30s gap is not.
+
+    Collapsing the two would make a legitimate long iteration indistinguishable
+    from a wedged I2C write.
+    """
+    ns = _alive_ns(tmp_path)
+    ns["note_loop_duration"](30.0)
+    ns["write_alive_heartbeat"]("scanning", now=6000.0)
+    ns["write_alive_heartbeat"]("scanning", now=6002.0)
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert rec["loop_duration_max_ms"] == 30000.0
+    assert rec["heartbeat_gap_max_ms"] == 2000.0
+    assert rec["watchdog_margin_min_ms"] == 13000.0
+
+
+def test_telemetry_absent_when_systemd_sets_no_deadline(tmp_path):
+    """Off systemd there is no watchdog, so there is no margin to claim."""
+    ns = _alive_ns(tmp_path, watchdog_usec="0")
+    ns["write_alive_heartbeat"]("running", now=7000.0)
+    ns["write_alive_heartbeat"]("running", now=7009.0)
+
+    rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
+    assert "watchdog_margin_min_ms" not in rec
+    assert rec["heartbeat_gap_max_ms"] == 9000.0  # gaps still observed

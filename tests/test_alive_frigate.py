@@ -110,7 +110,12 @@ def test_alive_heartbeat_records_loop_mode_atomically(tmp_path, monkeypatch):
 
     assert _ALIVE["write_alive_heartbeat"]("charging", now=123.5) is True
 
-    assert json.loads(heartbeat.read_text()) == {"ts": 123.5, "mode": "charging"}
+    # Asserts the progress record and the ordering, not the full schema: #194
+    # adds timing observations to this same record, and freezing it here would
+    # make every future field a test failure rather than a decision.
+    record = json.loads(heartbeat.read_text())
+    assert record["ts"] == 123.5
+    assert record["mode"] == "charging"
     assert notifications == ["WATCHDOG=1"]
     assert not list(tmp_path.glob("*.tmp"))
 
