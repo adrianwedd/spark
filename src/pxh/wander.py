@@ -39,11 +39,12 @@ TURN_S         = 0.7
 PROBE_S        = 0.4
 
 EXPLORE_STEP_TIMEOUT   = 30
-# Budget for one tool-describe-scene call: photo (~10s incl. a possible
-# stream pause) + Claude vision (60s in the tool) + onboard speech (~45s
-# worst case incl. the voice lock). Must stay comfortably above the tool's
-# CLAUDE_TIMEOUT — pinned by test_describe_scene_timeout_has_margin_over_claude.
-DESCRIBE_SCENE_TIMEOUT = 150
+# Budget for one tool-describe-scene call: Claude vision (vision.CLAUDE_TIMEOUT,
+# 60s) + bounded speech (60s) + ~20s photo/stream headroom = 140s worst case,
+# plus 25s slack. Moves WITH vision.CLAUDE_TIMEOUT — the pin in
+# test_describe_scene_timeout_has_margin_over_claude checks the surplus, not
+# just the sign, so raising one without the other fails the suite by name.
+DESCRIBE_SCENE_TIMEOUT = 165
 PHOTO_COOLDOWN_S       = 30
 DAILY_VISION_CAP       = 50
 VISION_FAIL_MAX        = 3

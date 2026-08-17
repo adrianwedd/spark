@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import subprocess
 from pathlib import Path
 
@@ -60,9 +61,17 @@ def main() -> int:
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
         python_path = os.environ.get("PYTHONPATH", "")
         lease_id = os.environ.get("PX_GPIO_LEASE_ID", "")
+        # sudo is env_reset, so root would land on HOME=/root — which has no
+        # ~/.local/lib/python3.11/site-packages, and `filelock` lives ONLY
+        # there. Without this every root-side update_session() in the subtree
+        # raises ImportError after the work is done, so the tool dies before
+        # printing its JSON and a successful run reads as a failure. Taken from
+        # the invoking uid rather than $HOME so a clobbered environment cannot
+        # silently reintroduce it. px-alive.service:17 does the same thing.
+        home = pwd.getpwuid(os.getuid()).pw_dir
         command.extend([
             "sudo", "-n", "env", f"PYTHONPATH={python_path}",
-            f"PX_GPIO_LEASE_ID={lease_id}",
+            f"PX_GPIO_LEASE_ID={lease_id}", f"HOME={home}",
         ])
     command.extend([str(PX_WANDER), "--steps", str(steps)])
     if mode == "explore":
