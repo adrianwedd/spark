@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# px-brain-status — what the resident Claude sessions can actually do.
+#
+#   bin/px-brain-status
+#
+# Prints each session's derived state, the model that answered its handshake,
+# the attempt count and the marker's age — plus free space on state/, because
+# `stale` has two causes: health._write_record swallows OSError, so on a full
+# disk every component reads stale and looks exactly like a dead supervisor.
+#
+# The state names are printed unchanged. They are the vocabulary a human uses
+# to describe the fault, and the spec writes a repair line per state:
+#   session_absent — px-brain is not doing its job (systemctl status px-brain)
+#   no_marker      — the session is up and cannot answer (attach and look)
+#   validating     — normal; a handshake is in flight
+#   validated      — a real round trip completed on the model shown
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+exec /usr/bin/python3 - <<'PY'
+import shutil
+
+from pxh import brain
+
+for session in (brain.BRAIN_SESSION, brain.IO_SESSION):
+    state = brain.session_state(session)
+    marker = brain.read_validation_marker(session) or {}
+    age = brain._marker_age_s(marker) if marker else float("inf")
+    age_text = "-" if age == float("inf") else f"{age:.0f}s"
+    print(f"{session:<12} {state:<15} "
+          f"model={marker.get('model') or '-'} "
+          f"attempt={marker.get('attempt') or '-'} "
+          f"marker_age={age_text}")
+
+try:
+    usage = shutil.disk_usage(brain.brain_root().parent)
+    print(f"\nstate/ free: {usage.free / (1024 ** 2):.0f} MiB of "
+          f"{usage.total / (1024 ** 2):.0f} MiB")
+except OSError as exc:
+    print(f"\nstate/ free: unknown ({exc})")
+PY

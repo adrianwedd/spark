@@ -1120,3 +1120,21 @@ def test_a_live_holder_is_refused_and_a_sigkilled_holder_releases(fake_tmux):
 
     released = subprocess.run([sys.executable, "-c", probe_script % (root, state, state)])
     assert released.returncode == 0, "the kernel releases the guard when the holder is killed"
+
+
+def test_px_brain_status_prints_the_state_vocabulary_and_free_space(tmp_path, monkeypatch):
+    """The state names are the words a human uses to describe the fault, so the
+    tool prints them unchanged rather than prettifying them into a different
+    set. Free space is there because `stale` has two causes: health._write_record
+    swallows OSError, so a full disk and a dead supervisor look identical."""
+    env = os.environ.copy()
+    env["PX_STATE_DIR"] = str(tmp_path)
+    env["PROJECT_ROOT"] = str(ROOT)
+    env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    result = subprocess.run([str(ROOT / "bin" / "px-brain-status")],
+                            capture_output=True, text=True, timeout=30, env=env)
+    assert result.returncode == 0, result.stderr
+    assert "spark-brain" in result.stdout and "spark-io" in result.stdout
+    assert any(word in result.stdout
+               for word in ("session_absent", "no_marker", "validating", "validated"))
+    assert "free" in result.stdout.lower()
