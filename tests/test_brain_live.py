@@ -19,7 +19,32 @@ import pytest
 
 from pxh import brain, brain_daemon, tmux_claude
 
+# Mark every test in this module as "live" so they can be selected/skipped
 pytestmark = pytest.mark.live
+
+
+def _is_live_brain_available():
+    """Quick probe: is the supervisor holding a real spark-io tmux session?
+
+    Bare `pytest` (no `-m` filter) is this project's real gate — there is no
+    CI workflow — so a live-only module must skip itself on a machine without
+    px-brain running, the same way test_tools_live.py's I2C probe does,
+    rather than report FAILED on every non-robot run. Must not raise, and
+    must not touch state/brain/ — conftest's autouse mailbox redirect hasn't
+    run yet at import time, so this only checks the tmux session itself.
+    """
+    try:
+        return tmux_claude.session_exists(brain.spec_for_session(brain.IO_SESSION))
+    except Exception:
+        return False
+
+
+# Skip the entire module if a live px-brain session is not available
+_brain_ok = _is_live_brain_available()
+if not _brain_ok:
+    pytestmark = [pytestmark, pytest.mark.skip(
+        reason="px-brain not running — start it on the Pi with "
+               "'sudo systemctl start px-brain' (spark-io tmux session not found)")]
 
 
 @pytest.fixture
