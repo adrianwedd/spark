@@ -228,16 +228,6 @@ def run_handshake(state: SessionState, reason: str) -> bool:
     session = state.name
     state.last_validation_attempt = time.monotonic()
 
-    # Narrow sweep: exactly the file the aged marker names, and nothing else.
-    # See §2.3 step 1 — this records the orphan of a supervisor that died
-    # mid-handshake, which nothing else will ever claim.
-    if reason == "no_marker":
-        marker = brain.read_validation_marker(session) or {}
-        stale_id = marker.get("request_id")
-        if isinstance(stale_id, str) and stale_id:
-            brain.sweep_one(session, stale_id)
-    brain.clear_validation_marker(session)
-
     lock = brain._lock_for(session)
     if lock is None:
         health.record_failure(state.component, "filelock unavailable")
@@ -255,6 +245,26 @@ def run_handshake(state: SessionState, reason: str) -> bool:
     request_id = str(uuid.uuid4())
     nonce = str(uuid.uuid4())
     try:
+        # Clearing happens under the lock, not before acquiring it. The marker
+        # is the only record that a model change is owed: `handshake_reason`
+        # derives "model_change" by comparing the marker's model against the
+        # configured one, so clearing it on a path that can still bail — a busy
+        # lock — erases the reason too. The next tick would read `no_marker`,
+        # skip the `/model` branch below, and then write a marker naming the
+        # newly configured model that nothing was ever switched to. Under the
+        # lock, a defer leaves the marker untouched and the change still owed.
+        #
+        # Narrow sweep: exactly the file the aged marker names, and nothing
+        # else. See §2.3 step 1 — this records the orphan of a supervisor that
+        # died mid-handshake, which nothing else will ever claim. It reads the
+        # marker, so it has to stay ahead of the clear.
+        if reason == "no_marker":
+            marker = brain.read_validation_marker(session) or {}
+            stale_id = marker.get("request_id")
+            if isinstance(stale_id, str) and stale_id:
+                brain.sweep_one(session, stale_id)
+        brain.clear_validation_marker(session)
+
         # ensure_session already polls for the glyph internally, up to its own
         # STARTUP_TIMEOUT_S. Do not wait again here — that spends the same
         # budget twice (§2.6). It returns True on session_exists() alone when
@@ -268,9 +278,10 @@ def run_handshake(state: SessionState, reason: str) -> bool:
 
         if reason == "model_change":
             # Ordering matters and this is the crash-safe direction: the marker
-            # is already gone (cleared above, before the lock), so a supervisor
-            # killed between here and the handshake leaves `no_marker` rather
-            # than a marker vouching for a session that has just been retuned.
+            # is already gone (cleared above, ahead of this keystroke), so a
+            # supervisor killed between here and the handshake leaves
+            # `no_marker` rather than a marker vouching for a session that has
+            # just been retuned.
             _log("model_change", session=session, model=model)
             if not tmux_claude.inject(f"/model {model}", spec=spec):
                 health.record_failure(state.component,

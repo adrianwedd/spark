@@ -1187,3 +1187,54 @@ def test_px_brain_status_prints_the_state_vocabulary_and_free_space(tmp_path, mo
     assert any(word in result.stdout
                for word in ("session_absent", "no_marker", "validating", "validated"))
     assert "free" in result.stdout.lower()
+
+
+def test_a_lock_busy_defer_does_not_lose_the_model_change(fake_tmux, _fast_handshake, monkeypatch):
+    """The marker is the only record that a model change is owed.
+
+    `handshake_reason` derives "model_change" by comparing the marker's model
+    against the configured one, so a marker cleared before the lock is acquired
+    erases the reason along with it. The next tick then reads `no_marker`, takes
+    the branch that skips `/model` entirely, and — on success — writes a fresh
+    marker naming the *newly configured* model that no session was ever switched
+    to. The model change is silently dropped and the marker vouches for it.
+    """
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model="a-model-nobody-configured", attempt=1)
+
+    # A caller is mid-turn: the supervisor's acquire times out and it defers.
+    held = brain._lock_for(session)
+    held.acquire(timeout=1.0)
+    try:
+        assert brain_daemon.run_handshake(_state(session), "model_change") is False
+    finally:
+        held.release()
+
+    assert brain_daemon.handshake_reason(_state(session)) == "model_change", \
+        "a deferred handshake must still owe the model change on the next tick"
+
+
+def test_a_deferred_model_change_still_injects_model_when_it_runs(
+        fake_tmux, _fast_handshake, monkeypatch):
+    """The end the previous test only implies: the switch actually happens."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model="a-model-nobody-configured", attempt=1)
+
+    held = brain._lock_for(session)
+    held.acquire(timeout=1.0)
+    try:
+        brain_daemon.run_handshake(_state(session), "model_change")
+    finally:
+        held.release()
+
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+    reason = brain_daemon.handshake_reason(_state(session))
+    assert brain_daemon.run_handshake(_state(session), reason) is True
+    assert any(text.startswith("/model") for _, text in fake_tmux.injected), \
+        "the retry must carry the /model keystroke the deferred attempt owed"

@@ -449,7 +449,15 @@ def record_request(kind: str) -> None:
     day = utc_timestamp()[:10]
     try:
         data = json.loads(_meter_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, OSError, ValueError):
+        # `ValueError` rather than `json.JSONDecodeError` for the reason given
+        # in `read_validation_marker`: a corrupt file's read_text raises
+        # `UnicodeDecodeError`, which is a ValueError and not an OSError.
+        data = {}
+    if not isinstance(data, dict):
+        # Valid JSON that is not an object — `[]`, `"x"`, `3`. `.get` below
+        # would raise AttributeError, out of a function that ask_brain calls
+        # unguarded. A meter we cannot read is a meter we start again.
         data = {}
     if data.get("day") != day:
         data = {"day": day, "by_kind": {}}
@@ -464,10 +472,12 @@ def record_request(kind: str) -> None:
 
 
 def meter_summary() -> dict[str, Any]:
+    empty: dict[str, Any] = {"day": None, "by_kind": {}, "total": 0}
     try:
-        return json.loads(_meter_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {"day": None, "by_kind": {}, "total": 0}
+        data = json.loads(_meter_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return empty
+    return data if isinstance(data, dict) else empty
 
 
 # --------------------------------------------------------------------------
@@ -560,6 +570,13 @@ def cleanup_request(session: str, request_id: str) -> None:
         return
     except OSError:
         return
+    except ValueError:
+        # Undecodable bytes. This runs in ask_brain's `finally`, ahead of
+        # `lock.release()` — an exception escaping here does not just break the
+        # never-raises contract, it leaks the single-flight lock and wedges the
+        # session for the life of the process. Fall through to the unclaimable
+        # branch below: no request id can ever match a file we cannot read.
+        raw = ""
     try:
         current = json.loads(raw)
     except json.JSONDecodeError:
@@ -658,7 +675,11 @@ def ask_brain(
             atomic_write(current_path(session),
                          json.dumps({"id": request_id, "kind": kind,
                                      "deadline": deadline}, indent=2))
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
+            # TypeError/ValueError: `payload` is caller-supplied and reaches
+            # `json.dumps` unvalidated, so a set, a dataclass or a stray object
+            # raises TypeError here. Every caller is a daemon holding a fallback
+            # for None and no handler at all for an exception.
             _log("brain_unavailable", kind=kind, session=session, reason=str(exc))
             return None
 

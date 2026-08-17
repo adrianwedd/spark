@@ -813,3 +813,54 @@ def test_check_wedge_carries_its_warning_in_the_code():
     branch = source.split("def check_wedge")[1].split("def ")[0]
     assert "permission dialog" in branch, \
         "the tolerated weakness must be labelled where it lives"
+
+
+# --------------------------------------------------------------------------
+# The never-raises contract, against corrupt state on disk
+#
+# Every one of these is the same shape: a file that `read_text(encoding="utf-8")`
+# cannot decode raises `UnicodeDecodeError` — a `ValueError`, not an `OSError` —
+# so an except clause naming only `OSError` and `json.JSONDecodeError` lets it
+# through. `read_validation_marker` was widened for exactly this; these are the
+# sites on the same `ask_brain` chain that were not.
+# --------------------------------------------------------------------------
+
+def test_corrupt_meter_does_not_break_the_never_raises_contract(_mailbox):
+    """record_request is called on every ask_brain, from a daemon."""
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    brain._meter_path().write_bytes(b"\xff\xfe not utf-8 at all")
+    brain.record_request("research")  # must not raise
+    assert brain.meter_summary()["by_kind"] == {"research": 1}
+
+
+def test_meter_holding_valid_json_that_is_not_an_object_recovers(_mailbox):
+    """`[]` parses fine, then `.get` raises AttributeError on a list."""
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    brain._meter_path().write_text("[1, 2, 3]", encoding="utf-8")
+    brain.record_request("compose")  # must not raise
+    assert brain.meter_summary()["by_kind"] == {"compose": 1}
+
+
+def test_corrupt_current_json_does_not_escape_cleanup_request(_mailbox):
+    """The sharpest of the three: cleanup_request runs in ask_brain's `finally`,
+    *before* lock.release(). An exception here does not just break the contract,
+    it leaks the single-flight lock and wedges the session for the process."""
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    brain.current_path(brain.BRAIN_SESSION).write_bytes(b"\xff\xfe\x00")
+    brain.cleanup_request(brain.BRAIN_SESSION, str(uuid.uuid4()))  # must not raise
+    assert not brain.current_path(brain.BRAIN_SESSION).exists(), \
+        "an undecodable current.json is unclaimable — it must be unlinked, not left"
+
+
+def test_ask_brain_returns_none_on_an_unserializable_payload(_live_pane):
+    """`json.dumps` raises TypeError, not OSError. The caller is a daemon that
+    has a fallback for None and no handler for an exception."""
+    assert brain.ask_brain("research", {"bad": {object()}}, timeout_s=1.0) is None
+
+
+def test_ask_brain_releases_the_lock_after_an_unserializable_payload(_live_pane):
+    """Proof the failure above is not merely quiet: the next caller still runs."""
+    brain.ask_brain("research", {"bad": {object()}}, timeout_s=1.0)
+    lock = brain._lock_for(brain.BRAIN_SESSION)
+    lock.acquire(timeout=0.5)  # would raise Timeout if the first call leaked it
+    lock.release()
