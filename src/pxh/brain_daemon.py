@@ -349,11 +349,47 @@ def check_wedge(state: SessionState, now: float) -> None:
         state.holder = None  # the holder is attached to a session that no longer exists
 
 
+def _pending_live(session: str) -> bool:
+    """True if any inbox entry still has a waiter.
+
+    The predicate `_is_idle` used to ask "is a request live?" and answer it with
+    "does a file exist?" — and those differ exactly when a writer died. Every
+    request carries `deadline` as wall-clock and `ask_brain` gives up precisely
+    at it, so a pending entry past its deadline (with no `current.json`, which
+    the caller checks first) has no waiter by construction. That holds for a
+    dead handshake's request and a killed caller's alike.
+
+    No grace period, deliberately, unlike `check_wedge`'s
+    `deadline + WEDGE_GRACE_S`: `ask_brain`'s loop is `while time.time() <
+    deadline` and its `finally:` removes the entry, so at the deadline the
+    caller has already cleaned up and no slack is needed to be sure. The grace
+    next door answers a different question — whether the *session* is stuck,
+    where slack buys safety before an Escape and a kill.
+
+    An unreadable or absent deadline counts as live. A predicate that cannot
+    read a deadline must not become a reason to recycle over a real request.
+    """
+    now = time.time()
+    for entry in brain.inbox_dir(session).glob("*.json"):
+        try:
+            data = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return True
+        if not isinstance(data, dict):
+            return True
+        deadline = data.get("deadline")
+        if not isinstance(deadline, (int, float)):
+            return True
+        if now < deadline:
+            return True
+    return False
+
+
 def _is_idle(state: SessionState) -> bool:
-    """No request in flight, nothing pending, and the pane is listening."""
+    """No request in flight, nothing live pending, and the pane is listening."""
     if _read_current(state.name) is not None:
         return False
-    if list(brain.inbox_dir(state.name).glob("*.json")):
+    if _pending_live(state.name):
         return False
     return tmux_claude.pane_ready(brain.spec_for_session(state.name))
 

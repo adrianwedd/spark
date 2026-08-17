@@ -8,6 +8,7 @@ tmux client so that injection fails only when nobody is watching.
 import json
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -290,8 +291,8 @@ def test_recycling_never_happens_mid_request(fake_tmux, monkeypatch):
 
 
 def test_recycling_waits_for_an_empty_inbox_too(fake_tmux):
-    """A queued request is still someone waiting, even before it starts."""
-    from datetime import datetime
+    """A queued request with no deadline reads as live — an unreadable
+    deadline must not become a reason to recycle over a real request."""
     session = brain.BRAIN_SESSION
     brain.ensure_mailbox(session)
     (brain.inbox_dir(session) / "queued.json").write_text("{}")
@@ -422,10 +423,16 @@ def _echo_when_nudged(fake_tmux, session, answer=True, wrong_echo=False):
         fake_tmux.injected.append((fake_tmux._name(spec), text))
         if not answer or "NEW REQUEST" not in text:
             return True
-        entries = list(brain.inbox_dir(session).glob("*.json"))
-        if not entries:
+        # Match the id the nudge actually names, not "whatever glob() returns
+        # first" — a stray orphan sitting in the same inbox has no ordering
+        # guarantee relative to the request this nudge is about.
+        match = re.search(r"/([0-9a-f-]{36})\.json", text)
+        if match is None:
             return True
-        request = json.loads(entries[0].read_text())
+        entry = brain.inbox_dir(session) / f"{match.group(1)}.json"
+        if not entry.exists():
+            return True
+        request = json.loads(entry.read_text())
         echo = "not-the-nonce" if wrong_echo else request["payload"]["echo"]
         brain.outbox_dir(session).mkdir(parents=True, exist_ok=True)
         (brain.outbox_dir(session) / f"{request['id']}.json").write_text(
@@ -818,3 +825,85 @@ def test_run_handshake_bumps_last_validation_attempt_even_on_a_fast_failure(
 
     assert brain_daemon.run_handshake(state, "no_marker") is False
     assert state.last_validation_attempt > 0.0
+
+
+# ---------------------------------------------------------------------------
+# _is_idle asks about live requests, not files (§2.3)
+# ---------------------------------------------------------------------------
+
+def _orphan(session, deadline, request_id="orphan"):
+    """A pending inbox entry with nobody waiting on it."""
+    brain.ensure_mailbox(session)
+    body = {"id": request_id, "kind": "research"}
+    if deadline is not None:
+        body["deadline"] = deadline
+    (brain.inbox_dir(session) / f"{request_id}.json").write_text(json.dumps(body))
+
+
+def test_a_past_deadline_orphan_does_not_block_a_recycle(fake_tmux):
+    """A killed caller leaves an inbox entry `ask_brain`'s finally: would have
+    removed. Globbing for files means that session never recycles again — not
+    nightly, not on turn count."""
+    session = brain.BRAIN_SESSION
+    _orphan(session, deadline=time.time() - 5)
+    state = _state(session)
+    state.turns = brain_daemon.CONTEXT_TURNS
+
+    assert brain_daemon._is_idle(state) is True
+    brain_daemon.maybe_recycle(state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
+    assert any("/clear" in text for _, text in fake_tmux.injected), \
+        "the point is that a due recycle actually fires"
+
+
+def test_a_live_request_still_withholds_the_recycle(fake_tmux):
+    """A `/clear` between the nudge and the reply loses the request entirely,
+    and the caller can only see that as a timeout."""
+    session = brain.BRAIN_SESSION
+    _orphan(session, deadline=time.time() + 300)
+    state = _state(session)
+    state.turns = brain_daemon.CONTEXT_TURNS
+
+    assert brain_daemon._is_idle(state) is False
+    brain_daemon.maybe_recycle(state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
+    assert not any("/clear" in text for _, text in fake_tmux.injected)
+
+
+@pytest.mark.parametrize("body", ["{not json", '{"id": "x"}', '{"id": "x", "deadline": "soon"}'])
+def test_an_unreadable_deadline_counts_as_live(fake_tmux, body):
+    """A predicate that cannot read a deadline must not become a reason to
+    recycle over a real request. Same conservative reading as check_wedge's
+    isinstance guard next door."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    (brain.inbox_dir(session) / "weird.json").write_text(body)
+    assert brain_daemon._is_idle(_state(session)) is False
+
+
+def test_the_narrow_sweep_records_the_dead_handshake_and_recycling_recovers(
+        fake_tmux, _fast_handshake, monkeypatch):
+    """A supervisor killed mid-handshake leaves a request the replacement never
+    claims. The sweep is how it reaches dead/ — the audit trail covers what the
+    supervisor owns."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    _orphan(session, deadline=time.time() - 5, request_id="deadhs")
+    _orphan(session, deadline=time.time() - 5, request_id="someoneelse")
+    monkeypatch.setattr(brain, "VALIDATION_CEILING_S", 0.01)
+    brain.write_validation_marker(session, state="validating", request_id="deadhs",
+                                  model=brain.configured_model(session), attempt=1)
+    time.sleep(0.05)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    brain_daemon.run_handshake(_state(session), "no_marker")
+
+    assert (brain.dead_dir(session) / "deadhs.json").exists(), \
+        "the supervisor's own orphan is recorded"
+    assert (brain.inbox_dir(session) / "someoneelse.json").exists(), \
+        "a request the supervisor did not write is not its to delete"
+    state = _state(session)
+    state.turns = brain_daemon.CONTEXT_TURNS
+    fake_tmux.injected.clear()
+    brain_daemon.maybe_recycle(state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
+    assert any("/clear" in text for _, text in fake_tmux.injected), \
+        "a test that only checked the file vanished would pass against a fix that swept the wrong one"
