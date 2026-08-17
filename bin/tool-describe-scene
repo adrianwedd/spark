@@ -12,7 +12,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import shutil
 import signal
 import subprocess
 import time
@@ -23,6 +22,7 @@ from pathlib import Path
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.logging import log_event
 from pxh.state import update_session
+from pxh.vision import describe_image
 
 PROJECT_ROOT      = Path(os.environ["PROJECT_ROOT"])
 STATE_DIR         = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
@@ -93,15 +93,6 @@ def _resume_stream() -> None:
         cwd=str(PROJECT_ROOT),
     )
 
-FALLBACK_DESCRIPTION = "I couldn't see anything right now."
-CLAUDE_TIMEOUT = 45
-
-# claude CLI may not be on PATH when launched from systemd — find it explicitly
-CLAUDE_BIN = (os.environ.get("PX_CLAUDE_BIN")
-              or shutil.which("claude")
-              or "/home/pi/.local/bin/claude")
-
-
 def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:
     env = os.environ.copy()
     env.update(extra_env)
@@ -117,46 +108,6 @@ def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:
     except (json.JSONDecodeError, IndexError):
         payload = {"status": "error", "stderr": result.stderr[-256:]}
     return result.returncode, payload
-
-
-def call_claude_vision(image_path: Path) -> str:
-    """Ask Claude to describe the image. Returns description string.
-
-    Uses the Read tool so Claude can view the JPEG directly.
-    """
-    # Unset Claude Code env vars so the CLI runs as plain claude (not code mode)
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-
-    prompt = (
-        f"Read the image at {image_path} and describe what you see "
-        f"in 2 short, fun sentences that a 7-year-old would enjoy. "
-        f"Use simple words. Focus on interesting things like colours, "
-        f"shapes, animals, or cool objects. Be enthusiastic but brief."
-    )
-    try:
-        result = subprocess.run(
-            [
-                CLAUDE_BIN, "-p", prompt,
-                "--allowedTools", "Read",
-                "--output-format", "text",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=CLAUDE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        return FALLBACK_DESCRIPTION
-    except Exception:
-        return FALLBACK_DESCRIPTION
-
-    if result.returncode != 0 or not result.stdout.strip():
-        return FALLBACK_DESCRIPTION
-
-    return result.stdout.strip()[:300]
 
 
 def main() -> int:
@@ -247,19 +198,23 @@ def main() -> int:
             _resume_stream()
             stream_paused = False
 
-        # Step 2: describe with Claude vision
-        description = call_claude_vision(photo_path)
+        # Step 2: describe with Claude vision. Drops privileges internally when
+        # we are root (wander self-elevates), because root has no credentials.
+        description = describe_image(photo_path)
 
         # Step 3: speak the description
         env = os.environ.copy()
         env["PX_TEXT"] = description[:2000]
         # Bounded, not unbounded: this runs inside wander's DESCRIBE_SCENE_TIMEOUT
-        # (150s) budget. tool-voice can block indefinitely when the audio device
-        # is held by another process, and an unbounded call here means wander
-        # kills the whole tool mid-run instead of the tool degrading to a silent
-        # but successful scene description. 45s Claude + 60s voice + ~20s photo
-        # and stream headroom stays under 150s.
-        # Pinned by tests/test_wander.py::test_describe_scene_timeout_has_margin_over_claude
+        # budget. tool-voice can block indefinitely when the audio device is held
+        # by another process, and an unbounded call here means wander kills the
+        # whole tool mid-run instead of the tool degrading to a silent but
+        # successful scene description. This 60s is the "bounded speech" term in
+        # wander.DESCRIBE_SCENE_TIMEOUT's budget; the vision term is
+        # vision.CLAUDE_TIMEOUT. Deliberately no totals here — a comment
+        # asserting a constant that lives in another file is a test that never
+        # runs. The arithmetic is checked by
+        # tests/test_wander.py::test_describe_scene_timeout_has_margin_over_claude
         try:
             subprocess.run([str(TOOL_VOICE)], capture_output=True, text=True,
                            check=False, env=env, timeout=60)

@@ -534,17 +534,34 @@ def test_explore_live_requires_calibration(isolated_project):
     assert "calibrat" in payload["reason"]
 
 
+# Surplus the outer wander timeout keeps over describe-scene's worst case, so a
+# slow-but-succeeding vision call is never killed mid-run (which would waste the
+# Claude spend and leave wander with no observation).
+MIN_DESCRIBE_SCENE_SLACK_S = 25
+
+
 def test_describe_scene_timeout_has_margin_over_claude():
     """The outer wander timeout must outlive tool-describe-scene's whole run:
     Claude call + photo capture (incl. an 8s stream pause) + bounded speech.
     Pin the RELATIONSHIP against the tool's actual constant, not a literal —
-    a literal check stays green when someone raises CLAUDE_TIMEOUT."""
+    a literal check stays green when someone raises CLAUDE_TIMEOUT.
+
+    A bare floor is not enough either. Raising CLAUDE_TIMEOUT eats the margin
+    without ever tripping the assertion, so the test stays green right up to
+    the moment there is nothing left — which is the failure it exists to catch.
+    Pin the surplus, so spending it has to be a deliberate edit here."""
+    from pxh import vision
+
     src = (PROJECT_ROOT / "bin" / "tool-describe-scene").read_text(encoding="utf-8")
-    m = re.search(r"^CLAUDE_TIMEOUT = (\d+)", src, re.M)
-    assert m, "CLAUDE_TIMEOUT not found in bin/tool-describe-scene"
-    claude_timeout = int(m.group(1))
+    claude_timeout = vision.CLAUDE_TIMEOUT
     # 60s voice bound + ~20s photo/stream headroom
-    assert wander.DESCRIBE_SCENE_TIMEOUT >= claude_timeout + 80
+    inner_worst_case = claude_timeout + 80
+    assert wander.DESCRIBE_SCENE_TIMEOUT >= inner_worst_case
+    assert wander.DESCRIBE_SCENE_TIMEOUT - inner_worst_case >= MIN_DESCRIBE_SCENE_SLACK_S, (
+        f"only {wander.DESCRIBE_SCENE_TIMEOUT - inner_worst_case}s of slack left over "
+        f"tool-describe-scene's worst case ({inner_worst_case}s); raise "
+        f"wander.DESCRIBE_SCENE_TIMEOUT alongside vision.CLAUDE_TIMEOUT"
+    )
     # and the tool's voice call must itself be bounded
     assert re.search(r"TOOL_VOICE.*\n.*\n\s*check=False, env=env, timeout=\d+", src) or \
            re.search(r"timeout=60\)", src), "tool-voice call in describe-scene is unbounded"
