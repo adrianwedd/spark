@@ -782,3 +782,21 @@ def test_brain_module_no_longer_consults_the_glyph():
     source = (ROOT / "src" / "pxh" / "brain.py").read_text()
     assert "pane_ready" not in source, \
         "brain.py must not consult the prompt glyph — readiness is the marker"
+
+
+def test_pane_ready_does_not_claim_the_session_can_answer():
+    """The docstring said "True once Claude is actually listening", which is the
+    claim the first end-to-end run disproved: a permission dialog renders the
+    glyph. It means the pane is accepting input, and nothing more."""
+    doc = tmux_claude.pane_ready.__doc__ or ""
+    assert "accepting input" in doc
+    assert "actually listening" not in doc
+
+
+def test_check_wedge_carries_its_warning_in_the_code():
+    """A limitation recorded only in a spec is a limitation the next reader
+    re-derives from scratch after it bites them a second time."""
+    source = (ROOT / "src" / "pxh" / "brain_daemon.py").read_text()
+    branch = source.split("def check_wedge")[1].split("def ")[0]
+    assert "permission dialog" in branch, \
+        "the tolerated weakness must be labelled where it lives"

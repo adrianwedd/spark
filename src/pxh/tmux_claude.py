@@ -152,7 +152,15 @@ def brain_pane(spec: SessionSpec | None = None) -> str | None:
 
 
 def pane_ready(spec: SessionSpec | None = None) -> bool:
-    """True once Claude is actually listening, not merely once tmux returned."""
+    """True once the pane is accepting input — NOT that the session can answer.
+
+    This is an observation of rendered terminal output, which is the exact thing
+    the mailbox exists to avoid trusting. A permission dialog waiting on a human
+    renders the glyph too, so a session that cannot answer a single request
+    looks ready here. Proof that a round trip works is
+    `brain.session_state() == "validated"`; this is a best-effort hint about
+    when it is worth starting to type.
+    """
     s = _spec(spec)
     pane = _tmux("capture-pane", "-t", s.name, "-p", socket=s.socket)
     return pane is not None and READY_GLYPH in pane

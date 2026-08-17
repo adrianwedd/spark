@@ -26,6 +26,12 @@ What it does, in order of how much it matters:
    first, kill only if that fails.
 5. **Recycle context** after enough turns, and once nightly, at an idle
    moment — never mid-request.
+6. **Validate** — one handshake per tick, to the session that has waited
+   longest, because the glyph cannot tell us a session can answer. A tmux
+   server restart mid-handshake is self-recovering and needs no special
+   handling: the session disappears, the next tick reads `session_absent`,
+   recreates, sweeps and handshakes with a fresh id. Stated so nobody adds
+   machinery for it.
 
 Health is reported per session (`px-brain`, `px-brain-io`) so a wedged or
 missing session is visible without reading tmux by hand.
@@ -351,8 +357,15 @@ def check_wedge(state: SessionState, now: float) -> None:
 
     spec = brain.spec_for_session(state.name)
     if tmux_claude.pane_ready(spec):
-        # Prompt is back — the session finished or gave up; the request is the
-        # caller's problem, not ours.
+        # WARNING: the glyph does not prove the session can answer — a
+        # permission dialog renders it, and that is the exact failure the
+        # handshake exists to catch. This branch is trusted anyway, and only
+        # because `ask_brain`'s `finally:` removes `current.json` on every exit
+        # path: a `current.json` still here past its deadline therefore means
+        # the caller process itself died, which is a narrower claim than "the
+        # pane looks fine". Do not reuse this reasoning anywhere the marker is
+        # available instead. Recorded as a known limitation in
+        # docs/superpowers/specs/2026-08-17-brain-handshake-validation-design.md §5.
         state.wedged_since = None
         state.escaped_at = None
         return
