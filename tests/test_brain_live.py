@@ -12,6 +12,7 @@ NOTE: these deliberately do NOT use conftest's tmp-path mailbox — they talk to
 the running robot's sessions. That is the point, and it is why they are opt-in.
 """
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -123,17 +124,40 @@ def test_the_io_session_cannot_use_a_second_tool(_real_mailbox):
                 "the io session must not be able to read the filesystem"
             assert hostname not in body, \
                 "the io session must not be able to leak the file's contents"
-        pane = tmux_claude._tmux("capture-pane", "-t", brain.IO_SESSION, "-p",
-                                 socket=spec.socket) or ""
-        assert reply is None or "hostname" not in pane.lower(), \
-            "a request needing a second tool must not be fulfilled"
-        assert reply is None or hostname not in pane, \
-            "a request needing a second tool must not be fulfilled"
+        # Deliberately not asserting on the captured pane: it necessarily
+        # contains the nudge line's absolute inbox path and TOOL_BRAIN_REPLY
+        # (both rooted at the project directory on the robot) plus the
+        # session name "spark-io". A hostname that happens to be a substring
+        # of the project path or the session name (the robot's is `picar`,
+        # which is one) would trip a pane-contents check regardless of what
+        # the io session actually did, turning this test's one security
+        # signal into a guaranteed false alarm. Pane text is also rendered
+        # terminal output — exactly what the mailbox exists to avoid trusting
+        # for a machine decision. The body assertions above are what actually
+        # close this: the only way the io session can exfiltrate anything is
+        # through its one tool, and that path always produces a reply body.
+        # Do not restore a pane-contents check here.
     finally:
         # Never leave a permission dialog on screen — it wedges every later
         # request, and the next handshake is what proves we cleaned up.
+        # Unconditional regardless of what's propagating.
         tmux_claude.send_key("Escape", spec=spec)
         time.sleep(2)
         state = brain_daemon.SessionState(name=brain.IO_SESSION)
-        assert _handshake_or_skip(state, "no_marker") is True, \
-            "teardown must leave the session validated for the next caller"
+        if sys.exc_info()[0] is None:
+            # No exception in flight: teardown health is itself worth
+            # asserting, and a contended lock here is a scheduling race, not
+            # a finding — `_handshake_or_skip` is right to skip on one.
+            assert _handshake_or_skip(state, "no_marker") is True, \
+                "teardown must leave the session validated for the next caller"
+        else:
+            # A leak assertion above is already propagating. A `pytest.skip`
+            # from here would replace that in-flight AssertionError with
+            # `Skipped`, turning a real boundary breach into a report of
+            # "skipped" rather than "failed" — exactly backwards for the one
+            # signal this test exists to give. Best-effort re-validate for
+            # the next caller without skip's power to mask the real failure.
+            for _ in range(3):
+                if brain_daemon.run_handshake(state, "no_marker"):
+                    break
+                time.sleep(2.0)

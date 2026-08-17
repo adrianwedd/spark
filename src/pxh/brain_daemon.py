@@ -557,10 +557,14 @@ def handshake_reason(state: SessionState) -> str | None:
             # the very turn that clears the context. Nudging in now is the
             # "never inject into a busy pane" hazard, by construction, on
             # every recycle. During this window the session records neither
-            # success nor failure, same as `validating` does: it reports
-            # `missing` for up to a turn's length against a 300s staleness
-            # window. That is the correct trade against splicing two prompts
-            # into one.
+            # success nor failure, same as `validating` does: with the idle
+            # extension below, the blackout can run up to VALIDATION_CEILING_S
+            # (180s) plus a full handshake budget (up to 167s) on top of that
+            # — long enough to cross the 300s `STALE_AFTER_S` window and
+            # surface as `stale` rather than `missing`. That crossover is
+            # accepted, not a bug: `stale` is still an alarm, and this window
+            # still cannot report `ok`. The trade is against splicing two
+            # prompts into one.
             #
             # The fixed RECYCLE_QUIET_S is only a floor: a recycle's
             # journal-append-then-/clear turn is a real Claude turn, not a
