@@ -27,11 +27,15 @@ What it does, in order of how much it matters:
 5. **Recycle context** after enough turns, and once nightly, at an idle
    moment — never mid-request.
 6. **Validate** — one handshake per tick, to the session that has waited
-   longest, because the glyph cannot tell us a session can answer. A tmux
-   server restart mid-handshake is self-recovering and needs no special
-   handling: the session disappears, the next tick reads `session_absent`,
-   recreates, sweeps and handshakes with a fresh id. Stated so nobody adds
-   machinery for it.
+   longest, because the glyph cannot tell us a session can answer. Health
+   success is recorded only for a session whose marker says `validated`,
+   never on the strength of the prompt glyph — a permission dialog renders
+   the glyph too, which is exactly how a session that could not answer a
+   single request used to report `ok` indefinitely. A tmux server restart
+   mid-handshake is self-recovering and needs no special handling: the
+   session disappears, the next tick reads `session_absent`, recreates,
+   sweeps and handshakes with a fresh id. Stated so nobody adds machinery
+   for it.
 
 Health is reported per session (`px-brain`, `px-brain-io`) so a wedged or
 missing session is visible without reading tmux by hand.
