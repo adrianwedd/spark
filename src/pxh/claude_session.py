@@ -278,6 +278,80 @@ def budget_summary() -> str:
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Routing: persistent session vs. one-shot subprocess
+# ---------------------------------------------------------------------------
+
+# Which session types are served by the resident Claude session in tmux
+# (src/pxh/brain.py) rather than by a `claude -p` subprocess. This is a rollout
+# dial, not a preference: `claude -p` is on its way out of the codebase
+# entirely, and each type moves across once its behaviour through the brain has
+# been watched in production. Phase 1 is research and compose — low stakes,
+# easy to verify, and neither needs tools beyond the brain's own envelope.
+#
+# Types NOT listed here still take the old path. `evolve` in particular cannot
+# move until the brain can work inside a git worktree, since a resident
+# session's tool envelope is fixed at launch and cannot be widened per call.
+_DEFAULT_BRAIN_KINDS = "research,compose"
+
+
+def _brain_kinds() -> frozenset[str]:
+    """Read at call time so the rollout can be widened or rolled back live."""
+    raw = os.environ.get("PX_BRAIN_KINDS", _DEFAULT_BRAIN_KINDS)
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _run_via_brain(
+    session_type: str,
+    prompt: str,
+    timeout: int,
+    model: str,
+) -> RunResult:
+    """Serve a session from the resident Claude session instead of a subprocess.
+
+    The RunResult contract is unchanged, so callers keep their existing
+    error handling: a brain that is down, wedged or busy comes back as a
+    non-zero returncode, which is exactly what they already do on a failed
+    `claude -p`.
+
+    `allowed_tools`, `skip_permissions` and `cwd` have no meaning here — a
+    resident session's envelope is fixed when it launches and cannot be
+    widened for one request. That is a security property, not a limitation to
+    work around.
+    """
+    from . import brain  # local import keeps the tmux dependency off the hot path
+
+    start = time.monotonic()
+    reply = brain.ask_brain(session_type, {"prompt": prompt},
+                            timeout_s=timeout, model=model)
+    duration = time.monotonic() - start
+
+    if reply is None:
+        _log_session(session_type, model, duration, 1, "brain_unavailable")
+        return RunResult(
+            stdout="",
+            stderr="brain unavailable — the resident Claude session did not answer",
+            returncode=1,
+            duration_s=duration,
+            model_used=model,
+        )
+
+    answer = reply.get("reply")
+    if not isinstance(answer, str):
+        # The session replied with structured JSON. Callers of this function
+        # all read stdout as text, so hand it back the way a subprocess would.
+        answer = json.dumps(answer)
+
+    _log_session(session_type, model, duration, 0, "success")
+    return RunResult(
+        stdout=answer,
+        stderr="",
+        returncode=0,
+        duration_s=duration,
+        model_used=model,
+    )
+
+
 def run_claude_session(
     session_type: str,
     prompt: str,
@@ -301,6 +375,9 @@ def run_claude_session(
 
     model = model_override or _model_for_type(session_type)
     work_dir = str(cwd) if cwd else str(PROJECT_ROOT)
+
+    if session_type in _brain_kinds():
+        return _run_via_brain(session_type, prompt, timeout, model)
 
     # Build command
     cmd = [

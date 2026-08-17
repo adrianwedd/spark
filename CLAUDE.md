@@ -201,6 +201,27 @@ Watches `state/thoughts-spark.jsonl` (salience ≥0.7 or spoken action), runs Cl
 
 Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
 
+### The Brain — persistent Claude session (`src/pxh/brain.py`)
+
+**SPARK's Claude calls are migrating off `claude -p` onto a resident interactive Claude Code session.** This is a settled decision, not a tradeoff to re-argue: a one-shot subprocess throws away context on every call and cannot use SPARK's own tools. `bin/px-claude-session` is the session; `src/pxh/tmux_claude.py` drives it in tmux; `src/pxh/brain.py` is the request/reply channel.
+
+**Replies come back through the filesystem, never the pane.** `capture-pane` returns *rendered* terminal output — wrapping, spinners, ANSI escapes, a finite scrollback — so an answer scraped from it is at the mercy of the terminal. The session answers by running a tool instead. Pane for humans, filesystem for machines.
+
+Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<uuid>.json` (reply, written by `bin/tool-brain-reply`) → `dead/` (swept on session recreate), plus `current.json` (the in-flight request — what wedge detection keys on) and `model` (marker, so `/model` is only injected on an actual change).
+
+**Two sessions, and the split is a trust boundary, not load balancing.** `spark-brain` runs at the repo root with SPARK's tools. `spark-io` handles text SPARK did not write (`post_qa`, `public_chat`, `obi_chat` — see `_IO_KINDS`) from a cwd *outside* the repository with exactly one tool, `tool-brain-reply`. **A new kind that handles untrusted input must be added to `_IO_KINDS`** — the default is the privileged session, so forgetting is the dangerous direction.
+
+**Critical gotchas:**
+- **`ask_brain()` returns `None` on every failure and never raises.** None means "fall back" — callers drop to the Ollama tiers exactly as they do today when Claude is unreachable. There is deliberately no exception path; this sits under daemons.
+- **Single-flight `FileLock` per session.** Two concurrent `send-keys` runs do not queue, they interleave into one garbled prompt — the failure mode is not "slow" but "both answers wrong". A caller that can't get the lock in `LOCK_WAIT_S` falls back rather than queueing.
+- **Mailbox directories are `1777`, and the lock file `0666`** — same reasoning as `state/health/`, and it is load-bearing for the same reason: SPARK's daemons do not all run as the same user, and a root-created 0755 dir locks every `pi` daemon out of `atomic_write`'s `mkstemp`. Do not tighten either.
+- **Never inject into a busy pane.** `pane_ready()` (prompt glyph) gates every request; injecting mid-turn splices two prompts into one and produces a plausible-looking wrong answer.
+- **`tool-brain-reply` validates everything** — bare-uuid4 id (it becomes a filename), the id must name a *pending* request (otherwise a valid uuid is a write primitive aimed at the outbox), JSON payload under `MAX_REPLY_BYTES`. It is reachable from the untrusted io session.
+- **`ask_brain` meters every request** (`state/brain/meter.json`, per kind per day). It is the first chokepoint every Claude request passes through; reflection Tier 2 bypasses `claude_session.py`'s accounting entirely today, which is how unbudgeted calls went unnoticed.
+- `tests/conftest.py` has an **autouse** fixture redirecting `brain_root()` to tmp. Without it an in-process test drops a real request into the running robot's inbox, where the live session answers it.
+
+**Rollout:** `PX_BRAIN_KINDS` (default `research,compose`) selects which session types `run_claude_session()` routes to the brain; everything else still takes the old path. Read at call time so the rollout can be widened or rolled back live. `evolve` cannot move until the brain can work inside a git worktree — a resident session's tool envelope is fixed at launch and cannot be widened per call. Remaining `claude -p` call sites: `mind.py` (`call_claude_haiku`), `api.py` (`_call_claude_public`), `bin/claude-voice-bridge`, `bin/px-blog`, `bin/px-post`, `bin/tool-describe-scene`, `bin/px-cron-say`. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
+
 ### Self-Evolution (px-evolve)
 
 SPARK proposes code changes via GitHub PR. Human approval required — changes never auto-apply.

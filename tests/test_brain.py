@@ -26,8 +26,14 @@ TOOL = ROOT / "bin" / "tool-brain-reply"
 
 @pytest.fixture(autouse=True)
 def _mailbox(tmp_path, monkeypatch):
-    """Point the mailbox at tmp and make waiting instant."""
-    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path / "state"))
+    """Point the mailbox at tmp and make waiting instant.
+
+    PX_STATE_DIR is tmp_path itself, not tmp_path/"state", so that the mailbox
+    the subprocess tests compute from the environment lands in the same place
+    as the one conftest's autouse fixture redirects in-process. A mismatch here
+    makes the round-trip tests fail in a way that looks like a protocol bug.
+    """
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("PROJECT_ROOT", str(ROOT))
     monkeypatch.setattr(brain, "POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(brain, "READY_WAIT_S", 0.05)
