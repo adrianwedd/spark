@@ -112,9 +112,14 @@ def _write_current(session, request_id="r1", deadline=None):
 # The holder — the reason this daemon exists
 # ---------------------------------------------------------------------------
 
-def test_a_holder_is_attached_to_every_session(fake_tmux):
+def test_a_holder_is_attached_to_every_session(fake_tmux, monkeypatch):
     """tmux 3.3a's send-keys fails with no attached client, and a daemon is
-    exactly the case where nothing is watching. No holder, no injection."""
+    exactly the case where nothing is watching. No holder, no injection.
+
+    Not about the handshake — stub it out so a fresh, unanswered session
+    doesn't fail its (real, slow) validation and drop the holder it just
+    attached."""
+    monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     states = {n: _state(n) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
     brain_daemon.tick(states)
     assert all(s.holder is not None and s.holder.alive() for s in states.values())
@@ -370,12 +375,16 @@ def test_a_tick_never_raises(monkeypatch, fake_tmux):
     brain_daemon.tick({brain.BRAIN_SESSION: _state()})  # must not raise
 
 
-def test_run_once_completes_a_single_pass(fake_tmux):
+def test_run_once_completes_a_single_pass(fake_tmux, monkeypatch):
+    # Not about the handshake — stub it so the pass doesn't block on a real,
+    # unanswered validation.
+    monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     assert brain_daemon.run(once=True) == 0
     assert set(fake_tmux.created) == {brain.BRAIN_SESSION, brain.IO_SESSION}
 
 
-def test_the_journal_is_seeded(fake_tmux):
+def test_the_journal_is_seeded(fake_tmux, monkeypatch):
+    monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     brain_daemon.run(once=True)
     assert brain_daemon.journal_path().exists()
 
@@ -634,3 +643,145 @@ def test_both_prompts_explain_the_handshake_with_the_placeholder(prompt):
     assert "payload.echo" in text
     assert "tool-brain-reply" not in text.replace("{{TOOL_BRAIN_REPLY}}", ""), \
         "the reply tool is named only via the placeholder"
+
+
+# ---------------------------------------------------------------------------
+# Triggers and fairness (§2.3, §2.6)
+# ---------------------------------------------------------------------------
+
+def test_no_marker_on_a_live_session_is_repaired_without_a_human(fake_tmux, monkeypatch):
+    """`no_marker` is the only state reachable by *aging*, so no edge ever fires
+    for it. Without a level-triggered tick the loud state has a repair line and
+    no path to it, and the session sits broken until someone attaches."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    # A supervisor died mid-handshake: a stale `validating` marker, aged out.
+    monkeypatch.setattr(brain, "VALIDATION_CEILING_S", 0.01)
+    brain.write_validation_marker(session, state="validating", request_id="old",
+                                  model=brain.configured_model(session), attempt=1)
+    time.sleep(0.05)
+
+    called = []
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: called.append((state.name, reason)) or True)
+    brain_daemon.tick({session: _state(session)})
+    assert called == [(session, "no_marker")]
+
+
+def test_a_validated_session_is_not_re_handshaked(fake_tmux, monkeypatch):
+    """Handshakes cost money. A working session is left alone."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model=brain.configured_model(session), attempt=1)
+    called = []
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: called.append(reason) or True)
+    brain_daemon.tick({session: _state(session)})
+    assert called == []
+
+
+def test_a_model_mismatch_triggers_a_transition(fake_tmux, monkeypatch):
+    """Someone changed the configuration. The marker's model is only ever
+    written by a handshake the new model actually answered."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model="claude-opus-4-6", attempt=1)
+    monkeypatch.setenv("PX_CLAUDE_TMUX_MODEL", "claude-haiku-4-5-20251001")
+    called = []
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: called.append(reason) or True)
+    brain_daemon.tick({session: _state(session)})
+    assert called == ["model_change"]
+
+
+def test_at_most_one_session_is_validated_per_tick(fake_tmux, monkeypatch):
+    """Two back-to-back validations in one tick would double the sibling's
+    health blackout against its 300s staleness window."""
+    fake_tmux.sessions.update({brain.BRAIN_SESSION, brain.IO_SESSION})
+    called = []
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: called.append(state.name) or False)
+    states = {n: _state(n) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
+    brain_daemon.tick(states)
+    assert len(called) == 1
+
+
+def test_a_failing_session_cannot_starve_a_healthy_one(fake_tmux, monkeypatch):
+    """The level trigger changed the failure shape: edge-triggered validation is
+    self-limiting, level-triggered is self-perpetuating. First-in-iteration-order
+    would hand every tick to a crash-looping spark-brain forever, and spark-io
+    would report failure for never having had a turn."""
+    fake_tmux.sessions.update({brain.BRAIN_SESSION, brain.IO_SESSION})
+    called = []
+
+    def _fail(state, reason):
+        state.last_validation_attempt = time.monotonic()
+        called.append(state.name)
+        return False
+
+    monkeypatch.setattr(brain_daemon, "run_handshake", _fail)
+    states = {n: _state(n) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
+    for _ in range(6):
+        brain_daemon.tick(states)
+
+    brain_n = called.count(brain.BRAIN_SESSION)
+    io_n = called.count(brain.IO_SESSION)
+    assert io_n > 0, "a session that never gets a turn reports failure for no fault of its own"
+    assert abs(brain_n - io_n) <= 1, f"validation must alternate, saw {called}"
+
+
+def test_health_success_requires_validation_not_a_glyph(fake_tmux, monkeypatch):
+    """Glyph site 7 — the original bug. This is the line that recorded `ok` for
+    a session that could not answer a single request, forever."""
+    from pxh import health
+
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    fake_tmux.ready = True          # the pane looks perfect
+    brain.ensure_mailbox(session)   # and there is no marker
+    monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: False)
+
+    brain_daemon.tick({session: _state(session)})
+    record = health.read_health(("px-brain",))["components"]["px-brain"]
+    assert record["status"] != "ok", \
+        "a ready pane is not evidence of anything; a permission dialog renders one"
+
+
+def test_a_validated_session_reports_ok(fake_tmux, monkeypatch):
+    """The positive control for the test above."""
+    from pxh import health
+
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model=brain.configured_model(session), attempt=1)
+    brain_daemon.tick({session: _state(session)})
+    record = health.read_health(("px-brain",))["components"]["px-brain"]
+    assert record["status"] == "ok"
+
+
+def test_validating_records_neither_success_nor_failure(fake_tmux, monkeypatch):
+    """Not a success (it cannot serve) and not a failure (it is working on it).
+    If it never resolves, staleness catches it — that is the alarm that was
+    missing."""
+    from pxh import health
+
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validating", request_id="r",
+                                  model=brain.configured_model(session), attempt=1)
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: pytest.fail("validating is not due"))
+    brain_daemon.tick({session: _state(session)})
+    # read_health always lists a requested component; an absent record derives
+    # to "missing" (health.py:192), which is exactly "nobody has reported yet".
+    record = health.read_health(("px-brain",))["components"]["px-brain"]
+    assert record["status"] == "missing", \
+        "validating writes neither success nor failure; staleness is the alarm"

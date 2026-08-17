@@ -400,10 +400,65 @@ def count_turns(state: SessionState) -> None:
             state.seen_request_ids.clear()
 
 
+def handshake_reason(state: SessionState) -> str | None:
+    """Why this session needs a handshake, or None if it does not.
+
+    Level-triggered on derived state rather than edge-triggered on events, and
+    that is the whole point: `no_marker` is the only state reachable by *aging*,
+    so no edge can ever fire for it. A supervisor killed mid-handshake leaves a
+    session that exists, was never validated, and ages out of `validating` with
+    nobody watching — and nothing recreates it, because tmux still has it.
+    """
+    derived = brain.session_state(state.name)
+    if derived == brain.SESSION_ABSENT:
+        return None  # start_session recreates it; the next tick handshakes
+    if derived == brain.VALIDATING:
+        return None  # in progress, and a stale marker has already aged out
+    if derived == brain.NO_MARKER:
+        return "no_marker"
+    marker = brain.read_validation_marker(state.name) or {}
+    if marker.get("model") != brain.configured_model(state.name):
+        # A caller that names a different model just falls back. Only the
+        # supervisor changes a session's model, and only at an idle moment.
+        return "model_change"
+    return None
+
+
+def _validate_one(live: list[SessionState]) -> None:
+    """At most one handshake per tick, to the session that has waited longest.
+
+    One per tick because two would double the sibling's health blackout.
+    Longest-waited rather than first-in-iteration-order because level-triggered
+    validation is self-perpetuating: a session that fails on every tick would
+    consume the budget on every tick, and its healthy sibling would never be
+    attempted at all — reporting failure not because anything is wrong with it,
+    but because it never got a turn.
+    """
+    due: list[tuple[float, SessionState, str]] = []
+    for state in live:
+        try:
+            reason = handshake_reason(state)
+        except Exception as exc:  # noqa: BLE001
+            _log("tick_error", session=state.name, error=str(exc))
+            continue
+        if reason is not None:
+            due.append((state.last_validation_attempt, state, reason))
+    if not due:
+        return
+    due.sort(key=lambda item: item[0])
+    _, state, reason = due[0]
+    try:
+        run_handshake(state, reason)
+    except Exception as exc:  # noqa: BLE001 - a supervisor that dies supervises nothing
+        _log("tick_error", session=state.name, error=str(exc))
+        health.record_failure(state.component, str(exc))
+
+
 def tick(states: dict[str, SessionState]) -> None:
     """One supervisor pass. Never raises — this loop must not be killable."""
     now = time.monotonic()
     now_local = datetime.now(HOBART)
+    live: list[SessionState] = []
     for state in states.values():
         try:
             if not start_session(state):
@@ -411,10 +466,23 @@ def tick(states: dict[str, SessionState]) -> None:
             count_turns(state)
             check_wedge(state, now)
             maybe_recycle(state, now_local)
-            if tmux_claude.pane_ready(brain.spec_for_session(state.name)):
+            live.append(state)
+        except Exception as exc:  # noqa: BLE001
+            _log("tick_error", session=state.name, error=str(exc))
+            health.record_failure(state.component, str(exc))
+
+    _validate_one(live)
+
+    # Health after validation, so a session validated this tick reports it
+    # immediately. Conditional on the marker and never on the glyph: a
+    # permission dialog renders a prompt, so the glyph reported `ok` for a
+    # session that could not answer a single request, forever.
+    for state in live:
+        try:
+            if brain.session_state(state.name) == brain.VALIDATED:
                 health.record_success(state.component, min_interval_s=60,
                                       detail={"turns": state.turns})
-        except Exception as exc:  # noqa: BLE001 - a supervisor that dies supervises nothing
+        except Exception as exc:  # noqa: BLE001
             _log("tick_error", session=state.name, error=str(exc))
             health.record_failure(state.component, str(exc))
 
