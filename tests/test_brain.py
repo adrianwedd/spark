@@ -342,6 +342,40 @@ def test_sweep_moves_pending_requests_to_dead(_mailbox):
     assert not brain.current_path(session).exists()
 
 
+def test_sweep_one_moves_the_named_entry_to_dead(_mailbox):
+    """The narrow sweep: it moves, it does not delete — the orphan is kept as
+    a record, the same way sweep_pending keeps its own swept entries."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    rid = str(uuid.uuid4())
+    (brain.inbox_dir(session) / f"{rid}.json").write_text("{}")
+
+    assert brain.sweep_one(session, rid) is True
+    assert not (brain.inbox_dir(session) / f"{rid}.json").exists()
+    assert (brain.dead_dir(session) / f"{rid}.json").exists()
+
+
+def test_sweep_one_leaves_a_sibling_inbox_entry_alone(_mailbox):
+    """This is the property that makes sweep_one safe to run without the
+    single-flight lock: it names its target rather than globbing, so it can
+    never pick up a request someone else is still waiting on."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    target = str(uuid.uuid4())
+    sibling = str(uuid.uuid4())
+    (brain.inbox_dir(session) / f"{target}.json").write_text("{}")
+    (brain.inbox_dir(session) / f"{sibling}.json").write_text("{}")
+
+    brain.sweep_one(session, target)
+    assert (brain.inbox_dir(session) / f"{sibling}.json").exists()
+
+
+def test_sweep_one_on_a_missing_entry_returns_false(_mailbox):
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    assert brain.sweep_one(session, str(uuid.uuid4())) is False
+
+
 def test_meter_counts_every_request(_live_pane):
     """Reflection Tier 2 bypassed budget accounting entirely and spent
     hundreds of unbudgeted calls. ask_brain is the chokepoint that cannot be

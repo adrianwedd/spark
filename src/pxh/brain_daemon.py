@@ -254,6 +254,11 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                          json.dumps({"id": request_id, "kind": "handshake",
                                      "deadline": deadline}, indent=2))
         except OSError as exc:
+            # No marker names this id yet (VALIDATING isn't written until the
+            # loop below), so the narrow sweep on the next handshake could
+            # never find and recover an orphaned inbox entry left by a partial
+            # write. Clean up now, on this same request_id, while we still can.
+            brain.cleanup_request(session, request_id)
             health.record_failure(state.component, f"handshake write failed: {exc}")
             return False
 

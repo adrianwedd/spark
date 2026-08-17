@@ -561,6 +561,69 @@ def test_a_caller_holding_the_lock_defers_the_handshake(fake_tmux, _fast_handsha
         held.release()
 
 
+def test_a_write_failure_does_not_orphan_the_inbox_entry(fake_tmux, _fast_handshake, monkeypatch):
+    """The inbox write can succeed while the current.json write fails right
+    after it (ENOSPC, EACCES — this runs on an SD card). No marker names this
+    id yet, so nothing could ever recover that file later."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    real_atomic_write = brain_daemon.atomic_write
+    calls = []
+
+    def _flaky_write(path, data, **kwargs):
+        calls.append(path)
+        if path == brain.current_path(session):
+            raise OSError("no space left on device")
+        return real_atomic_write(path, data, **kwargs)
+
+    monkeypatch.setattr(brain_daemon, "atomic_write", _flaky_write)
+
+    assert brain_daemon.run_handshake(_state(session), "no_marker") is False
+    assert not list(brain.inbox_dir(session).glob("*.json"))
+
+
+def test_run_handshake_sweeps_the_request_the_stale_marker_names(fake_tmux, _fast_handshake, monkeypatch):
+    """A supervisor that died mid-handshake leaves a `validating` marker
+    naming a request nobody will ever answer. The next handshake's narrow
+    sweep is what records that orphan."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    orphan_id = "11111111-1111-1111-1111-111111111111"
+    brain.write_validation_marker(session, state=brain.VALIDATING,
+                                  request_id=orphan_id,
+                                  model=brain.configured_model(session), attempt=1)
+    (brain.inbox_dir(session) / f"{orphan_id}.json").write_text("{}")
+
+    brain_daemon.run_handshake(_state(session), "no_marker")
+    assert (brain.dead_dir(session) / f"{orphan_id}.json").exists()
+    assert not (brain.inbox_dir(session) / f"{orphan_id}.json").exists()
+
+
+def test_a_killed_handshake_stops_and_drops_the_holder(fake_tmux, _fast_handshake, monkeypatch):
+    """The holder is attached to a session that no longer exists after a kill.
+    Leaving it in place would leak a client attached to nothing."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        _echo_when_nudged(fake_tmux, session, answer=False))
+
+    state = _state(session)
+    holder = _FakeHolder(brain.spec_for_session(session))
+    holder.start()
+    state.holder = holder
+
+    assert brain_daemon.run_handshake(state, "no_marker") is False
+    assert holder.alive() is False
+    assert state.holder is None
+
+
 @pytest.mark.parametrize("prompt", ["spark-brain-system.md", "spark-io-system.md"])
 def test_both_prompts_explain_the_handshake_with_the_placeholder(prompt):
     """A session that does not know how to answer a handshake cannot be
