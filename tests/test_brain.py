@@ -54,12 +54,22 @@ def _mailbox(tmp_path, monkeypatch):
 
 @pytest.fixture
 def _live_pane(monkeypatch):
-    """A tmux session that exists, is ready, and swallows every injection."""
+    """A tmux session that exists, is validated, and swallows every injection.
+
+    Readiness used to mean "the pane shows the prompt glyph"; now it means "the
+    marker says a handshake landed" (§3), so this fixture writes one — the same
+    fact ask_brain's session_state() checks, not the glyph it used to check.
+    """
     injected: list[str] = []
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
     monkeypatch.setattr(tmux_claude, "ensure_session", lambda *a, **k: True)
     monkeypatch.setattr(tmux_claude, "pane_ready", lambda *a, **k: True)
     monkeypatch.setattr(tmux_claude, "inject",
                         lambda text, spec=None: (injected.append(text), True)[1])
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model=brain.configured_model(brain.BRAIN_SESSION),
+                                  attempt=1)
     return injected
 
 
@@ -151,18 +161,6 @@ def test_a_dead_session_returns_none(monkeypatch):
     assert brain.ask_brain("research", {"q": 1}, timeout_s=1) is None
 
 
-def test_a_busy_pane_is_never_injected_into(monkeypatch):
-    """Injecting mid-turn splices two prompts into one — worse than falling
-    back, because the answer looks plausible."""
-    injected: list[str] = []
-    monkeypatch.setattr(tmux_claude, "ensure_session", lambda *a, **k: True)
-    monkeypatch.setattr(tmux_claude, "pane_ready", lambda *a, **k: False)
-    monkeypatch.setattr(tmux_claude, "inject",
-                        lambda text, spec=None: (injected.append(text), True)[1])
-    assert brain.ask_brain("research", {"q": 1}, timeout_s=1) is None
-    assert injected == []
-
-
 def test_second_caller_falls_back_rather_than_interleaving(_live_pane, monkeypatch):
     """Single-flight: two concurrent send-keys runs garble each other, so the
     loser of the lock must fall back instead of waiting behind a long turn."""
@@ -230,22 +228,6 @@ def test_io_session_holds_exactly_one_tool_and_no_repo_access():
     assert str(ROOT) != spec.cwd, "io session must not run at the repo root"
 
 
-def test_model_is_only_switched_when_it_actually_changes(_live_pane):
-    """/model costs a turn. The marker exists so a run of same-model requests
-    does not pay for it every time."""
-    session = brain.session_for_kind("research")
-
-    def _answer():
-        _reply_via_tool(session, _pending_id(session), {"ok": True})
-
-    for _ in range(2):
-        threading.Thread(target=_answer, daemon=True).start()
-        brain.ask_brain("research", {"q": 1}, timeout_s=15, model="claude-haiku-4-5")
-
-    switches = [line for line in _live_pane if line.startswith("/model")]
-    assert len(switches) == 1, f"expected one /model switch, got {switches}"
-
-
 # ---------------------------------------------------------------------------
 # One spelling of the reply tool
 #
@@ -304,7 +286,7 @@ def test_nudge_and_allowlist_agree_on_the_absolute_spelling():
     """The two ends of the permission check, compared directly."""
     assert brain.TOOL_BRAIN_REPLY.startswith("/"), "a relative allowlist cannot match"
     assert brain.TOOL_BRAIN_REPLY_ALLOW == f"Bash({brain.TOOL_BRAIN_REPLY}:*)"
-    assert _reply_spellings(brain._nudge_line(brain.BRAIN_SESSION, "abc")) == \
+    assert _reply_spellings(brain.nudge_line(brain.BRAIN_SESSION, "abc")) == \
         [brain.TOOL_BRAIN_REPLY]
 
 
@@ -592,3 +574,126 @@ def test_the_configured_model_default_matches_the_launcher(monkeypatch):
     monkeypatch.delenv("PX_CLAUDE_TMUX_MODEL", raising=False)
     launcher = (ROOT / "bin" / "px-claude-session").read_text()
     assert f'MODEL="${{PX_CLAUDE_TMUX_MODEL:-{brain.configured_model(brain.BRAIN_SESSION)}}}"' in launcher
+
+
+# ---------------------------------------------------------------------------
+# Callers read the marker, never the pane (§3)
+# ---------------------------------------------------------------------------
+
+def _validate(session, model=None):
+    """Mark a session as having answered a handshake."""
+    brain.write_validation_marker(session, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model=model or brain.configured_model(session),
+                                  attempt=1)
+
+
+def test_an_unvalidated_session_is_not_injected_into(_mailbox, monkeypatch):
+    """The pane may look perfect — a permission dialog renders a prompt glyph.
+    Injecting anyway is how a caller times out against a session that was never
+    going to answer."""
+    injected = []
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    monkeypatch.setattr(tmux_claude, "pane_ready", lambda spec=None: True)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        lambda text, spec=None: injected.append(text) or True)
+
+    assert brain.ask_brain("research", {"q": "why"}, timeout_s=1) is None
+    assert injected == [], "a caller must never inject into an unvalidated session"
+    assert not list(brain.inbox_dir(brain.BRAIN_SESSION).glob("*.json")), \
+        "and must not leave a request file behind either"
+
+
+def test_the_pre_lock_check_is_fast_and_takes_no_lock(_mailbox, monkeypatch):
+    """The common case during startup. A caller that queued behind the
+    supervisor's lock would burn LOCK_WAIT_S to learn what the marker already
+    said."""
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    monkeypatch.setattr(brain, "_lock_for", lambda session: pytest.fail(
+        "the pre-lock check must return before the lock is touched"))
+    assert brain.ask_brain("research", {"q": "why"}, timeout_s=1) is None
+
+
+def test_the_post_lock_recheck_prevents_a_confident_wrong_answer(_mailbox, _live_pane, monkeypatch):
+    """A caller can pass the pre-lock check, block on acquire(), and wake on the
+    far side of the supervisor's /clear. Injecting then produces a confident
+    answer generated with no context — which is worse than an error, because
+    nothing downstream can tell."""
+    session = brain.BRAIN_SESSION
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    _validate(session)
+
+    real_lock_for = brain._lock_for
+
+    def _invalidating_lock(sess):
+        lock = real_lock_for(sess)
+        real_acquire = lock.acquire
+
+        def _acquire(*args, **kwargs):
+            result = real_acquire(*args, **kwargs)
+            brain.clear_validation_marker(sess)  # the supervisor's /clear lands
+            return result
+
+        lock.acquire = _acquire
+        return lock
+
+    monkeypatch.setattr(brain, "_lock_for", _invalidating_lock)
+
+    assert brain.ask_brain("research", {"q": "why"}, timeout_s=1) is None
+    assert _live_pane == [], \
+        "the symptom being prevented is a confident wrong answer, not an error"
+
+
+def test_a_validated_session_is_used(_mailbox, _live_pane, monkeypatch):
+    """The positive control: without this, every test above would pass against a
+    version of ask_brain that never works at all."""
+    session = brain.BRAIN_SESSION
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    _validate(session)
+
+    def _fake_brain():
+        request_id = _pending_id(session)
+        _reply_via_tool(session, request_id, {"verdict": "yes"})
+
+    worker = threading.Thread(target=_fake_brain, daemon=True)
+    worker.start()
+    reply = brain.ask_brain("research", {"q": "why"}, timeout_s=15)
+    worker.join(timeout=10)
+    assert reply is not None and reply["reply"] == {"verdict": "yes"}
+
+
+def test_a_caller_never_injects_a_model_switch(_mailbox, _live_pane, monkeypatch):
+    """A session's model is a property of the session. Switching it per request
+    retunes the mind out from under the next caller."""
+    session = brain.BRAIN_SESSION
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    _validate(session, model="claude-haiku-4-5-20251001")
+
+    assert brain.ask_brain("research", {"q": "why"},
+                           timeout_s=1, model="claude-opus-4-6") is None
+    assert not any("/model" in text for text in _live_pane), \
+        "ask_brain must fall back on a model mismatch, never inject /model"
+
+
+def test_every_rolled_out_kind_matches_the_session_model():
+    """A kind whose model differs from the session default would fall back on
+    every single call, forever, silently. Failing here is how PX_BRAIN_KINDS
+    gets widened deliberately rather than by accident."""
+    from pxh import claude_session
+
+    default_kinds = ("research", "compose", "post_qa")
+    for kind in default_kinds:
+        model = claude_session._DEFAULT_MODELS.get(kind)
+        if model is None:
+            continue  # post_qa has no claude_session entry; it names no model
+        assert model == brain.configured_model(brain.session_for_kind(kind)), (
+            f"{kind} asks for {model} but its session runs "
+            f"{brain.configured_model(brain.session_for_kind(kind))}")
+
+
+def test_brain_module_no_longer_consults_the_glyph():
+    """Glyph sites 3 and 4 (§3.1). The pane is for humans; callers read the
+    marker. A test rather than a comment, so the pair cannot quietly come back."""
+    source = (ROOT / "src" / "pxh" / "brain.py").read_text()
+    assert "pane_ready" not in source, \
+        "brain.py must not consult the prompt glyph — readiness is the marker"

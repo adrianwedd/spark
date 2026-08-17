@@ -147,14 +147,12 @@ def start_session(state: SessionState) -> bool:
         return False
 
     if not existed:
-        # A fresh session inherits nothing: sweep whatever the old one left,
-        # and drop the model marker so the first request re-asserts its model
-        # instead of trusting a marker written by a session that is gone.
+        # A fresh session inherits nothing: sweep whatever the old one left, and
+        # drop the validation marker so nothing trusts a round trip that a
+        # session which no longer exists once completed. Deleting it leaves the
+        # session at `no_marker`, which is what makes the next tick handshake it.
         swept = brain.sweep_pending(state.name)
-        try:
-            brain.model_marker_path(state.name).unlink()
-        except OSError:
-            pass
+        brain.clear_validation_marker(state.name)
         state.turns = 0
         _log("session_created", session=state.name, swept=swept)
         if swept:

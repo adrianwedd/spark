@@ -161,14 +161,15 @@ def test_nothing_is_swept_when_the_session_was_already_up(fake_tmux):
         "an in-flight request must survive a supervisor tick"
 
 
-def test_the_model_marker_is_dropped_on_a_fresh_session(fake_tmux):
-    """The marker describes a session that no longer exists; trusting it would
-    leave the next request running on whatever model the launcher defaults to."""
+def test_validation_is_dropped_on_a_fresh_session(fake_tmux):
+    """The marker describes a session that no longer exists. Trusting it would
+    send the next request into a session that has never answered anything."""
     session = brain.BRAIN_SESSION
     brain.ensure_mailbox(session)
-    brain.model_marker_path(session).write_text("claude-opus-4-6\n")
+    brain.write_validation_marker(session, state="validated", request_id="x",
+                                  model="claude-haiku-4-5-20251001", attempt=1)
     brain_daemon.start_session(_state(session))
-    assert not brain.model_marker_path(session).exists()
+    assert not brain.validation_path(session).exists()
 
 
 # ---------------------------------------------------------------------------

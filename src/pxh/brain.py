@@ -17,7 +17,7 @@ The mailbox lives at `state/brain/<session>/`:
     outbox/<id>.json    reply written by tool-brain-reply, read and removed here
     dead/<id>.json      requests swept aside when a session is (re)created
     current.json        the in-flight request — what wedge detection keys on
-    model               the model marker, so /model is only injected on a change
+    validation.json     proof a real handshake landed — what readiness means now
 
 Everything here degrades rather than raises. A caller that gets `None` falls back
 to the Ollama tier chain exactly as it does today when Claude is unreachable;
@@ -252,10 +252,6 @@ def current_path(session: str) -> Path:
     return session_dir(session) / "current.json"
 
 
-def model_marker_path(session: str) -> Path:
-    return session_dir(session) / "model"
-
-
 def validation_path(session: str) -> Path:
     return session_dir(session) / "validation.json"
 
@@ -478,49 +474,14 @@ def _relax_lock_mode(session: str) -> None:
         pass
 
 
-def _read_model_marker(session: str) -> str:
-    try:
-        return model_marker_path(session).read_text(encoding="utf-8").strip()
-    except (FileNotFoundError, OSError):
-        return ""
-
-
-def _write_model_marker(session: str, model: str) -> None:
-    try:
-        atomic_write(model_marker_path(session), model + "\n")
-    except OSError:
-        pass
-
-
-def _wait_ready(spec: tmux_claude.SessionSpec, timeout_s: float) -> bool:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if tmux_claude.pane_ready(spec):
-            return True
-        time.sleep(POLL_INTERVAL_S)
-    return tmux_claude.pane_ready(spec)
-
-
-def _switch_model(spec: tmux_claude.SessionSpec, session: str, model: str) -> bool:
-    """Inject /model only when the session is not already on the right one."""
-    if not model or _read_model_marker(session) == model:
-        return True
-    if not tmux_claude.inject(f"/model {model}", spec=spec):
-        return False
-    if not _wait_ready(spec, READY_WAIT_S):
-        return False
-    _write_model_marker(session, model)
-    return True
-
-
-def _nudge_line(session: str, request_id: str) -> str:
+def nudge_line(session: str, request_id: str) -> str:
     return (
         f"NEW REQUEST {inbox_dir(session)}/{request_id}.json — read it, do the "
         f"work, then reply with: {TOOL_BRAIN_REPLY} {request_id} '<json>'"
     )
 
 
-def _collect_reply(session: str, request_id: str) -> dict[str, Any] | None:
+def collect_reply(session: str, request_id: str) -> dict[str, Any] | None:
     """Read and remove the reply, if it has landed.
 
     `tool-brain-reply` writes via atomic rename, so a file that exists is a
@@ -546,7 +507,7 @@ def _collect_reply(session: str, request_id: str) -> dict[str, Any] | None:
     return reply
 
 
-def _cleanup(session: str, request_id: str) -> None:
+def cleanup_request(session: str, request_id: str) -> None:
     """Clear the in-flight marker and drop the request. Always runs.
 
     `current.json` is what wedge detection keys on, so leaving it behind after a
@@ -579,13 +540,22 @@ def ask_brain(
 
     if not ensure_mailbox(session):
         _log("brain_unavailable", kind=kind, session=session,
-                  reason="mailbox not writable")
+             reason="mailbox not writable")
+        return None
+
+    # Fast path, before the lock. During startup this is the common case, and a
+    # caller that queued behind the supervisor's lock would spend LOCK_WAIT_S
+    # learning what the marker already said.
+    state = session_state(session, model=model)
+    if state != VALIDATED:
+        _log("brain_unavailable", kind=kind, session=session,
+             reason="session not validated", state=state)
         return None
 
     lock = _lock_for(session)
     if lock is None:
         _log("brain_unavailable", kind=kind, session=session,
-                  reason="filelock unavailable")
+             reason="filelock unavailable")
         return None
 
     started = time.monotonic()
@@ -599,18 +569,21 @@ def ask_brain(
 
     request_id = str(uuid.uuid4())
     try:
+        # Re-derive on the far side of the lock. The check above is
+        # check-then-act across a lock boundary, and the window is not
+        # theoretical: the supervisor holds this same lock for a model change or
+        # a recycle, so a caller can pass the check, block here, and wake up
+        # after a `/clear`. A slow supervisor costs ten seconds; a quick one
+        # gets a real request injected into a session that has just forgotten
+        # its identity prompt, and a confident answer produced with no context.
+        # Only this second check tells those apart.
+        state = session_state(session, model=model)
+        if state != VALIDATED:
+            _log("brain_unavailable", kind=kind, session=session,
+                 reason="invalidated while waiting for the lock", state=state)
+            return None
+
         spec = spec_for_session(session)
-        if not tmux_claude.ensure_session(spec=spec):
-            _log("brain_unavailable", kind=kind, session=session,
-                      reason=tmux_claude.last_error() or "session did not start")
-            return None
-        if not _wait_ready(spec, READY_WAIT_S):
-            _log("brain_busy", kind=kind, session=session, reason="pane not ready")
-            return None
-        if model and not _switch_model(spec, session, model):
-            _log("brain_unavailable", kind=kind, session=session,
-                      reason="model switch failed")
-            return None
 
         # The deadline travels with the request so the session can see how long
         # it has, and so wedge detection has something to compare against.
@@ -634,13 +607,13 @@ def ask_brain(
 
         record_request(kind)
 
-        if not tmux_claude.inject(_nudge_line(session, request_id), spec=spec):
+        if not tmux_claude.inject(nudge_line(session, request_id), spec=spec):
             _log("brain_unavailable", kind=kind, session=session,
                       reason=tmux_claude.last_error() or "inject failed")
             return None
 
         while time.time() < deadline:
-            reply = _collect_reply(session, request_id)
+            reply = collect_reply(session, request_id)
             if reply is not None:
                 _log("brain_reply", kind=kind, session=session,
                           duration_s=round(time.monotonic() - started, 2))
@@ -651,7 +624,7 @@ def ask_brain(
                   timeout_s=timeout_s)
         return None
     finally:
-        _cleanup(session, request_id)
+        cleanup_request(session, request_id)
         try:
             lock.release()
         except (RuntimeError, OSError):
