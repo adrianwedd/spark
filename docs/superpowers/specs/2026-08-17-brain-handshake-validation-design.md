@@ -143,8 +143,26 @@ one-validation-per-tick rule in §2.6.
 
 Then, in order:
 
-1. **Sweep** pending inbox entries to `dead/` (creation only — see §2.8), delete
-   `validation.json`.
+1. **Sweep, at one of two widths.** On session creation, sweep *all* pending
+   inbox entries to `dead/` (unlocked, per §2.8). On the level-triggered path
+   there is no creation, so instead sweep **exactly one file**: the
+   `inbox/<request_id>.json` named by the aged `validating` marker about to be
+   replaced. Then delete `validation.json`.
+
+   The narrow sweep is not tidiness, it is the fix for a hole this spec's own
+   level trigger would otherwise open. A supervisor killed mid-handshake leaves
+   its request in the inbox; step 4 then mints a *fresh* id (§2.4), so nothing
+   ever claims the old file, and nothing recreates the session to sweep it.
+   `_is_idle()` returns False on any non-empty inbox
+   (`brain_daemon.py:216-221`), so that session would never recycle again —
+   not nightly, not on turn count. The state machine that closes the `no_marker`
+   hole would open a permanent recycle hole on the same path.
+
+   It is safe outside the lock for a stronger reason than the creation sweep's:
+   the marker names the one file it may delete, so there is no glob and no
+   discovery step, and that request belongs to a handshake whose only waiter —
+   a previous supervisor — is dead. If the marker is absent entirely rather than
+   aged, there is nothing to sweep: no handshake had been sent.
 2. **Acquire the single-flight `FileLock`** for the session and hold it for the
    whole handshake. This is the same lock `ask_brain` takes, so no caller can
    inject into a session that is mid-handshake, and no handshake can splice
@@ -258,7 +276,13 @@ The inner deadline covers one turn only:
   of §2.3 had the supervisor wait for the glyph again after `ensure_session()`
   returned, which spent the same 45s twice and put the true worst case at 212s,
   not 167s. There is one glyph wait in the system per session start, it lives
-  inside `ensure_session()`, and this term accounts for it.
+  inside `ensure_session()`, and this term accounts for it. Corollary: on the
+  level-triggered path (§2.3, third trigger) the session already exists, and
+  `ensure_session()` returns immediately on `session_exists()`
+  (`tmux_claude.py:190-191`), so that handshake spends none of the 45s — its
+  real cost is `SETTLE_S + HANDSHAKE_ATTEMPTS × HANDSHAKE_TIMEOUT_S` = 122s. The
+  identity still holds as the upper bound; it is simply not tight on the path
+  that fires most often once something is already wrong.
 - `HANDSHAKE_TIMEOUT_S` covers a single first turn — read a small JSON file, run
   one Bash tool. It is generous for that (60s, matching the cold-start figure
   that forced `CLAUDE_TIMEOUT` 45→60 on the describe-scene path) because a first
@@ -291,6 +315,20 @@ Two consequences, both stated so a later reader is not surprised:
 
 - **At most one session is validated per tick.** Two back-to-back validations in
   one tick would double the sibling's blackout.
+- **And the one chosen is the session that has waited longest** since its last
+  validation attempt — not the first in iteration order. This matters because
+  the level trigger in §2.3 changed the failure shape: edge-triggered validation
+  is self-limiting (an event fires once), while level-triggered validation is
+  self-perpetuating, since a failing session re-qualifies on every tick. With
+  `tick()`'s fixed iteration over an insertion-ordered dict
+  (`brain_daemon.py:270`, built at `:288`), a `spark-brain` that fails
+  validation forever would consume the per-tick budget forever and `spark-io`
+  would never be attempted at all — reporting failure not because anything is
+  wrong with it, but because it never got a turn. That is a different case from
+  the both-crash-looping one above, and `stale` is *not* an accurate report of
+  it. Longest-waited is the smallest rule that makes it impossible; alternating
+  the starting index would also work, but degrades as soon as a third session
+  exists.
 - The 0.6 factor is the margin for the rest of the tick (holder checks, wedge
   checks, the sibling's own work). If `HANDSHAKE_ATTEMPTS` or
   `HANDSHAKE_TIMEOUT_S` ever grow past this budget, the answer is not a bigger
@@ -357,7 +395,19 @@ the handshake then times out against a request that no longer exists.
 
 **The guard:** `fcntl.flock(LOCK_EX | LOCK_NB)` on
 `state/brain/.supervisor.lock`, taken at startup and held for the process
-lifetime. A loser logs which pid holds it and exits non-zero.
+lifetime. The loser exits non-zero.
+
+**flock cannot tell the loser who holds the lock.** `LOCK_EX | LOCK_NB` fails
+with `EWOULDBLOCK` and nothing else — there is no `F_GETLK` equivalent for
+flock, so the holder's pid is not recoverable from the call. Since the guard's
+entire value is the log line an operator reads at 3am, the winner writes its own
+pid into the lock file after acquiring, and the loser reads that file and logs
+it **as a hint that may be stale** — a crashed holder leaves its pid behind. The
+log line says so, rather than asserting a pid that may name a process that no
+longer exists. (POSIX record locks via `F_SETLK`/`F_GETLK` would report the
+holder authoritatively, but carry the footgun that closing *any* fd on the file
+drops the process's lock; a hint we label as a hint is the better trade for a
+message that never gates a decision.)
 
 Two deliberate choices there. It is flock rather than px-mind's PID-file-plus-
 `/proc` pattern because a supervisor that can be SIGKILLed wants a guard the
@@ -478,6 +528,17 @@ and answers via the real `bin/tool-brain-reply`):
   session + no supervisor event → the next `tick()` starts a handshake. This is
   the closure test for the state machine; without it the loud state has a repair
   line and no path to it.
+- **A failing session cannot starve a healthy one.** `spark-brain` fails
+  validation on every tick; assert `spark-io` is still attempted, and that over
+  N ticks each session gets roughly half the validations. The regression this
+  guards is specific to the level trigger, so it must fail against a
+  first-in-iteration-order implementation.
+- **The dead handshake's request is swept, and recycling recovers.** Aged
+  `validating` marker plus its orphaned `inbox/<old-id>.json` → after the
+  level-triggered handshake, that one file is gone, a differently-named request
+  is not, `_is_idle()` is true again, and a due recycle actually fires. The last
+  assertion is the point: a test that only checks the file vanished would pass
+  against a fix that swept the wrong file.
 - **The post-lock re-check fires.** Caller passes the pre-lock check, the
   supervisor invalidates the marker while the caller is blocked in
   `acquire()`, and on acquiring the caller returns `None` **without** calling
@@ -525,6 +586,13 @@ re-validates in teardown.
 
 - Fixing `check_wedge()`'s `pane_ready()` branch (§2.3) — warning-labelled in
   the code, not fixed.
+- A *caller's* abandoned inbox entry blocking `_is_idle()` the same way a dead
+  handshake's does (§2.3). `ask_brain`'s `finally:` removes it on every planned
+  path, so this needs the caller process to die outright; it is pre-existing,
+  predates the level trigger, and the narrow sweep deliberately does not widen
+  to cover it — a supervisor deleting requests it did not write is how the
+  creation-only scoping got its reasoning in the first place. Recorded, not
+  absorbed.
 - Making `health._write_record`'s silent `OSError` visible (§2.6). The swallow is
   correct; the ambiguity it creates between "disk full" and "daemon dead"
   belongs to `health.py` and would be a change to every component at once.
