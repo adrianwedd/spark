@@ -118,7 +118,8 @@ def test_a_holder_is_attached_to_every_session(fake_tmux, monkeypatch):
 
     Not about the handshake — stub it out so a fresh, unanswered session
     doesn't fail its (real, slow) validation and drop the holder it just
-    attached."""
+    attached. The stub reports success without writing a marker; this test
+    only reads `state.holder`, never the marker, so that's fine here."""
     monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     states = {n: _state(n) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
     brain_daemon.tick(states)
@@ -377,13 +378,16 @@ def test_a_tick_never_raises(monkeypatch, fake_tmux):
 
 def test_run_once_completes_a_single_pass(fake_tmux, monkeypatch):
     # Not about the handshake — stub it so the pass doesn't block on a real,
-    # unanswered validation.
+    # unanswered validation. The stub reports success without writing a
+    # marker; this test only checks which sessions got created, not their
+    # validation state.
     monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     assert brain_daemon.run(once=True) == 0
     assert set(fake_tmux.created) == {brain.BRAIN_SESSION, brain.IO_SESSION}
 
 
 def test_the_journal_is_seeded(fake_tmux, monkeypatch):
+    # Same stub, same reason — this test only checks the journal file.
     monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     brain_daemon.run(once=True)
     assert brain_daemon.journal_path().exists()
@@ -785,3 +789,32 @@ def test_validating_records_neither_success_nor_failure(fake_tmux, monkeypatch):
     record = health.read_health(("px-brain",))["components"]["px-brain"]
     assert record["status"] == "missing", \
         "validating writes neither success nor failure; staleness is the alarm"
+
+
+def test_session_absent_needs_no_handshake(fake_tmux, monkeypatch):
+    """A session that does not exist cannot be handshaked. `start_session`
+    recreates it (as `no_marker`, since creation clears the marker) and the
+    *next* tick is the one that handshakes it — not this one."""
+    session = brain.BRAIN_SESSION
+    assert brain.session_state(session) == brain.SESSION_ABSENT
+    assert brain_daemon.handshake_reason(_state(session)) is None
+
+
+def test_run_handshake_bumps_last_validation_attempt_even_on_a_fast_failure(
+        fake_tmux, monkeypatch):
+    """The fairness sort in `_validate_one` reads `last_validation_attempt`,
+    and `run_handshake` sets it at entry — before the lock, before any I/O —
+    specifically so a session that fails immediately still records that it
+    was attempted. Nothing else pins that assignment: if it moved below an
+    early return, this is the only thing that would catch it, because
+    `_validate_one`'s own fairness test fakes the field with its stub rather
+    than exercising the real function."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(brain, "_lock_for", lambda session: None)
+    state = _state(session)
+    assert state.last_validation_attempt == 0.0
+
+    assert brain_daemon.run_handshake(state, "no_marker") is False
+    assert state.last_validation_attempt > 0.0

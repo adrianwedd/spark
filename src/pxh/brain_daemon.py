@@ -471,7 +471,14 @@ def tick(states: dict[str, SessionState]) -> None:
             _log("tick_error", session=state.name, error=str(exc))
             health.record_failure(state.component, str(exc))
 
-    _validate_one(live)
+    # _validate_one already guards its own internals; this is belt and
+    # braces around whatever's left (_log or health.record_failure raising
+    # from inside one of its except handlers) — tick() must not raise no
+    # matter where the exception comes from.
+    try:
+        _validate_one(live)
+    except Exception as exc:  # noqa: BLE001
+        _log("tick_error", session="_validate_one", error=str(exc))
 
     # Health after validation, so a session validated this tick reports it
     # immediately. Conditional on the marker and never on the glyph: a
