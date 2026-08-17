@@ -687,6 +687,9 @@ def test_a_validated_session_is_not_re_handshaked(fake_tmux, monkeypatch):
     brain.ensure_mailbox(session)
     brain.write_validation_marker(session, state="validated", request_id="r",
                                   model=brain.configured_model(session), attempt=1)
+    # Real wall-clock time almost always has nightly_due true on a fresh
+    # SessionState; recycling is not what this test is about.
+    monkeypatch.setattr(brain_daemon, "maybe_recycle", lambda *a, **k: None)
     called = []
     monkeypatch.setattr(brain_daemon, "run_handshake",
                         lambda state, reason: called.append(reason) or True)
@@ -703,6 +706,9 @@ def test_a_model_mismatch_triggers_a_transition(fake_tmux, monkeypatch):
     brain.write_validation_marker(session, state="validated", request_id="r",
                                   model="claude-opus-4-6", attempt=1)
     monkeypatch.setenv("PX_CLAUDE_TMUX_MODEL", "claude-haiku-4-5-20251001")
+    # Real wall-clock time almost always has nightly_due true on a fresh
+    # SessionState; recycling is not what this test is about.
+    monkeypatch.setattr(brain_daemon, "maybe_recycle", lambda *a, **k: None)
     called = []
     monkeypatch.setattr(brain_daemon, "run_handshake",
                         lambda state, reason: called.append(reason) or True)
@@ -772,6 +778,9 @@ def test_a_validated_session_reports_ok(fake_tmux, monkeypatch):
     brain.ensure_mailbox(session)
     brain.write_validation_marker(session, state="validated", request_id="r",
                                   model=brain.configured_model(session), attempt=1)
+    # Real wall-clock time almost always has nightly_due true on a fresh
+    # SessionState; recycling is not what this test is about.
+    monkeypatch.setattr(brain_daemon, "maybe_recycle", lambda *a, **k: None)
     brain_daemon.tick({session: _state(session)})
     record = health.read_health(("px-brain",))["components"]["px-brain"]
     assert record["status"] == "ok"
@@ -788,6 +797,9 @@ def test_validating_records_neither_success_nor_failure(fake_tmux, monkeypatch):
     brain.ensure_mailbox(session)
     brain.write_validation_marker(session, state="validating", request_id="r",
                                   model=brain.configured_model(session), attempt=1)
+    # Real wall-clock time almost always has nightly_due true on a fresh
+    # SessionState; recycling is not what this test is about.
+    monkeypatch.setattr(brain_daemon, "maybe_recycle", lambda *a, **k: None)
     monkeypatch.setattr(brain_daemon, "run_handshake",
                         lambda state, reason: pytest.fail("validating is not due"))
     brain_daemon.tick({session: _state(session)})
@@ -907,3 +919,74 @@ def test_the_narrow_sweep_records_the_dead_handshake_and_recycling_recovers(
     brain_daemon.maybe_recycle(state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
     assert any("/clear" in text for _, text in fake_tmux.injected), \
         "a test that only checked the file vanished would pass against a fix that swept the wrong one"
+
+
+# ---------------------------------------------------------------------------
+# Model changes and recycles are transitions, not side effects (§2.5)
+# ---------------------------------------------------------------------------
+
+def test_a_model_change_clears_the_marker_before_injecting(fake_tmux, _fast_handshake, monkeypatch):
+    """Crash-safe direction: a supervisor killed between the two steps drops the
+    lock at process death and leaves no marker, so the next reader falls back.
+    The reverse order has a window where the marker vouches for a session whose
+    context has just been cleared."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model="claude-opus-4-6", attempt=1)
+    order = []
+
+    def _inject(text, spec=None):
+        order.append(("marker" if brain.validation_path(session).exists() else "no-marker", text))
+        return _echo_when_nudged(fake_tmux, session)(text, spec)
+
+    monkeypatch.setattr(tmux_claude, "inject", _inject)
+    brain_daemon.run_handshake(_state(session), "model_change")
+
+    model_injects = [entry for entry in order if entry[1].startswith("/model")]
+    assert model_injects, "a model change injects /model"
+    assert model_injects[0][0] == "no-marker", \
+        "the marker must be gone before the keystroke that invalidates it"
+    assert brain.read_validation_marker(session)["model"] == brain.configured_model(session), \
+        "the marker's model is only written by a handshake the new model answered"
+
+
+def test_a_recycle_holds_the_single_flight_lock(fake_tmux):
+    """Today /clear is injected with no lock held at all, which races any
+    caller's nudge."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    state.turns = brain_daemon.CONTEXT_TURNS
+
+    held = brain._lock_for(session)
+    held.acquire()
+    try:
+        brain_daemon.maybe_recycle(
+            state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
+        assert not any("/clear" in text for _, text in fake_tmux.injected), \
+            "a caller mid-turn must not have its context cleared underneath it"
+    finally:
+        held.release()
+
+    brain_daemon.maybe_recycle(
+        state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
+    assert any("/clear" in text for _, text in fake_tmux.injected)
+
+
+def test_a_recycle_clears_the_marker_so_the_next_tick_re_handshakes(fake_tmux):
+    """A session that has just forgotten its identity prompt has not been
+    validated on that context. Every recycle is followed by a handshake."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state="validated", request_id="r",
+                                  model=brain.configured_model(session), attempt=1)
+    state = _state(session)
+    state.turns = brain_daemon.CONTEXT_TURNS
+
+    brain_daemon.maybe_recycle(
+        state, datetime(2026, 8, 17, 12, 0, tzinfo=brain_daemon.HOBART))
+    assert brain.session_state(session) == brain.NO_MARKER

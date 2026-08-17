@@ -239,6 +239,18 @@ def run_handshake(state: SessionState, reason: str) -> bool:
             health.record_failure(state.component,
                                   tmux_claude.last_error() or "session did not start")
             return False
+
+        if reason == "model_change":
+            # Ordering matters and this is the crash-safe direction: the marker
+            # is already gone (cleared above, before the lock), so a supervisor
+            # killed between here and the handshake leaves `no_marker` rather
+            # than a marker vouching for a session that has just been retuned.
+            _log("model_change", session=session, model=model)
+            if not tmux_claude.inject(f"/model {model}", spec=spec):
+                health.record_failure(state.component,
+                                      tmux_claude.last_error() or "model switch failed")
+                return False
+
         time.sleep(brain.SETTLE_S)
 
         # One deadline for the whole handshake, so a retry does not leave the
@@ -398,7 +410,10 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
     """Reset context at an idle moment — on turn count, or once a night.
 
     Never mid-request: a `/clear` between the nudge and the reply loses the
-    request entirely, and the caller can only see that as a timeout.
+    request entirely, and the caller can only see that as a timeout. Held under
+    the single-flight lock for the same reason, non-blocking: waiting for it
+    would stall the supervisor for the length of a caller's deadline — up to
+    1800s for `evolve` — and there is another tick in ten seconds.
     """
     day = now_local.strftime("%Y-%m-%d")
     nightly_due = (now_local.hour >= NIGHTLY_RECYCLE_HOUR
@@ -409,18 +424,39 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
     if not _is_idle(state):
         return
 
-    spec = brain.spec_for_session(state.name)
-    reason = "nightly" if nightly_due else "turns"
-    _log("recycle", session=state.name, reason=reason, turns=state.turns)
+    lock = brain._lock_for(state.name)
+    if lock is None:
+        return
+    try:
+        lock.acquire(timeout=0)
+    except Exception:  # noqa: BLE001 - filelock's Timeout, or an OSError
+        _log("recycle_deferred", session=state.name, reason="lock busy")
+        return
 
-    # Journal first, then clear — the other order throws away the thing the
-    # journal was supposed to preserve.
-    tmux_claude.inject(
-        f"Before anything else: append anything worth keeping to {journal_path()}, "
-        "then run /clear.", spec=spec)
-    state.turns = 0
-    if nightly_due:
-        state.last_recycle_day = day
+    try:
+        spec = brain.spec_for_session(state.name)
+        reason = "nightly" if nightly_due else "turns"
+        _log("recycle", session=state.name, reason=reason, turns=state.turns)
+
+        # Marker first, then the keystroke. A supervisor killed between the two
+        # drops the lock at process death and leaves no marker, so the next
+        # reader sees `no_marker`, falls back, and the next tick re-handshakes —
+        # rather than injecting into a session whose context has just gone.
+        brain.clear_validation_marker(state.name)
+
+        # Journal before clearing — the other order throws away the thing the
+        # journal was supposed to preserve.
+        tmux_claude.inject(
+            f"Before anything else: append anything worth keeping to {journal_path()}, "
+            "then run /clear.", spec=spec)
+        state.turns = 0
+        if nightly_due:
+            state.last_recycle_day = day
+    finally:
+        try:
+            lock.release()
+        except (RuntimeError, OSError):
+            pass
 
 
 def count_turns(state: SessionState) -> None:
