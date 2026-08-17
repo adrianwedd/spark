@@ -381,7 +381,17 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 # Run in parallel via run_in_background; synthesise results
 
 hermes -z "QA prompt" 2>&1
-agy --print --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark "QA prompt" 2>&1
+agy --dangerously-skip-permissions --add-dir /Users/adrian/repos/spark --print-timeout 10m --print "QA prompt" 2>&1
 gemini -p "QA prompt" 2>&1
 echo "QA prompt" | codex exec --full-auto - 2>&1
 ```
+
+**`agy --print` takes the prompt as its value, not as a trailing argument.** The
+old spelling here put `--print` first and the prompt last, so `--print` consumed
+`--dangerously-skip-permissions` as its value and the prompt was never read —
+agy answered a question about the flag and exited 0. A QA run that returns
+cleanly having reviewed nothing is the dangerous failure: it looks like a pass.
+Keep `--print` last. Its default timeout is 5m, short for a whole-diff review.
+
+Narrow prompts for agy — it does better with a named file list and a ranked
+list of what to look for than with "review this branch".
