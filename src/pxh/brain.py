@@ -114,10 +114,6 @@ DEFAULT_DEADLINE_S = 300
 # Ollama tiers than by blocking a daemon loop for minutes.
 LOCK_WAIT_S = float(os.environ.get("PX_BRAIN_LOCK_WAIT_S", "10"))
 
-# Grace period for the pane to show its prompt glyph before we give up. Never
-# inject into a busy pane — that is how two turns get spliced into one.
-READY_WAIT_S = float(os.environ.get("PX_BRAIN_READY_WAIT_S", "20"))
-
 POLL_INTERVAL_S = 0.25
 
 # Replies are answers, not payloads. A cap keeps a runaway session (or a
@@ -508,16 +504,50 @@ def collect_reply(session: str, request_id: str) -> dict[str, Any] | None:
 
 
 def cleanup_request(session: str, request_id: str) -> None:
-    """Clear the in-flight marker and drop the request. Always runs.
+    """Drop this request's inbox entry, and clear current.json IF it is ours.
 
-    `current.json` is what wedge detection keys on, so leaving it behind after a
-    caller-side timeout would report a healthy session as wedged and get it
-    killed. It is cleared on every exit path, including the ones nobody plans
-    for.
+    `current.json` is what wedge detection keys on, so leaving a stale one
+    behind after a caller-side timeout would report a healthy session as
+    wedged and get it killed — that half of the cleanup runs unconditionally.
+    But `current.json` can belong to someone else: a caller that bails at
+    ask_brain's post-lock recheck runs this in its `finally` while the
+    supervisor's own in-flight request may already be sitting in the file.
+    Deleting on request-id, not unconditionally, keeps "cleanup touches only
+    this request" true regardless of who else is using the file right now.
+
+    That id check needs a readable file to compare against, and unreadable
+    splits three ways rather than one. Absent is fine — nothing to clean up.
+    But corrupt JSON, valid JSON that isn't an object, or an object missing
+    "id" all describe a file no request can ever claim by id — leaving one of
+    those behind is the exact permanent-stale-file failure this function
+    exists to prevent, so those are unlinked on sight rather than treated as
+    "not ours". Only a *readable, id-bearing* file naming someone else is left
+    alone.
     """
-    for path in (inbox_dir(session) / f"{request_id}.json", current_path(session)):
+    try:
+        (inbox_dir(session) / f"{request_id}.json").unlink()
+    except OSError:
+        pass
+    try:
+        raw = current_path(session).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+    try:
+        current = json.loads(raw)
+    except json.JSONDecodeError:
+        current = None
+    if not (isinstance(current, dict) and "id" in current):
+        # Unclaimable — no future cleanup_request call could ever match it.
         try:
-            path.unlink()
+            current_path(session).unlink()
+        except OSError:
+            pass
+        return
+    if current.get("id") == request_id:
+        try:
+            current_path(session).unlink()
         except OSError:
             pass
 
@@ -530,9 +560,10 @@ def ask_brain(
 ) -> dict[str, Any] | None:
     """Send one request to the persistent Claude session and wait for its reply.
 
-    Returns the reply dict, or None on any failure — no session, no lock, a busy
-    pane, or no answer before the deadline. None means "fall back", and every
-    caller must have a fallback; there is deliberately no exception path.
+    Returns the reply dict, or None on any failure — no session, no lock, an
+    unvalidated session, or no answer before the deadline. None means "fall
+    back", and every caller must have a fallback; there is deliberately no
+    exception path.
     """
     session = session_for_kind(kind)
     if timeout_s is None:

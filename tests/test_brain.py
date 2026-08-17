@@ -47,7 +47,6 @@ def _mailbox(tmp_path, monkeypatch):
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("PROJECT_ROOT", str(ROOT))
     monkeypatch.setattr(brain, "POLL_INTERVAL_S", 0.01)
-    monkeypatch.setattr(brain, "READY_WAIT_S", 0.05)
     monkeypatch.setattr(brain, "LOCK_WAIT_S", 0.5)
     return tmp_path / "state"
 
@@ -63,7 +62,6 @@ def _live_pane(monkeypatch):
     injected: list[str] = []
     monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
     monkeypatch.setattr(tmux_claude, "ensure_session", lambda *a, **k: True)
-    monkeypatch.setattr(tmux_claude, "pane_ready", lambda *a, **k: True)
     monkeypatch.setattr(tmux_claude, "inject",
                         lambda text, spec=None: (injected.append(text), True)[1])
     brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
@@ -157,7 +155,7 @@ def test_timeout_clears_current_json(_live_pane):
 
 
 def test_a_dead_session_returns_none(monkeypatch):
-    monkeypatch.setattr(tmux_claude, "ensure_session", lambda *a, **k: False)
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: False)
     assert brain.ask_brain("research", {"q": 1}, timeout_s=1) is None
 
 
@@ -642,6 +640,59 @@ def test_the_post_lock_recheck_prevents_a_confident_wrong_answer(_mailbox, _live
     assert brain.ask_brain("research", {"q": "why"}, timeout_s=1) is None
     assert _live_pane == [], \
         "the symptom being prevented is a confident wrong answer, not an error"
+
+
+def test_a_post_lock_bailout_leaves_a_foreign_current_json_alone(_mailbox, _live_pane, monkeypatch):
+    """A caller that bails at the post-lock recheck still runs cleanup_request
+    in its `finally`. current.json may belong to someone else's in-flight
+    request at that moment — deleting it unconditionally would report a
+    healthy request as wedged."""
+    session = brain.BRAIN_SESSION
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    _validate(session)
+
+    foreign_id = str(uuid.uuid4())
+    brain.ensure_mailbox(session)
+    brain.current_path(session).write_text(json.dumps(
+        {"id": foreign_id, "kind": "evolve", "deadline": time.time() + 999}))
+
+    real_lock_for = brain._lock_for
+
+    def _invalidating_lock(sess):
+        lock = real_lock_for(sess)
+        real_acquire = lock.acquire
+
+        def _acquire(*args, **kwargs):
+            result = real_acquire(*args, **kwargs)
+            brain.clear_validation_marker(sess)  # the supervisor's /clear lands
+            return result
+
+        lock.acquire = _acquire
+        return lock
+
+    monkeypatch.setattr(brain, "_lock_for", _invalidating_lock)
+
+    assert brain.ask_brain("research", {"q": "why"}, timeout_s=1) is None
+    current = json.loads(brain.current_path(session).read_text())
+    assert current["id"] == foreign_id, \
+        "cleanup_request must not delete a current.json it does not own"
+
+
+@pytest.mark.parametrize("garbage", ["{not json", "[]", "null", '{"kind": "evolve"}'])
+def test_cleanup_request_removes_a_current_json_nothing_could_ever_claim(_mailbox, garbage):
+    """The flip side of the fix above: a current.json that is corrupt, not an
+    object, or missing "id" can never match any request's id, so leaving it
+    behind is the same permanent-stale-file bug the id check was written to
+    stop — just reached from the opposite direction. Only a readable,
+    id-bearing file naming someone else is left alone."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    brain.current_path(session).write_text(garbage)
+
+    brain.cleanup_request(session, str(uuid.uuid4()))
+
+    assert not brain.current_path(session).exists(), \
+        f"an unclaimable current.json ({garbage!r}) must be removed, not left forever"
 
 
 def test_a_validated_session_is_used(_mailbox, _live_pane, monkeypatch):
