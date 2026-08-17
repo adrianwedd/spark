@@ -66,9 +66,15 @@ answered the handshake that produced this marker. There is no state in which the
 marker claims a model the session has not demonstrably answered on. The separate
 `state/brain/<session>/model` file is removed — one fact, one file.
 
-The marker is created 0666 for the same reason the mailbox directories are 1777:
-SPARK's daemons do not all run as the same uid, and a root-created 0644 marker
-locks every `pi` reader out of rewriting it.
+The marker is created **0644, not 0666**. The 1777 reasoning that governs the
+mailbox directories and `state/health/` does not transfer, and it is worth
+saying why rather than copying the mode across out of habit: those are
+world-writable because they have *many* writers running as different uids. This
+marker has exactly one writer — the supervisor, always `pi` — and every other
+process only reads it. Handing write permission to uids that never write is
+permission for no reason, and it would let a compromised or confused caller
+forge a `validated` marker for a session that cannot answer, which is the exact
+claim this whole design exists to make unforgeable.
 
 ### 2.2 States
 
@@ -116,15 +122,41 @@ is the same as any other "nobody is working on it".
 Owned by the supervisor. Callers never handshake — `brain_daemon.py` exists
 precisely so that no daemon has to drive session lifecycle on its own timing.
 
-On session (re)create, and on any transition out of `validated`:
+**Three triggers**, and the third is the one that makes the state machine
+closed:
 
-1. **Sweep** pending inbox entries to `dead/`, delete `validation.json`.
+- on session (re)create;
+- on any transition out of `validated` (model change, recycle);
+- **on observing `no_marker` for a session that exists.**
+
+The third is not redundant with the first two, because `no_marker` is the only
+state you arrive at by *aging* rather than by an event. A supervisor killed
+mid-handshake leaves a session that exists, was never validated, and whose
+`validating` marker crosses `VALIDATION_CEILING_S` some time later with nobody
+watching. Neither edge ever fires again: nothing recreates the session, because
+tmux still has it. Without this trigger the session sits loud and unrepaired
+until a human attaches — which is exactly the "up and cannot answer" case §2.2
+writes a repair line for, with no automatic path to that repair. So the tick is
+**level-triggered on state**, not edge-triggered on events: any tick that
+observes `no_marker` on an existing session starts a handshake, subject to the
+one-validation-per-tick rule in §2.6.
+
+Then, in order:
+
+1. **Sweep** pending inbox entries to `dead/` (creation only — see §2.8), delete
+   `validation.json`.
 2. **Acquire the single-flight `FileLock`** for the session and hold it for the
    whole handshake. This is the same lock `ask_brain` takes, so no caller can
    inject into a session that is mid-handshake, and no handshake can splice
    itself into a caller's turn.
-3. **Wait for `pane_ready()`**, bounded by `STARTUP_CEILING_S`. This is the weak
-   signal — necessary but not sufficient. It only gates when we start typing.
+3. **Take `ensure_session()`'s word for the glyph, and do not wait again.**
+   `tmux_claude.ensure_session()` already polls `pane_ready()` for up to its own
+   `STARTUP_TIMEOUT_S` before returning (`tmux_claude.py:209-217`), so a second
+   wait here would spend that budget twice — see §2.6. Note it returns `True` on
+   `session_exists()` alone when the prompt never appeared, and that is fine
+   *here specifically*: the glyph is now a best-effort hint about when to start
+   typing, and the handshake is the authoritative readiness test. A session that
+   never showed a prompt gets nudged anyway and fails validation on the merits.
 4. **Settle** `SETTLE_S`, then generate one fresh `request_id` (uuid4) and write
    the marker as `validating`.
 5. **Write the handshake request** to `inbox/<request_id>.json` with
@@ -148,6 +180,20 @@ that renders a prompt glyph. Leaving `check_wedge()` as-is is deliberate: for a
 `finally:` removes `current.json` on timeout, so a lingering past-deadline
 marker there means the caller process itself died. Recorded here as a known
 limitation of that path rather than fixed by this spec.
+
+**It carries a warning label in the code, not only in this document.** The
+`pane_ready()` branch in `check_wedge()` gets a comment saying in as many words
+that the glyph does not prove the session can answer, that a permission dialog
+renders it, and that this branch is therefore trusted only because
+`ask_brain`'s `finally:` makes a lingering `current.json` mean something
+narrower. A limitation recorded only in a spec is a limitation the next reader
+re-derives from scratch after it bites them a second time.
+
+**A tmux server restart mid-handshake is self-recovering and needs no special
+handling.** The session disappears, `session_exists()` goes false, the next tick
+reads `session_absent`, recreates, sweeps, and handshakes with a fresh id. The
+in-flight handshake's caller is the supervisor itself, which is not waiting on a
+deadline it cannot abandon. Stated so nobody adds machinery for it.
 
 ### 2.4 Request ids: fresh per creation, reused across retries
 
@@ -205,7 +251,14 @@ marker vouches for a session that no longer holds its identity prompt.
 
 The inner deadline covers one turn only:
 
-- `STARTUP_CEILING_S` is spent before the handshake clock starts (§2.3 step 6).
+- `STARTUP_CEILING_S` is spent before the handshake clock starts (§2.3 step 6),
+  and it is **counted once**. `STARTUP_CEILING_S` *is*
+  `tmux_claude.STARTUP_TIMEOUT_S` — the wait that `ensure_session()` already
+  performs internally — not a second wait layered on top of it. An earlier draft
+  of §2.3 had the supervisor wait for the glyph again after `ensure_session()`
+  returned, which spent the same 45s twice and put the true worst case at 212s,
+  not 167s. There is one glyph wait in the system per session start, it lives
+  inside `ensure_session()`, and this term accounts for it.
 - `HANDSHAKE_TIMEOUT_S` covers a single first turn — read a small JSON file, run
   one Bash tool. It is generous for that (60s, matching the cold-start figure
   that forced `CLAUDE_TIMEOUT` 45→60 on the describe-scene path) because a first
@@ -245,9 +298,30 @@ Two consequences, both stated so a later reader is not surprised:
   tick instead of blocking. A test asserts the inequality so that decision is
   forced rather than discovered.
 
+**The inequality bounds one session's validation, not a run of them**, and that
+distinction is worth stating because the arithmetic invites a wrong reading in
+both directions. Summing two validations (167 + 167 = 334 > 300) looks like a
+guaranteed stale sibling on boot, and it isn't: with one validation per tick,
+session A's health lands at the end of its own iteration, B's a moment later,
+and A's next write comes ~355s after its first — a gap of ~188s, inside the
+300s window. The sum is only reached when *both* sessions handshake on every
+tick, which means both are crash-looping, and in that state `stale` is an
+accurate report rather than a false alarm. So: no boot-time breakage, but the
+budget genuinely does not cover a sustained multi-session failure, and nobody
+should later "prove" it does by adding the terms up.
+
 `validating` deliberately does not write health success, so a session stuck in
 validation goes `stale` on its own component after 300s rather than reporting
 `ok`. That is the alarm that was missing.
+
+One caveat on reading that alarm: **`stale` has two causes.**
+`health._write_record` swallows `OSError` silently (`health.py:124-126`), so on a
+full disk no record is written at all and every component reads `stale` —
+indistinguishable from a supervisor that stopped working. The silent swallow is
+correct behaviour (health reporting must never kill the daemon it reports on),
+but an operator seeing `stale` should check `df` before concluding the brain is
+wedged, and `bin/px-brain-status` prints free space on `state/` alongside the
+session states for exactly that reason.
 
 ### 2.7 The handshake request
 
@@ -271,13 +345,73 @@ They are real Claude turns and cost real money, and a spike in the handshake
 count is the visible symptom of a session restart-looping. They also count
 toward `CONTEXT_TURNS`, because a handshake is a turn of context like any other.
 
+### 2.8 One supervisor, and what the lock does not cover
+
+`bin/px-brain` has no single-instance guard today — no PID file, no flock,
+nothing. So two supervisors is not a hypothetical, and the obvious way to get
+there is an operator running `bin/px-brain` in a shell to watch it while systemd
+already has one. The damage is not subtle: `start_session`, `sweep_pending`,
+`kill_session` and `check_wedge` all run *outside* the single-flight lock, so one
+supervisor can sweep the other's in-flight handshake request into `dead/`, and
+the handshake then times out against a request that no longer exists.
+
+**The guard:** `fcntl.flock(LOCK_EX | LOCK_NB)` on
+`state/brain/.supervisor.lock`, taken at startup and held for the process
+lifetime. A loser logs which pid holds it and exits non-zero.
+
+Two deliberate choices there. It is flock rather than px-mind's PID-file-plus-
+`/proc` pattern because a supervisor that can be SIGKILLed wants a guard the
+kernel releases at death — no stale-PID window, no PID-reuse `cmdline` check to
+get subtly wrong. And it is stdlib `fcntl` rather than `filelock` because
+`bin/px-brain` runs under `/usr/bin/python3`, where `brain.py` already carries an
+`ImportError` path that degrades to "no lock available"; a guard that can
+silently degrade into no guard is not a guard.
+
+The systemd interaction is the intended one: `StartLimitBurst=5` /
+`StartLimitIntervalSec=300` means the losing copy gives up after five attempts
+rather than restart-looping forever, and `px-brain`'s health goes `stale`, which
+is visible. One supervisor wins, the other stops, and the fact that it happened
+is legible.
+
+**Which lifecycle operations take the per-session single-flight lock:**
+
+| Operation | Lock | Why |
+|---|---|---|
+| Handshake (§2.3) | held | It is a request. Same splice hazard as any other. |
+| Model change / recycle (§2.5) | held | Injects keystrokes into the pane. |
+| `sweep_pending` on create | **not held** | Acquiring it would block the supervisor for the length of a caller's deadline — up to 1800s for `evolve`. The request being swept belongs to a session that no longer exists, so the caller is already doomed to fall back; blocking the supervisor to be tidy about it trades a lost request for a stalled brain. |
+| Escape / `kill_session` on a wedge | **not held** | The wedged caller *is* the lock holder. Waiting for the lock would make unwedging structurally impossible — the one case where taking it is precisely wrong. |
+| `check_wedge`, `_is_idle`, state reads | not held | Read-only. |
+
+Note what that table means: the operations that could collide between two
+supervisors are exactly the ones that must not take the lock. **The
+dual-supervisor hazard is closed by the guard, not by the lock**, and no amount
+of widening the lock's scope would close it without deadlocking the unwedge
+path.
+
 ## 3. What callers and operators see
 
-`ask_brain` gains one check, before the lock: if `session_state(session)` is not
+`ask_brain` gains **two** checks, and both are load-bearing.
+
+**Before the lock**, as a fast path: if `session_state(session)` is not
 `validated`, return `None` immediately — no lock, no injection, no request file.
-This is the fast path, and it is the common one during startup: a caller that
-arrives while `spark-brain` is validating gets its fallback in milliseconds
-instead of waiting `LOCK_WAIT_S` behind the supervisor's lock.
+This is the common case during startup — a caller that arrives while
+`spark-brain` is validating gets its fallback in milliseconds instead of waiting
+`LOCK_WAIT_S` behind the supervisor's lock.
+
+**After `lock.acquire()` returns**, re-derive the state and bail if it is no
+longer `validated`. The pre-lock check is a check-then-act across a lock
+boundary, and the window is not theoretical: the supervisor holds the same lock
+for a model change or a recycle, so a caller can pass the check, block on
+`acquire()`, and wake up on the far side of a `/clear`. The failure depends on
+timing in a way that gets worse as the system gets faster. If the supervisor is
+slow, the caller times out at `LOCK_WAIT_S` and loses ten seconds. If the
+supervisor is quick, the caller acquires the lock moments after the `/clear`
+lands and injects a real request into a session that has just forgotten
+everything, including its identity prompt — and gets back a confident answer
+produced with no context. A wasted ten seconds is a performance bug; a plausible
+wrong answer routed into SPARK's cognition is not, and only the second check
+distinguishes them.
 
 Logging follows §2.2 exactly. `brain_unavailable` gains a `state` field carrying
 the derived state verbatim, so the log line names the repair:
@@ -298,6 +432,26 @@ Health, per session component (`px-brain`, `px-brain-io`):
 attempt count and marker age for both sessions. The state names in the table are
 the vocabulary a human uses to describe the fault, so the tool prints them
 unchanged rather than prettifying them into a different set of words.
+
+### 3.1 Every glyph site, named
+
+The glyph is not being deleted — it is being demoted from "the session can
+answer" to "the pane is accepting input", which is all `capture-pane` was ever
+able to tell us. A demotion is only real if every site is accounted for, so all
+seven are listed with their verdict. Two change, two go, three stay.
+
+| # | Site | Verdict |
+|---|---|---|
+| 1 | `tmux_claude.pane_ready()` — `tmux_claude.py:154` | **Stays, docstring corrected.** It currently reads "True once Claude is actually listening, not merely once tmux returned", which is the claim this spec disproves. It means: the pane is accepting input. |
+| 2 | `tmux_claude.ensure_session()` startup poll — `:212` | **Stays**, and becomes the *only* glyph wait per session start (§2.3 step 3, §2.6). |
+| 3 | `brain._wait_ready()` poll loop — `brain.py:351` | **Removed** with `_switch_model` (§2.5). |
+| 4 | `brain._wait_ready()` final check — `brain.py:354` | **Removed**. Callers no longer wait on readiness at all; they read the marker. |
+| 5 | `brain_daemon.check_wedge()` — `:191` | **Stays, warning-labelled** (§2.3). The one site where the glyph's weakness is load-bearing and tolerated. |
+| 6 | `brain_daemon._is_idle()` — `:221` | **Stays.** "Idle" really is a question about the pane, and it gates recycles. A recycle mistimed by a dialog is now recoverable rather than silent, because every recycle is followed by a handshake. |
+| 7 | `brain_daemon.tick()` health success — `:277` | **Changed, and this is the bug.** This is the line that recorded `ok` for a session that could not answer a single request. Success becomes conditional on `session_state() == "validated"`, never on the glyph. |
+
+A test asserts that `pane_ready` has no call sites in `brain.py` after this
+change, so the removed pair cannot quietly come back.
 
 ## 4. Testing
 
@@ -320,10 +474,31 @@ and answers via the real `bin/tool-brain-reply`):
 - **The recycle ordering.** Marker is deleted before `/clear` is injected, and
   both happen under the lock — assert the call order, and assert a caller
   holding the lock blocks the recycle.
+- **`no_marker` is repaired without a human.** Aged `validating` marker + live
+  session + no supervisor event → the next `tick()` starts a handshake. This is
+  the closure test for the state machine; without it the loud state has a repair
+  line and no path to it.
+- **The post-lock re-check fires.** Caller passes the pre-lock check, the
+  supervisor invalidates the marker while the caller is blocked in
+  `acquire()`, and on acquiring the caller returns `None` **without** calling
+  `tmux_claude.inject` — asserted on the mock, because the symptom being
+  prevented is a confident answer, not an error.
+- **One supervisor.** A second `brain_daemon.run()` against the same
+  `state/brain/` exits non-zero rather than starting, and the guard is released
+  when the first process dies (kill it and assert the second now starts).
+- **Health tracks validation, not the glyph.** A session whose pane is ready but
+  whose marker is absent records a *failure*, not a success — the regression
+  test for the original bug (glyph site 7).
+- **No glyph left in the request path.** `pane_ready` has zero call sites in
+  `brain.py` (grep-style assertion over the source, per §3.1).
 - **The bound holds.** `STARTUP_CEILING_S + SETTLE_S + HANDSHAKE_ATTEMPTS ×
   HANDSHAKE_TIMEOUT_S ≤ VALIDATION_CEILING_S`, with `VALIDATION_CEILING_S` read
-  from `health.STALE_AFTER_S` rather than a literal — the same pattern as
-  `test_describe_scene_timeout_has_margin_over_claude`.
+  from `health.STALE_AFTER_S` and `STARTUP_CEILING_S` read from
+  `tmux_claude.STARTUP_TIMEOUT_S` rather than literals — the same pattern as
+  `test_describe_scene_timeout_has_margin_over_claude`. Reading the startup term
+  from the module is what stops the double-count reappearing: if someone adds a
+  second glyph wait, the identity `STARTUP_CEILING_S is STARTUP_TIMEOUT_S`
+  stops describing the code.
 - **Envelope, statically.** The io spec's `PX_CLAUDE_ALLOWED_TOOLS` is exactly
   `TOOL_BRAIN_REPLY_ALLOW` and nothing else.
 
@@ -348,8 +523,11 @@ re-validates in teardown.
 
 ## 5. Not in scope
 
-- Fixing `check_wedge()`'s `pane_ready()` branch (§2.3) — recorded as a known
-  limitation.
+- Fixing `check_wedge()`'s `pane_ready()` branch (§2.3) — warning-labelled in
+  the code, not fixed.
+- Making `health._write_record`'s silent `OSError` visible (§2.6). The swallow is
+  correct; the ambiguity it creates between "disk full" and "daemon dead"
+  belongs to `health.py` and would be a change to every component at once.
 - Per-request model switching. It is removed, not redesigned; a resident
   session's model is a property of the session, and every kind that needs a
   different one either accepts the session default or waits for a supervisor
