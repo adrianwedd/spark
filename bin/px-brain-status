@@ -32,7 +32,7 @@ for session in (brain.BRAIN_SESSION, brain.IO_SESSION):
     age_text = "-" if age == float("inf") else f"{age:.0f}s"
     print(f"{session:<12} {state:<15} "
           f"model={marker.get('model') or '-'} "
-          f"attempt={marker.get('attempt') or '-'} "
+          f"attempt={marker.get('attempt', '-')} "
           f"marker_age={age_text}")
 
 try:

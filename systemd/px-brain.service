@@ -1,6 +1,8 @@
 [Unit]
 Description=SPARK resident Claude sessions (brain + io) supervisor
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -18,8 +20,6 @@ Environment=TERM=tmux-256color
 ExecStart=/home/pi/picar-x-hacking/bin/px-brain
 Restart=always
 RestartSec=10
-StartLimitBurst=5
-StartLimitIntervalSec=300
 # The tmux server and its sessions are deliberately NOT in this unit's cgroup
 # lifecycle — killing the supervisor must not kill the brain it supervises. A
 # restart re-attaches to the sessions that are already running, which is what

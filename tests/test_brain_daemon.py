@@ -765,16 +765,27 @@ def test_a_failing_session_cannot_starve_a_healthy_one(fake_tmux, monkeypatch):
 
 def test_health_success_requires_validation_not_a_glyph(fake_tmux, monkeypatch):
     """Glyph site 7 — the original bug. This is the line that recorded `ok` for
-    a session that could not answer a single request, forever."""
+    a session that could not answer a single request, forever.
+
+    Uses `real_clock=True` and asserts the stub was actually consulted: built
+    with a fixed (empty) `last_recycle_day` and no `real_clock`, `nightly_due`
+    is true for ~22 hours of the day, `tick()`'s recycle fires first, stamps
+    `last_recycle_at`, and the quiet window means the stubbed `run_handshake`
+    below is never called at all — `status != "ok"` then passes for the
+    unrelated reason that the status is `missing`, not because anything
+    proved the glyph doesn't count."""
     from pxh import health
 
     session = brain.BRAIN_SESSION
     fake_tmux.sessions.add(session)
     fake_tmux.ready = True          # the pane looks perfect
     brain.ensure_mailbox(session)   # and there is no marker
-    monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: False)
+    called = []
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: called.append(reason) or False)
 
-    brain_daemon.tick({session: _state(session)})
+    brain_daemon.tick({session: _state(session, real_clock=True)})
+    assert called, "the stub must actually be consulted for this test to mean anything"
     record = health.read_health(("px-brain",))["components"]["px-brain"]
     assert record["status"] != "ok", \
         "a ready pane is not evidence of anything; a permission dialog renders one"
@@ -822,6 +833,44 @@ def test_session_absent_needs_no_handshake(fake_tmux, monkeypatch):
     session = brain.BRAIN_SESSION
     assert brain.session_state(session) == brain.SESSION_ABSENT
     assert brain_daemon.handshake_reason(_state(session)) is None
+
+
+def test_a_busy_pane_extends_the_quiet_window_past_its_fixed_floor(fake_tmux):
+    """I2: RECYCLE_QUIET_S alone is a floor, not the whole story. A recycle's
+    journal+/clear turn is a real Claude turn and can outlast one
+    HANDSHAKE_TIMEOUT_S on a slow night — if the pane is still busy once the
+    fixed window expires, handshake_reason must keep withholding rather than
+    nudge a session that is demonstrably still working, or the nudge cancels
+    the very recycle turn the supervisor already believes landed."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    fake_tmux.ready = False  # the pane is still busy with the recycle turn
+    brain.ensure_mailbox(session)  # no marker — the recycle already cleared it
+    state = _state(session)
+    # Past RECYCLE_QUIET_S (60s), well inside VALIDATION_CEILING_S (180s).
+    state.last_recycle_at = time.monotonic() - 90
+
+    assert brain_daemon.handshake_reason(state) is None, \
+        "a still-busy pane must keep suppressing the handshake past the fixed floor"
+
+
+def test_a_pane_that_never_goes_idle_is_eventually_handshaked_anyway(fake_tmux):
+    """I2's other half: the extension is bounded. An unbounded idle gate on
+    this path would break the state machine's closure property — a session
+    whose pane never shows a glyph again would never be handshaked and so
+    never repaired. Once VALIDATION_CEILING_S has passed since the recycle,
+    handshake_reason must stop waiting for idle and return to the level
+    trigger, busy pane or not."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    fake_tmux.ready = False  # still busy — this must not matter any more
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    # Past VALIDATION_CEILING_S (180s) since the recycle.
+    state.last_recycle_at = time.monotonic() - 190
+
+    assert brain_daemon.handshake_reason(state) == "no_marker", \
+        "the extension must not wait on idle forever"
 
 
 def test_run_handshake_bumps_last_validation_attempt_even_on_a_fast_failure(

@@ -570,6 +570,19 @@ def test_a_corrupt_marker_reads_as_no_marker(_mailbox, _session_present):
     assert brain.session_state(brain.BRAIN_SESSION) == brain.NO_MARKER
 
 
+def test_an_invalid_utf8_marker_reads_as_no_marker_not_a_raised_exception(
+        _mailbox, _session_present):
+    """A `UnicodeDecodeError` is a `ValueError`, not an `OSError` — the narrower
+    except clause this pins against let SD-card corruption raise straight out
+    of `read_validation_marker`, up through `session_state`, and into
+    `ask_brain`, which the module docstring promises never happens."""
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    brain.validation_path(brain.BRAIN_SESSION).write_bytes(b"\xff\xfe\x00bad")
+    assert brain.read_validation_marker(brain.BRAIN_SESSION) is None
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.NO_MARKER
+    assert brain.ask_brain("research", {"x": 1}) is None
+
+
 def test_the_marker_is_single_writer_readable_not_world_writable(_mailbox, _session_present):
     """The 1777 reasoning for the mailbox does not transfer: one writer, and
     write permission for uids that never write would let a confused caller

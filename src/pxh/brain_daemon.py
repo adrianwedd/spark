@@ -136,7 +136,10 @@ def _log(event: str, **fields: Any) -> None:
 def _read_current(session: str) -> dict[str, Any] | None:
     try:
         data = json.loads(brain.current_path(session).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, OSError, ValueError):
+        # ValueError, not just OSError: a corrupt file's read_text raises
+        # UnicodeDecodeError (a ValueError), and json.JSONDecodeError already
+        # is one too. See brain.read_validation_marker for the same reasoning.
         return None
     return data if isinstance(data, dict) else None
 
@@ -305,11 +308,15 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                 # Escape whatever the last attempt left in the input box. Alone,
                 # never followed by Enter — that submits a stray turn.
                 tmux_claude.send_key("Escape", spec=spec)
-            brain.record_request("handshake")
             if not tmux_claude.inject(brain.nudge_line(session, request_id), spec=spec):
                 health.record_failure(state.component,
                                       tmux_claude.last_error() or "handshake inject failed")
                 continue
+            # Billed only once the turn is actually delivered — an injection
+            # that failed above never reached the session, so counting it here
+            # would inflate the meter the spec designates as the restart-loop
+            # signal with turns nobody ever answered.
+            brain.record_request("handshake")
             if _await_handshake_reply(session, request_id, nonce,
                                       brain.HANDSHAKE_TIMEOUT_S):
                 brain.write_validation_marker(session, state=brain.VALIDATED,
@@ -319,6 +326,17 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                 health.record_success(state.component,
                                       detail={"model": model, "attempt": attempt})
                 _log("handshake_ok", session=session, attempt=attempt, model=model)
+                # Handshakes count toward CONTEXT_TURNS too (spec §2.7).
+                # count_turns() cannot see this turn on its own — current.json
+                # is written and removed entirely inside this function, after
+                # count_turns() already ran for this tick — so it is counted
+                # here instead.
+                state.turns += 1
+                # The quiet window's job is done: the thing it was protecting
+                # (a slow recycle turn) is over, one way or another, by the
+                # time a handshake succeeds. Clearing it here means the window
+                # cannot outlive the recycle it exists to protect.
+                state.last_recycle_at = 0.0
                 return True
 
         # Attempts exhausted. Kill it: the next tick sees session_absent,
@@ -415,7 +433,9 @@ def _pending_live(session: str) -> bool:
     for entry in brain.inbox_dir(session).glob("*.json"):
         try:
             data = json.loads(entry.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError catches UnicodeDecodeError too (see _read_current);
+            # json.JSONDecodeError is already a ValueError.
             return True
         if not isinstance(data, dict):
             return True
@@ -530,8 +550,8 @@ def handshake_reason(state: SessionState) -> str | None:
     if derived == brain.VALIDATING:
         return None  # in progress, and a stale marker has already aged out
     if derived == brain.NO_MARKER:
-        if (state.last_recycle_at
-                and time.monotonic() - state.last_recycle_at < RECYCLE_QUIET_S):
+        if state.last_recycle_at:
+            since_recycle = time.monotonic() - state.last_recycle_at
             # The marker is legitimately absent here — the supervisor cleared
             # it moments ago as part of a recycle, and the pane is busy with
             # the very turn that clears the context. Nudging in now is the
@@ -541,7 +561,23 @@ def handshake_reason(state: SessionState) -> str | None:
             # `missing` for up to a turn's length against a 300s staleness
             # window. That is the correct trade against splicing two prompts
             # into one.
-            return None
+            #
+            # The fixed RECYCLE_QUIET_S is only a floor: a recycle's
+            # journal-append-then-/clear turn is a real Claude turn, not a
+            # keystroke, and can run longer than one HANDSHAKE_TIMEOUT_S on a
+            # slow night. If the pane is still busy when the floor expires,
+            # extend the quiet window rather than nudging a session that is
+            # demonstrably still working — but only up to VALIDATION_CEILING_S
+            # from the recycle, never unboundedly. An unbounded idle gate on
+            # this path would break the state machine's closure property (see
+            # design doc §2.3): a session whose pane never shows a glyph again
+            # would never be handshaked and so never repaired. Bounding the
+            # extension keeps every no_marker session reachable while still
+            # giving a slow recycle turn room to finish undisturbed.
+            if since_recycle < RECYCLE_QUIET_S:
+                return None
+            if since_recycle < brain.VALIDATION_CEILING_S and not _is_idle(state):
+                return None
         return "no_marker"
     marker = brain.read_validation_marker(state.name) or {}
     if marker.get("model") != brain.configured_model(state.name):

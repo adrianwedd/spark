@@ -265,11 +265,17 @@ def read_validation_marker(session: str) -> dict[str, Any] | None:
     """The marker as written, or None if absent or unreadable.
 
     Reads are lenient in one direction only: anything we cannot parse is absent,
-    never validated.
+    never validated. `ValueError` is in the except clause (not just `OSError`)
+    because a corrupt file's `read_text(encoding="utf-8")` raises
+    `UnicodeDecodeError`, a `ValueError`, not an `OSError` — and this function
+    sits on the `ask_brain` chain, whose only contract with its callers is
+    "never raise, return None on failure". `json.JSONDecodeError` is already a
+    `ValueError`, so this narrows nothing there; it only widens the SD-card
+    corruption case.
     """
     try:
         data = json.loads(validation_path(session).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (FileNotFoundError, OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -508,7 +514,7 @@ def collect_reply(session: str, request_id: str) -> dict[str, Any] | None:
     path = outbox_dir(session) / f"{request_id}.json"
     try:
         raw = path.read_text(encoding="utf-8")
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError, ValueError):
         return None
     try:
         reply = json.loads(raw)
