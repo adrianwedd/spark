@@ -6,7 +6,10 @@ clearing context mid-request, or — the quiet one — running without an attach
 tmux client so that injection fails only when nobody is watching.
 """
 import json
+import os
 import re
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +25,12 @@ ROOT = Path(__file__).resolve().parent.parent
 def _mailbox(tmp_path, monkeypatch):
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "brain")
+
+
+@pytest.fixture(autouse=True)
+def _release_supervisor_guard():
+    yield
+    brain_daemon.release_supervisor_lock()
 
 
 class _FakeTmux:
@@ -1036,3 +1045,51 @@ def test_a_failed_recycle_inject_does_not_advance_the_bookkeeping(fake_tmux, mon
     assert state.last_recycle_at == 0.0
     assert brain.session_state(session) == brain.NO_MARKER, \
         "the marker clears regardless, so the next tick still handshakes"
+
+
+# ---------------------------------------------------------------------------
+# One supervisor (§2.8)
+# ---------------------------------------------------------------------------
+
+def test_a_second_supervisor_refuses_to_start(fake_tmux):
+    """start_session, sweep_pending, kill_session and check_wedge all run
+    outside the single-flight lock, so a second supervisor can sweep the first
+    one's in-flight handshake into dead/ and the handshake then times out
+    against a request that no longer exists."""
+    assert brain_daemon.acquire_supervisor_lock() is True
+    try:
+        assert brain_daemon.run(once=True) != 0, \
+            "the loser exits non-zero rather than starting"
+    finally:
+        brain_daemon.release_supervisor_lock()
+
+
+def test_the_winner_writes_its_pid_as_a_hint(fake_tmux):
+    """flock fails with EWOULDBLOCK and nothing else — there is no F_GETLK for
+    it — so the holder's pid is not recoverable from the call. The winner writes
+    it, and the loser reads it as a hint that may be stale."""
+    assert brain_daemon.acquire_supervisor_lock() is True
+    try:
+        assert brain_daemon.supervisor_lock_path().read_text().strip() == str(os.getpid())
+    finally:
+        brain_daemon.release_supervisor_lock()
+
+
+def test_the_guard_is_released_when_the_holder_dies(fake_tmux):
+    """A supervisor that can be SIGKILLed wants a guard the kernel releases at
+    death — no stale-PID window, no PID-reuse cmdline check to get subtly
+    wrong."""
+    script = (
+        "import os, sys;"
+        "sys.path.insert(0, %r);"
+        "os.environ['PX_STATE_DIR'] = %r;"
+        "from pxh import brain, brain_daemon;"
+        "brain.brain_root = lambda: __import__('pathlib').Path(%r) / 'brain';"
+        "sys.exit(0 if brain_daemon.acquire_supervisor_lock() else 1)"
+    )
+    root = str(ROOT / "src")
+    state = str(brain.brain_root().parent)
+    first = subprocess.run([sys.executable, "-c", script % (root, state, state)])
+    assert first.returncode == 0, "the first process gets the guard"
+    second = subprocess.run([sys.executable, "-c", script % (root, state, state)])
+    assert second.returncode == 0, "and the guard is gone once that process exits"

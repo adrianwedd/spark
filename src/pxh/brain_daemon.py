@@ -33,6 +33,7 @@ missing session is visible without reading tmux by hand.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
@@ -603,8 +604,91 @@ def tick(states: dict[str, SessionState]) -> None:
             health.record_failure(state.component, str(exc))
 
 
+# The supervisor's own fd, held for the process lifetime. Module-level because
+# closing it would drop the lock: flock is released on the last close of the
+# file, so a local variable going out of scope would silently unguard us.
+_supervisor_fd: int | None = None
+
+
+def supervisor_lock_path() -> Path:
+    return brain.brain_root() / ".supervisor.lock"
+
+
+def acquire_supervisor_lock() -> bool:
+    """Take the single-instance guard. False means another supervisor has it.
+
+    `bin/px-brain` has had no guard at all, and the obvious way to get two
+    supervisors is an operator running it in a shell to watch it while systemd
+    already has one. The damage is not subtle: `start_session`, `sweep_pending`,
+    `kill_session` and `check_wedge` all run outside the per-session
+    single-flight lock, so one supervisor can sweep the other's in-flight
+    handshake into `dead/`.
+
+    flock rather than px-mind's PID-file-plus-`/proc` pattern because a
+    supervisor that can be SIGKILLed wants a guard the kernel releases at death
+    — no stale-PID window, no PID-reuse `cmdline` check to get subtly wrong. And
+    stdlib `fcntl` rather than `filelock` because this runs under
+    `/usr/bin/python3`, where `brain.py` already carries an `ImportError` path
+    that degrades to "no lock available"; a guard that can silently become no
+    guard is not a guard.
+    """
+    global _supervisor_fd
+    if brain._ensure_dir(brain.brain_root()) is None:
+        _log("supervisor_lock_unavailable", reason="brain root not writable")
+        return False
+    path = supervisor_lock_path()
+    try:
+        # No O_TRUNC: truncating before we hold the lock would erase the
+        # winner's pid, which is the only hint the loser gets.
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        _log("supervisor_lock_unavailable", reason=str(exc))
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # flock reports EWOULDBLOCK and nothing else — no F_GETLK equivalent —
+        # so the pid below is whatever the holder wrote, and may be stale: a
+        # crashed holder leaves its pid behind. Labelled as a hint because it
+        # never gates a decision, only an operator's next step.
+        try:
+            hint = os.read(fd, 64).decode("utf-8", "replace").strip() or "unknown"
+        except OSError:
+            hint = "unknown"
+        os.close(fd)
+        _log("supervisor_already_running", holder_pid_hint=hint,
+             note="pid is a hint written by the holder and may be stale")
+        return False
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.fsync(fd)
+    except OSError:
+        pass
+    _supervisor_fd = fd
+    return True
+
+
+def release_supervisor_lock() -> None:
+    """Drop the guard. For tests — the daemon holds it until it exits."""
+    global _supervisor_fd
+    if _supervisor_fd is None:
+        return
+    try:
+        fcntl.flock(_supervisor_fd, fcntl.LOCK_UN)
+        os.close(_supervisor_fd)
+    except OSError:
+        pass
+    _supervisor_fd = None
+
+
 def run(once: bool = False) -> int:
     """Supervisor loop. Returns an exit code (for `once` mode / tests)."""
+    if not acquire_supervisor_lock():
+        # StartLimitBurst=5 / StartLimitIntervalSec=300 means a losing copy
+        # under systemd gives up after five attempts rather than restart-looping
+        # forever, and px-brain's health goes stale — which is visible.
+        return 1
     ensure_journal()
     states = {name: SessionState(name=name)
               for name in (brain.BRAIN_SESSION, brain.IO_SESSION)}

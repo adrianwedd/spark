@@ -9,6 +9,10 @@
 #
 # Watch either session live:
 #   tmux -S /tmp/tmux-1000/px-mind attach -t spark-brain   (detach: Ctrl-b d)
+#
+# Only one supervisor may run: an flock guard on state/brain/.supervisor.lock
+# means a second copy exits non-zero rather than fighting the first over
+# sweeps and kills. Check the log for supervisor_already_running.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
