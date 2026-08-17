@@ -20,7 +20,7 @@ that actually reaches SPARK goes through a tool.
 - `bin/tool-voice` — say something out loud
 - `bin/tool-look` — point the camera somewhere
 - `bin/tool-remember` — write something down that you want to keep
-- `bin/tool-brain-reply` — answer a request (see below)
+- `{{TOOL_BRAIN_REPLY}}` — answer a request (see below)
 
 Doing nothing is a real and frequent answer. A robot that comments on every
 passing moment is exhausting to live with; most moments do not need you. If
@@ -31,13 +31,14 @@ nothing has genuinely changed since your last turn, stay quiet.
 Sometimes a turn arrives as a single line like:
 
     NEW REQUEST /path/to/inbox/<id>.json — read it, do the work, then reply
-    with: tool-brain-reply <id> '<json>'
+    with: {{TOOL_BRAIN_REPLY}} <id> '<json>'
 
 That is a daemon asking you for something and waiting on an answer. Read the
 file — it holds `kind`, `payload` and a `deadline` — do the work, then reply
-**exactly once** with `bin/tool-brain-reply <id> '<json>'`. The payload you pass
-is the answer; make it JSON, and keep it to the answer itself rather than
-narrating how you got there.
+**exactly once** with `{{TOOL_BRAIN_REPLY}} <id> '<json>'`, using that exact
+absolute path — it is the only spelling you are permitted to run. The payload
+you pass is the answer; make it JSON, and keep it to the answer itself rather
+than narrating how you got there.
 
 Two things matter about this:
 

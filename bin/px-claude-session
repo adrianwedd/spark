@@ -55,8 +55,18 @@ fi
 # loop's own gating. The envelope is fixed here, at launch, and deliberately
 # cannot be widened per request; PX_CLAUDE_ALLOWED_TOOLS is how the watchdog
 # hands the io session its single-tool envelope, not a per-call escape hatch.
+#
+# The reply tool is named ABSOLUTELY, here and in the system prompt, because
+# Claude Code matches a Bash rule against the command by prefix: a bare
+# `tool-brain-reply` or a relative `bin/tool-brain-reply` misses this pattern
+# and raises a permission dialog nobody is attached to answer. The io session
+# could never use a relative spelling anyway — its cwd is outside the repo.
+# Mirrored by TOOL_BRAIN_REPLY in src/pxh/brain.py, which builds the same
+# string from the same repo root; tests/test_brain.py pins the two together.
+TOOL_BRAIN_REPLY="$PROJECT_ROOT/bin/tool-brain-reply"
+
 DEFAULT_TOOLS=(
-    "Bash($PROJECT_ROOT/bin/tool-brain-reply:*)"
+    "Bash($TOOL_BRAIN_REPLY:*)"
     "Bash($PROJECT_ROOT/bin/tool-voice:*)"
     "Bash($PROJECT_ROOT/bin/tool-remember:*)"
     "Bash($PROJECT_ROOT/bin/tool-look:*)"
@@ -76,7 +86,16 @@ fi
 # Allow nesting when launched from inside a Claude Code session.
 unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
 
+# Render {{TOOL_BRAIN_REPLY}} into the prompt, so the text telling the session
+# how to reply and the rule deciding whether it may are the same string. The
+# prompt cannot hardcode the path (it varies by checkout) and cannot be
+# relative (see above), so a placeholder is the only spelling that is right in
+# both places. Bash substitution, not sed: PROJECT_ROOT is a path, and every
+# sed delimiter is a character a path may legally contain.
+PROMPT_TEXT="$(cat "$PROMPT_FILE")"
+PROMPT_TEXT="${PROMPT_TEXT//\{\{TOOL_BRAIN_REPLY\}\}/$TOOL_BRAIN_REPLY}"
+
 exec "$CLAUDE_BIN" \
     --model "$MODEL" \
     --allowedTools "${TOOLS[@]}" \
-    --append-system-prompt "$(cat "$PROMPT_FILE")"
+    --append-system-prompt "$PROMPT_TEXT"

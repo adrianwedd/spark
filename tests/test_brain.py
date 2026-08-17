@@ -9,6 +9,7 @@ mocked reply writer would prove nothing about the handshake.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -22,6 +23,16 @@ from pxh import brain, tmux_claude
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / "bin" / "tool-brain-reply"
+
+
+def _reply_spellings(text: str) -> list[str]:
+    """Every way `text` names the reply tool, each with its whole prefix.
+
+    Asserting `"tool-brain-reply" in text` is what let three different
+    spellings coexist: the substring is present in all of them, and the prefix
+    is the entire semantic content, because the allowlist matches on it.
+    """
+    return re.findall(r"[^\s`'\"]*tool-brain-reply", text)
 
 
 @pytest.fixture(autouse=True)
@@ -112,7 +123,7 @@ def test_nudge_names_the_request_file_and_the_reply_verb(_live_pane):
 
     nudge = [line for line in _live_pane if "NEW REQUEST" in line]
     assert nudge, f"no nudge injected, got {_live_pane}"
-    assert "tool-brain-reply" in nudge[0]
+    assert _reply_spellings(nudge[0]) == [brain.TOOL_BRAIN_REPLY]
     assert str(brain.inbox_dir(session)) in nudge[0]
 
 
@@ -233,6 +244,92 @@ def test_model_is_only_switched_when_it_actually_changes(_live_pane):
 
     switches = [line for line in _live_pane if line.startswith("/model")]
     assert len(switches) == 1, f"expected one /model switch, got {switches}"
+
+
+# ---------------------------------------------------------------------------
+# One spelling of the reply tool
+#
+# Claude Code matches `Bash(...)` allowlist patterns against the command it is
+# about to run, by prefix. `Bash(/abs/bin/tool-brain-reply:*)` therefore admits
+# an absolute invocation and nothing else — a bare or repo-relative spelling
+# misses the pattern and raises a permission dialog, which is a wedge, because
+# nothing is attached to answer it. So the nudge, both system prompts and both
+# allowlists have to say one identical absolute thing. Relative could never
+# have worked for the io session in any case: its cwd is deliberately outside
+# the repository, so `bin/tool-brain-reply` does not resolve there at all.
+# ---------------------------------------------------------------------------
+
+def _launch_argv(tmp_path, env_extra):
+    """Run bin/px-claude-session with a stub `claude` and capture its argv.
+
+    The launcher `exec`s the binary, so a stub that dumps its arguments shows
+    exactly what the real session would have been started with — including the
+    rendered system prompt, which is the half of the interface a unit test on
+    the Python side cannot see.
+    """
+    argv_out = tmp_path / "argv"
+    stub = tmp_path / "claude-stub"
+    stub.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$ARGV_OUT"\n')
+    stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update({"PX_CLAUDE_BIN": str(stub), "ARGV_OUT": str(argv_out)})
+    env.pop("PX_CLAUDE_TMUX_PROMPT", None)
+    env.pop("PX_CLAUDE_ALLOWED_TOOLS", None)
+    env.update(env_extra)
+
+    run = subprocess.run([str(ROOT / "bin" / "px-claude-session")],
+                         capture_output=True, text=True, timeout=60, env=env)
+    assert run.returncode == 0, f"launcher failed: {run.stderr}"
+
+    parts = argv_out.read_bytes().decode("utf-8").split("\0")[:-1]
+    tools: list[str] = []
+    prompt = ""
+    i = 0
+    while i < len(parts):
+        if parts[i] == "--allowedTools":
+            i += 1
+            while i < len(parts) and not parts[i].startswith("--"):
+                tools.append(parts[i])
+                i += 1
+        elif parts[i] == "--append-system-prompt":
+            prompt = parts[i + 1]
+            i += 2
+        else:
+            i += 1
+    return tools, prompt
+
+
+def test_nudge_and_allowlist_agree_on_the_absolute_spelling():
+    """The two ends of the permission check, compared directly."""
+    assert brain.TOOL_BRAIN_REPLY.startswith("/"), "a relative allowlist cannot match"
+    assert brain.TOOL_BRAIN_REPLY_ALLOW == f"Bash({brain.TOOL_BRAIN_REPLY}:*)"
+    assert _reply_spellings(brain._nudge_line(brain.BRAIN_SESSION, "abc")) == \
+        [brain.TOOL_BRAIN_REPLY]
+
+
+def test_io_allowlist_is_the_shared_constant():
+    spec = brain.spec_for_session(brain.IO_SESSION)
+    assert spec.env["PX_CLAUDE_ALLOWED_TOOLS"] == brain.TOOL_BRAIN_REPLY_ALLOW
+
+
+@pytest.mark.parametrize("session", [brain.BRAIN_SESSION, brain.IO_SESSION])
+def test_launcher_renders_one_absolute_reply_spelling(tmp_path, session):
+    """End to end across the language boundary: what bash actually hands
+    `claude` must match what Python tells the session to type."""
+    extra = {"PX_BRAIN_SESSION": session}
+    if session == brain.IO_SESSION:
+        extra["PX_CLAUDE_ALLOWED_TOOLS"] = \
+            brain.spec_for_session(brain.IO_SESSION).env["PX_CLAUDE_ALLOWED_TOOLS"]
+        extra["PX_CLAUDE_CWD"] = str(tmp_path / "io-cwd")
+    tools, prompt = _launch_argv(tmp_path, extra)
+
+    assert brain.TOOL_BRAIN_REPLY_ALLOW in tools, tools
+    assert prompt, "no system prompt was passed"
+    assert set(_reply_spellings(prompt)) == {brain.TOOL_BRAIN_REPLY}, \
+        f"prompt names the tool a way the allowlist will not match: " \
+        f"{sorted(set(_reply_spellings(prompt)))}"
+    assert "{{" not in prompt, "unsubstituted placeholder left in the rendered prompt"
 
 
 # ---------------------------------------------------------------------------

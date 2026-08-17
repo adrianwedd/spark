@@ -67,6 +67,23 @@ except ImportError:  # pragma: no cover
 BRAIN_SESSION = "spark-brain"
 IO_SESSION = "spark-io"
 
+# The one spelling of the reply tool, and the allowlist pattern that admits it.
+#
+# Claude Code matches a `Bash(...)` rule against the command it is about to run,
+# by prefix — so this pattern admits an absolute invocation and nothing else. A
+# bare `tool-brain-reply` or a repo-relative `bin/tool-brain-reply` misses it and
+# raises a permission dialog instead, which is a wedge: the session is waiting on
+# a human who isn't there, while a daemon waits on the session. Absolute is also
+# the only spelling that can work for the io session at all, whose cwd is
+# deliberately outside the repository.
+#
+# Everything that names the tool derives from here: both allowlists, the nudge,
+# and — via the {{TOOL_BRAIN_REPLY}} placeholder that bin/px-claude-session
+# substitutes at launch — both system prompts. They are one interface, and when
+# they disagreed every request hit the dialog.
+TOOL_BRAIN_REPLY = str(Path(PROJECT_ROOT) / "bin" / "tool-brain-reply")
+TOOL_BRAIN_REPLY_ALLOW = f"Bash({TOOL_BRAIN_REPLY}:*)"
+
 # Which session handles which kind of request. This is a trust boundary, not
 # load balancing: `io` kinds carry text SPARK did not write — a social post
 # being QA'd, a stranger's message to the public chat endpoint — and that text
@@ -141,8 +158,7 @@ def spec_for_session(session: str) -> tmux_claude.SessionSpec:
             cwd=str(cwd),
             env={
                 "PX_BRAIN_SESSION": IO_SESSION,
-                "PX_CLAUDE_ALLOWED_TOOLS":
-                    f"Bash({PROJECT_ROOT}/bin/tool-brain-reply:*)",
+                "PX_CLAUDE_ALLOWED_TOOLS": TOOL_BRAIN_REPLY_ALLOW,
                 "PX_CLAUDE_CWD": str(cwd),
             },
         )
@@ -353,7 +369,7 @@ def _switch_model(spec: tmux_claude.SessionSpec, session: str, model: str) -> bo
 def _nudge_line(session: str, request_id: str) -> str:
     return (
         f"NEW REQUEST {inbox_dir(session)}/{request_id}.json — read it, do the "
-        f"work, then reply with: tool-brain-reply {request_id} '<json>'"
+        f"work, then reply with: {TOOL_BRAIN_REPLY} {request_id} '<json>'"
     )
 
 
