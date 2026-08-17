@@ -158,13 +158,39 @@ def pane_ready(spec: SessionSpec | None = None) -> bool:
     return pane is not None and READY_GLYPH in pane
 
 
+def _ensure_socket_dir(path: Path) -> None:
+    """Create the tmux socket directory 0700, and repair it if it isn't.
+
+    The opposite of `state/health/` and the brain mailbox, and for the opposite
+    reason: those are 1777 because several uids must write them, while this one
+    belongs to a single uid and tmux *refuses* it otherwise —
+
+        directory /tmp/tmux-1000 has unsafe permissions
+
+    A bare `mkdir(parents=True, exist_ok=True)` takes the process umask, so the
+    usual 022 yields 0755 and every later `tmux ls` greets the operator with
+    that error. `exist_ok=True` then hides it forever, because the mode is only
+    applied on creation — hence the chmod as well as the mode.
+
+    Best-effort: a session that starts on an explicit `-S` socket works fine at
+    0755. This is an operator papercut, not a failure, and must never be the
+    reason the brain won't start.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.stat().st_uid == os.getuid():
+            path.chmod(0o700)
+    except OSError:
+        pass
+
+
 def ensure_session(timeout_s: float = STARTUP_TIMEOUT_S,
                    spec: SessionSpec | None = None) -> bool:
     """Start the session if it is not already up. Idempotent."""
     s = _spec(spec)
     if session_exists(s):
         return True
-    Path(s.socket).parent.mkdir(parents=True, exist_ok=True)
+    _ensure_socket_dir(Path(s.socket).parent)
     # `-e` passes the launcher's configuration through tmux rather than through
     # our own environment: the session outlives this process, so anything set
     # here has to travel with the session itself.

@@ -5,6 +5,7 @@ exists because of a failure mode that only appears in production — no attached
 client, a session-name target, a missing TERM — so a regression would look like
 "injection intermittently does nothing" on a robot with nobody watching.
 """
+import stat
 import subprocess
 
 import pytest
@@ -184,3 +185,44 @@ def test_holder_start_is_idempotent(monkeypatch):
     holder.start()
     holder.start()
     assert len(starts) == 1, "must not spawn a second holder over a live one"
+
+
+def test_socket_dir_is_created_private(tmp_path, monkeypatch):
+    """tmux refuses a world-readable socket directory:
+
+        directory /tmp/tmux-1000 has unsafe permissions
+
+    A bare mkdir takes the process umask, so the usual 022 yields 0755 and
+    every later `tmux ls` greets the operator with that error.
+    """
+    monkeypatch.setattr(tmux_claude.os, "umask", lambda mask: 0o022)
+    target = tmp_path / "tmux-1000"
+
+    tmux_claude._ensure_socket_dir(target)
+
+    assert target.is_dir()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+def test_existing_socket_dir_is_repaired(tmp_path):
+    """exist_ok=True applies the mode only on creation, so a directory already
+    sitting at 0755 stays broken forever without the chmod."""
+    target = tmp_path / "tmux-1000"
+    target.mkdir(mode=0o755)
+
+    tmux_claude._ensure_socket_dir(target)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+def test_socket_dir_owned_by_another_uid_is_left_alone(tmp_path, monkeypatch):
+    """Never chmod a directory we do not own, and never raise: a session on an
+    explicit -S socket works fine at 0755. This is a papercut, not a failure,
+    and must not be the reason the brain won't start."""
+    target = tmp_path / "tmux-1000"
+    target.mkdir(mode=0o755)
+    monkeypatch.setattr(tmux_claude.os, "getuid", lambda: 999999)
+
+    tmux_claude._ensure_socket_dir(target)          # must not raise
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755
