@@ -1075,11 +1075,24 @@ def test_the_winner_writes_its_pid_as_a_hint(fake_tmux):
         brain_daemon.release_supervisor_lock()
 
 
-def test_the_guard_is_released_when_the_holder_dies(fake_tmux):
-    """A supervisor that can be SIGKILLed wants a guard the kernel releases at
-    death — no stale-PID window, no PID-reuse cmdline check to get subtly
-    wrong."""
-    script = (
+def test_a_live_holder_is_refused_and_a_sigkilled_holder_releases(fake_tmux):
+    """The actual production hazard is refusal while the first supervisor is
+    still running, not merely after it exits cleanly — and because a
+    supervisor can be SIGKILLed, the guard must be released by the kernel at
+    death, not by any cleanup code a kill signal skips entirely. A holder
+    that runs sequentially and exits normally, as an earlier version of this
+    test did, would pass even if acquire_supervisor_lock were a no-op."""
+    holder_script = (
+        "import os, sys, time;"
+        "sys.path.insert(0, %r);"
+        "os.environ['PX_STATE_DIR'] = %r;"
+        "from pxh import brain, brain_daemon;"
+        "brain.brain_root = lambda: __import__('pathlib').Path(%r) / 'brain';"
+        "ok = brain_daemon.acquire_supervisor_lock();"
+        "print('locked' if ok else 'failed', flush=True);"
+        "sys.exit(1) if not ok else time.sleep(60)"
+    )
+    probe_script = (
         "import os, sys;"
         "sys.path.insert(0, %r);"
         "os.environ['PX_STATE_DIR'] = %r;"
@@ -1089,7 +1102,21 @@ def test_the_guard_is_released_when_the_holder_dies(fake_tmux):
     )
     root = str(ROOT / "src")
     state = str(brain.brain_root().parent)
-    first = subprocess.run([sys.executable, "-c", script % (root, state, state)])
-    assert first.returncode == 0, "the first process gets the guard"
-    second = subprocess.run([sys.executable, "-c", script % (root, state, state)])
-    assert second.returncode == 0, "and the guard is gone once that process exits"
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_script % (root, state, state)],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        # Wait for the holder to confirm it has the guard, rather than
+        # sleeping a fixed interval, so the probe below is never racing it.
+        signal = holder.stdout.readline().strip()
+        assert signal == "locked", "the holder must hold the guard before we probe it"
+
+        probe = subprocess.run([sys.executable, "-c", probe_script % (root, state, state)])
+        assert probe.returncode == 1, "a second supervisor is refused while the first is alive"
+    finally:
+        holder.kill()  # SIGKILL
+        holder.wait(timeout=5)
+
+    released = subprocess.run([sys.executable, "-c", probe_script % (root, state, state)])
+    assert released.returncode == 0, "the kernel releases the guard when the holder is killed"

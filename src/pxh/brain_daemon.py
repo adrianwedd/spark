@@ -645,6 +645,17 @@ def acquire_supervisor_lock() -> bool:
         _log("supervisor_lock_unavailable", reason=str(exc))
         return False
     try:
+        # 0666, not the validation marker's 0644: the marker has exactly one
+        # writer and carries a claim another uid could forge, so it stays
+        # locked down. This file has no claim to forge — only a pid hint that
+        # already gates nothing — and any uid that can legitimately run
+        # bin/px-brain needs to open it read-write, same reasoning as the
+        # session lock's _relax_lock_mode. Best-effort: whichever uid wins the
+        # creation race, both must still be able to open it.
+        os.chmod(path, 0o666)
+    except OSError:
+        pass
+    try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         # flock reports EWOULDBLOCK and nothing else — no F_GETLK equivalent —
@@ -655,7 +666,11 @@ def acquire_supervisor_lock() -> bool:
             hint = os.read(fd, 64).decode("utf-8", "replace").strip() or "unknown"
         except OSError:
             hint = "unknown"
-        os.close(fd)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         _log("supervisor_already_running", holder_pid_hint=hint,
              note="pid is a hint written by the holder and may be stale")
         return False
@@ -676,9 +691,17 @@ def release_supervisor_lock() -> None:
         return
     try:
         fcntl.flock(_supervisor_fd, fcntl.LOCK_UN)
-        os.close(_supervisor_fd)
     except OSError:
         pass
+    finally:
+        # Close even if the unlock raised — otherwise the module believes it
+        # is unguarded while the kernel still holds the lock on an
+        # unreachable fd, and every later acquire in this process fails
+        # forever.
+        try:
+            os.close(_supervisor_fd)
+        except OSError:
+            pass
     _supervisor_fd = None
 
 
