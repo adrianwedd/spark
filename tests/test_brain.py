@@ -471,3 +471,124 @@ def test_module_contains_no_claude_p_subprocess():
     assert "import subprocess" not in source
     assert "subprocess.run" not in source and "subprocess.Popen" not in source, \
         "brain.py must reach Claude through the resident session, not a subprocess"
+
+
+# ---------------------------------------------------------------------------
+# Validation marker and derived state (§2.1, §2.2, §2.6)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _session_present(monkeypatch):
+    """tmux has the session. Says nothing about whether it can answer."""
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+
+
+@pytest.fixture
+def _session_missing(monkeypatch):
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: False)
+
+
+def test_a_marker_absent_on_a_live_session_is_no_marker(_mailbox, _session_present):
+    """The loud state: the session is up and nothing is handshaking it."""
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.NO_MARKER
+
+
+def test_no_session_at_all_is_its_own_state(_mailbox, _session_missing):
+    """`session_absent` and `no_marker` are two different repairs — px-brain is
+    down, versus the session is up and cannot answer."""
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.SESSION_ABSENT, \
+        "a marker must never outvote tmux — a dead supervisor cannot leave a lying validated behind"
+
+
+def test_a_fresh_validating_marker_is_quiet(_mailbox, _session_present):
+    """`validating` covers every boot and every nightly recycle. An alarm that
+    fires on healthy operation several times a day is un-taught within a week."""
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validating",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.VALIDATING
+
+
+def test_a_stale_validating_marker_degrades_to_no_marker(_mailbox, _session_present, monkeypatch):
+    """A supervisor killed mid-handshake leaves exactly this, and the repair is
+    the same as any other 'nobody is working on it'."""
+    monkeypatch.setattr(brain, "VALIDATION_CEILING_S", 0.05)
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validating",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    time.sleep(0.1)
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.NO_MARKER
+
+
+def test_a_validated_marker_is_validated(_mailbox, _session_present):
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=2)
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.VALIDATED
+
+
+def test_a_caller_naming_a_model_the_marker_does_not_carry_is_not_validated(
+        _mailbox, _session_present):
+    """A session's model is a property of the session. One caller must not be
+    able to retune the mind out from under the next one, so it falls back."""
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    assert brain.session_state(brain.BRAIN_SESSION, model="claude-opus-4-6") != brain.VALIDATED
+    assert brain.session_state(brain.BRAIN_SESSION,
+                               model="claude-haiku-4-5-20251001") == brain.VALIDATED
+
+
+def test_a_caller_that_names_no_model_accepts_the_session_default(_mailbox, _session_present):
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.VALIDATED
+
+
+def test_a_corrupt_marker_reads_as_no_marker(_mailbox, _session_present):
+    """Unparseable is not validated. The one direction this may fail is quiet."""
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    brain.validation_path(brain.BRAIN_SESSION).write_text("{not json")
+    assert brain.session_state(brain.BRAIN_SESSION) == brain.NO_MARKER
+
+
+def test_the_marker_is_single_writer_readable_not_world_writable(_mailbox, _session_present):
+    """The 1777 reasoning for the mailbox does not transfer: one writer, and
+    write permission for uids that never write would let a confused caller
+    forge a validated marker."""
+    brain.write_validation_marker(brain.BRAIN_SESSION, state="validated",
+                                  request_id=str(uuid.uuid4()),
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    mode = brain.validation_path(brain.BRAIN_SESSION).stat().st_mode & 0o777
+    assert mode == 0o644, f"marker mode is {oct(mode)}, must be 0o644 (readable by all, writable by pi)"
+
+
+def test_validation_budget_fits_inside_the_staleness_window():
+    """The bound that has to hold (§2.6), read from the modules rather than from
+    literals: if someone adds a second glyph wait, the identity below stops
+    describing the code and this test is what forces the conversation."""
+    from pxh import health
+
+    assert brain.STARTUP_CEILING_S is tmux_claude.STARTUP_TIMEOUT_S, \
+        "there is ONE glyph wait per session start and it lives in ensure_session"
+    ceiling = 0.6 * min(health.STALE_AFTER_S["px-brain"],
+                        health.STALE_AFTER_S["px-brain-io"])
+    assert brain.VALIDATION_CEILING_S == ceiling
+    budget = (brain.STARTUP_CEILING_S + brain.SETTLE_S
+              + brain.HANDSHAKE_ATTEMPTS * brain.HANDSHAKE_TIMEOUT_S)
+    assert budget <= brain.VALIDATION_CEILING_S, (
+        f"{budget}s of validation exceeds the {brain.VALIDATION_CEILING_S}s ceiling; the fix is "
+        "a state machine that advances one step per tick, not a bigger number")
+
+
+def test_the_configured_model_default_matches_the_launcher(monkeypatch):
+    """brain.configured_model() and bin/px-claude-session must agree on the
+    default, or the supervisor sees a permanent model mismatch and re-handshakes
+    a healthy session forever."""
+    monkeypatch.delenv("PX_CLAUDE_TMUX_MODEL", raising=False)
+    launcher = (ROOT / "bin" / "px-claude-session").read_text()
+    assert f'MODEL="${{PX_CLAUDE_TMUX_MODEL:-{brain.configured_model(brain.BRAIN_SESSION)}}}"' in launcher

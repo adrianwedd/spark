@@ -48,7 +48,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import tmux_claude
+from . import health, tmux_claude
 from .logging import log_event
 from .state import PROJECT_ROOT, atomic_write
 from .time import utc_timestamp
@@ -123,6 +123,52 @@ POLL_INTERVAL_S = 0.25
 # Replies are answers, not payloads. A cap keeps a runaway session (or a
 # hijacked io session) from filling the SD card through the reply channel.
 MAX_REPLY_BYTES = 256 * 1024
+
+# --------------------------------------------------------------------------
+# Validation budget (§2.6)
+# --------------------------------------------------------------------------
+
+# The glyph wait that `ensure_session()` already performs internally. This is
+# the SAME object, not a copy of the number: there is one glyph wait per session
+# start, it lives inside ensure_session, and this term accounts for it. An
+# earlier draft waited again in the supervisor and spent the same 45s twice.
+STARTUP_CEILING_S = tmux_claude.STARTUP_TIMEOUT_S
+
+# Let the pane finish drawing before typing into it.
+SETTLE_S = float(os.environ.get("PX_BRAIN_SETTLE_S", "2"))
+
+# One first turn: read a small JSON file, run one Bash tool. Generous for that,
+# because a first turn pays model warm-up and permission evaluation.
+HANDSHAKE_TIMEOUT_S = float(os.environ.get("PX_BRAIN_HANDSHAKE_TIMEOUT_S", "60"))
+HANDSHAKE_ATTEMPTS = int(os.environ.get("PX_BRAIN_HANDSHAKE_ATTEMPTS", "2"))
+
+# Total time one validation may consume. NOT derived from systemd: px-brain is
+# Type=simple with no TimeoutStartSec and no WatchdogSec, so systemd has no
+# slowness timeout to breach. What binds is that tick() walks both sessions in
+# one thread, so time spent validating one is time the other is not getting a
+# health write. The 0.6 leaves margin for the rest of the tick.
+VALIDATION_CEILING_S = 0.6 * min(health.STALE_AFTER_S["px-brain"],
+                                 health.STALE_AFTER_S["px-brain-io"])
+
+# The four states. These exact strings reach log lines and px-brain-status,
+# because the vocabulary a human uses to describe the fault should be the
+# vocabulary the tool prints.
+VALIDATED = "validated"
+VALIDATING = "validating"
+NO_MARKER = "no_marker"
+SESSION_ABSENT = "session_absent"
+
+# Unlike the mailbox directories, this file has exactly one writer — the
+# supervisor, always `pi` — and every other process only reads it. Handing
+# write permission to uids that never write would let a confused caller forge a
+# `validated` marker for a session that cannot answer, which is the exact claim
+# this design exists to make unforgeable.
+_MARKER_MODE = 0o644
+
+# The model the launcher gives a session when nothing overrides it. Must stay
+# equal to bin/px-claude-session's own default, which
+# test_the_configured_model_default_matches_the_launcher pins.
+DEFAULT_TMUX_MODEL = "claude-haiku-4-5-20251001"
 
 _DIR_MODE = 0o1777
 
@@ -208,6 +254,107 @@ def current_path(session: str) -> Path:
 
 def model_marker_path(session: str) -> Path:
     return session_dir(session) / "model"
+
+
+def validation_path(session: str) -> Path:
+    return session_dir(session) / "validation.json"
+
+
+def configured_model(session: str) -> str:
+    """The model this session was launched (or last switched) to.
+
+    Read from the environment the launcher reads, so the supervisor's idea of
+    the configured model and the session's actual model come from one source.
+    """
+    return os.environ.get("PX_CLAUDE_TMUX_MODEL", DEFAULT_TMUX_MODEL)
+
+
+def read_validation_marker(session: str) -> dict[str, Any] | None:
+    """The marker as written, or None if absent or unreadable.
+
+    Reads are lenient in one direction only: anything we cannot parse is absent,
+    never validated.
+    """
+    try:
+        data = json.loads(validation_path(session).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_validation_marker(session: str, *, state: str, request_id: str,
+                            model: str, attempt: int) -> bool:
+    """Record the outcome of a handshake. Returns False if it could not land."""
+    if not ensure_mailbox(session):
+        return False
+    marker = {
+        "state": state,
+        "request_id": request_id,
+        "model": model,
+        "attempt": attempt,
+        "updated_at": utc_timestamp(),
+    }
+    path = validation_path(session)
+    try:
+        atomic_write(path, json.dumps(marker, indent=2))
+    except OSError:
+        return False
+    try:
+        # atomic_write's mkstemp yields 0600, which every reader but the writer
+        # would get EACCES on. 0644 is the mode; the chmod is how it gets there.
+        os.chmod(path, _MARKER_MODE)
+    except OSError:
+        pass
+    return True
+
+
+def clear_validation_marker(session: str) -> None:
+    """Delete the marker. Every reader now sees `no_marker`."""
+    try:
+        validation_path(session).unlink()
+    except OSError:
+        pass
+
+
+def _marker_age_s(marker: dict[str, Any]) -> float:
+    """Seconds since the marker was written; +inf if it does not say."""
+    stamp = marker.get("updated_at")
+    if not isinstance(stamp, str):
+        return float("inf")
+    try:
+        import datetime as _dt
+
+        written = _dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if written.tzinfo is None:
+            written = written.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(_dt.timezone.utc) - written).total_seconds()
+    except (ValueError, TypeError):
+        return float("inf")
+
+
+def session_state(session: str, model: str | None = None) -> str:
+    """Derive whether a session may be trusted with a request, at read time.
+
+    Never stored — same discipline as health.py, and for the same reason: a dead
+    supervisor must not be able to leave a lying `validated` behind. `model` is
+    optional and usually omitted; a caller that accepts the session's own model
+    asks only whether the session can answer at all.
+    """
+    if not tmux_claude.session_exists(spec_for_session(session)):
+        return SESSION_ABSENT
+    marker = read_validation_marker(session)
+    if marker is None:
+        return NO_MARKER
+    state = marker.get("state")
+    if state == VALIDATED:
+        if model and marker.get("model") != model:
+            return NO_MARKER
+        return VALIDATED
+    if state == VALIDATING and _marker_age_s(marker) <= VALIDATION_CEILING_S:
+        return VALIDATING
+    # A stale `validating` marker means a supervisor died mid-handshake. The
+    # repair is the same as any other "nobody is working on it".
+    return NO_MARKER
 
 
 def _ensure_dir(path: Path) -> Path | None:
