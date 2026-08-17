@@ -56,6 +56,18 @@ def blog_mod(tmp_path, monkeypatch):
     return ns, state_dir, log_dir
 
 
+@pytest.fixture(autouse=True)
+def _blog_qa_off(monkeypatch):
+    """Default the Claude QA gate OFF for every test in this file.
+
+    `_qa_gate()` in bin/px-blog shells out to a real `claude` subprocess. Tests
+    that mocked `run_claude_session` but not the gate were making live billed
+    calls on whatever machine ran pytest — and then failing when the real Claude
+    answered NO to the mock post. A test that needs the gate must opt back in.
+    """
+    monkeypatch.setenv("PX_BLOG_QA", "0")
+
+
 # ---------------------------------------------------------------------------
 # Helper to create thoughts JSONL
 # ---------------------------------------------------------------------------
@@ -684,9 +696,12 @@ class TestGenerationFailureCap:
         pid = ns["id_for_post"]("daily", today)
         blog_subprocess = ns["subprocess"]
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
-            with patch.object(blog_subprocess, "run", return_value=_mock_run_result("NO")):
-                post = ns["generate_post"]("daily", today, {"posts": []})
+        # Opt back into the QA gate (autouse fixture turns it off) — the gate's
+        # subprocess is mocked here, so no live `claude` call is made.
+        with patch.dict(os.environ, {"PX_BLOG_QA": "1"}):
+            with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+                with patch.object(blog_subprocess, "run", return_value=_mock_run_result("NO")):
+                    post = ns["generate_post"]("daily", today, {"posts": []})
 
         assert post is None
         data = ns["load_blog_failures"]()
