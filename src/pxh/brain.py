@@ -400,6 +400,26 @@ def sweep_pending(session: str) -> int:
     return swept
 
 
+def sweep_one(session: str, request_id: str) -> bool:
+    """Move exactly one named inbox entry to dead/. Returns whether it moved.
+
+    The narrow sweep (§2.3 step 1). Unlike `sweep_pending` this names its target
+    rather than globbing, which is what makes it safe to run without the
+    single-flight lock: there is no discovery step that could pick up a request
+    written by someone still waiting on it. It exists to record the orphan of a
+    supervisor that died mid-handshake — the replacement handshake mints a fresh
+    id, so nothing else will ever claim that file.
+    """
+    if not ensure_mailbox(session):
+        return False
+    entry = inbox_dir(session) / f"{request_id}.json"
+    try:
+        entry.replace(dead_dir(session) / entry.name)
+        return True
+    except OSError:
+        return False
+
+
 # --------------------------------------------------------------------------
 # Request metering
 # --------------------------------------------------------------------------

@@ -6,11 +6,15 @@ clearing context mid-request, or — the quiet one — running without an attach
 tmux client so that injection fails only when nobody is watching.
 """
 import json
+import re
 import time
+from pathlib import Path
 
 import pytest
 
 from pxh import brain, brain_daemon, tmux_claude
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -383,3 +387,187 @@ def test_both_sessions_report_health_separately():
     assert "px-brain-io" in health.STALE_AFTER_S
     assert _state(brain.BRAIN_SESSION).component == "px-brain"
     assert _state(brain.IO_SESSION).component == "px-brain-io"
+
+
+# ---------------------------------------------------------------------------
+# The handshake — one real request, one real reply (§2.3)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def _fast_handshake(monkeypatch):
+    """Real logic, no waiting."""
+    monkeypatch.setattr(brain, "SETTLE_S", 0.0)
+    monkeypatch.setattr(brain, "HANDSHAKE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(brain, "HANDSHAKE_ATTEMPTS", 2)
+    monkeypatch.setattr(brain_daemon, "HANDSHAKE_POLL_S", 0.01)
+
+
+def _echo_when_nudged(fake_tmux, session, answer=True, wrong_echo=False):
+    """Answer the handshake the way a real session does: read the inbox, write
+    the outbox. Installed as the fake tmux's inject hook."""
+    def _inject(text, spec=None):
+        fake_tmux.injected.append((fake_tmux._name(spec), text))
+        if not answer or "NEW REQUEST" not in text:
+            return True
+        entries = list(brain.inbox_dir(session).glob("*.json"))
+        if not entries:
+            return True
+        request = json.loads(entries[0].read_text())
+        echo = "not-the-nonce" if wrong_echo else request["payload"]["echo"]
+        brain.outbox_dir(session).mkdir(parents=True, exist_ok=True)
+        (brain.outbox_dir(session) / f"{request['id']}.json").write_text(
+            json.dumps({"id": request["id"], "status": "ok",
+                        "reply": {"echo": echo}}))
+        return True
+    return _inject
+
+
+def test_a_round_trip_writes_a_validated_marker(fake_tmux, _fast_handshake, monkeypatch):
+    """The whole point: `validated` means a real reply came back through the
+    real channel, not that a prompt glyph appeared."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    assert brain_daemon.run_handshake(_state(session), "no_marker") is True
+    marker = brain.read_validation_marker(session)
+    assert marker["state"] == "validated"
+    assert marker["model"] == brain.configured_model(session)
+    assert brain.session_state(session) == brain.VALIDATED
+
+
+def test_the_handshake_leaves_no_request_behind(fake_tmux, _fast_handshake, monkeypatch):
+    """A leftover inbox entry pins _is_idle() and blocks every later recycle."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    brain_daemon.run_handshake(_state(session), "no_marker")
+    assert not list(brain.inbox_dir(session).glob("*.json"))
+    assert not brain.current_path(session).exists()
+
+
+def test_a_reply_with_the_wrong_nonce_does_not_validate(fake_tmux, _fast_handshake, monkeypatch):
+    """Echoing the nonce is what stops a stale reply from a previous handshake
+    validating the current one."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        _echo_when_nudged(fake_tmux, session, wrong_echo=True))
+
+    assert brain_daemon.run_handshake(_state(session), "no_marker") is False
+    assert brain.session_state(session) != brain.VALIDATED
+
+
+def test_a_silent_session_is_escaped_retried_then_killed(fake_tmux, _fast_handshake, monkeypatch):
+    """The handshake does its own escalation. It cannot rely on check_wedge,
+    which clears itself the moment the glyph is back — exactly the case a
+    permission dialog produces."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        _echo_when_nudged(fake_tmux, session, answer=False))
+
+    assert brain_daemon.run_handshake(_state(session), "no_marker") is False
+    assert (session, "Escape") in fake_tmux.keys
+    assert session in fake_tmux.killed
+    assert brain.session_state(session) == brain.SESSION_ABSENT
+
+
+def test_a_retry_re_nudges_the_same_request_id(fake_tmux, _fast_handshake, monkeypatch):
+    """Two live requests for one handshake is two turns billed for one answer.
+    The session may simply have been slow."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        _echo_when_nudged(fake_tmux, session, answer=False))
+
+    brain_daemon.run_handshake(_state(session), "no_marker")
+    nudges = [text for _, text in fake_tmux.injected if "NEW REQUEST" in text]
+    assert len(nudges) == 2, "HANDSHAKE_ATTEMPTS nudges, not more"
+    ids = {re.search(r"/([0-9a-f-]{36})\.json", text).group(1) for text in nudges}
+    assert len(ids) == 1, f"a retry must re-nudge the same id, saw {ids}"
+
+
+def test_a_handshake_after_a_kill_uses_a_fresh_id(fake_tmux, _fast_handshake, monkeypatch):
+    """The sweep and the new handshake would otherwise handle one id in both
+    roles — one moving it to dead/, the other waiting on it."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        _echo_when_nudged(fake_tmux, session, answer=False))
+    first = _state(session)
+    fake_tmux.sessions.add(session)
+    brain_daemon.run_handshake(first, "no_marker")
+    first_ids = {re.search(r"/([0-9a-f-]{36})\.json", t).group(1)
+                 for _, t in fake_tmux.injected if "NEW REQUEST" in t}
+
+    fake_tmux.injected.clear()
+    fake_tmux.sessions.add(session)
+    brain_daemon.run_handshake(_state(session), "no_marker")
+    second_ids = {re.search(r"/([0-9a-f-]{36})\.json", t).group(1)
+                  for _, t in fake_tmux.injected if "NEW REQUEST" in t}
+    assert first_ids.isdisjoint(second_ids)
+
+
+def test_handshakes_are_metered_like_any_other_request(fake_tmux, _fast_handshake, monkeypatch):
+    """They are real Claude turns and cost real money, and a spike in the count
+    is the visible symptom of a session restart-looping."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    brain_daemon.run_handshake(_state(session), "no_marker")
+    assert brain.meter_summary()["by_kind"].get("handshake") == 1
+
+
+def test_the_marker_says_validating_while_the_handshake_runs(fake_tmux, _fast_handshake, monkeypatch):
+    """`validating` is a normal state covering every boot and nightly recycle.
+    A reader that saw `no_marker` there would alarm several times a day."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    seen = []
+
+    def _inject(text, spec=None):
+        seen.append(brain.read_validation_marker(session))
+        return _echo_when_nudged(fake_tmux, session)(text, spec)
+
+    monkeypatch.setattr(tmux_claude, "inject", _inject)
+    brain_daemon.run_handshake(_state(session), "no_marker")
+    assert seen[0]["state"] == "validating"
+    assert seen[0]["attempt"] == 1
+
+
+def test_a_caller_holding_the_lock_defers_the_handshake(fake_tmux, _fast_handshake, monkeypatch):
+    """Injecting mid-turn splices two prompts into one and produces a
+    plausible-looking wrong answer. There is another tick in ten seconds."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(brain, "LOCK_WAIT_S", 0.05)
+    held = brain._lock_for(session)
+    held.acquire()
+    try:
+        assert brain_daemon.run_handshake(_state(session), "no_marker") is False
+        assert not any("NEW REQUEST" in t for _, t in fake_tmux.injected)
+    finally:
+        held.release()
+
+
+@pytest.mark.parametrize("prompt", ["spark-brain-system.md", "spark-io-system.md"])
+def test_both_prompts_explain_the_handshake_with_the_placeholder(prompt):
+    """A session that does not know how to answer a handshake cannot be
+    validated, and the placeholder is the only spelling that is right in both
+    the prompt and the allowlist."""
+    text = (ROOT / "docs" / "prompts" / prompt).read_text()
+    assert "handshake" in text.lower()
+    assert "payload.echo" in text
+    assert "tool-brain-reply" not in text.replace("{{TOOL_BRAIN_REPLY}}", ""), \
+        "the reply tool is named only via the placeholder"

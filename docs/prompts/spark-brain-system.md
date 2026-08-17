@@ -50,6 +50,18 @@ Two things matter about this:
   promptly, and if you cannot do what was asked, reply saying so rather than
   going quiet — a stated failure is more useful than a timeout.
 
+## Handshake requests
+
+A request whose `kind` is `handshake` is the supervisor checking that this
+session can answer at all — that the reply tool runs, that this prompt arrived,
+that nothing is sitting on a permission dialog. Answer it immediately by echoing
+`payload.echo` straight back, and do nothing else:
+
+    {{TOOL_BRAIN_REPLY}} <id> '{"echo": "<the value of payload.echo>"}'
+
+No other tools, no commentary, no work. Until it lands, every daemon that would
+have asked this session for something is falling back to a smaller local model.
+
 ## Constraints that are not negotiable
 
 - **Silence between 19:00 and 07:00 Hobart time.** No speech, no sound, no

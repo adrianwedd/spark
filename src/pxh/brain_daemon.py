@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +59,9 @@ WEDGE_GRACE_S = float(os.environ.get("PX_BRAIN_WEDGE_GRACE_S", "120"))
 
 # After Escape, how long to wait for the pane to come back before killing it.
 ESCAPE_GRACE_S = float(os.environ.get("PX_BRAIN_ESCAPE_GRACE_S", "30"))
+
+# How often to check the outbox during a handshake.
+HANDSHAKE_POLL_S = float(os.environ.get("PX_BRAIN_HANDSHAKE_POLL_S", "0.25"))
 
 # Turns before a context recycle. Continuity across /clear comes from the
 # journal, not from the context window.
@@ -90,6 +94,9 @@ class SessionState:
     escaped_at: float | None = None
     last_recycle_day: str = ""
     seen_request_ids: set[str] = field(default_factory=set)
+    # When this session last had a handshake attempted (monotonic). Validation
+    # goes to whoever has waited longest — see _validate_one in tick().
+    last_validation_attempt: float = 0.0
 
     @property
     def component(self) -> str:
@@ -166,6 +173,133 @@ def start_session(state: SessionState) -> bool:
     if not state.holder.alive():
         state.holder.start()
     return True
+
+
+def _await_handshake_reply(session: str, request_id: str, nonce: str,
+                           timeout_s: float) -> bool:
+    """Wait for one reply and require it to echo the nonce."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        reply = brain.collect_reply(session, request_id)
+        if reply is not None:
+            body = reply.get("reply")
+            return isinstance(body, dict) and body.get("echo") == nonce
+        time.sleep(HANDSHAKE_POLL_S)
+    return False
+
+
+def run_handshake(state: SessionState, reason: str) -> bool:
+    """Send one real request and require one real reply. Returns success.
+
+    This is not a ping. It is `tool-brain-reply` executing under the real
+    permission rules, from the real cwd, with the real allowlist — the same path
+    every subsequent request takes. A success proves the allowlist spelling, the
+    system prompt's placeholder substitution, the mailbox permissions and
+    Claude's own onboarding state all line up, and each of those has broken once.
+
+    `reason` is "no_marker" (aged or freshly created) or "model_change".
+    """
+    session = state.name
+    state.last_validation_attempt = time.monotonic()
+
+    # Narrow sweep: exactly the file the aged marker names, and nothing else.
+    # See §2.3 step 1 — this records the orphan of a supervisor that died
+    # mid-handshake, which nothing else will ever claim.
+    if reason == "no_marker":
+        marker = brain.read_validation_marker(session) or {}
+        stale_id = marker.get("request_id")
+        if isinstance(stale_id, str) and stale_id:
+            brain.sweep_one(session, stale_id)
+    brain.clear_validation_marker(session)
+
+    lock = brain._lock_for(session)
+    if lock is None:
+        health.record_failure(state.component, "filelock unavailable")
+        return False
+    try:
+        lock.acquire(timeout=brain.LOCK_WAIT_S)
+    except Exception:  # noqa: BLE001 - filelock's Timeout, or an OSError
+        # A caller is mid-turn. Injecting now splices two prompts into one; the
+        # next tick is ten seconds away.
+        _log("handshake_deferred", session=session, reason="lock busy")
+        return False
+
+    spec = brain.spec_for_session(session)
+    model = brain.configured_model(session)
+    request_id = str(uuid.uuid4())
+    nonce = str(uuid.uuid4())
+    try:
+        # ensure_session already polls for the glyph internally, up to its own
+        # STARTUP_TIMEOUT_S. Do not wait again here — that spends the same
+        # budget twice (§2.6). It returns True on session_exists() alone when
+        # the prompt never appeared, and that is fine: the glyph is a
+        # best-effort hint about when to start typing, and the handshake below
+        # is the authoritative readiness test.
+        if not tmux_claude.ensure_session(spec=spec):
+            health.record_failure(state.component,
+                                  tmux_claude.last_error() or "session did not start")
+            return False
+        time.sleep(brain.SETTLE_S)
+
+        # One deadline for the whole handshake, so a retry does not leave the
+        # request looking abandoned to _is_idle() or check_wedge().
+        deadline = time.time() + brain.HANDSHAKE_ATTEMPTS * brain.HANDSHAKE_TIMEOUT_S
+        try:
+            atomic_write(brain.inbox_dir(session) / f"{request_id}.json",
+                         json.dumps({"id": request_id, "kind": "handshake",
+                                     "payload": {"echo": nonce},
+                                     "deadline": deadline,
+                                     "created_at": utc_timestamp()}, indent=2))
+            atomic_write(brain.current_path(session),
+                         json.dumps({"id": request_id, "kind": "handshake",
+                                     "deadline": deadline}, indent=2))
+        except OSError as exc:
+            health.record_failure(state.component, f"handshake write failed: {exc}")
+            return False
+
+        for attempt in range(1, brain.HANDSHAKE_ATTEMPTS + 1):
+            brain.write_validation_marker(session, state=brain.VALIDATING,
+                                          request_id=request_id, model=model,
+                                          attempt=attempt)
+            if attempt > 1:
+                # Escape whatever the last attempt left in the input box. Alone,
+                # never followed by Enter — that submits a stray turn.
+                tmux_claude.send_key("Escape", spec=spec)
+            brain.record_request("handshake")
+            if not tmux_claude.inject(brain.nudge_line(session, request_id), spec=spec):
+                health.record_failure(state.component,
+                                      tmux_claude.last_error() or "handshake inject failed")
+                continue
+            if _await_handshake_reply(session, request_id, nonce,
+                                      brain.HANDSHAKE_TIMEOUT_S):
+                brain.write_validation_marker(session, state=brain.VALIDATED,
+                                              request_id=request_id, model=model,
+                                              attempt=attempt)
+                brain.cleanup_request(session, request_id)
+                health.record_success(state.component,
+                                      detail={"model": model, "attempt": attempt})
+                _log("handshake_ok", session=session, attempt=attempt, model=model)
+                return True
+
+        # Attempts exhausted. Kill it: the next tick sees session_absent,
+        # recreates, sweeps, and handshakes with a new id.
+        health.record_failure(
+            state.component,
+            f"handshake failed after {brain.HANDSHAKE_ATTEMPTS} attempts")
+        _log("handshake_failed", session=session,
+             attempts=brain.HANDSHAKE_ATTEMPTS, request=request_id)
+        brain.clear_validation_marker(session)
+        brain.cleanup_request(session, request_id)
+        tmux_claude.kill_session(spec)
+        if state.holder is not None:
+            state.holder.stop()
+            state.holder = None  # attached to a session that no longer exists
+        return False
+    finally:
+        try:
+            lock.release()
+        except (RuntimeError, OSError):
+            pass
 
 
 def check_wedge(state: SessionState, now: float) -> None:
