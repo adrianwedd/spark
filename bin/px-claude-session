@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# px-claude-session — the interactive Claude Code session that is SPARK's brain.
+#
+# Started inside tmux by src/pxh/tmux_claude.py (socket /tmp/tmux-1000/px-mind,
+# session name px-mind). Watch or steer it live:
+#   tmux -S /tmp/tmux-1000/px-mind attach -t px-mind     (detach: Ctrl-b d)
+#
+# This replaces `claude -p`. The session stays resident, so context survives
+# between reflections, and it answers by running SPARK's own tools rather than
+# printing JSON for us to parse back out of stdout.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Resolve the binary explicitly. `claude` on picar is a symlink in
+# ~/.local/bin that points into a versioned directory, and a tmux session
+# inherits a different environment than a subprocess does — this is the classic
+# place where the lookup silently fails and something falls back instead.
+CLAUDE_BIN="${PX_CLAUDE_BIN:-}"
+if [[ -z "$CLAUDE_BIN" ]]; then
+    CLAUDE_BIN="$(command -v claude || true)"
+fi
+if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+    CLAUDE_BIN="$HOME/.local/bin/claude"
+fi
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "px-claude-session: claude binary not found (set PX_CLAUDE_BIN)" >&2
+    exit 1
+fi
+
+MODEL="${PX_CLAUDE_TMUX_MODEL:-claude-haiku-4-5-20251001}"
+PROMPT_FILE="${PX_CLAUDE_TMUX_PROMPT:-$PROJECT_ROOT/docs/prompts/spark-brain-system.md}"
+
+if [[ ! -f "$PROMPT_FILE" ]]; then
+    echo "px-claude-session: prompt file not found: $PROMPT_FILE" >&2
+    exit 1
+fi
+
+# Allow nesting when launched from inside a Claude Code session.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
+
+# The tool allowlist IS the output channel: the session speaks, looks and
+# remembers by running these, so there is no stdout contract to parse. Keep it
+# to the cognitive tools — motion stays behind the voice loop's own gating.
+exec "$CLAUDE_BIN" \
+    --model "$MODEL" \
+    --allowedTools \
+        "Bash($PROJECT_ROOT/bin/tool-voice:*)" \
+        "Bash($PROJECT_ROOT/bin/tool-remember:*)" \
+        "Bash($PROJECT_ROOT/bin/tool-look:*)" \
+    --append-system-prompt "$(cat "$PROMPT_FILE")"

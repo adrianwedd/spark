@@ -1,0 +1,512 @@
+"""Ask SPARK's persistent Claude session a question and get an answer back.
+
+This is the replacement for `claude -p`. `tmux_claude` can already *type into* a
+resident Claude Code session; what was missing — and what kept every call site on
+one-shot subprocesses — is a way to read a reply. Scraping the pane was the
+obvious option and the wrong one: `capture-pane` returns rendered terminal
+output, so a reply would be at the mercy of wrapping, spinners, ANSI escapes and
+the pane's scrollback height. Instead the session answers the way it does
+everything else, by running a tool: `bin/tool-brain-reply` writes the answer to a
+file and we poll for it.
+
+    pane for humans, filesystem for machines
+
+The mailbox lives at `state/brain/<session>/`:
+
+    inbox/<id>.json     request written by ask_brain, deleted by the reply tool
+    outbox/<id>.json    reply written by tool-brain-reply, read and removed here
+    dead/<id>.json      requests swept aside when a session is (re)created
+    current.json        the in-flight request — what wedge detection keys on
+    model               the model marker, so /model is only injected on a change
+
+Everything here degrades rather than raises. A caller that gets `None` falls back
+to the Ollama tier chain exactly as it does today when Claude is unreachable;
+that is the whole contract, and it is why no failure path below is allowed to
+propagate an exception into a daemon.
+
+## Why the directory is world-writable
+
+`state/health/` learned this the hard way and the reasoning transfers verbatim:
+SPARK's daemons do not all run as the same user. Anything reached under `sudo`
+(the wander path elevates for GPIO) would write here as root, and a root-created
+0755 directory locks every `pi` daemon out of `atomic_write`'s `mkstemp`, which
+needs *directory* write permission. So the mailbox directories are created 1777
+— sticky, world-writable, like `/tmp` — and re-chmodded on every write so
+whichever user wins the creation race, both can still write. The single-flight
+lock file gets the same treatment for the same reason: a root-created 0644 lock
+would hand every `pi` daemon an EACCES instead of a queue position.
+
+Do not "tighten" either of these to 0755/0644.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+from . import tmux_claude
+from .logging import log_event
+from .state import PROJECT_ROOT, atomic_write
+from .time import utc_timestamp
+
+try:  # pragma: no cover - exercised by the import-failure path only
+    from filelock import FileLock, Timeout as FileLockTimeout
+except ImportError:  # pragma: no cover
+    FileLock = None  # type: ignore[assignment]
+    FileLockTimeout = Exception  # type: ignore[assignment,misc]
+
+
+# --------------------------------------------------------------------------
+# Sessions
+# --------------------------------------------------------------------------
+
+BRAIN_SESSION = "spark-brain"
+IO_SESSION = "spark-io"
+
+# Which session handles which kind of request. This is a trust boundary, not
+# load balancing: `io` kinds carry text SPARK did not write — a social post
+# being QA'd, a stranger's message to the public chat endpoint — and that text
+# reaches a session holding exactly one tool, from a scratch cwd, with no
+# repository access. Anything absent from this map runs on the privileged
+# brain, so adding a kind that handles untrusted input means adding it HERE.
+_IO_KINDS = frozenset({"post_qa", "public_chat", "obi_chat"})
+
+# Per-kind wall-clock deadline. These bound one turn; the per-type cooldowns and
+# daily cap in claude_session.py still sit in front of ask_brain and bound how
+# many turns happen at all.
+_DEADLINE_S: dict[str, int] = {
+    "post_qa": 120,
+    "public_chat": 60,
+    "obi_chat": 60,
+    "reflection": 120,
+    "research": 300,
+    "compose": 300,
+    "blog": 300,
+    "consolidate": 600,
+    "self_debug": 900,
+    "evolve": 1800,
+}
+DEFAULT_DEADLINE_S = 300
+
+# How long to wait for the single-flight lock before giving up and falling back.
+# Deliberately short: a caller queued behind a slow turn is better served by the
+# Ollama tiers than by blocking a daemon loop for minutes.
+LOCK_WAIT_S = float(os.environ.get("PX_BRAIN_LOCK_WAIT_S", "10"))
+
+# Grace period for the pane to show its prompt glyph before we give up. Never
+# inject into a busy pane — that is how two turns get spliced into one.
+READY_WAIT_S = float(os.environ.get("PX_BRAIN_READY_WAIT_S", "20"))
+
+POLL_INTERVAL_S = 0.25
+
+# Replies are answers, not payloads. A cap keeps a runaway session (or a
+# hijacked io session) from filling the SD card through the reply channel.
+MAX_REPLY_BYTES = 256 * 1024
+
+_DIR_MODE = 0o1777
+
+
+def _log(event: str, **fields: Any) -> None:
+    """Structured log line. Never raises — logging must not break a fallback."""
+    try:
+        log_event("brain", {"event": event, **fields})
+    except Exception:  # noqa: BLE001 - logging is never load-bearing
+        pass
+
+
+def session_for_kind(kind: str) -> str:
+    return IO_SESSION if kind in _IO_KINDS else BRAIN_SESSION
+
+
+def deadline_for_kind(kind: str) -> int:
+    return _DEADLINE_S.get(kind, DEFAULT_DEADLINE_S)
+
+
+def spec_for_session(session: str) -> tmux_claude.SessionSpec:
+    """tmux configuration for one session, including its launcher envelope.
+
+    The io session's envelope is the security property: one tool, and a cwd
+    outside the repository so a prompt-injected turn has nothing local to read.
+    """
+    socket = os.environ.get("PX_BRAIN_TMUX_SOCKET", tmux_claude.SOCKET)
+    if session == IO_SESSION:
+        cwd = session_dir(IO_SESSION)
+        return tmux_claude.SessionSpec(
+            name=IO_SESSION,
+            socket=socket,
+            cwd=str(cwd),
+            env={
+                "PX_BRAIN_SESSION": IO_SESSION,
+                "PX_CLAUDE_ALLOWED_TOOLS":
+                    f"Bash({PROJECT_ROOT}/bin/tool-brain-reply:*)",
+                "PX_CLAUDE_CWD": str(cwd),
+            },
+        )
+    return tmux_claude.SessionSpec(
+        name=BRAIN_SESSION,
+        socket=socket,
+        cwd=str(PROJECT_ROOT),
+        env={"PX_BRAIN_SESSION": BRAIN_SESSION},
+    )
+
+
+# --------------------------------------------------------------------------
+# Mailbox layout
+# --------------------------------------------------------------------------
+
+def _state_dir() -> Path:
+    root = Path(os.environ.get("PROJECT_ROOT", PROJECT_ROOT))
+    return Path(os.environ.get("PX_STATE_DIR", root / "state"))
+
+
+def brain_root() -> Path:
+    return _state_dir() / "brain"
+
+
+def session_dir(session: str) -> Path:
+    # Session names are internal constants, but normalise defensively — a
+    # traversal here would let a caller-supplied name escape state/.
+    safe = session.replace("/", "_").replace("..", "_").strip() or "unknown"
+    return brain_root() / safe
+
+
+def inbox_dir(session: str) -> Path:
+    return session_dir(session) / "inbox"
+
+
+def outbox_dir(session: str) -> Path:
+    return session_dir(session) / "outbox"
+
+
+def dead_dir(session: str) -> Path:
+    return session_dir(session) / "dead"
+
+
+def current_path(session: str) -> Path:
+    return session_dir(session) / "current.json"
+
+
+def model_marker_path(session: str) -> Path:
+    return session_dir(session) / "model"
+
+
+def _ensure_dir(path: Path) -> Path | None:
+    """Create a mailbox directory world-writable. Returns None if we cannot.
+
+    Never raises: this is called on the request path of a daemon that must
+    survive a read-only filesystem by falling back, not by crashing.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    try:
+        if (path.stat().st_mode & 0o7777) != _DIR_MODE:
+            os.chmod(path, _DIR_MODE)
+    except OSError:
+        pass  # not the owner — whoever created it already set the mode
+    return path
+
+
+def ensure_mailbox(session: str) -> bool:
+    """Create the full mailbox tree for a session. Idempotent."""
+    for path in (brain_root(), session_dir(session), inbox_dir(session),
+                 outbox_dir(session), dead_dir(session)):
+        if _ensure_dir(path) is None:
+            return False
+    return True
+
+
+def sweep_pending(session: str) -> int:
+    """Move every pending inbox entry to dead/. Returns how many were swept.
+
+    Called when a session is (re)created. Daemons own their own timeout and
+    fallback, so by the time a session restarts, every request that was in
+    flight has already been answered by a fallback path — replaying them would
+    produce answers nobody is waiting for, and burn budget doing it.
+    """
+    if not ensure_mailbox(session):
+        return 0
+    swept = 0
+    for entry in sorted(inbox_dir(session).glob("*.json")):
+        try:
+            entry.replace(dead_dir(session) / entry.name)
+            swept += 1
+        except OSError:
+            continue
+    try:
+        current_path(session).unlink()
+    except OSError:
+        pass
+    return swept
+
+
+# --------------------------------------------------------------------------
+# Request metering
+# --------------------------------------------------------------------------
+
+def _meter_path() -> Path:
+    return brain_root() / "meter.json"
+
+
+def record_request(kind: str) -> None:
+    """Count one brain request, per kind, per day.
+
+    This exists because reflection Tier 2 has historically bypassed
+    `claude_session.py`'s quota accounting entirely, so its spend was invisible
+    — hundreds of unbudgeted calls with nothing to show for them but a bill.
+    `ask_brain` is the first single chokepoint every Claude request passes
+    through, so counting here cannot be bypassed the way the old per-call-site
+    accounting was. This is observability, not a quota: it never blocks.
+    """
+    if _ensure_dir(brain_root()) is None:
+        return
+    day = utc_timestamp()[:10]
+    try:
+        data = json.loads(_meter_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    if data.get("day") != day:
+        data = {"day": day, "by_kind": {}}
+    by_kind = data.setdefault("by_kind", {})
+    by_kind[kind] = by_kind.get(kind, 0) + 1
+    data["total"] = sum(by_kind.values())
+    data["updated_ts"] = utc_timestamp()
+    try:
+        atomic_write(_meter_path(), json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+def meter_summary() -> dict[str, Any]:
+    try:
+        return json.loads(_meter_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"day": None, "by_kind": {}, "total": 0}
+
+
+# --------------------------------------------------------------------------
+# The request
+# --------------------------------------------------------------------------
+
+def _lock_for(session: str):
+    """Single-flight lock for one session, or None if locking is unavailable.
+
+    Two concurrent `send-keys` runs interleave into one garbled prompt, so
+    without a lock the failure mode is not "slow" but "both answers wrong".
+    Callers treat None as a hard failure and fall back.
+    """
+    if FileLock is None:
+        return None
+    lock_path = session_dir(session) / ".lock"
+    lock = FileLock(str(lock_path))
+    return lock
+
+
+def _relax_lock_mode(session: str) -> None:
+    """Make the lock file writable by every uid that might need it."""
+    try:
+        os.chmod(session_dir(session) / ".lock", 0o666)
+    except OSError:
+        pass
+
+
+def _read_model_marker(session: str) -> str:
+    try:
+        return model_marker_path(session).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _write_model_marker(session: str, model: str) -> None:
+    try:
+        atomic_write(model_marker_path(session), model + "\n")
+    except OSError:
+        pass
+
+
+def _wait_ready(spec: tmux_claude.SessionSpec, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if tmux_claude.pane_ready(spec):
+            return True
+        time.sleep(POLL_INTERVAL_S)
+    return tmux_claude.pane_ready(spec)
+
+
+def _switch_model(spec: tmux_claude.SessionSpec, session: str, model: str) -> bool:
+    """Inject /model only when the session is not already on the right one."""
+    if not model or _read_model_marker(session) == model:
+        return True
+    if not tmux_claude.inject(f"/model {model}", spec=spec):
+        return False
+    if not _wait_ready(spec, READY_WAIT_S):
+        return False
+    _write_model_marker(session, model)
+    return True
+
+
+def _nudge_line(session: str, request_id: str) -> str:
+    return (
+        f"NEW REQUEST {inbox_dir(session)}/{request_id}.json — read it, do the "
+        f"work, then reply with: tool-brain-reply {request_id} '<json>'"
+    )
+
+
+def _collect_reply(session: str, request_id: str) -> dict[str, Any] | None:
+    """Read and remove the reply, if it has landed.
+
+    `tool-brain-reply` writes via atomic rename, so a file that exists is a
+    complete file — but a reply that fails to parse is still treated as absent
+    rather than as an error, so a half-written file from a future writer that
+    forgets that guarantee degrades into a timeout instead of a wrong answer.
+    """
+    path = outbox_dir(session) / f"{request_id}.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        reply = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(reply, dict):
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    return reply
+
+
+def _cleanup(session: str, request_id: str) -> None:
+    """Clear the in-flight marker and drop the request. Always runs.
+
+    `current.json` is what wedge detection keys on, so leaving it behind after a
+    caller-side timeout would report a healthy session as wedged and get it
+    killed. It is cleared on every exit path, including the ones nobody plans
+    for.
+    """
+    for path in (inbox_dir(session) / f"{request_id}.json", current_path(session)):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def ask_brain(
+    kind: str,
+    payload: Any,
+    timeout_s: float | None = None,
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    """Send one request to the persistent Claude session and wait for its reply.
+
+    Returns the reply dict, or None on any failure — no session, no lock, a busy
+    pane, or no answer before the deadline. None means "fall back", and every
+    caller must have a fallback; there is deliberately no exception path.
+    """
+    session = session_for_kind(kind)
+    if timeout_s is None:
+        timeout_s = float(deadline_for_kind(kind))
+
+    if not ensure_mailbox(session):
+        _log("brain_unavailable", kind=kind, session=session,
+                  reason="mailbox not writable")
+        return None
+
+    lock = _lock_for(session)
+    if lock is None:
+        _log("brain_unavailable", kind=kind, session=session,
+                  reason="filelock unavailable")
+        return None
+
+    started = time.monotonic()
+    try:
+        lock.acquire(timeout=LOCK_WAIT_S)
+    except (FileLockTimeout, OSError):
+        _log("brain_busy", kind=kind, session=session,
+                  waited_s=round(time.monotonic() - started, 2))
+        return None
+    _relax_lock_mode(session)
+
+    request_id = str(uuid.uuid4())
+    try:
+        spec = spec_for_session(session)
+        if not tmux_claude.ensure_session(spec=spec):
+            _log("brain_unavailable", kind=kind, session=session,
+                      reason=tmux_claude.last_error() or "session did not start")
+            return None
+        if not _wait_ready(spec, READY_WAIT_S):
+            _log("brain_busy", kind=kind, session=session, reason="pane not ready")
+            return None
+        if model and not _switch_model(spec, session, model):
+            _log("brain_unavailable", kind=kind, session=session,
+                      reason="model switch failed")
+            return None
+
+        # The deadline travels with the request so the session can see how long
+        # it has, and so wedge detection has something to compare against.
+        deadline = time.time() + timeout_s
+        request = {
+            "id": request_id,
+            "kind": kind,
+            "payload": payload,
+            "deadline": deadline,
+            "created_at": utc_timestamp(),
+        }
+        try:
+            atomic_write(inbox_dir(session) / f"{request_id}.json",
+                         json.dumps(request, indent=2))
+            atomic_write(current_path(session),
+                         json.dumps({"id": request_id, "kind": kind,
+                                     "deadline": deadline}, indent=2))
+        except OSError as exc:
+            _log("brain_unavailable", kind=kind, session=session, reason=str(exc))
+            return None
+
+        record_request(kind)
+
+        if not tmux_claude.inject(_nudge_line(session, request_id), spec=spec):
+            _log("brain_unavailable", kind=kind, session=session,
+                      reason=tmux_claude.last_error() or "inject failed")
+            return None
+
+        while time.time() < deadline:
+            reply = _collect_reply(session, request_id)
+            if reply is not None:
+                _log("brain_reply", kind=kind, session=session,
+                          duration_s=round(time.monotonic() - started, 2))
+                return reply
+            time.sleep(POLL_INTERVAL_S)
+
+        _log("brain_timeout", kind=kind, session=session,
+                  timeout_s=timeout_s)
+        return None
+    finally:
+        _cleanup(session, request_id)
+        try:
+            lock.release()
+        except (RuntimeError, OSError):
+            pass
+
+
+async def ask_brain_async(
+    kind: str,
+    payload: Any,
+    timeout_s: float | None = None,
+    model: str | None = None,
+) -> dict[str, Any] | None:
+    """`ask_brain` for api.py's async handlers.
+
+    The sync version polls with `time.sleep` and must never be called on the
+    event loop — one brain request would stall every other HTTP request for the
+    length of a Claude turn.
+    """
+    import asyncio
+
+    return await asyncio.to_thread(ask_brain, kind, payload, timeout_s, model)
