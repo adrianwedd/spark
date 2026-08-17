@@ -196,6 +196,10 @@ both sessions:
   replay abandoned requests.
 - **Heartbeat**: `session_exists()` + `pane_ready()` observation — *not* a
   request round-trip, so a legitimate long turn is never mistaken for a wedge.
+  (Superseded in part: `pane_ready()` turned out not to prove a session can
+  answer — a permission dialog renders the same glyph. A session must now pass a
+  handshake round-trip before any caller may use it. See
+  `2026-08-17-brain-handshake-validation-design.md`.)
 - **Wedge detection**: keyed on `current.json`, not stale inbox files (an
   abandoned inbox entry is not a wedge). `current.json` deadline passed, no
   outbox, pane still busy → inject Escape; still busy after a grace period →
