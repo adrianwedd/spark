@@ -220,7 +220,11 @@ Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<
 - **`ask_brain` meters every request** (`state/brain/meter.json`, per kind per day). It is the first chokepoint every Claude request passes through; reflection Tier 2 bypasses `claude_session.py`'s accounting entirely today, which is how unbudgeted calls went unnoticed.
 - `tests/conftest.py` has an **autouse** fixture redirecting `brain_root()` to tmp. Without it an in-process test drops a real request into the running robot's inbox, where the live session answers it.
 
-**Rollout:** `PX_BRAIN_KINDS` (default `research,compose`) selects which session types `run_claude_session()` routes to the brain; everything else still takes the old path. Read at call time so the rollout can be widened or rolled back live. `evolve` cannot move until the brain can work inside a git worktree — a resident session's tool envelope is fixed at launch and cannot be widened per call. Remaining `claude -p` call sites: `mind.py` (`call_claude_haiku`), `api.py` (`_call_claude_public`), `bin/claude-voice-bridge`, `bin/px-blog`, `bin/px-post`, `bin/tool-describe-scene`, `bin/px-cron-say`. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
+**`px-brain` supervisor (`bin/px-brain`, `src/pxh/brain_daemon.py`):** owns both sessions so callers don't have to. **Its first job is holding a read-only attached tmux client per session** — 3.3a's `send-keys` fails outright when no client is attached, so without the holder injection fails precisely when nobody is watching. `TERM` must be set in the unit (`tmux attach` refuses without one). `KillMode=process` is deliberate: restarting the supervisor must not kill the sessions it supervises. It also sweeps pending requests to `dead/` on session (re)create, unwedges (Escape, then kill after `ESCAPE_GRACE_S`), and recycles context on turn count + nightly at 02:00 Hobart — **always at an idle moment**, since a `/clear` between nudge and reply loses the request. Wedge detection keys on `current.json`, never on stale inbox files (an abandoned inbox entry means a caller gave up, not that the session is stuck).
+
+**Rollout:** `PX_BRAIN_KINDS` (default `research,compose,post_qa`) selects which kinds route to the brain; everything else still takes the old path. Read at call time so the rollout can be widened or rolled back live — `bin/px-post` consults the same dial for its QA gate. `evolve` cannot move until the brain can work inside a git worktree: a resident session's tool envelope is fixed at launch and cannot be widened per call. Remaining `claude -p` call sites: `mind.py` (`call_claude_haiku`), `api.py` (`_call_claude_public`), `bin/claude-voice-bridge`, `bin/px-blog`, `bin/px-post` (legacy branch), `bin/tool-describe-scene`, `bin/px-cron-say`. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
+
+**`bin/tool-describe-scene` may be a bug fix, not just a migration.** `bin/tool-wander:64` runs `px-wander` under `sudo -n`, and `wander._call_describe_scene` passes that environment straight down — so the tool's `claude -p` runs **as root**, with root's `HOME`. If root has no Claude credentials there, vision silently returns `FALLBACK_DESCRIPTION` on every real wander and nothing logs a credential error. The sudo chain is verified in the code; **the credential failure itself has not been confirmed on the robot** — check before claiming it fixed. Under the brain the root process only drops a JSON file and the authenticated `claude` runs as `pi`, which sidesteps it either way.
 
 ### Self-Evolution (px-evolve)
 
@@ -314,6 +318,7 @@ See `src/pxh/api.py` for full endpoint list.
 | `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10s |
 | `px-battery-poll` | `bin/px-battery-poll` | root | always, 10s |
 | `px-mind` | `bin/px-mind` | pi | always, 10s |
+| `px-brain` | `bin/px-brain` | pi | always, 10s (`KillMode=process`) |
 | `px-post` | `bin/px-post` | pi | always, 30s |
 | `px-api-server` | `bin/px-api-server` | pi | always, 2s |
 | `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10s |

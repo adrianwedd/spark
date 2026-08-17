@@ -292,7 +292,7 @@ def budget_summary() -> str:
 # Types NOT listed here still take the old path. `evolve` in particular cannot
 # move until the brain can work inside a git worktree, since a resident
 # session's tool envelope is fixed at launch and cannot be widened per call.
-_DEFAULT_BRAIN_KINDS = "research,compose"
+_DEFAULT_BRAIN_KINDS = "research,compose,post_qa"
 
 
 def _brain_kinds() -> frozenset[str]:

@@ -501,12 +501,12 @@ def test_consolidate_quota_one_per_day(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_phase_one_types_default_to_the_resident_session():
-    """research and compose are the first two types off `claude -p`."""
+    """Phase 1 of the `claude -p` retirement: research, compose and post QA."""
     from pxh import claude_session as cs
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("PX_BRAIN_KINDS", None)
         kinds = cs._brain_kinds()
-    assert kinds == {"research", "compose"}
+    assert kinds == {"research", "compose", "post_qa"}
 
 
 def test_brain_kinds_is_read_at_call_time_not_import_time():
