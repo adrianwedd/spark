@@ -73,6 +73,13 @@ CONTEXT_TURNS = int(os.environ.get("PX_BRAIN_CONTEXT_TURNS", "20"))
 # turn someone is waiting on.
 NIGHTLY_RECYCLE_HOUR = int(os.environ.get("PX_BRAIN_RECYCLE_HOUR", "2"))
 
+# How long handshake_reason holds off after a recycle injects the
+# journal+/clear turn, before it will consider the session due again. That
+# injection is a real Claude turn, not a keystroke that lands instantly, so it
+# gets a turn's own budget rather than a made-up number — the same one a
+# handshake gets.
+RECYCLE_QUIET_S = brain.HANDSHAKE_TIMEOUT_S
+
 _HEALTH_COMPONENT = {
     brain.BRAIN_SESSION: "px-brain",
     brain.IO_SESSION: "px-brain-io",
@@ -97,6 +104,11 @@ class SessionState:
     # When this session last had a handshake attempted (monotonic). Validation
     # goes to whoever has waited longest — see _validate_one in tick().
     last_validation_attempt: float = 0.0
+    # Monotonic time of the last recycle whose inject actually landed. A
+    # recycle clears the marker, which makes handshake_reason see `no_marker`
+    # in the very same tick — this is how it holds off nudging the pane it
+    # just made busy with the journal+/clear turn. See RECYCLE_QUIET_S.
+    last_recycle_at: float = 0.0
 
     @property
     def component(self) -> str:
@@ -426,6 +438,7 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
 
     lock = brain._lock_for(state.name)
     if lock is None:
+        _log("recycle_deferred", session=state.name, reason="filelock unavailable")
         return
     try:
         lock.acquire(timeout=0)
@@ -446,10 +459,22 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
 
         # Journal before clearing — the other order throws away the thing the
         # journal was supposed to preserve.
-        tmux_claude.inject(
+        landed = tmux_claude.inject(
             f"Before anything else: append anything worth keeping to {journal_path()}, "
             "then run /clear.", spec=spec)
+        if not landed:
+            # The marker is already gone — that is fine, it makes the next
+            # tick handshake this session, same as any other no_marker. But
+            # turns, last_recycle_day and last_recycle_at must not move: they
+            # are the bookkeeping for a recycle that landed, and advancing
+            # them here would make the supervisor think it recycled — and
+            # wait another CONTEXT_TURNS to try again — while the context was
+            # never actually cleared.
+            _log("recycle_inject_failed", session=state.name,
+                 error=tmux_claude.last_error())
+            return
         state.turns = 0
+        state.last_recycle_at = time.monotonic()
         if nightly_due:
             state.last_recycle_day = day
     finally:
@@ -487,6 +512,18 @@ def handshake_reason(state: SessionState) -> str | None:
     if derived == brain.VALIDATING:
         return None  # in progress, and a stale marker has already aged out
     if derived == brain.NO_MARKER:
+        if (state.last_recycle_at
+                and time.monotonic() - state.last_recycle_at < RECYCLE_QUIET_S):
+            # The marker is legitimately absent here — the supervisor cleared
+            # it moments ago as part of a recycle, and the pane is busy with
+            # the very turn that clears the context. Nudging in now is the
+            # "never inject into a busy pane" hazard, by construction, on
+            # every recycle. During this window the session records neither
+            # success nor failure, same as `validating` does: it reports
+            # `missing` for up to a turn's length against a 300s staleness
+            # window. That is the correct trade against splicing two prompts
+            # into one.
+            return None
         return "no_marker"
     marker = brain.read_validation_marker(state.name) or {}
     if marker.get("model") != brain.configured_model(state.name):
