@@ -207,6 +207,27 @@ So the glob skips entries whose `deadline` has passed. An entry whose
 `check_wedge()`'s existing guard (`brain_daemon.py:187`) — a predicate that
 cannot read a deadline must not become a reason to recycle over a real request.
 
+**The deadline is read with no grace period, and that asymmetry with
+`check_wedge()` is deliberate.** That path waits `deadline + WEDGE_GRACE_S`
+(`brain_daemon.py:187`) before it will act, and the temptation on noticing the
+difference will be to copy the grace across for consistency. It must not be
+copied, for the same by-construction reason the predicate works at all:
+`ask_brain`'s loop is `while time.time() < deadline` (`brain.py:495`) and its
+`finally:` calls `_cleanup` (`:507`), so at the deadline the caller has already
+removed its own inbox entry — an entry still present at that instant has no
+waiter, and no slack is required to be sure of it. The grace exists for a
+different question. `check_wedge()` is judging whether the *session* is stuck,
+and wants slack before escalating to an Escape and a kill. `_is_idle()` is
+judging whether a *caller* is waiting, and it may use the caller's exact bound
+because the caller uses it too.
+
+The one window where an inbox entry exists with no `current.json` and a live
+caller is inside `ask_brain` itself, which writes the request before the
+in-flight marker (`brain.py:479`, `:481`). It is pre-deadline by construction —
+the deadline is computed just above, at `:470` — so the predicate reads that
+entry as live and withholds the recycle. There is no ordering in which the
+predicate sees a live request as abandoned.
+
 This deletes nothing and transfers no ownership. The supervisor still sweeps
 only the one file it wrote itself, so the scoping argument in step 1 and §5
 stands untouched; what changes is that a corpse the supervisor may *not* delete
