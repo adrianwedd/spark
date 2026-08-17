@@ -31,23 +31,52 @@ if [[ -z "$CLAUDE_BIN" ]]; then
 fi
 
 MODEL="${PX_CLAUDE_TMUX_MODEL:-claude-haiku-4-5-20251001}"
-PROMPT_FILE="${PX_CLAUDE_TMUX_PROMPT:-$PROJECT_ROOT/docs/prompts/spark-brain-system.md}"
+
+# Which session this is. The two sessions are a trust boundary: spark-brain is
+# privileged and runs here at the repo root, spark-io chews on text SPARK did
+# not write and gets one tool and a cwd outside the repository.
+BRAIN_SESSION="${PX_BRAIN_SESSION:-spark-brain}"
+
+if [[ "$BRAIN_SESSION" == "spark-io" ]]; then
+    DEFAULT_PROMPT="$PROJECT_ROOT/docs/prompts/spark-io-system.md"
+else
+    DEFAULT_PROMPT="$PROJECT_ROOT/docs/prompts/spark-brain-system.md"
+fi
+PROMPT_FILE="${PX_CLAUDE_TMUX_PROMPT:-$DEFAULT_PROMPT}"
 
 if [[ ! -f "$PROMPT_FILE" ]]; then
     echo "px-claude-session: prompt file not found: $PROMPT_FILE" >&2
     exit 1
 fi
 
+# The tool allowlist IS the output channel: the session speaks, looks, remembers
+# and answers by running these, so there is no stdout contract to parse. Keep
+# the privileged default to the cognitive tools — motion stays behind the voice
+# loop's own gating. The envelope is fixed here, at launch, and deliberately
+# cannot be widened per request; PX_CLAUDE_ALLOWED_TOOLS is how the watchdog
+# hands the io session its single-tool envelope, not a per-call escape hatch.
+DEFAULT_TOOLS=(
+    "Bash($PROJECT_ROOT/bin/tool-brain-reply:*)"
+    "Bash($PROJECT_ROOT/bin/tool-voice:*)"
+    "Bash($PROJECT_ROOT/bin/tool-remember:*)"
+    "Bash($PROJECT_ROOT/bin/tool-look:*)"
+)
+if [[ -n "${PX_CLAUDE_ALLOWED_TOOLS:-}" ]]; then
+    # Space-separated, one "Bash(...)" pattern per entry.
+    read -r -a TOOLS <<< "$PX_CLAUDE_ALLOWED_TOOLS"
+else
+    TOOLS=("${DEFAULT_TOOLS[@]}")
+fi
+
+if [[ -n "${PX_CLAUDE_CWD:-}" ]]; then
+    mkdir -p "$PX_CLAUDE_CWD"
+    cd "$PX_CLAUDE_CWD"
+fi
+
 # Allow nesting when launched from inside a Claude Code session.
 unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
 
-# The tool allowlist IS the output channel: the session speaks, looks and
-# remembers by running these, so there is no stdout contract to parse. Keep it
-# to the cognitive tools — motion stays behind the voice loop's own gating.
 exec "$CLAUDE_BIN" \
     --model "$MODEL" \
-    --allowedTools \
-        "Bash($PROJECT_ROOT/bin/tool-voice:*)" \
-        "Bash($PROJECT_ROOT/bin/tool-remember:*)" \
-        "Bash($PROJECT_ROOT/bin/tool-look:*)" \
+    --allowedTools "${TOOLS[@]}" \
     --append-system-prompt "$(cat "$PROMPT_FILE")"

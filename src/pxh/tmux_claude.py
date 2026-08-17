@@ -212,6 +212,20 @@ def inject(text: str, spec: SessionSpec | None = None) -> bool:
     return _tmux_via_pty("send-keys", "-t", target, "Enter", socket=s.socket)
 
 
+def send_key(key: str, spec: SessionSpec | None = None) -> bool:
+    """Send a single named key (Escape, C-c) without pressing Enter after it.
+
+    `inject` is for prompts; this is for interrupting one. A wedged session
+    needs Escape *alone* — following it with Enter submits whatever is sitting
+    in the input box, which is how an unwedge attempt turns into a stray turn.
+    """
+    s = _spec(spec)
+    if not session_exists(s):
+        return False
+    target = brain_pane(s) or s.name
+    return _tmux_via_pty("send-keys", "-t", target, key, socket=s.socket)
+
+
 def reset_context(spec: SessionSpec | None = None) -> bool:
     """Clear the session's context without restarting it (Claude's /clear)."""
     return inject("/clear", spec=spec)
