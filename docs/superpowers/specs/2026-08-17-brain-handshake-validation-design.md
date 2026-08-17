@@ -149,14 +149,13 @@ Then, in order:
    `inbox/<request_id>.json` named by the aged `validating` marker about to be
    replaced. Then delete `validation.json`.
 
-   The narrow sweep is not tidiness, it is the fix for a hole this spec's own
-   level trigger would otherwise open. A supervisor killed mid-handshake leaves
+   The narrow sweep is not tidiness. A supervisor killed mid-handshake leaves
    its request in the inbox; step 4 then mints a *fresh* id (§2.4), so nothing
-   ever claims the old file, and nothing recreates the session to sweep it.
-   `_is_idle()` returns False on any non-empty inbox
-   (`brain_daemon.py:216-221`), so that session would never recycle again —
-   not nightly, not on turn count. The state machine that closes the `no_marker`
-   hole would open a permanent recycle hole on the same path.
+   ever claims the old file, and nothing recreates the session to sweep it. The
+   sweep is how that orphan gets **recorded** — `dead/` is the audit trail, and
+   a request that vanished from the inbox without appearing there is a request
+   nobody can later account for. It is not, on its own, what keeps the session
+   recycling; that is the predicate change below.
 
    It is safe outside the lock for a stronger reason than the creation sweep's:
    the marker names the one file it may delete, so there is no glob and no
@@ -189,6 +188,38 @@ Then, in order:
    - Attempts exhausted → `record_failure()`, `kill_session()`, drop the holder,
      return. The next tick recreates the session, which sweeps and starts a
      handshake with a **new** `request_id`.
+
+**`_is_idle()` stops asking about files and asks about live requests.** The
+sweep records the orphan; this is what stops any orphan from pinning recycles
+forever, and the two compose rather than substitute. Today the predicate asks
+"is a request live?" and answers it with "does a file exist?"
+(`brain_daemon.py:219`) — and those differ exactly when a writer died. Every
+request carries `deadline` as wall-clock (`brain.py:470`, `:475`) and
+`ask_brain` gives up precisely at it (`brain.py:495`); by the time `_is_idle()`
+reaches the inbox glob it has already established that `current.json` is absent
+(`:217`). A pending inbox entry that is **past its deadline with no
+`current.json` has no waiter by construction** — that holds for a dead
+handshake's request and for a killed caller's alike, which is why one predicate
+closes both without the supervisor needing to know which it is looking at.
+
+So the glob skips entries whose `deadline` has passed. An entry whose
+`deadline` is missing or not a number counts as **live**, matching
+`check_wedge()`'s existing guard (`brain_daemon.py:187`) — a predicate that
+cannot read a deadline must not become a reason to recycle over a real request.
+
+This deletes nothing and transfers no ownership. The supervisor still sweeps
+only the one file it wrote itself, so the scoping argument in step 1 and §5
+stands untouched; what changes is that a corpse the supervisor may *not* delete
+no longer blocks every future recycle on that session.
+
+**The predicate is now clock-dependent, and that is worth saying out loud so
+nobody reads it as a fresh hazard.** The Pi 4 has no RTC, so NTP steps the clock
+at boot, and a large enough forward step could make a live request look expired
+and let a recycle land on it. This is not new exposure: `ask_brain`'s own wait
+loop (`brain.py:495`) and `check_wedge()`'s comparison (`:187`) already trust
+the same wall-clock `deadline`, and a step big enough to fool the predicate has
+already ended the caller's wait for the same reason. The change adds a third
+reader of an existing trust assumption, not a new one.
 
 **The handshake does its own escalation and does not rely on `check_wedge()`.**
 That path clears itself whenever `pane_ready()` is true (`brain_daemon.py:191`),
@@ -497,7 +528,7 @@ seven are listed with their verdict. Two change, two go, three stay.
 | 3 | `brain._wait_ready()` poll loop — `brain.py:351` | **Removed** with `_switch_model` (§2.5). |
 | 4 | `brain._wait_ready()` final check — `brain.py:354` | **Removed**. Callers no longer wait on readiness at all; they read the marker. |
 | 5 | `brain_daemon.check_wedge()` — `:191` | **Stays, warning-labelled** (§2.3). The one site where the glyph's weakness is load-bearing and tolerated. |
-| 6 | `brain_daemon._is_idle()` — `:221` | **Stays.** "Idle" really is a question about the pane, and it gates recycles. A recycle mistimed by a dialog is now recoverable rather than silent, because every recycle is followed by a handshake. |
+| 6 | `brain_daemon._is_idle()` — `:221` | **Stays.** "Idle" really is a question about the pane, and it gates recycles. A recycle mistimed by a dialog is now recoverable rather than silent, because every recycle is followed by a handshake. (The *inbox* half of the same predicate, `:219`, does change — see §2.3 — but that half was never a glyph question.) |
 | 7 | `brain_daemon.tick()` health success — `:277` | **Changed, and this is the bug.** This is the line that recorded `ok` for a session that could not answer a single request. Success becomes conditional on `session_state() == "validated"`, never on the glyph. |
 
 A test asserts that `pane_ready` has no call sites in `brain.py` after this
@@ -539,6 +570,14 @@ and answers via the real `bin/tool-brain-reply`):
   is not, `_is_idle()` is true again, and a due recycle actually fires. The last
   assertion is the point: a test that only checks the file vanished would pass
   against a fix that swept the wrong file.
+- **`_is_idle()` reads deadlines, not filenames.** Three cases against one
+  pending `inbox/<id>.json` and no `current.json`: a **past** `deadline` →
+  `_is_idle()` is true and a due recycle fires; a **future** `deadline` → false
+  and the recycle is withheld; a `deadline` that is **absent or non-numeric** →
+  false. The middle and last cases are what make the test meaningful — asserting
+  only the first would pass against an implementation that dropped the inbox
+  check altogether. This one uses a caller-shaped orphan with no marker to sweep,
+  so it exercises the predicate on its own, disentangled from the sweep.
 - **The post-lock re-check fires.** Caller passes the pre-lock check, the
   supervisor invalidates the marker while the caller is blocked in
   `acquire()`, and on acquiring the caller returns `None` **without** calling
@@ -586,13 +625,14 @@ re-validates in teardown.
 
 - Fixing `check_wedge()`'s `pane_ready()` branch (§2.3) — warning-labelled in
   the code, not fixed.
-- A *caller's* abandoned inbox entry blocking `_is_idle()` the same way a dead
-  handshake's does (§2.3). `ask_brain`'s `finally:` removes it on every planned
-  path, so this needs the caller process to die outright; it is pre-existing,
-  predates the level trigger, and the narrow sweep deliberately does not widen
-  to cover it — a supervisor deleting requests it did not write is how the
-  creation-only scoping got its reasoning in the first place. Recorded, not
-  absorbed.
+- **Widening the sweep** to a *caller's* abandoned inbox entry (§2.3). Sweeping
+  stays creation-scoped plus the one file the supervisor wrote itself: a
+  supervisor deleting requests it did not write is how that scoping got its
+  reasoning in the first place, and nothing here changes it. The consequence is
+  that a caller's corpse never reaches `dead/` — the audit trail covers what the
+  supervisor owns, and only that. It is no longer a *recycle* problem, because
+  §2.3's deadline predicate ignores it without needing permission to delete it;
+  what remains out of scope is recording it.
 - Making `health._write_record`'s silent `OSError` visible (§2.6). The swallow is
   correct; the ambiguity it creates between "disk full" and "daemon dead"
   belongs to `health.py` and would be a change to every component at once.
