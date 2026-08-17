@@ -32,15 +32,26 @@ CLAUDE_TIMEOUT = 60
 
 MAX_DESCRIPTION_CHARS = 300
 
-# Who owns the Claude credentials. Not root, and not necessarily the caller.
-CLAUDE_USER = os.environ.get("PX_CLAUDE_USER", "pi")
+DEFAULT_CLAUDE_USER = "pi"
+
+
+def claude_user() -> str:
+    """Who owns the Claude credentials. Not root, and not necessarily the caller.
+
+    Read at call time rather than bound at import, and read in exactly one
+    place: the user picks both who we drop privileges to *and* whose home the
+    binary is looked up in, so an import-time constant plus a call-time
+    override would let those two disagree — dropping to one user while
+    reaching for another user's CLI.
+    """
+    return os.environ.get("PX_CLAUDE_USER", DEFAULT_CLAUDE_USER)
 
 
 def claude_bin() -> str:
     """Locate the CLI. Not on PATH under systemd, nor on root's PATH at all."""
     return (os.environ.get("PX_CLAUDE_BIN")
             or shutil.which("claude")
-            or f"/home/{CLAUDE_USER}/.local/bin/claude")
+            or f"/home/{claude_user()}/.local/bin/claude")
 
 
 def vision_command(prompt: str) -> list[str]:
@@ -58,9 +69,8 @@ def vision_command(prompt: str) -> list[str]:
         "--allowedTools", "Read",
         "--output-format", "text",
     ]
-    user = os.environ.get("PX_CLAUDE_USER", CLAUDE_USER)
     if os.geteuid() == 0:
-        return ["runuser", "-u", user, "--", *argv]
+        return ["runuser", "-u", claude_user(), "--", *argv]
     return argv
 
 

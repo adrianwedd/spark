@@ -206,12 +206,15 @@ def main() -> int:
         env = os.environ.copy()
         env["PX_TEXT"] = description[:2000]
         # Bounded, not unbounded: this runs inside wander's DESCRIBE_SCENE_TIMEOUT
-        # (150s) budget. tool-voice can block indefinitely when the audio device
-        # is held by another process, and an unbounded call here means wander
-        # kills the whole tool mid-run instead of the tool degrading to a silent
-        # but successful scene description. 45s Claude + 60s voice + ~20s photo
-        # and stream headroom stays under 150s.
-        # Pinned by tests/test_wander.py::test_describe_scene_timeout_has_margin_over_claude
+        # budget. tool-voice can block indefinitely when the audio device is held
+        # by another process, and an unbounded call here means wander kills the
+        # whole tool mid-run instead of the tool degrading to a silent but
+        # successful scene description. This 60s is the "bounded speech" term in
+        # wander.DESCRIBE_SCENE_TIMEOUT's budget; the vision term is
+        # vision.CLAUDE_TIMEOUT. Deliberately no totals here — a comment
+        # asserting a constant that lives in another file is a test that never
+        # runs. The arithmetic is checked by
+        # tests/test_wander.py::test_describe_scene_timeout_has_margin_over_claude
         try:
             subprocess.run([str(TOOL_VOICE)], capture_output=True, text=True,
                            check=False, env=env, timeout=60)

@@ -68,6 +68,15 @@ def main() -> int:
         # printing its JSON and a successful run reads as a failure. Taken from
         # the invoking uid rather than $HOME so a clobbered environment cannot
         # silently reintroduce it. px-alive.service:17 does the same thing.
+        #
+        # This override buys ROOT-SIDE *READS* of pi's home, nothing more, and
+        # it applies to the whole elevated subtree — not just wander. Any code
+        # under here that WRITES beneath $HOME will drop root-owned files into
+        # the pi user's home, and the first root-owned file in a directory pi
+        # later needs to write is a permanent lockout for the pi user. Code
+        # that writes must drop privileges instead; see `pxh.vision`, which
+        # runs the Claude CLI under `runuser` for exactly this reason rather
+        # than riding this HOME.
         home = pwd.getpwuid(os.getuid()).pw_dir
         command.extend([
             "sudo", "-n", "env", f"PYTHONPATH={python_path}",
