@@ -11,7 +11,9 @@
 #
 # Reading the payload from stdin is supported (`--stdin`) and preferred for
 # anything with quotes in it — an argv round-trip through send-keys is exactly
-# where a shell-quoting mistake turns into a truncated reply.
+# where a shell-quoting mistake turns into a truncated reply. It is also the
+# only transport that carries a big reply: Linux caps every argv string at
+# MAX_ARG_STRLEN (32 pages = 131072 bytes), which is half MAX_REPLY_BYTES.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,11 +23,21 @@ source "$SCRIPT_DIR/px-env"
 REQUEST_ID="${1:-}"
 PAYLOAD="${2:-}"
 
+# The payload reaches Python through a file, never through argv or the
+# environment. That is not tidiness: MAX_ARG_STRLEN caps each argv *and* envp
+# string at 131072 bytes, so a legal reply between that and MAX_REPLY_BYTES
+# used to die at this very execve with exit 126 and an empty stdout — no JSON
+# object at all, which is the one thing every tool must always emit, and it
+# left our own size guard as unreachable dead code.
+PAYLOAD_FILE="$(mktemp "${TMPDIR:-/tmp}/brain-reply.XXXXXX")"
+trap 'rm -f "$PAYLOAD_FILE"' EXIT
 if [[ "$PAYLOAD" == "--stdin" || ( -z "$PAYLOAD" && ! -t 0 ) ]]; then
-    PAYLOAD="$(cat)"
+    cat > "$PAYLOAD_FILE"
+else
+    printf '%s' "$PAYLOAD" > "$PAYLOAD_FILE"
 fi
 
-PX_BRAIN_REQUEST_ID="$REQUEST_ID" PX_BRAIN_PAYLOAD="$PAYLOAD" \
+PX_BRAIN_REQUEST_ID="$REQUEST_ID" PX_BRAIN_PAYLOAD_FILE="$PAYLOAD_FILE" \
 /usr/bin/env python3 <<'PY'
 import json
 import os
@@ -43,7 +55,7 @@ def fail(msg: str) -> None:
 
 
 request_id = (os.environ.get("PX_BRAIN_REQUEST_ID") or "").strip()
-raw = os.environ.get("PX_BRAIN_PAYLOAD") or ""
+payload_file = os.environ.get("PX_BRAIN_PAYLOAD_FILE") or ""
 session = os.environ.get("PX_BRAIN_SESSION") or brain.BRAIN_SESSION
 
 # 1. The id must be a bare uuid4 and nothing else. This is the path-traversal
@@ -66,10 +78,22 @@ if not inbox_entry.exists():
 
 # 3. The payload must be JSON, and small. Both bounds exist because this tool
 #    is reachable from the untrusted io session.
+try:
+    size = os.path.getsize(payload_file)
+except OSError:
+    fail("payload unreadable")
+# Sized before it is read: the file is written by a language model that may
+# have just read a stranger's text, and there is no longer an exec limit
+# accidentally bounding it for us.
+if size > brain.MAX_REPLY_BYTES:
+    fail(f"payload exceeds {brain.MAX_REPLY_BYTES} bytes")
+try:
+    with open(payload_file, encoding="utf-8") as handle:
+        raw = handle.read()
+except (OSError, UnicodeDecodeError):
+    fail("payload unreadable")
 if not raw.strip():
     fail("empty payload")
-if len(raw.encode("utf-8")) > brain.MAX_REPLY_BYTES:
-    fail(f"payload exceeds {brain.MAX_REPLY_BYTES} bytes")
 try:
     payload = json.loads(raw)
 except json.JSONDecodeError as exc:

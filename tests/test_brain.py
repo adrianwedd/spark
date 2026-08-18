@@ -389,12 +389,29 @@ def test_meter_counts_every_request(_live_pane):
 # tool-brain-reply validation — the io session's only tool
 # ---------------------------------------------------------------------------
 
-def _run_tool(session: str, request_id: str, raw_payload: str):
+def _tool_env(session: str) -> dict:
     env = os.environ.copy()
     env["PX_BRAIN_SESSION"] = session
     env["PYTHONPATH"] = str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _run_tool(session: str, request_id: str, raw_payload: str):
     return subprocess.run([str(TOOL), request_id, raw_payload],
-                          capture_output=True, text=True, timeout=30, env=env)
+                          capture_output=True, text=True, timeout=30,
+                          env=_tool_env(session))
+
+
+def _run_tool_stdin(session: str, request_id: str, raw_payload: str):
+    """Feed the payload on stdin — the only transport that survives a big reply.
+
+    Linux caps every argv *and* envp string at MAX_ARG_STRLEN (32 pages =
+    131072 bytes), so anything larger cannot be handed over as an argument at
+    all: the caller's own execve fails before the tool runs.
+    """
+    return subprocess.run([str(TOOL), request_id, "--stdin"], input=raw_payload,
+                          capture_output=True, text=True, timeout=30,
+                          env=_tool_env(session))
 
 
 @pytest.mark.parametrize("bad_id", [
@@ -431,11 +448,38 @@ def test_reply_tool_rejects_non_json_and_oversized_payloads(_mailbox):
     assert json.loads(bad.stdout.strip().splitlines()[-1])["status"] == "error"
 
     huge = json.dumps({"x": "a" * (brain.MAX_REPLY_BYTES + 1)})
-    big = _run_tool(session, rid, huge)
+    big = _run_tool_stdin(session, rid, huge)
     assert json.loads(big.stdout.strip().splitlines()[-1])["status"] == "error"
 
     assert (brain.inbox_dir(session) / f"{rid}.json").exists(), \
         "a rejected reply must leave the request pending"
+
+
+def test_reply_tool_accepts_a_payload_the_environment_could_not_carry(_mailbox):
+    """A legal reply must not be capped by the kernel's per-string exec limit.
+
+    The tool used to hand the payload to its Python step through an environment
+    variable. Linux caps every argv/envp string at MAX_ARG_STRLEN (32 pages =
+    131072 bytes), which is *half* MAX_REPLY_BYTES — so a reply in that band
+    died at execve with exit 126 and an empty stdout, breaking the one-JSON-
+    object contract every tool has, and making the tool's own size guard
+    unreachable dead code. Sized above the kernel limit and below our own.
+    """
+    session = brain.IO_SESSION
+    brain.ensure_mailbox(session)
+    rid = str(uuid.uuid4())
+    (brain.inbox_dir(session) / f"{rid}.json").write_text("{}")
+
+    body = "a" * 200_000
+    assert len(body) > 131072, "must exceed MAX_ARG_STRLEN to pin the bug"
+    assert len(body) < brain.MAX_REPLY_BYTES, "must stay a legal reply"
+
+    out = _run_tool_stdin(session, rid, json.dumps({"essay": body}))
+
+    assert out.stdout.strip(), f"tool emitted nothing (rc={out.returncode}): {out.stderr[:200]}"
+    assert json.loads(out.stdout.strip().splitlines()[-1])["status"] == "ok", out.stderr
+    written = json.loads((brain.outbox_dir(session) / f"{rid}.json").read_text())
+    assert written["reply"]["essay"] == body
 
 
 def test_reply_tool_retires_the_request_on_success(_mailbox):
