@@ -33,6 +33,7 @@ pretending otherwise would be the exact failure this module exists to prevent.
 > `src/pxh/provenance.py`'s module docstring still opens with the words "Six
 > kinds" — a stale count left over from before `model_perception` was added by
 > #177. The table beneath it and `provenance.KINDS` are both correct at seven.
+> Filed as [#214](https://github.com/adrianwedd/spark/issues/214).
 
 ### Ceilings are clamped on write *and* on read
 

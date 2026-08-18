@@ -112,11 +112,20 @@ policy coverage lives in `tests/test_policy.py`. **Keep that split** — see
 
 ## Known limitations
 
-- **A full run produces 1–2 failures that differ between runs** and pass in
-  isolation: 15s subprocess timeouts under load, and a process-wide
-  `time.sleep` patch in `test_race` catching leaked `test_api` threads.
-  Re-run in isolation before believing any `test_race` / `test_api` /
-  `test_evolve_coverage` failure.
+- **A full run produces failures that are not your change.** Before blaming a
+  branch, check them against this list:
+
+  | Failure | Cause |
+  |---|---|
+  | `tests/test_tools_live.py` (11) | live hardware — needs `sudo` and the mic/GPIO free |
+  | `test_mind_utils` (6) | samples the live session; [#210](https://github.com/adrianwedd/spark/issues/210) |
+  | `TestBudgetSummary` (2) | fixed offsets vs. Hobart calendar day — fails before ~08:20 local; [#213](https://github.com/adrianwedd/spark/issues/213) |
+  | `TestRaceEndpoint` (1–2) | fixed waits on a background thread under load; [#211](https://github.com/adrianwedd/spark/issues/211) |
+
+- **Some failures differ between runs** and pass in isolation: 15s subprocess
+  timeouts under load, and a process-wide `time.sleep` patch in `test_race`
+  catching leaked `test_api` threads. Re-run in isolation before believing any
+  `test_race` / `test_api` / `test_evolve_coverage` failure.
 - **Test runs write into the real `logs/`.** Millisecond-clustered entries, or
   ones naming `/tmp/pytest-of-pi/`, are artifacts rather than incidents.
 - **Test runs can trip `px-post`'s in-memory 3-failure Bluesky auth disable.**
