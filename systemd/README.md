@@ -1,6 +1,8 @@
 # systemd units
 
-Service units for the eleven SPARK daemons (see CLAUDE.md "Systemd Services").
+Service units for the SPARK daemons. The full table — script, user, and
+restart policy for each — is in
+[docs/operations/deployment.md](../docs/operations/deployment.md).
 Install to `/etc/systemd/system/` on the Pi, then `daemon-reload` + `enable --now`.
 
 ## Maintenance timer: pip /tmp cleanup
