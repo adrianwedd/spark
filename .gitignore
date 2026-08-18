@@ -103,6 +103,11 @@ state/notes-*.jsonl.bak-*
 # Tokenized GPIO hardware authority — written by whichever process currently
 # owns the Picarx handle. Pure runtime state, never meaningful in a commit.
 state/gpio_lease.json
+
+# px-alive's watchdog telemetry — rewritten twice a second. Committed by
+# accident in 54891d19 via `git add -A`; harmless content, but a file whose
+# every read is a different value has nothing to say in a diff.
+state/alive_heartbeat.json
 # Rotation backups (.env.bak-YYYYMMDD-rotate), .env.local, and anything else
 # derived from .env — all hold live secrets. The negation must stay last:
 # .env.* matches .env.example, which is tracked and must remain so.
