@@ -337,6 +337,104 @@ See `src/pxh/api.py` for full endpoint list.
 - All tools must be in `ALLOWED_TOOLS` in `voice_loop.py`
 - Parameter ranges hard-validated in `validate_action()` (speed 0–60, duration 1–12s, etc.)
 
+### Behavioural Policy (#174) — `src/pxh/policy.py`
+
+Quiet mode, night silence and on-call/hot-mic suppression are *behavioural*
+invariants: they hold regardless of which prompt, persona or dispatcher proposed
+the action. This matters because `voice_loop.py`'s persona swap **replaces** the
+system prompt rather than supplementing it, so any safety behaviour that lives
+only in prose vanishes the moment GREMLIN or VIXEN is active.
+
+`policy.evaluate()` is the rule and only the rule — pure, no I/O, no clock, no
+imports from the dispatchers, and it never executes anything. Callers classify
+their own vocabulary into an `Effect` and pass the context in.
+
+**Three enforcement points. The third is the one that closes the hole:**
+
+| Site | Origin | On a blocked verdict |
+|---|---|---|
+| `voice_loop.validate_action()` | `interactive` | downgrade to a presence-safe substitute |
+| `mind.expression()` | `autonomous` | drop the action |
+| **`bin/tool-voice`** | `interactive` | `{"status":"suppressed","reason":…}`, exit 0 |
+
+The first two are dispatchers, so they only bind callers that go *through* a
+dispatcher. `bin/tool-voice` is the sink every speech producer funnels into
+(`tool-chat`, `tool-chat-vixen`, `tool-voice-persona`, `px-cron-say`,
+`px-battery-poll`), and it is also what anything holding a shell reaches —
+including the resident `spark-brain` session, whose tool envelope is SPARK's own
+`bin/`. Before the sink gate, prose in a system prompt was the only thing
+between that session and the speaker at 3am. The upstream checks stay as defence
+in depth; **do not remove one because the other exists.**
+
+**The sink pins `origin` and `effect` rather than accepting them.** A sink
+cannot know its caller — that is precisely why it needs its own gate —
+`interactive` is the stricter of the two origins so a wrong guess can only ever
+suppress, and a caller that could declare its own effect could declare its way
+out of the gate entirely.
+
+**The gate sits above both the persona reroute and the `PX_DRY` branch.**
+`tool-voice-persona` re-enters `tool-voice`, so a gate below the reroute would
+still catch the audio — but only after an Ollama round trip on text that was
+never going to be spoken. And a dry run must model the live decision, or every
+dry test of a speaking route asserts behaviour the robot will not show.
+
+`src/pxh/policy_context.py` is the **only** loader of the session/awareness/clock
+facts `policy.evaluate()` refuses to read for itself; the dispatcher and the sink
+both go through it so the two cannot drift. **Its two reads have opposite failure
+postures, and that is the point.**
+
+- **Session — fails closed.** `load_session_for_policy()` returns a
+  `SessionRead(data, available)`, never a bare dict, and `policy.evaluate()`'s
+  rule 0 suppresses audio when `available` is false. A `{}` cannot carry both
+  "no quiet flag set" and "no idea": quiet mode is the dysregulation protocol,
+  so resolving the second into the first grants permission to speak during a
+  meltdown on the strength of a failed file read. The earlier fail-open posture
+  argued a contended lock would otherwise mute SPARK under load; it bought no
+  such thing, since `tool-voice` calls `update_session()` on that same lock a
+  few lines later and dies there — pre-fix, contention produced an utterance
+  *and* a traceback. The `except` in the loader is deliberately broad because
+  failing closed cannot permit anything; every failure prints to stderr.
+- **Awareness — fails open.** An unreadable snapshot yields `{}` and the
+  on-call/hot-mic rule goes inactive, rather than muting SPARK for as long as
+  px-mind is down. `awareness.json` is written by a daemon that is routinely
+  down; the session is written by whatever is running. Quiet mode and night
+  silence read nothing from this file.
+
+Both dispatchers still fail open on their own session read (`voice_loop.py` and
+`mind.py` catch `FileLockTimeout` into `{}` — they do not use this loader for the
+session). That is now backstopped rather than load-bearing: every audio action
+they dispatch funnels through the sink, which re-reads and fails closed.
+
+Pinned by `test_direct_tool_voice_is_silent_while_the_session_lock_is_held` and
+`test_direct_tool_voice_is_silent_when_the_session_cannot_be_read`, which assert
+against a canary player script on disk rather than against tool-voice's own
+JSON — a sink that speaks and then crashes prints no self-report at all.
+
+Night-window bounds come from `spark_config.night_silence_bounds()`, which
+honours `PX_NIGHT_SILENCE_START_H`/`_END_H`. That seam is load-bearing for the
+suite: without it every subprocess test of a speaking tool would pass by day and
+return `suppressed` after 19:00 Hobart. `tests/conftest.py` pins the window shut
+(`START=99`) for `isolated_project`; tests that mean to exercise night silence
+override both values.
+
+**Still ungated, deliberately and on the record:** `bin/tool-play-sound`,
+`bin/px-perform`, `px-wake-listen`'s chimes, `wander._speak()`,
+`mind._play_alarm_beeps()`, and `px-battery-poll`'s plug/unplug sweep.
+`tool-announce` self-gates at its own relay chokepoint, and since it now reads
+`policy.is_night_hour()` the Nest path and the onboard speaker cannot disagree
+about when night is — but it still enforces night silence *only*, not quiet mode
+or on-call.
+All of these are inventoried in `tests/test_policy_invariants.py::AUDIO_PRODUCERS`
+with a disposition each, and **a new file that reaches `aplay`/`espeak`/a TTS
+endpoint fails `test_every_audio_producer_is_inventoried` until someone
+classifies it.** That test is the tripwire against the next silent bypass, not a
+formality — a `delegates` claim is re-verified against the file rather than
+trusted.
+
+`src/pxh/policy.py` and `tests/test_policy_invariants.py` are blacklisted from
+px-evolve (see `claude_session.BLACKLIST_FILES`). Evolvable policy coverage
+lives in `tests/test_policy.py` — keep that split.
+
 ## Security
 
 - PIN verify returns session tokens (4h TTL) — raw Bearer token never exposed to browser

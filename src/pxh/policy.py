@@ -48,8 +48,7 @@ def is_night_hour(hour: int) -> bool:
     delegate here without policy.py importing mind.py. The autonomous
     enforcement rule stays where it is; only the clock semantics are shared.
     """
-    start = spark_config.NIGHT_SILENCE_START_H
-    end = spark_config.NIGHT_SILENCE_END_H
+    start, end = spark_config.night_silence_bounds()
     return hour >= start or hour < end
 
 
@@ -62,6 +61,7 @@ def evaluate(
     session: dict,
     awareness: dict,
     now: float,
+    session_available: bool = True,
     _depth: int = 0,
 ) -> PolicyVerdict:
     """Decide whether an action may proceed. Returns a verdict; never executes.
@@ -69,6 +69,14 @@ def evaluate(
     `effect` and `origin` are supplied by the caller and never inferred — the
     caller owns its vocabulary, and the two dispatchers stay legible about
     which one they are.
+
+    `session_available` is how a caller says "I could not read the session" as
+    distinct from "I read it and quiet mode is off". An empty dict cannot carry
+    both meanings: `{}` is a *fact* (no quiet flag set), and a caller that
+    passes it after a failed read has already answered the question this module
+    exists to answer, in the permissive direction, without any evidence. The
+    default is True because a caller holding a session dict it actually read
+    has nothing to declare.
 
     On a blocked verdict with suggest_presence_substitute, the caller picks a
     presence-safe action from its own vocabulary and re-evaluates *that* action
@@ -90,6 +98,20 @@ def evaluate(
         return PolicyVerdict(
             allowed=False, reason=reason, suggest_presence_substitute=True
         )
+
+    # Rule 0 — the session could not be read, so rule 1 cannot be evaluated.
+    # Quiet mode is constitutional and binds both origins, which means a caller
+    # with no session has no basis for the claim "the dysregulation protocol is
+    # not running" — and that claim is precisely what proceeding would assert.
+    # Unknown therefore resolves the same way as known-quiet: no audio.
+    #
+    # This is the one rule whose posture is about *evidence* rather than state,
+    # so it is deliberately not folded into rule 1. `session.get(...) is True`
+    # must keep meaning "I read the session and the flag is off" and nothing
+    # else; the moment it also has to mean "I have no idea", the rule below
+    # stops being checkable.
+    if not session_available:
+        return _block("session_unavailable")
 
     # Rule 1 — quiet mode / dysregulation protocol. Both origins: an active
     # meltdown does not care who initiated the turn.

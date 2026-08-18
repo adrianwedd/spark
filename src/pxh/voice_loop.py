@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from filelock import Timeout as FileLockTimeout
 
-from pxh import policy
+from pxh import policy, policy_context
 from pxh.utils import clamp
 from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
@@ -182,22 +182,12 @@ def _policy_now() -> float:
 def _load_awareness_for_policy() -> Dict[str, Any]:
     """Best-effort awareness read for policy's on-call/hot-mic check.
 
-    Fails open, deliberately and narrowly: an unreadable awareness.json means
-    the on-call/hot-mic rule cannot fire, and SPARK stays audible during a turn
-    Obi initiated. Failing closed would mute SPARK entirely whenever px-mind is
-    down — the more common failure, and the worse one. Quiet mode and night
-    silence read nothing from this file, so the two rules that must hold
-    unconditionally are unaffected either way.
+    Delegates to policy_context so the dispatcher and the audio sink read the
+    same file with the same failure posture. Kept as a named function here
+    because it is the seam the invariant suite patches to pin an awareness
+    state without writing one to disk.
     """
-    path = _state_dir() / "awareness.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"[voice-loop] policy: awareness read failed ({exc}) — "
-              f"on-call rule inactive this turn", file=sys.stderr)
-        return {}
+    return policy_context.load_awareness(warn_prefix="[voice-loop]")
 
 
 TOOL_COMMANDS = {

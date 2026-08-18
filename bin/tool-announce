@@ -27,20 +27,22 @@ from zoneinfo import ZoneInfo
 
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.state import update_session
+from pxh import policy
 from pxh import spark_config as cfg
 
 # Test/ops override hooks (production uses spark_config defaults). The tool runs
 # as a fresh subprocess, so config can't be monkeypatched in-process — these env
-# overrides are the test seam. Night-hour overrides make the clock-dependent gate
-# deterministic in tests (e.g. START=99,END=0 -> never night; START=0,END=24 -> always).
+# overrides are the test seam.
+#
+# PX_NIGHT_SILENCE_START_H/_END_H are deliberately NOT re-read here: they are
+# honoured centrally by spark_config.night_silence_bounds(), which policy
+# .is_night_hour() reads. This tool and bin/tool-voice have to agree about when
+# night is, and the only way to guarantee that is for neither of them to own
+# the answer.
 if os.environ.get("PX_ANNOUNCE_RELAY_URL"):
     cfg.ANNOUNCE_RELAY_URL = os.environ["PX_ANNOUNCE_RELAY_URL"]
 if os.environ.get("PX_HA_HOST"):
     cfg.HA_BASE_URL = os.environ["PX_HA_HOST"]
-if os.environ.get("PX_NIGHT_SILENCE_START_H"):
-    cfg.NIGHT_SILENCE_START_H = int(os.environ["PX_NIGHT_SILENCE_START_H"])
-if os.environ.get("PX_NIGHT_SILENCE_END_H"):
-    cfg.NIGHT_SILENCE_END_H = int(os.environ["PX_NIGHT_SILENCE_END_H"])
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 STATE_DIR    = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
@@ -53,9 +55,12 @@ def _emit(payload: dict) -> int:
 
 
 def _is_night_silence() -> bool:
-    """True during the night-silence window — applies to ALL announce paths."""
-    hour = dt.datetime.now(HOBART_TZ).hour
-    return hour >= cfg.NIGHT_SILENCE_START_H or hour < cfg.NIGHT_SILENCE_END_H
+    """True during the night-silence window — applies to ALL announce paths.
+
+    Delegates to pxh.policy so the Nest path and the onboard speaker
+    (bin/tool-voice) cannot end up disagreeing about when night is.
+    """
+    return policy.is_night_hour(dt.datetime.now(HOBART_TZ).hour)
 
 
 def _resolve_targets() -> list[str]:
