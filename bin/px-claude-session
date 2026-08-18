@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# px-claude-session — the interactive Claude Code session that is SPARK's brain.
+#
+# Started inside tmux by src/pxh/tmux_claude.py (socket /tmp/tmux-1000/px-mind,
+# session name px-mind). Watch or steer it live:
+#   tmux -S /tmp/tmux-1000/px-mind attach -t px-mind     (detach: Ctrl-b d)
+#
+# This replaces `claude -p`. The session stays resident, so context survives
+# between reflections, and it answers by running SPARK's own tools rather than
+# printing JSON for us to parse back out of stdout.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Resolve the binary explicitly. `claude` on picar is a symlink in
+# ~/.local/bin that points into a versioned directory, and a tmux session
+# inherits a different environment than a subprocess does — this is the classic
+# place where the lookup silently fails and something falls back instead.
+CLAUDE_BIN="${PX_CLAUDE_BIN:-}"
+if [[ -z "$CLAUDE_BIN" ]]; then
+    CLAUDE_BIN="$(command -v claude || true)"
+fi
+if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+    CLAUDE_BIN="$HOME/.local/bin/claude"
+fi
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "px-claude-session: claude binary not found (set PX_CLAUDE_BIN)" >&2
+    exit 1
+fi
+
+MODEL="${PX_CLAUDE_TMUX_MODEL:-claude-haiku-4-5-20251001}"
+
+# Which session this is. The two sessions are a trust boundary: spark-brain is
+# privileged and runs here at the repo root, spark-io chews on text SPARK did
+# not write and gets one tool and a cwd outside the repository.
+BRAIN_SESSION="${PX_BRAIN_SESSION:-spark-brain}"
+
+if [[ "$BRAIN_SESSION" == "spark-io" ]]; then
+    DEFAULT_PROMPT="$PROJECT_ROOT/docs/prompts/spark-io-system.md"
+else
+    DEFAULT_PROMPT="$PROJECT_ROOT/docs/prompts/spark-brain-system.md"
+fi
+PROMPT_FILE="${PX_CLAUDE_TMUX_PROMPT:-$DEFAULT_PROMPT}"
+
+if [[ ! -f "$PROMPT_FILE" ]]; then
+    echo "px-claude-session: prompt file not found: $PROMPT_FILE" >&2
+    exit 1
+fi
+
+# The tool allowlist IS the output channel: the session speaks, looks, remembers
+# and answers by running these, so there is no stdout contract to parse. Keep
+# the privileged default to the cognitive tools — motion stays behind the voice
+# loop's own gating. The envelope is fixed here, at launch, and deliberately
+# cannot be widened per request; PX_CLAUDE_ALLOWED_TOOLS is how the watchdog
+# hands the io session its single-tool envelope, not a per-call escape hatch.
+#
+# The reply tool is named ABSOLUTELY, here and in the system prompt, because
+# Claude Code matches a Bash rule against the command by prefix: a bare
+# `tool-brain-reply` or a relative `bin/tool-brain-reply` misses this pattern
+# and raises a permission dialog nobody is attached to answer. The io session
+# could never use a relative spelling anyway — its cwd is outside the repo.
+# Mirrored by TOOL_BRAIN_REPLY in src/pxh/brain.py, which builds the same
+# string from the same repo root; tests/test_brain.py pins the two together.
+TOOL_BRAIN_REPLY="$PROJECT_ROOT/bin/tool-brain-reply"
+
+DEFAULT_TOOLS=(
+    "Bash($TOOL_BRAIN_REPLY:*)"
+    "Bash($PROJECT_ROOT/bin/tool-voice:*)"
+    "Bash($PROJECT_ROOT/bin/tool-remember:*)"
+    "Bash($PROJECT_ROOT/bin/tool-look:*)"
+)
+if [[ -n "${PX_CLAUDE_ALLOWED_TOOLS:-}" ]]; then
+    # Space-separated, one "Bash(...)" pattern per entry.
+    read -r -a TOOLS <<< "$PX_CLAUDE_ALLOWED_TOOLS"
+else
+    TOOLS=("${DEFAULT_TOOLS[@]}")
+fi
+
+if [[ -n "${PX_CLAUDE_CWD:-}" ]]; then
+    mkdir -p "$PX_CLAUDE_CWD"
+    cd "$PX_CLAUDE_CWD"
+fi
+
+# Allow nesting when launched from inside a Claude Code session.
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
+
+# Render {{TOOL_BRAIN_REPLY}} into the prompt, so the text telling the session
+# how to reply and the rule deciding whether it may are the same string. The
+# prompt cannot hardcode the path (it varies by checkout) and cannot be
+# relative (see above), so a placeholder is the only spelling that is right in
+# both places. Bash substitution, not sed: PROJECT_ROOT is a path, and every
+# sed delimiter is a character a path may legally contain.
+PROMPT_TEXT="$(cat "$PROMPT_FILE")"
+PROMPT_TEXT="${PROMPT_TEXT//\{\{TOOL_BRAIN_REPLY\}\}/$TOOL_BRAIN_REPLY}"
+
+exec "$CLAUDE_BIN" \
+    --model "$MODEL" \
+    --allowedTools "${TOOLS[@]}" \
+    --append-system-prompt "$PROMPT_TEXT"

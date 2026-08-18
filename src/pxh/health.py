@@ -53,6 +53,10 @@ STALE_AFTER_S: dict[str, int] = {
     "px-blog": 86400,         # daily cadence at its most frequent
     "px-api-server": 300,
     "px-frigate-stream": 300,
+    # The brain supervisor ticks every 10s but throttles its success writes to
+    # once a minute, so its window only has to clear that comfortably.
+    "px-brain": 300,
+    "px-brain-io": 300,
 }
 DEFAULT_STALE_AFTER_S = 900
 

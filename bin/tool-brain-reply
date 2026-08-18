@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# tool-brain-reply — how a persistent Claude session answers SPARK.
+#
+#   tool-brain-reply <request-id> '<json>'
+#
+# The session reads a request from its inbox, does the work, then calls this to
+# hand the answer back. It is the io session's ONLY tool, which makes it a
+# security boundary and not merely a convenience: everything it accepts is
+# validated here, because the caller is a language model that may have just read
+# a stranger's text.
+#
+# Reading the payload from stdin is supported (`--stdin`) and preferred for
+# anything with quotes in it — an argv round-trip through send-keys is exactly
+# where a shell-quoting mistake turns into a truncated reply. It is also the
+# only transport that carries a big reply: Linux caps every argv string at
+# MAX_ARG_STRLEN (32 pages = 131072 bytes), which is half MAX_REPLY_BYTES.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+REQUEST_ID="${1:-}"
+PAYLOAD="${2:-}"
+
+# The payload reaches Python through a file, never through argv or the
+# environment. That is not tidiness: MAX_ARG_STRLEN caps each argv *and* envp
+# string at 131072 bytes, so a legal reply between that and MAX_REPLY_BYTES
+# used to die at this very execve with exit 126 and an empty stdout — no JSON
+# object at all, which is the one thing every tool must always emit, and it
+# left our own size guard as unreachable dead code.
+PAYLOAD_FILE="$(mktemp "${TMPDIR:-/tmp}/brain-reply.XXXXXX")"
+trap 'rm -f "$PAYLOAD_FILE"' EXIT
+if [[ "$PAYLOAD" == "--stdin" || ( -z "$PAYLOAD" && ! -t 0 ) ]]; then
+    cat > "$PAYLOAD_FILE"
+else
+    printf '%s' "$PAYLOAD" > "$PAYLOAD_FILE"
+fi
+
+PX_BRAIN_REQUEST_ID="$REQUEST_ID" PX_BRAIN_PAYLOAD_FILE="$PAYLOAD_FILE" \
+/usr/bin/env python3 <<'PY'
+import json
+import os
+import sys
+import uuid
+
+from pxh import brain
+from pxh.state import atomic_write
+from pxh.time import utc_timestamp
+
+
+def fail(msg: str) -> None:
+    print(json.dumps({"status": "error", "error": msg}))
+    sys.exit(0)  # a tool always emits one JSON object and exits clean
+
+
+request_id = (os.environ.get("PX_BRAIN_REQUEST_ID") or "").strip()
+payload_file = os.environ.get("PX_BRAIN_PAYLOAD_FILE") or ""
+session = os.environ.get("PX_BRAIN_SESSION") or brain.BRAIN_SESSION
+
+# 1. The id must be a bare uuid4 and nothing else. This is the path-traversal
+#    guard: the id becomes a filename, so "../../.ssh/authorized_keys" has to
+#    die here. Round-tripping through uuid.UUID also rejects the near-misses
+#    (wrong length, stray whitespace) that a string comparison would let past.
+try:
+    parsed = uuid.UUID(request_id)
+except (ValueError, AttributeError, TypeError):
+    fail("invalid request id")
+if str(parsed) != request_id:
+    fail("invalid request id")
+
+# 2. It must name a request we are actually waiting on. An id for a request
+#    that timed out, or was never made, is not an answer — it is a write
+#    primitive pointed at the outbox.
+inbox_entry = brain.inbox_dir(session) / f"{request_id}.json"
+if not inbox_entry.exists():
+    fail("no such pending request")
+
+# 3. The payload must be JSON, and small. Both bounds exist because this tool
+#    is reachable from the untrusted io session.
+try:
+    size = os.path.getsize(payload_file)
+except OSError:
+    fail("payload unreadable")
+# Sized before it is read: the file is written by a language model that may
+# have just read a stranger's text, and there is no longer an exec limit
+# accidentally bounding it for us.
+if size > brain.MAX_REPLY_BYTES:
+    fail(f"payload exceeds {brain.MAX_REPLY_BYTES} bytes")
+try:
+    with open(payload_file, encoding="utf-8") as handle:
+        raw = handle.read()
+except (OSError, UnicodeDecodeError):
+    fail("payload unreadable")
+if not raw.strip():
+    fail("empty payload")
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    fail(f"payload is not valid JSON: {exc}")
+
+reply = {
+    "id": request_id,
+    "status": "ok",
+    "reply": payload,
+    "session": session,
+    "ts": utc_timestamp(),
+}
+
+if not brain.ensure_mailbox(session):
+    fail("mailbox not writable")
+
+# Written atomically, so ask_brain's poll can treat "the file is there" as
+# "the reply is complete" — it never sees a half-written answer.
+atomic_write(brain.outbox_dir(session) / f"{request_id}.json",
+             json.dumps(reply, indent=2))
+
+# Only now retire the request: if the write above failed, the request stays
+# pending and the session can try again.
+try:
+    inbox_entry.unlink()
+except OSError:
+    pass
+
+print(json.dumps({"status": "ok", "id": request_id}))
+PY

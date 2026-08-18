@@ -33,6 +33,26 @@ def _isolate_health_writes(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_brain_mailbox(tmp_path, monkeypatch):
+    """Keep brain requests out of the live state/brain/ mailbox.
+
+    Same hazard as _isolate_health_writes, and worse in one respect: an
+    unisolated test that reaches run_claude_session for a brain-routed type
+    drops a real request into the running robot's inbox, where the resident
+    Claude session will pick it up and answer it. A test would spend budget
+    and make SPARK act on a prompt nobody meant to send.
+
+    Redirects only the mailbox root, so tests that deliberately set
+    PX_STATE_DIR keep working.
+    """
+    try:
+        from pxh import brain
+    except ImportError:
+        return
+    monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "brain")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_alive_heartbeat(tmp_path, monkeypatch):
     """Keep heartbeat reads off the live robot's /run/spark.
 

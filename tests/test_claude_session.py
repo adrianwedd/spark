@@ -226,7 +226,11 @@ class TestRunSession:
         mock_result.stderr = ""
         mock_result.returncode = 0
 
-        with patch.object(cs, "check_budget", return_value=None), \
+        # This test is about the legacy subprocess path, which "research" no
+        # longer takes by default — pin the routing off so it keeps testing
+        # what it was written to test rather than silently testing nothing.
+        with patch.dict(os.environ, {"PX_BRAIN_KINDS": ""}), \
+             patch.object(cs, "check_budget", return_value=None), \
              patch("subprocess.run", return_value=mock_result), \
              patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
              patch.object(cs, "STATE_DIR", sd):
@@ -259,7 +263,8 @@ class TestRunSession:
              patch("subprocess.run", side_effect=mock_run), \
              patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
              patch.object(cs, "STATE_DIR", sd), \
-             patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_FOO": "bar"}):
+             patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_FOO": "bar",
+                                     "PX_BRAIN_KINDS": ""}):
             cs.run_claude_session("research", "test prompt", timeout=10)
             assert "CLAUDECODE" not in captured_env
             assert "CLAUDE_CODE_FOO" not in captured_env
@@ -489,3 +494,151 @@ def test_consolidate_quota_one_per_day(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "BUDGET_DISABLED", False)
     reason = cs.check_budget("consolidate")
     assert reason is not None and "quota" in reason
+
+
+# ---------------------------------------------------------------------------
+# Routing to the resident Claude session (the `claude -p` retirement)
+# ---------------------------------------------------------------------------
+
+def test_default_routed_types_are_the_ones_watched_in_production():
+    """The `claude -p` retirement, as far as it has actually been run.
+
+    Phase 1 was research, compose and post QA. Phase 2 added reflection, which
+    is the hot one — px-mind's tier 2, every 5 minutes — and which reads this
+    same dial from mind.call_claude rather than keeping its own.
+
+    This is a pin on the rollout, not on a preference: widening it is a
+    deliberate act, and a kind that appears here without anyone deciding to
+    move it is the failure worth catching.
+    """
+    from pxh import claude_session as cs
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("PX_BRAIN_KINDS", None)
+        kinds = cs.brain_kinds()
+    assert kinds == {"research", "compose", "post_qa", "reflection"}
+
+
+def test_reflection_reads_the_same_dial_as_everything_else():
+    """One switch. Two that can disagree is how a rollback half-happens."""
+    from pxh import claude_session as cs
+    from pxh import mind
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research"}):
+        assert "reflection" not in cs.brain_kinds()
+        assert mind._reflection_via_brain_enabled() is False
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,reflection"}):
+        assert mind._reflection_via_brain_enabled() is True
+
+
+def test_brain_kinds_is_read_at_call_time_not_import_time():
+    """The rollout has to be widenable — and rollback-able — without a restart."""
+    from pxh import claude_session as cs
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,compose,blog"}):
+        assert "blog" in cs._brain_kinds()
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": ""}):
+        assert cs._brain_kinds() == frozenset()
+
+
+def test_a_routed_type_never_spawns_a_subprocess(tmp_path, monkeypatch):
+    """The whole point: for these types, no `claude -p` process is created."""
+    from pxh import brain
+    from pxh import claude_session as cs
+
+    def _boom(*a, **k):
+        raise AssertionError(f"run_claude_session spawned a subprocess: {a}")
+
+    monkeypatch.setattr(cs.subprocess, "run", _boom)
+    monkeypatch.setattr(brain, "ask_brain",
+                        lambda kind, payload, timeout_s=None, model=None:
+                        {"reply": "the answer"})
+    monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
+
+    result = cs.run_claude_session("research", "what is a wombat", timeout=5)
+    assert result.returncode == 0
+    assert result.stdout == "the answer"
+
+
+def test_the_prompt_reaches_the_brain_intact(tmp_path, monkeypatch):
+    from pxh import brain
+    from pxh import claude_session as cs
+    seen = {}
+
+    def _capture(kind, payload, timeout_s=None, model=None):
+        seen.update(kind=kind, payload=payload, timeout_s=timeout_s, model=model)
+        return {"reply": "ok"}
+
+    monkeypatch.setattr(brain, "ask_brain", _capture)
+    monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
+
+    cs.run_claude_session("compose", "write a haiku", timeout=42)
+    assert seen["kind"] == "compose"
+    assert seen["payload"]["prompt"] == "write a haiku"
+    assert seen["timeout_s"] == 42
+    assert seen["model"].startswith("claude-haiku")
+
+
+def test_an_unavailable_brain_looks_like_a_failed_run_not_an_exception(
+        tmp_path, monkeypatch):
+    """Callers already handle a non-zero returncode from `claude -p`. Reusing
+    that contract is what lets the brain fail without touching any of them."""
+    from pxh import brain
+    from pxh import claude_session as cs
+
+    monkeypatch.setattr(brain, "ask_brain",
+                        lambda kind, payload, timeout_s=None, model=None: None)
+    monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
+
+    result = cs.run_claude_session("research", "anything", timeout=5)
+    assert result.returncode != 0
+    assert "brain unavailable" in result.stderr
+    assert result.stdout == ""
+
+
+def test_a_structured_reply_is_handed_back_as_text(tmp_path, monkeypatch):
+    """Every caller of run_claude_session reads stdout as text."""
+    from pxh import brain
+    from pxh import claude_session as cs
+
+    monkeypatch.setattr(brain, "ask_brain",
+                        lambda kind, payload, timeout_s=None, model=None:
+                        {"reply": {"verdict": "yes"}})
+    monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
+
+    result = cs.run_claude_session("research", "anything", timeout=5)
+    assert json.loads(result.stdout) == {"verdict": "yes"}
+
+
+def test_budget_is_still_checked_before_the_brain_is_asked(tmp_path, monkeypatch):
+    """Routing must not become a way around the quota."""
+    from pxh import brain
+    from pxh import claude_session as cs
+
+    asked = []
+    monkeypatch.setattr(brain, "ask_brain",
+                        lambda *a, **k: asked.append(1) or {"reply": "x"})
+    monkeypatch.setattr(cs, "check_budget", lambda t: "daily cap reached")
+
+    with pytest.raises(cs.SessionBudgetExhausted):
+        cs.run_claude_session("research", "anything")
+    assert asked == [], "budget check must run before the request"
+
+
+def test_a_routed_session_is_still_logged(tmp_path, monkeypatch):
+    """state/claude_sessions.jsonl is how spend is reconstructed after the
+    fact — a type that moves to the brain must not vanish from it."""
+    from pxh import brain
+    from pxh import claude_session as cs
+    log = tmp_path / "claude_sessions.jsonl"
+
+    monkeypatch.setattr(brain, "ask_brain",
+                        lambda kind, payload, timeout_s=None, model=None:
+                        {"reply": "ok"})
+    monkeypatch.setattr(cs, "SESSION_LOG", log)
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
+
+    cs.run_claude_session("research", "anything", timeout=5)
+    entries = [json.loads(line) for line in log.read_text().splitlines() if line]
+    assert entries and entries[-1]["type"] == "research"

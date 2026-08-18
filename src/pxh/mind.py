@@ -2328,6 +2328,116 @@ def _reset_state():
 
 
 
+def _extract_thought_json(text: str) -> str | None:
+    """Return the first JSON object carrying a 'thought' key, re-serialised.
+
+    Models preface, apologise and wrap in fences, so the object is found by
+    scanning rather than by parsing the whole string. Shared by the subprocess
+    and resident-session paths so they cannot drift in what they accept.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "thought" in obj:
+            return json.dumps(obj)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1 and idx < len(text):
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict) and "thought" in obj:
+                return json.dumps(obj)
+            idx = end
+        except (json.JSONDecodeError, ValueError):
+            idx += 1
+        idx = text.find("{", idx)
+    return None
+
+
+def _reflection_via_brain_enabled() -> bool:
+    """One dial, read at call time — see claude_session.brain_kinds()."""
+    try:
+        from pxh.claude_session import brain_kinds
+    except Exception:
+        return False
+    return "reflection" in brain_kinds()
+
+
+def call_brain_reflection(prompt: str, system: str) -> dict:
+    """Ask the resident Claude session for a thought.
+
+    Returns the same {"response": ...} / {"error": ...} shape as
+    call_claude_haiku, so it drops into the tier chain unchanged.
+
+    `ask_brain` never raises and returns None for every failure — no session,
+    an unvalidated one, a busy lock, a missed deadline. All of those mean the
+    same thing here: use the subprocess. The broad `except` is the same
+    contract one level up, because this runs under a daemon whose reflection
+    loop must survive anything the brain does.
+    """
+    try:
+        from pxh import brain
+        reply = brain.ask_brain("reflection", {
+            "system": system,
+            "prompt": prompt,
+            # Named explicitly because the resident session's own prompt tells
+            # it to answer by *acting* (speak, look, remember). Reflection is
+            # the opposite: the caller wants the thought handed back so it can
+            # decide what to dispatch. Without this the session tends to go
+            # ahead and say the thing.
+            "respond_with": (
+                "a single JSON object with the keys the prompt asks for "
+                "(thought, mood, action, ...). Do not speak, move or remember "
+                "anything for this request — return the object and nothing else."
+            ),
+        })
+    except Exception as exc:
+        return {"error": f"brain call failed: {exc}"}
+
+    if reply is None:
+        return {"error": "brain unavailable"}
+
+    answer = reply.get("reply")
+    if isinstance(answer, dict) and "thought" in answer:
+        return {"response": json.dumps(answer)}
+    # A reply that came off disk is always JSON-serialisable, but this path
+    # must hold for whatever a future writer puts in the outbox: re-serialising
+    # is the one step here that can raise, and this function's contract with
+    # the reflection loop is that it never does.
+    try:
+        text = answer if isinstance(answer, str) else json.dumps(answer)
+    except (TypeError, ValueError):
+        return {"error": "brain reply is not serialisable"}
+    found = _extract_thought_json(text)
+    if found is not None:
+        return {"response": found}
+    return {"error": "no thought JSON in brain reply"}
+
+
+def call_claude(prompt: str, system: str) -> dict:
+    """Reflection's Claude tier: resident session first, `claude -p` behind it.
+
+    Both are Claude and both are billed, so this is not a cost decision — it is
+    a latency and context one. A subprocess starts cold every time and knows
+    nothing of the last thought; the resident session answers from warm context
+    and is metered by ask_brain, which is the accounting tier 2 never had.
+    """
+    if _reflection_via_brain_enabled():
+        result = call_brain_reflection(prompt, system)
+        if "error" not in result:
+            return result
+        try:
+            log(f"brain reflection failed ({result['error']}), falling back to claude -p")
+        except Exception:
+            pass
+    return call_claude_haiku(prompt, system)
+
+
 def call_claude_haiku(prompt: str, system: str) -> dict:
     """Call Claude via subprocess (`claude -p`). Simple, reliable, no tmux overhead."""
     import shutil
@@ -2373,28 +2483,9 @@ def call_claude_haiku(prompt: str, system: str) -> dict:
     if not stdout:
         return {"error": "claude returned empty output"}
 
-    # Try direct parse first
-    try:
-        obj = json.loads(stdout)
-        if isinstance(obj, dict) and "thought" in obj:
-            return {"response": json.dumps(obj)}
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Scan for JSON object with 'thought' key
-    decoder = json.JSONDecoder()
-    idx = stdout.find("{")
-    while idx != -1 and idx < len(stdout):
-        try:
-            obj, end = decoder.raw_decode(stdout, idx)
-            if isinstance(obj, dict) and "thought" in obj:
-                log(f"claude subprocess response captured ({len(stdout)}B)")
-                return {"response": json.dumps(obj)}
-            idx = end
-        except (json.JSONDecodeError, ValueError):
-            idx += 1
-        idx = stdout.find("{", idx)
-
+    found = _extract_thought_json(stdout)
+    if found is not None:
+        return {"response": found}
     return {"error": f"no thought JSON in claude output ({len(stdout)}B)"}
 
 
@@ -2423,7 +2514,7 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
         if spark_auto:
             log(f"M5 ollama failed ({result['error']}), falling back to claude")
             try:
-                claude_result = call_claude_haiku(prompt, system)
+                claude_result = call_claude(prompt, system)
             except Exception as exc:
                 try:
                     log(f"claude crashed ({exc}), continuing to cloud ollama")
@@ -2441,7 +2532,7 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
     else:
         # MIND_BACKEND=claude: Claude is primary
         try:
-            result = call_claude_haiku(prompt, system)
+            result = call_claude(prompt, system)
         except Exception as exc:
             try:
                 log(f"claude crashed ({exc}), falling back to ollama")

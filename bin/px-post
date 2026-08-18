@@ -322,11 +322,70 @@ def is_duplicate(thought: str, recent_posts: list[str]) -> bool:
     return False
 
 
+QA_PROMPT = ('Is this thought from a small robot interesting enough to share '
+             'publicly on social media?\n'
+             'Answer only YES or NO. Nothing else.')
+
+
+def _interpret_qa(response: str) -> str:
+    """Map a QA answer onto a verdict. Ambiguity passes.
+
+    QA is a safety net, not a quality bar — "Maybe" is not a reason to bin a
+    thought, and treating it as one would make the gate quietly editorial.
+    """
+    resp = (response or "").strip().lower()
+    if resp.startswith("yes"):
+        return "pass"
+    if resp.startswith("no"):
+        return "rejected"
+    return "ambiguous"
+
+
+def _qa_trip_breaker() -> None:
+    """Count a QA failure and open the breaker once it has happened enough."""
+    _qa_breaker["failures"] += 1
+    if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
+        _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
+        log(f"qa gate circuit breaker opened ({_qa_breaker['failures']} failures)")
+
+
+def _qa_uses_brain() -> bool:
+    """Whether post QA runs on the resident io session rather than a subprocess."""
+    try:
+        from pxh.claude_session import _brain_kinds
+    except ImportError:
+        return False
+    return "post_qa" in _brain_kinds()
+
+
+def _qa_via_brain(thought: str) -> str | None:
+    """Ask the io session. Returns a verdict, or None if it did not answer.
+
+    Post QA runs on the *unprivileged* session by design: the text being judged
+    is SPARK's own, but the judgement is a public-facing decision and the same
+    channel handles genuinely untrusted input. Nothing here needs repo access.
+    """
+    from pxh.brain import ask_brain
+
+    reply = ask_brain("post_qa", {"instruction": QA_PROMPT, "thought": thought})
+    if reply is None:
+        return None
+    answer = reply.get("reply")
+    if isinstance(answer, dict):
+        # A structured reply is the preferred shape; fall back to any string
+        # field that looks like the verdict.
+        answer = answer.get("verdict") or answer.get("answer") or ""
+    return _interpret_qa(str(answer))
+
+
 def run_qa_gate(thought: str) -> str | None:
     """Return 'pass', 'rejected', 'ambiguous', or None (error/timeout).
 
-    Calls claude CLI with a binary YES/NO prompt. Response is stripped,
-    lowercased, and prefix-matched.
+    Asks the resident io session when post_qa is routed there, otherwise falls
+    back to the legacy one-shot subprocess. A brain that does not answer
+    returns None — the caller skips the post and retries next cycle, which is
+    the same thing it already does on a QA timeout. It deliberately does NOT
+    fall through to `claude -p`; that path is being removed, not kept warm.
 
     A circuit breaker opens after 3 consecutive failures, skipping QA calls
     for 5 minutes (returns None immediately). Resets on any success.
@@ -345,14 +404,24 @@ def run_qa_gate(thought: str) -> str | None:
             log(f"qa breaker: cooldown elapsed, retrying (was {_qa_breaker['failures']} consecutive failures)")
             _qa_breaker["failures"] = 0
 
+    if _qa_uses_brain():
+        try:
+            verdict = _qa_via_brain(thought)
+        except Exception as exc:  # noqa: BLE001 - QA must never stop the poster
+            log(f"qa gate error (brain): {exc}")
+            verdict = None
+        if verdict is None:
+            log("qa gate: brain did not answer — deferring this thought")
+            _qa_trip_breaker()
+            return None
+        _qa_breaker["failures"] = 0
+        return verdict
+
     claude_bin = (os.environ.get("PX_CLAUDE_BIN")
                   or shutil.which("claude")
                   or "/home/pi/.local/bin/claude")
 
-    prompt = ('Is this thought from a small robot interesting enough to share '
-              'publicly on social media?\n'
-              'Answer only YES or NO. Nothing else.\n\n'
-              f'The thought: "{thought}"')
+    prompt = f'{QA_PROMPT}\n\nThe thought: "{thought}"'
 
     # Strip Claude Code env vars to allow nested invocation
     env = {k: v for k, v in os.environ.items()
@@ -371,35 +440,20 @@ def run_qa_gate(thought: str) -> str | None:
         )
         if result.returncode != 0:
             log(f"qa gate error: claude exit {result.returncode}: {result.stderr[:200]}")
-            _qa_breaker["failures"] += 1
-            if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
-                _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
-                log(f"qa gate circuit breaker opened ({_qa_breaker['failures']} failures)")
+            _qa_trip_breaker()
             return None
-        resp = result.stdout.strip().lower()
-        if resp.startswith("yes"):
-            _qa_breaker["failures"] = 0
-            return "pass"
-        elif resp.startswith("no"):
-            _qa_breaker["failures"] = 0
-            return "rejected"
-        else:
+        verdict = _interpret_qa(result.stdout)
+        if verdict == "ambiguous":
             log(f"qa gate ambiguous response: {result.stdout.strip()[:100]}")
-            _qa_breaker["failures"] = 0
-            return "ambiguous"
+        _qa_breaker["failures"] = 0
+        return verdict
     except subprocess.TimeoutExpired:
         log("qa gate timeout (90s)")
-        _qa_breaker["failures"] += 1
-        if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
-            _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
-            log(f"qa gate circuit breaker opened ({_qa_breaker['failures']} failures)")
+        _qa_trip_breaker()
         return None
     except Exception as exc:
         log(f"qa gate error: {exc}")
-        _qa_breaker["failures"] += 1
-        if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
-            _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]
-            log(f"qa gate circuit breaker opened ({_qa_breaker['failures']} failures)")
+        _qa_trip_breaker()
         return None
 
 

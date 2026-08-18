@@ -302,42 +302,60 @@ def _mock_run_result(stdout="YES", returncode=0, stderr=""):
     return result
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_gate_pass():
     """Claude responds YES — gate returns 'pass'."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("YES")):
         assert run_qa_gate("I see a bird on the fence") == "pass"
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_gate_pass_verbose():
     """Claude responds with YES prefix — gate returns 'pass' (prefix match)."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("Yes, this is wonderful")):
         assert run_qa_gate("The sunset is beautiful tonight") == "pass"
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_gate_fail():
     """Claude responds NO — gate returns 'rejected'."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("NO")):
         assert run_qa_gate("sonar: 42cm") == "rejected"
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_gate_ambiguous():
     """Claude responds with something other than YES/NO — gate returns 'ambiguous'."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("Maybe")):
         assert run_qa_gate("hmm not sure") == "ambiguous"
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_gate_timeout():
     """Subprocess times out — gate returns None."""
     with patch.object(_post_subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=15)):
         assert run_qa_gate("anything") is None
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_response_whitespace():
     """Whitespace-padded response is stripped before matching."""
     with patch.object(_post_subprocess, "run", return_value=_mock_run_result("  YES\n")):
@@ -355,7 +373,10 @@ def _reset_qa_breaker():
     breaker.update(orig)
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_circuit_breaker_opens_after_consecutive_failures(_reset_qa_breaker):
     """After 3 failures the breaker opens; 4th call skips subprocess entirely."""
     breaker = _POST["_qa_breaker"]
@@ -373,7 +394,10 @@ def test_qa_circuit_breaker_opens_after_consecutive_failures(_reset_qa_breaker):
         assert mock_run.call_count == call_count_before  # no new subprocess call
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_circuit_breaker_resets_on_success(_reset_qa_breaker):
     """A successful call resets the failure counter to 0."""
     breaker = _POST["_qa_breaker"]
@@ -386,7 +410,10 @@ def test_qa_circuit_breaker_resets_on_success(_reset_qa_breaker):
     assert breaker["failures"] == 0
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_circuit_breaker_reopens_after_cooldown(_reset_qa_breaker):
     """After the cooldown expires the breaker resets and subprocess is called again."""
     import time as _time
@@ -733,7 +760,10 @@ def test_flush_max_one_per_cycle(_cursor_env):
     assert bsky.post.call_count <= 1
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude"})
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_CLAUDE_BIN": "/usr/bin/claude",
+                         # These exercise the legacy subprocess path; post_qa
+                         # now routes to the resident io session by default.
+                         "PX_BRAIN_KINDS": ""})
 def test_qa_rejected_not_posted_on_next_flush(_cursor_env):
     """QA-rejected thought is never posted on subsequent flush cycles."""
     tmp = _cursor_env
@@ -926,3 +956,62 @@ def test_watchdog_stale_detection():
     assert _check_watchdog(_time.monotonic(), 600) is False
     # Stale timestamp — should trigger
     assert _check_watchdog(_time.monotonic() - 700, 600) is True
+
+
+# ---------------------------------------------------------------------------
+# QA gate on the resident io session (the `claude -p` retirement)
+# ---------------------------------------------------------------------------
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
+def test_qa_gate_uses_the_io_session_not_a_subprocess():
+    """post_qa judges text that goes public. It runs on the unprivileged
+    session, and it must not spawn `claude -p` to do it."""
+    from pxh import brain
+
+    def _boom(*a, **k):
+        raise AssertionError("QA gate spawned a subprocess")
+
+    with patch.object(_POST["subprocess"], "run", _boom), \
+         patch.object(brain, "ask_brain", return_value={"reply": "YES"}) as ask:
+        assert run_qa_gate("I see a bird on the fence") == "pass"
+    assert ask.call_args[0][0] == "post_qa", "must route to the post_qa kind"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
+def test_qa_gate_accepts_a_structured_verdict():
+    """A resident session naturally replies with JSON; both shapes are read."""
+    from pxh import brain
+    with patch.object(brain, "ask_brain", return_value={"reply": {"verdict": "NO"}}):
+        assert run_qa_gate("sonar: 42cm") == "rejected"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
+def test_qa_gate_still_defaults_ambiguous_to_pass():
+    """QA is a safety net, not a quality bar — unchanged by the move."""
+    from pxh import brain
+    with patch.object(brain, "ask_brain", return_value={"reply": "Maybe?"}):
+        assert run_qa_gate("hmm not sure") == "ambiguous"
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
+def test_a_silent_brain_defers_the_post_rather_than_publishing_it():
+    """None means "skip and retry next cycle". Falling back to `claude -p`
+    here would keep alive the exact thing being removed."""
+    from pxh import brain
+    with patch.object(brain, "ask_brain", return_value=None):
+        assert run_qa_gate("anything") is None
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
+def test_a_raising_brain_never_takes_the_poster_down():
+    from pxh import brain
+    with patch.object(brain, "ask_brain", side_effect=RuntimeError("tmux gone")):
+        assert run_qa_gate("anything") is None
+
+
+@patch.dict(os.environ, {"PX_POST_QA": "0", "PX_BRAIN_KINDS": "post_qa"})
+def test_qa_disabled_still_short_circuits_before_the_brain():
+    """PX_POST_QA=0 must not reach the session at all — tests rely on it."""
+    from pxh import brain
+    with patch.object(brain, "ask_brain", side_effect=AssertionError("reached the brain")):
+        assert run_qa_gate("anything") == "pass"
