@@ -36,6 +36,10 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 ## Architecture
 
+> This section is an orientation sketch. The **canonical** architecture docs —
+> and the invariants that must not be broken — are
+> [CLAUDE.md](CLAUDE.md) and [docs/architecture/overview.md](docs/architecture/overview.md).
+
 ```
                           ┌─────────────────────────────────────────────┐
                           │               Voice Backends                │
@@ -481,7 +485,7 @@ source .venv/bin/activate
 # 4. Dry-run a tool to verify the setup
 PX_DRY=1 bin/tool-status
 
-# 5. Run tests (1070 dry-run, no hardware needed)
+# 5. Run tests (~1460 collected; use -m 'not live' to skip hardware)
 python -m pytest tests/ -m "not live"
 
 # 6. Launch SPARK (Claude voice companion)
