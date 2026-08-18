@@ -1518,3 +1518,37 @@ def test_tool_compose_note_is_stamped_as_sparks_own_narrative(tmp_path, monkeypa
     capsys.readouterr()
     rec = json.loads((tmp_path / "notes-spark.jsonl").read_text().strip())
     assert provenance.read_provenance(rec)["kind"] == "narrative"
+
+
+def test_tool_wander_sudo_env_carries_home(isolated_project, tmp_path):
+    """The elevated wander must inherit HOME=/home/pi.
+
+    `sudo` is env_reset, so root lands on HOME=/root — where there is no
+    ~/.local/lib/python3.11/site-packages. `filelock` lives only there, so
+    every root-side `update_session()` in the subtree (wander itself, and
+    tool-describe-scene) dies on ImportError *after* doing its work, and the
+    tool exits without emitting its JSON. px-alive.service:17 already sets
+    this for the same reason.
+
+    Verified against the real constructed argv via a stub `sudo` on PATH,
+    rather than by grepping the script's source.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    recorded = tmp_path / "argv.txt"
+    stub = bindir / "sudo"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$@\" > {recorded}\n"
+        "echo '{\"status\": \"ok\", \"steps\": 1}'\n"
+    )
+    stub.chmod(0o755)
+
+    env = isolated_project["env"].copy()
+    env.pop("PX_BYPASS_SUDO", None)          # exercise the elevated branch
+    env["PX_DRY"] = "1"
+    env["PATH"] = f"{bindir}:{env.get('PATH', '')}"
+    run_tool(["bin/tool-wander"], env)
+
+    argv = recorded.read_text().splitlines()
+    assert "HOME=/home/pi" in argv, f"HOME not threaded into sudo env: {argv}"

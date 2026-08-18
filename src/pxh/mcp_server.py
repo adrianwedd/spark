@@ -103,7 +103,8 @@ def spark_awareness() -> str:
 @mcp.tool()
 def spark_sonar() -> str:
     """Get the latest sonar reading (distance in cm, source, timestamp)."""
-    data = _read_json(STATE_DIR / "sonar_live.json")
+    from .runtime_paths import resolve_sonar_live_read_path
+    data = _read_json(resolve_sonar_live_read_path(STATE_DIR))
     if data is None:
         return json.dumps({"error": "sonar_live.json not found — px-alive may not be running"})
     return json.dumps(data, indent=2)

@@ -5,6 +5,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+# Ignore SIGUSR1 across the exec, until Python arms its own handler.
+#
+# Belt-and-braces, not a fix for an observed failure. 2e875e5c already closed
+# the failure we actually saw (status=10/USR1 during the lease park: 17 kills
+# in the 7 days before it deployed at 14:20 on 2026-08-16, zero in the 46
+# restarts after). What it cannot cover is everything *before* main() runs: the
+# program arrives on stdin as a heredoc, so Python reads ~1000 lines off a pipe,
+# compiles them and runs argparse before reaching signal.signal(). A yield
+# landing in there would still hit Python's default SIGUSR1 disposition and
+# terminate the daemon. No instance of that has been observed — the window is
+# just narrow, not closed.
+#
+# SIG_IGN survives exec (handlers do not — they reset to default), so Python
+# inherits it and holds it until signal.signal() replaces it. A yield lost in
+# this window is correctly lost: pre-main px-alive holds no Picarx handle, so
+# there is nothing to yield. Must be set before the exec — this shell is gone
+# after it.
+trap '' USR1
+
 # Use system python3 explicitly — the venv has include-system-site-packages=false
 # so the venv python3 cannot see robot_hat/picarx which live in system site-packages.
 exec /usr/bin/python3 - "$@" <<'PY'
@@ -30,6 +49,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -76,9 +96,53 @@ except ImportError:                                   # pxh not on PYTHONPATH
 # fsync the SD card 172,800 times a day.
 HEALTH_INTERVAL_S = 60
 
+# Throttle state lives here rather than relying on health.record_success's own
+# min_interval_s, because the throttle has to happen *before* a thread is
+# spawned — otherwise the 2 Hz loop would start 172,800 threads a day just to
+# have almost all of them return immediately.
+_last_health_report: float | None = None
+
+
+def _report_health_success(now: float) -> None:
+    """Report loop health without ever blocking the loop.
+
+    health.record_success() already promises never to raise, on the grounds
+    that reporting must not take down the daemon it reports on. Blocking
+    breaks that promise just as effectively: the write is an fsync into
+    state/health/ on the SD card, and a /proc sampler caught px-alive parked
+    in jbd2_log_wait_commit on state/health/tmp<rand>.tmp across 17
+    consecutive samples — seconds inside one fsync, against WatchdogSec=15.
+
+    It is invisible in the log because it bites hardest on the night path
+    (OBI_DAY_END=20), where no scan or gaze drift runs and this is the only
+    SD write left on the loop; the daemon simply goes quiet and is SIGABRTed.
+
+    A daemon thread is the right shape here: the record is advisory, and
+    losing an in-flight one at exit costs nothing (the next tick rewrites it),
+    whereas making the watchdog-fed thread wait on the SD card costs the
+    process. record_failure stays synchronous and is deliberately left alone —
+    failures are rare, carry the streak that separates a glitch from a dead
+    sensor, and a daemon that is genuinely failing to talk to its hardware
+    should not also be racing its own exit to record that.
+    """
+    global _last_health_report
+    if _last_health_report is not None and (now - _last_health_report) < HEALTH_INTERVAL_S:
+        return
+    _last_health_report = now
+
+    def _write() -> None:
+        try:
+            _health.record_success("px-alive")
+        except Exception:  # pragma: no cover — reporting is never load-bearing
+            pass
+
+    try:
+        threading.Thread(target=_write, name="px-alive-health", daemon=True).start()
+    except RuntimeError:  # out of threads — reporting is not worth dying for
+        pass
+
 MOOD_FILE       = STATE_DIR / "mood.json"
 SESSION_FILE    = STATE_DIR / "session.json"
-SONAR_LIVE_FILE = STATE_DIR / "sonar_live.json"
 BATTERY_FILE    = STATE_DIR / "battery.json"
 FRIGATE_FILE = STATE_DIR / "frigate_presence.json"
 FRIGATE_STALE_S = 300   # ignore frigate_presence.json if older than this
@@ -93,16 +157,24 @@ LEASE_RECHECK_S = 2.0
 # under WatchdogSec=15, and cheap now the write lands on tmpfs.
 HEARTBEAT_EVERY_S = 2.0
 
-# The heartbeat is disposable liveness state and does NOT belong on the SD card
-# — see pxh/runtime_paths.py for the measurements that moved it to tmpfs. The
-# location is shared with pxh.api (the reader) so the two cannot drift apart.
+# The heartbeat and the live sonar reading are disposable runtime state and do
+# NOT belong on the SD card — see pxh/runtime_paths.py for the measurements
+# that moved them to tmpfs. Both locations are shared with the readers
+# (pxh.api, pxh.health, pxh.mind, pxh.mcp_server) so they cannot drift apart.
 try:
-    from pxh.runtime_paths import resolve_heartbeat_write_dir
-    HEARTBEAT_DIR = resolve_heartbeat_write_dir(STATE_DIR)
+    from pxh.runtime_paths import resolve_runtime_write_dir
+    RUNTIME_DIR = resolve_runtime_write_dir(STATE_DIR)
 except ImportError:                                   # pxh not on PYTHONPATH
-    HEARTBEAT_DIR = STATE_DIR
+    RUNTIME_DIR = STATE_DIR
 
-ALIVE_HEARTBEAT_FILE = HEARTBEAT_DIR / "alive_heartbeat.json"
+HEARTBEAT_DIR = RUNTIME_DIR  # retained: referenced by the test suite
+ALIVE_HEARTBEAT_FILE = RUNTIME_DIR / "alive_heartbeat.json"
+# Every PROX_CHECK_S this is rewritten with a fresh distance. Its fsync into
+# state/ was caught holding px-alive in uninterruptible sleep for seconds at a
+# time against WatchdogSec=15 — 66 of 86 watchdog kills in a measured 6h
+# window. os.replace is what gives readers a torn-free view; the fsync only
+# bought power-loss durability for a value that is stale 5s later anyway.
+SONAR_LIVE_FILE = RUNTIME_DIR / "sonar_live.json"
 
 MOOD_BEHAVIOR = {
     "excited":       {"gaze_min": 5,  "gaze_max": 12, "tilt_bias": 10},
@@ -366,12 +438,20 @@ def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
         if _ready:
             _sd_notify("WATCHDOG=1")
         else:
-            # Pre-READY the watchdog is not yet armed; what can kill us is
-            # TimeoutStartSec. Push it out on every beat so a slow acquisition
-            # (or a long lease park) survives, while still proving liveness.
-            _sd_notify(
-                "WATCHDOG=1\nEXTEND_TIMEOUT_USEC=%d" % int(START_EXTEND_S * 1_000_000)
-            )
+            # Pre-READY the only deadline is TimeoutStartSec, so push it out on
+            # every beat and send NOTHING ELSE.
+            #
+            # This branch used to also send WATCHDOG=1, on the belief that the
+            # watchdog "is not yet armed" so the keyword was inert. It is not:
+            # systemd routes WATCHDOG=1 through service_notify_message() into
+            # service_reset_watchdog() -> service_start_watchdog(), with no
+            # SERVICE_RUNNING guard. The beat meant to buy startup time was
+            # itself arming WatchdogSec=15 — mid Picarx.__init__, which blocks
+            # for seconds at a stretch and cannot feed a 15s watchdog. That is
+            # 20 of the 86 watchdog kills in a measured 6h window, each logged
+            # by systemd as "Failed to start" because the start job was still
+            # open. Adding WATCHDOG=1 back here re-arms the trap.
+            _sd_notify("EXTEND_TIMEOUT_USEC=%d" % int(START_EXTEND_S * 1_000_000))
         return True
     except OSError as exc:
         if not _heartbeat_err_logged:
@@ -672,6 +752,19 @@ def idle_loop(args) -> None:
     # can legitimately take several seconds on the Pi's SD card.
     write_alive_heartbeat("starting")
 
+    # One-time migration sweep: sonar_live.json used to live on the state dir.
+    # resolve_runtime_read_path() falls back there when the runtime copy is
+    # absent, so a leftover would be found during every restart gap and read as
+    # a permanently-stale value. Age gates make that harmless but confusing;
+    # deleting it makes "missing" mean missing. Guarded on the two dirs being
+    # distinct, so a host that already fell back to state/ doesn't delete the
+    # file it is about to write.
+    if RUNTIME_DIR != STATE_DIR:
+        try:
+            (STATE_DIR / "sonar_live.json").unlink(missing_ok=True)
+        except OSError as _me:
+            log(f"legacy sonar_live.json cleanup skipped: {_me}")
+
     # Write a startup heartbeat so px-mind doesn't see a stale file during the
     # Picarx acquisition window (takes ~5s), avoiding the tool-sonar fallback
     # that would immediately send SIGUSR1 and kill us before we do anything useful.
@@ -891,7 +984,7 @@ def idle_loop(args) -> None:
                 next_scan = i2c_ok_after + random.uniform(SCAN_MIN_S, SCAN_MAX_S)
                 next_prox = i2c_ok_after + PROX_CHECK_S
             else:
-                _health.record_success("px-alive", min_interval_s=HEALTH_INTERVAL_S)
+                _report_health_success(now)
 
             time.sleep(0.5)
     finally:
