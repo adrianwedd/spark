@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from filelock import FileLock, Timeout as _FileLockTimeout
 
+from pxh import policy_context
 from pxh.logging import log_event
 from pxh.state import update_session
 
@@ -66,6 +67,34 @@ def main() -> int:
         log_event("voice", payload)
         print(json.dumps(payload))
         return 1
+
+    # Behavioural policy (#174) — the audio sink's own gate.
+    #
+    # voice_loop.validate_action() and mind.expression() both evaluate policy
+    # before dispatching here, and they still do; this is not a replacement for
+    # either. It is the check that survives a caller that is neither. Every
+    # speech producer in the tree funnels through this file — tool-chat,
+    # tool-chat-vixen, tool-voice-persona, px-cron-say, px-battery-poll — and
+    # so does anything holding a shell, which now includes the resident
+    # spark-brain session. Before this gate, prose in a system prompt was the
+    # only thing standing between that session and the speaker at 3am.
+    #
+    # Placed ahead of the persona reroute deliberately. tool-voice-persona
+    # re-enters this file, so a gate below the reroute would still catch the
+    # audio, but only after an Ollama round trip has already run on text that
+    # was never going to be spoken.
+    #
+    # Deliberately also ahead of the PX_DRY branch: a dry run must model the
+    # decision the live path would make, or every dry test of a speaking route
+    # asserts behaviour the robot will not show.
+    _verdict = policy_context.evaluate_audio_sink(
+        "tool_voice", {"text": text}, warn_prefix="[tool-voice]")
+    if not _verdict.allowed:
+        payload = {"status": "suppressed", "reason": _verdict.reason,
+                   "text": text[:200]}
+        log_event("voice", payload)
+        print(json.dumps(payload))
+        return 0
 
     # If a persona is active, reroute through the persona voice wrapper
     # which rephrases text via Ollama before speaking

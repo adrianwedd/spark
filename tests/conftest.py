@@ -88,6 +88,14 @@ def isolated_project(tmp_path):
     env["PX_BYPASS_SUDO"] = "1"
     env["PX_VOICE_DEVICE"] = "null"
     env["PX_STATE_DIR"] = str(state_dir)
+    # Pin the night-silence window open. bin/tool-voice now evaluates policy
+    # (#174) for itself, so without this every subprocess test of a speaking
+    # tool would pass by day and return "suppressed" after 19:00 Hobart —
+    # the in-process equivalent of what voice_loop._policy_now() exists to
+    # prevent. `hour >= 99` is never true, so this window never opens.
+    # Tests that mean to exercise night silence override both values.
+    env["PX_NIGHT_SILENCE_START_H"] = "99"
+    env["PX_NIGHT_SILENCE_END_H"] = "0"
 
     return {
         "env": env,

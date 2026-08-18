@@ -41,6 +41,33 @@ HA_BASE_URL              = os.environ.get("PX_HA_HOST", "http://homeassistant.lo
 NIGHT_SILENCE_START_H    = 19
 NIGHT_SILENCE_END_H      = 7
 
+
+def night_silence_bounds() -> tuple[int, int]:
+    """(start_h, end_h), honouring the PX_NIGHT_SILENCE_*_H test overrides.
+
+    Read at call time, and from the environment rather than from a value
+    frozen at import, because the enforcement points are subprocesses: a test
+    that pins the window has no way to monkeypatch inside bin/tool-voice. The
+    same two variables already drive bin/tool-announce, so a suite forcing the
+    window deterministically (START=99,END=0 never; START=0,END=24 always)
+    moves every audio path together instead of one at a time.
+
+    Module attributes stay authoritative when the overrides are absent, so
+    in-process monkeypatching of NIGHT_SILENCE_START_H keeps working.
+    """
+    def _bound(env_name: str, default: int) -> int:
+        raw = os.environ.get(env_name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    return (_bound("PX_NIGHT_SILENCE_START_H", NIGHT_SILENCE_START_H),
+            _bound("PX_NIGHT_SILENCE_END_H", NIGHT_SILENCE_END_H))
+
+
 MOOD_TO_SOUND = {
     "curious": "beep", "alert": "beep",
     "happy": "tada", "excited": "tada", "playful": "tada",

@@ -48,8 +48,7 @@ def is_night_hour(hour: int) -> bool:
     delegate here without policy.py importing mind.py. The autonomous
     enforcement rule stays where it is; only the clock semantics are shared.
     """
-    start = spark_config.NIGHT_SILENCE_START_H
-    end = spark_config.NIGHT_SILENCE_END_H
+    start, end = spark_config.night_silence_bounds()
     return hour >= start or hour < end
 
 

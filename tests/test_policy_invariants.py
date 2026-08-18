@@ -203,3 +203,266 @@ def test_override_mechanism_stays_narrow():
     """One member, because bin/tool-quiet is three programs under one name. A
     second one means splitting that tool, not describing it more cleverly."""
     assert set(voice_loop.VOICE_EFFECT_OVERRIDES) == {"tool_quiet"}
+
+
+# ---------------------------------------------------------------------------
+# The sink itself.
+#
+# Everything above pins a *dispatcher*. These pin bin/tool-voice, which is the
+# final common boundary every speech producer funnels through — tool-chat,
+# tool-chat-vixen, tool-voice-persona, px-cron-say, px-battery-poll and both
+# dispatchers all end here. Anything holding a shell reaches it directly,
+# including the resident spark-brain session, whose tool envelope is SPARK's
+# whole bin/ directory. Before this gate existed, only prose stopped it.
+#
+# The proof of silence is a canary in place of the speaker: PX_VOICE_PLAYER
+# names a script that touches a marker file. A leak through the gate leaves
+# the marker behind, so "no audio" is asserted against an artefact rather than
+# against tool-voice's own self-report.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TOOL_VOICE = REPO_ROOT / "bin" / "tool-voice"
+
+# Deterministic night-window bounds. `hour >= 0` is always true, `hour >= 99`
+# never is, so these pin the rule regardless of when the suite runs.
+ALWAYS_NIGHT = {"PX_NIGHT_SILENCE_START_H": "0", "PX_NIGHT_SILENCE_END_H": "24"}
+NEVER_NIGHT = {"PX_NIGHT_SILENCE_START_H": "99", "PX_NIGHT_SILENCE_END_H": "0"}
+
+
+@pytest.fixture
+def sink(tmp_path):
+    """Invoke bin/tool-voice the way something outside the loop would.
+
+    Every PX_* variable is stripped from the inherited environment first: this
+    is deliberately NOT the env voice_loop or mind.py hands down, because the
+    bypass being closed is exactly a call that never passed through either.
+    """
+    import json as _json
+    import os as _os
+    import subprocess as _subprocess
+
+    log_dir = tmp_path / "logs"
+    state_dir = tmp_path / "state"
+    log_dir.mkdir()
+    state_dir.mkdir()
+    marker = tmp_path / "spoke"
+
+    canary = tmp_path / "canary-player"
+    canary.write_text('#!/usr/bin/env bash\nprintf "%s" "$*" > "$PX_CANARY_MARKER"\n')
+    canary.chmod(0o755)
+
+    base = {k: v for k, v in _os.environ.items()
+            if not k.startswith("PX_") and not k.startswith("_PX_")}
+    base.update({
+        "LOG_DIR": str(log_dir),
+        "PX_STATE_DIR": str(state_dir),
+        "PX_SESSION_PATH": str(state_dir / "session.json"),
+        "PX_BYPASS_SUDO": "1",
+        "PX_DRY": "0",                       # live path — the one that can speak
+        "PX_VOICE_PLAYER": str(canary),
+        "PX_CANARY_MARKER": str(marker),
+        # Personas would otherwise reach the real GLaDOS TTS on this Pi.
+        "PX_TTS_GREMLIN": "http://127.0.0.1:9",
+        "PX_TTS_VIXEN": "http://127.0.0.1:9",
+        "PX_TTS_SPARK": "http://127.0.0.1:9",
+    })
+    base.update(NEVER_NIGHT)
+
+    def run(text="testing one two", *, session=None, awareness=None, **env_overrides):
+        if session is not None:
+            (state_dir / "session.json").write_text(_json.dumps(session))
+        if awareness is not None:
+            (state_dir / "awareness.json").write_text(_json.dumps(awareness))
+        env = dict(base, PX_TEXT=text, **env_overrides)
+        proc = _subprocess.run(
+            [str(TOOL_VOICE)], cwd=str(REPO_ROOT), env=env,
+            capture_output=True, text=True, check=False, timeout=90,
+        )
+        payload = _json.loads(proc.stdout.strip().splitlines()[-1])
+        return payload, marker.exists()
+
+    return run
+
+
+def test_direct_tool_voice_is_silent_under_quiet_mode(sink):
+    payload, spoke = sink(session={"spark_quiet_mode": True})
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "quiet_mode"
+    assert spoke is False
+
+
+def test_direct_tool_voice_is_silent_during_night_silence(sink):
+    payload, spoke = sink(**ALWAYS_NIGHT)
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+    assert spoke is False
+
+
+def test_direct_tool_voice_is_silent_while_adrian_is_on_call(sink):
+    payload, spoke = sink(awareness={"ha_context": {"adrian_on_call": True}})
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "on_call"
+    assert spoke is False
+
+
+def test_direct_tool_voice_is_silent_while_the_mic_is_hot(sink):
+    payload, spoke = sink(awareness={"ha_context": {"adrian_mic_active": True}})
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "on_call"
+    assert spoke is False
+
+
+def test_direct_tool_voice_still_speaks_when_policy_allows(sink):
+    """The gate must not be a mute button. Allowed audio still reaches the player."""
+    payload, spoke = sink("hello there")
+    assert payload["status"] == "ok"
+    assert spoke is True
+
+
+def test_persona_routing_cannot_bypass_the_sink_gate(sink):
+    """A persona reaches the speaker via bin/tool-voice-persona, which re-enters
+    tool-voice. The gate therefore has to sit *before* the reroute, or a persona
+    turn is evaluated only on the second pass — and the wrapper has already run
+    an Ollama call and a network TTS fetch by then."""
+    payload, spoke = sink(
+        session={"spark_quiet_mode": True, "persona": "gremlin"},
+        PX_PERSONA="gremlin",
+    )
+    assert payload["status"] == "suppressed"
+    assert spoke is False
+    assert "rephrased" not in payload, "tool-voice-persona ran before the gate"
+
+
+def test_persona_audio_still_works_when_policy_allows(sink):
+    payload, spoke = sink(
+        "persona line", session={"persona": "gremlin"},
+        PX_PERSONA="gremlin", _PX_VOICE_PERSONA_DONE="1",
+    )
+    assert payload["status"] == "ok"
+    assert spoke is True
+
+
+def test_dry_run_is_still_gated(sink):
+    """Dry-run must model the live decision, not route around it — otherwise
+    every dry test of a speaking path asserts behaviour the robot won't show."""
+    payload, spoke = sink(session={"spark_quiet_mode": True}, PX_DRY="1")
+    assert payload["status"] == "suppressed"
+    assert spoke is False
+
+
+# ---------------------------------------------------------------------------
+# The audio-producer inventory.
+#
+# test_no_tool_can_speak_under_an_innocent_name (above) asks "is this tool
+# classified loudly enough?" — it starts from the dispatcher's vocabulary and
+# looks down. It cannot see a producer that no dispatcher names, which is
+# precisely the shape of the bypass this section exists for.
+#
+# So this one runs the other way: start from the audio primitives themselves
+# and require every file that reaches one to be listed here with a disposition.
+# The point is not that "ungated" entries are acceptable — several are known
+# gaps, recorded as such. The point is that adding a seventeenth producer
+# fails the suite until somebody decides which column it belongs in.
+#
+# Still a text scan, with the same honest limits as its neighbour: it cannot
+# see a runtime-assembled command, a helper two imports deep, or a primitive
+# spelled through a variable. It catches the common accidental case.
+# ---------------------------------------------------------------------------
+
+AUDIO_PRIMITIVE = re.compile(
+    r"\b(?:aplay|paplay|espeak|mpg123|afplay|ffplay)\b"
+    r"|/synthesize\b|/announce\b|enable_speaker\b"
+)
+
+# path -> (disposition, why)
+#
+#   gated        — evaluates pxh.policy itself before making a sound
+#   self-gated   — enforces its own subset of the rules at its own chokepoint
+#   delegates    — reaches the speaker only through bin/tool-voice
+#   ungated      — makes a sound without consulting policy. A known gap.
+#   mention      — names a primitive in a comment or passes a device through
+#   diagnostic   — human-run tooling, never on an autonomous path
+#   server       — synthesises audio for someone else to play; plays nothing
+AUDIO_PRODUCERS: dict[str, tuple[str, str]] = {
+    "bin/tool-voice": (
+        "gated", "the sink; every speech producer funnels here"),
+    "bin/tool-announce": (
+        "self-gated", "night silence at the relay chokepoint; quiet mode and "
+                      "on-call are not enforced here yet"),
+    "bin/tool-voice-persona": (
+        "delegates", "rephrases via Ollama, then re-enters tool-voice"),
+    "bin/tool-chat-vixen": (
+        "delegates", "VIXEN reply text goes out through tool-voice"),
+    "bin/px-battery-poll": (
+        "delegates", "speech via tool-voice; its plug/unplug sweep is a raw "
+                     "aplay tone and is not gated"),
+    "bin/tool-play-sound": (
+        "ungated", "plays a bundled WAV with aplay directly"),
+    "bin/px-perform": (
+        "ungated", "own espeak->aplay pipeline for choreographed routines"),
+    "bin/px-wake-listen": (
+        "ungated", "wake/ack/timeout chimes, generated and played inline"),
+    "src/pxh/wander.py": (
+        "ungated", "_speak() runs its own espeak->aplay while exploring"),
+    "src/pxh/mind.py": (
+        "ungated", "_play_alarm_beeps() for the battery emergency; every other "
+                   "audio route in this module goes through a tool and is "
+                   "evaluated by expression()"),
+    "bin/px-mic-check": ("diagnostic", "chirp-train loopback regression test"),
+    "bin/px-voice-test": ("diagnostic", "manual voice check"),
+    "bin/px-voice-sampler": ("diagnostic", "manual espeak parameter sweep"),
+    "bin/tts-glados-server": ("server", "synthesises WAV bytes, plays nothing"),
+    "bin/px-env": ("mention", "comment explaining the PULSE_SERVER fix"),
+    "bin/run-wake": ("mention", "forwards --aplay-device to px-wake-listen"),
+}
+
+
+def _discover_audio_producers() -> set[str]:
+    found = set()
+    for directory in ("bin", "src/pxh"):
+        for path in sorted((REPO_ROOT / directory).rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            if AUDIO_PRIMITIVE.search(text):
+                found.add(str(path.relative_to(REPO_ROOT)))
+    return found
+
+
+def test_every_audio_producer_is_inventoried():
+    """A new file that can make a sound must be classified, not merely added."""
+    discovered = _discover_audio_producers()
+    assert discovered == set(AUDIO_PRODUCERS), (
+        f"unclassified audio producers: {sorted(discovered - set(AUDIO_PRODUCERS))}; "
+        f"inventoried but gone: {sorted(set(AUDIO_PRODUCERS) - discovered)}"
+    )
+
+
+def test_the_sink_is_the_only_gated_producer_and_it_still_evaluates_policy():
+    """Pins the gate's existence in the file itself.
+
+    The subprocess tests above prove the gate *works*; this proves it is still
+    *there* in a form a reader can find. Both matter: an evolution PR that
+    deleted the call and adjusted the whitelisted tests to match would be
+    caught here, in a file px-evolve cannot touch.
+    """
+    gated = [p for p, (kind, _) in AUDIO_PRODUCERS.items() if kind == "gated"]
+    assert gated == ["bin/tool-voice"]
+    source = (REPO_ROOT / "bin" / "tool-voice").read_text(encoding="utf-8")
+    assert "policy_context" in source
+    assert "evaluate_audio_sink(" in source
+
+
+def test_delegating_producers_really_do_route_through_the_sink():
+    """'delegates' is a claim about behaviour, so it gets checked rather than
+    trusted — otherwise the inventory launders a direct producer into a safe
+    column by relabelling it."""
+    for path, (kind, _) in AUDIO_PRODUCERS.items():
+        if kind != "delegates":
+            continue
+        source = (REPO_ROOT / path).read_text(encoding="utf-8")
+        assert "tool-voice" in source, path
