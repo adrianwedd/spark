@@ -183,3 +183,71 @@ def test_token_usage_backend_defaults_to_unknown(tmp_path, monkeypatch):
     token_log.log_usage("prompt", "response")
     data = json.loads((tmp_path / "token_usage.json").read_text())
     assert data["by_backend"]["unknown"]["call_count"] == 1
+
+
+# ── Tier 2 is the resident brain, with `claude -p` behind it ───────────────
+#
+# Reflection's Claude tier was the last hot path still shelling out to
+# `claude -p` on every call: a fresh process, a cold context, no metering, and
+# ~10s of startup before it says a word. The resident session answers from
+# warm context and `ask_brain` meters it. These tests pin the ordering and,
+# more importantly, the fallback — a brain that is down must be invisible.
+
+def _brain_reply(obj):
+    """Shape of what ask_brain() hands back: the session's JSON under 'reply'."""
+    return {"id": "x", "reply": obj}
+
+
+def test_reflection_claude_tier_prefers_the_resident_brain():
+    """With the brain up, the Claude tier must not spawn a subprocess at all."""
+    import pxh.brain
+
+    ran = []
+
+    def _record(*args, **kwargs):
+        ran.append(args[0] if args else kwargs.get("args"))
+        return _fake_claude(1, stderr="should never be reached")
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
+         patch.object(pxh.brain, "ask_brain",
+                      return_value=_brain_reply({"thought": "from the brain",
+                                                 "mood": "curious"})) as ask, \
+         patch("subprocess.run", side_effect=_record):
+        result = call_llm("prompt", "system", persona="spark")
+
+    assert "error" not in result, result
+    assert "from the brain" in result["response"]
+    assert result["backend"] == "claude"
+    assert ask.call_count == 1
+    assert ask.call_args.args[0] == "reflection"
+    assert not any("-p" in (cmd or []) for cmd in ran), ran
+
+
+def test_reflection_falls_back_to_claude_p_when_the_brain_is_unavailable():
+    """ask_brain() returns None for every failure; that must mean 'old path'."""
+    import pxh.brain
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
+         patch.object(pxh.brain, "ask_brain", return_value=None), \
+         patch("subprocess.run",
+               return_value=_fake_claude(0, stdout='{"thought": "from claude -p"}')):
+        result = call_llm("prompt", "system", persona="spark")
+
+    assert "error" not in result, result
+    assert "from claude -p" in result["response"]
+    assert result["backend"] == "claude"
+
+
+def test_reflection_brain_routing_is_read_at_call_time():
+    """PX_BRAIN_KINDS is a live dial — dropping reflection rolls it back."""
+    import pxh.brain
+
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,compose"}), \
+         patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
+         patch.object(pxh.brain, "ask_brain") as ask, \
+         patch("subprocess.run",
+               return_value=_fake_claude(0, stdout='{"thought": "old path"}')):
+        result = call_llm("prompt", "system", persona="spark")
+
+    assert ask.call_count == 0
+    assert "old path" in result["response"]

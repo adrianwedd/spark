@@ -500,13 +500,33 @@ def test_consolidate_quota_one_per_day(tmp_path, monkeypatch):
 # Routing to the resident Claude session (the `claude -p` retirement)
 # ---------------------------------------------------------------------------
 
-def test_phase_one_types_default_to_the_resident_session():
-    """Phase 1 of the `claude -p` retirement: research, compose and post QA."""
+def test_default_routed_types_are_the_ones_watched_in_production():
+    """The `claude -p` retirement, as far as it has actually been run.
+
+    Phase 1 was research, compose and post QA. Phase 2 added reflection, which
+    is the hot one — px-mind's tier 2, every 5 minutes — and which reads this
+    same dial from mind.call_claude rather than keeping its own.
+
+    This is a pin on the rollout, not on a preference: widening it is a
+    deliberate act, and a kind that appears here without anyone deciding to
+    move it is the failure worth catching.
+    """
     from pxh import claude_session as cs
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("PX_BRAIN_KINDS", None)
-        kinds = cs._brain_kinds()
-    assert kinds == {"research", "compose", "post_qa"}
+        kinds = cs.brain_kinds()
+    assert kinds == {"research", "compose", "post_qa", "reflection"}
+
+
+def test_reflection_reads_the_same_dial_as_everything_else():
+    """One switch. Two that can disagree is how a rollback half-happens."""
+    from pxh import claude_session as cs
+    from pxh import mind
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research"}):
+        assert "reflection" not in cs.brain_kinds()
+        assert mind._reflection_via_brain_enabled() is False
+    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,reflection"}):
+        assert mind._reflection_via_brain_enabled() is True
 
 
 def test_brain_kinds_is_read_at_call_time_not_import_time():

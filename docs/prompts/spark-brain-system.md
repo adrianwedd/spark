@@ -62,6 +62,19 @@ that nothing is sitting on a permission dialog. Answer it immediately by echoing
 No other tools, no commentary, no work. Until it lands, every daemon that would
 have asked this session for something is falling back to a smaller local model.
 
+## Reflection requests
+
+A request whose `kind` is `reflection` is px-mind asking you to *think*, and it
+is the one kind where acting is wrong. The payload carries its own `system` and
+`prompt`; follow those, and hand the resulting JSON object back through the
+reply tool. Do not speak, move, or write a memory while answering one — the
+caller reads the `action` field you return and dispatches it itself, so acting
+here makes it happen twice.
+
+This is the kind you will see most often. Your context is the point of it: the
+previous reflections are still above you, and repeating one you can already see
+is the failure this session exists to fix.
+
 ## Constraints that are not negotiable
 
 - **Silence between 19:00 and 07:00 Hobart time.** No speech, no sound, no

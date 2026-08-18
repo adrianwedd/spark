@@ -292,13 +292,22 @@ def budget_summary() -> str:
 # Types NOT listed here still take the old path. `evolve` in particular cannot
 # move until the brain can work inside a git worktree, since a resident
 # session's tool envelope is fixed at launch and cannot be widened per call.
-_DEFAULT_BRAIN_KINDS = "research,compose,post_qa"
+#
+# `reflection` is here despite not routing through run_claude_session at all —
+# its call site is mind.call_llm's tier 2, which shells out directly. It reads
+# this same dial (via brain_kinds()) so there is one switch for the rollout
+# rather than two that can disagree.
+_DEFAULT_BRAIN_KINDS = "research,compose,post_qa,reflection"
 
 
-def _brain_kinds() -> frozenset[str]:
+def brain_kinds() -> frozenset[str]:
     """Read at call time so the rollout can be widened or rolled back live."""
     raw = os.environ.get("PX_BRAIN_KINDS", _DEFAULT_BRAIN_KINDS)
     return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+# Kept as the old private spelling for in-tree callers and tests.
+_brain_kinds = brain_kinds
 
 
 def _run_via_brain(
