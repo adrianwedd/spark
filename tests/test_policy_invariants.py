@@ -26,7 +26,9 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from pxh import mind, policy, voice_loop
+from filelock import Timeout as FileLockTimeout
+
+from pxh import mind, policy, policy_context, voice_loop
 
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 NIGHT_TS = dt.datetime(2026, 1, 1, 22, 0, tzinfo=HOBART_TZ).timestamp()
@@ -279,7 +281,12 @@ def sink(tmp_path):
             [str(TOOL_VOICE)], cwd=str(REPO_ROOT), env=env,
             capture_output=True, text=True, check=False, timeout=90,
         )
-        payload = _json.loads(proc.stdout.strip().splitlines()[-1])
+        # A sink that dies mid-run prints no JSON. That must stay
+        # distinguishable from a sink that suppressed, and it must not be able
+        # to hide an artefact: the canary is checked against the filesystem,
+        # never against what the tool managed to say about itself.
+        lines = proc.stdout.strip().splitlines()
+        payload = _json.loads(lines[-1]) if lines else None
         return payload, marker.exists()
 
     return run
@@ -349,6 +356,133 @@ def test_dry_run_is_still_gated(sink):
     payload, spoke = sink(session={"spark_quiet_mode": True}, PX_DRY="1")
     assert payload["status"] == "suppressed"
     assert spoke is False
+
+
+# ---------------------------------------------------------------------------
+# "Unknown" is not "not quiet".
+#
+# policy_context used to return a bare {} when the session could not be read,
+# and {} reads as quiet-mode-off — so a contended lock, a permission error or
+# an unreadable session file silently granted permission to speak. The bad
+# case is not hypothetical: quiet mode is the dysregulation protocol, so the
+# utterance a failed read buys is one during a meltdown.
+#
+# The contract now separates the two facts, and the rule resolves the missing
+# one in the only direction a sink can justify: no evidence, no audio.
+# ---------------------------------------------------------------------------
+
+def test_unreadable_session_blocks_audio_on_both_origins():
+    """Quiet mode binds both origins, so its indeterminate case must too.
+
+    Pins the rule directly rather than through a dispatcher because the whole
+    point of rule 0 is that it protects the caller which has no dispatcher.
+    """
+    for origin in ("interactive", "autonomous"):
+        verdict = policy.evaluate(
+            "tool_voice", {"text": "hi"}, effect="audio", origin=origin,
+            session={}, awareness={}, now=DAY_TS, session_available=False,
+        )
+        assert verdict.allowed is False, origin
+        assert verdict.reason == "session_unavailable", origin
+
+
+def test_an_empty_but_readable_session_still_permits_audio():
+    """The other half of the distinction, and the one a fail-closed change can
+    break silently: {} must keep meaning 'read it, quiet mode is off'. If this
+    fails, the gate has become a mute button."""
+    verdict = policy.evaluate(
+        "tool_voice", {"text": "hi"}, effect="audio", origin="interactive",
+        session={}, awareness={}, now=DAY_TS,
+    )
+    assert verdict.allowed is True
+    assert verdict.reason == "ok"
+
+
+def test_an_unreadable_session_does_not_block_a_silent_action():
+    """Rule 0 suppresses audio, not everything. A presence substitute is what
+    the dispatchers fall back to, so if an unreadable session blocked that too
+    there would be nothing left to downgrade to."""
+    verdict = policy.evaluate(
+        "tool_emote", {"name": "idle"}, effect="presence", origin="interactive",
+        session={}, awareness={}, now=DAY_TS, session_available=False,
+    )
+    assert verdict.allowed is True
+
+
+@pytest.mark.parametrize("exc", [
+    FileLockTimeout("session.json.lock"),
+    PermissionError("session.json"),
+    IsADirectoryError("session.json"),
+    ValueError("session.json is not an object"),
+    RuntimeError("filelock is not installed"),
+])
+def test_policy_context_reports_a_failed_session_read_as_unavailable(monkeypatch, exc):
+    """Every failure class, not just the contended lock the old comment named.
+
+    RuntimeError is in the list on purpose: the broad except in the loader is
+    only defensible while failing closed, so this pins that an unanticipated
+    failure suppresses rather than escaping as a traceback or, worse, being
+    reported as a successful read of an empty session.
+    """
+    def _raise():
+        raise exc
+    monkeypatch.setattr(policy_context, "load_session", _raise)
+    read = policy_context.load_session_for_policy()
+    assert read.available is False
+    assert read.data == {}
+
+
+def test_policy_context_reports_a_successful_read_as_available(monkeypatch):
+    monkeypatch.setattr(policy_context, "load_session", lambda: {"spark_quiet_mode": False})
+    read = policy_context.load_session_for_policy()
+    assert read.available is True
+    assert read.data == {"spark_quiet_mode": False}
+
+
+def test_direct_tool_voice_is_silent_when_the_session_cannot_be_read(sink, tmp_path):
+    """The regression, end to end through the real sink.
+
+    PX_SESSION_PATH names a directory, so the read fails inside pxh.state with
+    a real OSError rather than a patched one — this is a subprocess, and the
+    bypass being closed is a caller that shares no interpreter with the suite.
+    The canary proves the silence: nothing reached the player.
+    """
+    payload, spoke = sink(PX_SESSION_PATH=str(tmp_path / "state"))
+    assert spoke is False, "audio reached the player on an unreadable session"
+    assert payload is not None, "the sink died instead of suppressing"
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "session_unavailable"
+
+
+def test_direct_tool_voice_is_silent_while_the_session_lock_is_held(sink, tmp_path):
+    """The exact scenario the old fail-open posture was written for.
+
+    Takes ~10s: the test holds the session FileLock across the subprocess run,
+    so the sink's read waits out pxh.state.LOCK_TIMEOUT_S and fails. Worth the
+    wall clock, because "contended lock" was the argument for failing open and
+    this is the case that argument was making. Note the sink returns while the
+    lock is still held, which is also the answer to that argument: tool-voice
+    calls update_session() on this same lock a few lines further down, so the
+    old posture never actually bought a spoken turn under contention.
+    """
+    from filelock import FileLock
+
+    session = tmp_path / "state" / "session.json"
+    session.write_text("{}")
+    with FileLock(str(session) + ".lock"):
+        payload, spoke = sink()
+    assert spoke is False, "audio reached the player while the session lock was held"
+    assert payload is not None, "the sink died instead of suppressing"
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "session_unavailable"
+
+
+def test_direct_tool_voice_speaks_when_the_session_reads_empty(sink):
+    """Companion to the two above: a session that reads fine and sets nothing
+    is a known 'not quiet', and must still reach the speaker."""
+    payload, spoke = sink(session={})
+    assert payload["status"] == "ok"
+    assert spoke is True
 
 
 # ---------------------------------------------------------------------------

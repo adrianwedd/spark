@@ -14,18 +14,28 @@ influenced by whatever happens to be on disk.
 
 The failure postures here are deliberate and they differ:
 
-  * session — a FileLock timeout yields {}. Quiet mode then reads as off. The
-    lock is held for milliseconds, and blocking a turn on a contended session
-    file would make SPARK mute under load.
+  * session — a failed read is reported as a failed read. load_session_for_policy
+    returns a SessionRead carrying both the data and whether it was actually
+    obtained, and policy.evaluate() suppresses audio when it was not. Quiet mode
+    is constitutional and binds both origins, so "I could not establish quiet
+    state" must not resolve to "quiet mode is off": that resolution is a claim,
+    made in the permissive direction, with no evidence behind it. This posture
+    replaces an earlier one that returned a bare {} and let the rule read it as
+    not-quiet. The argument for the old posture — that blocking on a contended
+    session file would mute SPARK under load — does not survive contact with the
+    sink: bin/tool-voice calls update_session() on the very same lock a few lines
+    later, so a lock contended long enough to fail this read was going to fail
+    that write too. The old posture did not buy speech under load; it bought one
+    unlogged utterance during a meltdown.
   * awareness — an unreadable snapshot yields {}, so the on-call/hot-mic rule
     goes inactive rather than muting SPARK for as long as px-mind is down. That
-    is voice_loop's long-standing choice, moved rather than changed. Quiet mode
-    and night silence read nothing from this file, so the two rules that must
-    hold unconditionally are unaffected by it either way.
+    is voice_loop's long-standing choice, moved rather than changed, and it is
+    load-bearing in a way the session read is not: awareness.json is written by
+    a daemon that is routinely down, whereas the session is written by whatever
+    is running. Quiet mode and night silence read nothing from this file.
 
-Both fail *open*, which is only defensible because the rules that matter most
-do not depend on either read succeeding: night silence needs a clock, and quiet
-mode is re-checked upstream by both dispatchers.
+So the two postures are now opposites, on purpose. The rule that must hold
+unconditionally fails closed; the rule that degrades gracefully fails open.
 """
 from __future__ import annotations
 
@@ -33,6 +43,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
@@ -49,14 +60,49 @@ def state_dir() -> Path:
     return Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state")))
 
 
-def load_session_for_policy() -> Dict[str, Any]:
-    """Session dict, or {} if the lock is contended. Never raises."""
+@dataclass(frozen=True)
+class SessionRead:
+    """A session read, plus whether it actually happened.
+
+    Two fields rather than one dict because the two facts are independent and
+    a dict can only carry one of them. `data == {}` says the session holds no
+    fields; `available is False` says there is no session to speak of. Callers
+    that conflate the two answer a policy question by accident, which is the
+    bug this type exists to make unrepresentable.
+    """
+
+    data: Dict[str, Any]
+    available: bool
+
+
+def load_session_for_policy(*, warn_prefix: str = "[policy]") -> SessionRead:
+    """Read the session for a policy decision. Never raises.
+
+    A failed read returns `SessionRead({}, available=False)`, which
+    policy.evaluate() treats as grounds to suppress audio — see rule 0 there.
+
+    The except clause is deliberately broad. Under the old fail-open posture
+    that would have been indefensible, because a swallowed bug would have
+    permitted speech; under fail-closed it cannot permit anything, and the
+    alternative is an unhandled traceback out of a sink whose callers parse
+    stdout as JSON. Every failure is announced on stderr rather than swallowed
+    silently, so "SPARK went quiet" is never a mystery.
+
+    One residual, on the record: pxh.state.load_session() self-heals a corrupt
+    session by backing it up and returning defaults, so corruption arrives here
+    as a successful read of a session with no quiet flag. That is state.py's
+    behaviour and predates this module; closing it means changing what
+    load_session() promises, not what this function catches.
+    """
     try:
-        return load_session() or {}
-    except FileLockTimeout:
-        return {}
-    except (OSError, ValueError):
-        return {}
+        return SessionRead(dict(load_session() or {}), available=True)
+    except FileLockTimeout as exc:
+        reason = f"session lock contended ({exc})"
+    except Exception as exc:  # noqa: BLE001 — see docstring; cannot permit
+        reason = f"session read failed ({type(exc).__name__}: {exc})"
+    print(f"{warn_prefix} policy: {reason} — quiet mode indeterminate, "
+          f"audio suppressed this turn", file=sys.stderr)
+    return SessionRead({}, available=False)
 
 
 def load_awareness(*, warn_prefix: str = "[policy]") -> Dict[str, Any]:
@@ -92,13 +138,20 @@ def evaluate_audio_sink(
     `effect` is pinned to "audio" for the same reason. A caller that could
     declare its own effect could declare its way out of the gate, and the
     verdict would then be decided by the least trustworthy party in the chain.
+
+    A session the sink could not read suppresses rather than proceeds. The
+    sink is the last boundary before the speaker, so it is the worst possible
+    place to guess: there is nothing downstream to catch a wrong guess, and the
+    thing a wrong guess produces is an utterance during a meltdown or at 3am.
     """
+    session = load_session_for_policy(warn_prefix=warn_prefix)
     return policy.evaluate(
         action,
         params or {},
         effect="audio",
         origin="interactive",
-        session=load_session_for_policy(),
+        session=session.data,
+        session_available=session.available,
         awareness=load_awareness(warn_prefix=warn_prefix),
         now=time.time(),
     )

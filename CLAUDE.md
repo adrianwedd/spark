@@ -380,10 +380,35 @@ dry test of a speaking route asserts behaviour the robot will not show.
 
 `src/pxh/policy_context.py` is the **only** loader of the session/awareness/clock
 facts `policy.evaluate()` refuses to read for itself; the dispatcher and the sink
-both go through it so the two cannot drift. Both reads fail *open* (a contended
-session lock or an unreadable `awareness.json` yields `{}`), which is only
-defensible because night silence needs just a clock and quiet mode is re-checked
-upstream.
+both go through it so the two cannot drift. **Its two reads have opposite failure
+postures, and that is the point.**
+
+- **Session — fails closed.** `load_session_for_policy()` returns a
+  `SessionRead(data, available)`, never a bare dict, and `policy.evaluate()`'s
+  rule 0 suppresses audio when `available` is false. A `{}` cannot carry both
+  "no quiet flag set" and "no idea": quiet mode is the dysregulation protocol,
+  so resolving the second into the first grants permission to speak during a
+  meltdown on the strength of a failed file read. The earlier fail-open posture
+  argued a contended lock would otherwise mute SPARK under load; it bought no
+  such thing, since `tool-voice` calls `update_session()` on that same lock a
+  few lines later and dies there — pre-fix, contention produced an utterance
+  *and* a traceback. The `except` in the loader is deliberately broad because
+  failing closed cannot permit anything; every failure prints to stderr.
+- **Awareness — fails open.** An unreadable snapshot yields `{}` and the
+  on-call/hot-mic rule goes inactive, rather than muting SPARK for as long as
+  px-mind is down. `awareness.json` is written by a daemon that is routinely
+  down; the session is written by whatever is running. Quiet mode and night
+  silence read nothing from this file.
+
+Both dispatchers still fail open on their own session read (`voice_loop.py` and
+`mind.py` catch `FileLockTimeout` into `{}` — they do not use this loader for the
+session). That is now backstopped rather than load-bearing: every audio action
+they dispatch funnels through the sink, which re-reads and fails closed.
+
+Pinned by `test_direct_tool_voice_is_silent_while_the_session_lock_is_held` and
+`test_direct_tool_voice_is_silent_when_the_session_cannot_be_read`, which assert
+against a canary player script on disk rather than against tool-voice's own
+JSON — a sink that speaks and then crashes prints no self-report at all.
 
 Night-window bounds come from `spark_config.night_silence_bounds()`, which
 honours `PX_NIGHT_SILENCE_START_H`/`_END_H`. That seam is load-bearing for the
