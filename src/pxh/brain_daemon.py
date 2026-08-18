@@ -166,7 +166,8 @@ def ensure_journal() -> None:
         pass
 
 
-def start_session(state: SessionState) -> bool:
+def start_session(state: SessionState,
+                  now_local: datetime | None = None) -> bool:
     """Bring one session up and attach its holder. Idempotent per tick."""
     spec = brain.spec_for_session(state.name)
     brain.ensure_mailbox(state.name)
@@ -187,6 +188,13 @@ def start_session(state: SessionState) -> bool:
         swept = brain.sweep_pending(state.name)
         brain.clear_validation_marker(state.name)
         state.turns = 0
+        # Creating a session IS a context reset, so record it as today's. An
+        # empty `last_recycle_day` made every session born after
+        # NIGHTLY_RECYCLE_HOUR instantly "nightly due": it spent its first turn
+        # on a journal+/clear with nothing to write, and the busy pane starved
+        # the handshake that a create is supposed to be followed by.
+        local = now_local or datetime.now(HOBART)
+        state.last_recycle_day = local.strftime("%Y-%m-%d")
         _log("session_created", session=state.name, swept=swept)
         if swept:
             # A sweep means requests were in flight when the session died.
@@ -639,7 +647,7 @@ def tick(states: dict[str, SessionState]) -> None:
     live: list[SessionState] = []
     for state in states.values():
         try:
-            if not start_session(state):
+            if not start_session(state, now_local):
                 continue
             count_turns(state)
             check_wedge(state, now)

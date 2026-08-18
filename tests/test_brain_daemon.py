@@ -352,6 +352,30 @@ def test_the_nightly_recycle_happens_once_a_day(fake_tmux):
     assert len(fake_tmux.injected) == 2, "a new day gets a new recycle"
 
 
+def test_a_freshly_created_session_is_not_immediately_nightly_recycled(fake_tmux):
+    """Creating a session IS a context reset, so it is not also due for one.
+
+    `last_recycle_day` started empty on a new session, so any session created
+    after NIGHTLY_RECYCLE_HOUR was instantly "nightly due" with turns=0 and an
+    empty context. Its very first turn was spent on a journal+/clear it had
+    nothing to write, and the busy pane starved the handshake that follows a
+    create — leaving the session stuck at `no_marker` and every caller falling
+    back. Observed live: a session created at 12:00 Hobart recycled in the same
+    second it was born.
+    """
+    from datetime import datetime
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    noon = datetime(2026, 8, 18, 12, 0, tzinfo=brain_daemon.HOBART)
+
+    assert brain_daemon.start_session(state, noon) is True
+
+    brain_daemon.maybe_recycle(state, noon)
+    assert fake_tmux.injected == [], \
+        f"a session born clear was recycled anyway: {fake_tmux.injected}"
+
+
 def test_a_busy_brain_delays_the_nightly_recycle_rather_than_preempting(fake_tmux):
     """Overnight research and compose are allowed to run past the window. The
     recycle waits for idle; it never interrupts work someone is waiting on."""
