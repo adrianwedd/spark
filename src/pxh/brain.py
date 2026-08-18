@@ -88,9 +88,24 @@ TOOL_BRAIN_REPLY_ALLOW = f"Bash({TOOL_BRAIN_REPLY}:*)"
 # load balancing: `io` kinds carry text SPARK did not write — a social post
 # being QA'd, a stranger's message to the public chat endpoint — and that text
 # reaches a session holding exactly one tool, from a scratch cwd, with no
-# repository access. Anything absent from this map runs on the privileged
-# brain, so adding a kind that handles untrusted input means adding it HERE.
+# repository access.
 _IO_KINDS = frozenset({"post_qa", "public_chat", "obi_chat"})
+
+# Kinds whose payload SPARK itself wrote or assembled, and which therefore run
+# on the privileged session — SPARK's tools, at the repo root.
+#
+# **Both lists are explicit, and a kind in neither is not privileged.** This
+# used to be `IO if kind in _IO_KINDS else BRAIN`, which made "I forgot to
+# classify it" and "I decided it is trusted" the same act. That is backwards:
+# the person adding a kind that chews text from strangers is exactly the person
+# who will forget, and the mistake pointed the wrong way. Now an unclassified
+# kind cannot reach the privileged session by any path, and `ask_brain` refuses
+# it outright rather than quietly serving it from the sandbox — a silent
+# downgrade would let the omission ship unnoticed.
+_BRAIN_KINDS = frozenset({
+    "reflection", "research", "compose", "blog",
+    "consolidate", "self_debug", "evolve",
+})
 
 # Per-kind wall-clock deadline. These bound one turn; the per-type cooldowns and
 # daily cap in claude_session.py still sit in front of ask_brain and bound how
@@ -177,8 +192,22 @@ def _log(event: str, **fields: Any) -> None:
         pass
 
 
+def is_classified_kind(kind: str) -> bool:
+    """Has someone actually decided how far this kind is trusted?"""
+    return kind in _IO_KINDS or kind in _BRAIN_KINDS
+
+
 def session_for_kind(kind: str) -> str:
-    return IO_SESSION if kind in _IO_KINDS else BRAIN_SESSION
+    """Route a kind to its session, defaulting to the LEAST privileged one.
+
+    `ask_brain` refuses unclassified kinds before it gets here, so the fallback
+    is defence in depth rather than a working path — but it is the answer this
+    function must give, because a future caller that skips ask_brain must not
+    be handed the privileged session by omission.
+    """
+    if kind in _BRAIN_KINDS:
+        return BRAIN_SESSION
+    return IO_SESSION
 
 
 def deadline_for_kind(kind: str) -> int:
@@ -608,6 +637,14 @@ def ask_brain(
     back", and every caller must have a fallback; there is deliberately no
     exception path.
     """
+    if not is_classified_kind(kind):
+        # Before the mailbox, before the lock, before any injection: an
+        # unclassified kind is a bug in the caller, and every caller has a
+        # fallback for None. Serving it from the io session instead would work
+        # well enough that nobody would ever notice the omission.
+        _log("brain_unavailable", kind=kind, reason="unclassified kind")
+        return None
+
     session = session_for_kind(kind)
     if timeout_s is None:
         timeout_s = float(deadline_for_kind(kind))

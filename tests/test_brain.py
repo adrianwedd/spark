@@ -216,6 +216,68 @@ def test_untrusted_kinds_route_to_the_io_session():
         assert brain.session_for_kind(kind) == brain.BRAIN_SESSION, kind
 
 
+def test_an_unclassified_kind_can_never_reach_the_privileged_session():
+    """The default must be the SAFE direction, not the convenient one.
+
+    Routing used to be `IO if kind in _IO_KINDS else BRAIN` — so anything not
+    explicitly named as untrusted landed on the session holding SPARK's tools,
+    at the repo root. That makes forgetting to classify a new kind the
+    dangerous mistake, which is exactly backwards: the person adding a kind
+    that chews text from strangers is the person most likely to forget.
+
+    Typos, near-misses and case differences are the realistic shape of this —
+    they are not *unknown* to a human reading the diff, only to the frozenset.
+    """
+    invented = (
+        "obi_chat_v2",         # a plausible next kind, handling stranger text
+        "public_chat ",        # a stray space
+        "POST_QA",             # wrong case
+        "webhook",             # something nobody has thought of yet
+        "",                    # a caller that forgot to pass one
+        "../evolve",           # a kind built from untrusted input
+    )
+    for kind in invented:
+        assert brain.session_for_kind(kind) != brain.BRAIN_SESSION, (
+            f"unclassified kind {kind!r} routed to the privileged session")
+
+
+def test_every_kind_with_a_deadline_is_explicitly_classified():
+    """A kind real enough to have a deadline is real enough to classify.
+
+    This is the structural half: it fails when someone adds a kind to
+    _DEADLINE_S and to nothing else, which is the moment the omission is
+    cheap to fix rather than after it has shipped.
+    """
+    unclassified = [k for k in brain._DEADLINE_S
+                    if k not in brain._IO_KINDS and k not in brain._BRAIN_KINDS]
+    assert unclassified == [], (
+        f"kinds with a deadline but no trust classification: {unclassified}")
+
+
+def test_ask_brain_refuses_an_unclassified_kind_outright(_live_pane):
+    """Least-privilege routing is the backstop; refusing is the front door.
+
+    Asserting on the *injected pane text* rather than on the return value or
+    the inbox, because both of those pass for the wrong reason: ask_brain
+    returns None for a dozen ordinary causes, and `cleanup_request` unlinks
+    the inbox entry on the way out, so a request that WAS sent leaves the
+    directory looking exactly like one that was refused.
+
+    An injection is the irreversible step — it is text typed into a live
+    Claude — so "nothing was injected" is the only claim worth pinning.
+    """
+    started = time.monotonic()
+    assert brain.ask_brain("a_kind_nobody_declared", {"q": 1},
+                           timeout_s=5) is None
+    elapsed = time.monotonic() - started
+
+    assert [line for line in _live_pane if "NEW REQUEST" in line] == [], (
+        f"an unclassified kind was nudged into a live pane: {_live_pane}")
+    assert elapsed < 2.0, (
+        f"refusal must be immediate, not a {elapsed:.1f}s deadline wait — a "
+        "slow refusal means the request was sent and merely went unanswered")
+
+
 def test_io_session_holds_exactly_one_tool_and_no_repo_access():
     """The io envelope IS the security property — assert it, don't assume it."""
     spec = brain.spec_for_session(brain.IO_SESSION)
