@@ -1262,3 +1262,41 @@ def test_a_deferred_model_change_still_injects_model_when_it_runs(
     assert brain_daemon.run_handshake(_state(session), reason) is True
     assert any(text.startswith("/model") for _, text in fake_tmux.injected), \
         "the retry must carry the /model keystroke the deferred attempt owed"
+
+
+def test_a_dead_sessions_validation_is_dropped_before_the_new_one_boots(
+        fake_tmux, monkeypatch):
+    """Clearing the marker after `ensure_session` returns is ~45s too late.
+
+    `ensure_session` blocks waiting for the prompt glyph, and for that whole
+    window a brand-new Claude — quite possibly still on a trust dialog — is
+    wearing the previous session's `validated` badge. `ask_brain` reads that
+    badge and injects. Observed live: a session recreated at 12:25:29 still
+    read `validated` from a marker stamped 12:06:50, and only dropped it at
+    12:26:12.
+
+    The marker must be gone before the boot starts, not after it finishes.
+    """
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    brain.write_validation_marker(session, state=brain.VALIDATED,
+                                  request_id="from-the-dead-session",
+                                  model="claude-haiku-4-5-20251001", attempt=1)
+    fake_tmux.sessions.discard(session)
+
+    seen = {}
+    inner = fake_tmux._ensure
+
+    def _watching_ensure(timeout_s=None, spec=None):
+        # Stand-in for the glyph wait: whatever the marker says here is what
+        # every caller sees for the duration of a real session boot.
+        seen["marker"] = brain.read_validation_marker(session)
+        return inner(timeout_s=timeout_s, spec=spec)
+
+    monkeypatch.setattr(tmux_claude, "ensure_session", _watching_ensure)
+
+    assert brain_daemon.start_session(_state(session)) is True
+    assert "marker" in seen, "ensure_session was never called"
+    assert seen["marker"] is None, (
+        "a booting session inherited the dead one's validation: "
+        f"{seen['marker']}")

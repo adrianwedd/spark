@@ -173,6 +173,20 @@ def start_session(state: SessionState,
     brain.ensure_mailbox(state.name)
 
     existed = tmux_claude.session_exists(spec)
+    if not existed:
+        # Drop the dead session's validation BEFORE the new one boots, not
+        # after. `ensure_session` blocks waiting for the prompt glyph — tens of
+        # seconds — and for that whole window `ask_brain` would read a
+        # `validated` marker belonging to a session that no longer exists, and
+        # inject a real request into a Claude that is still starting up or
+        # sitting on a trust dialog. Clearing it here leaves the session at
+        # `no_marker` for the boot, which is what makes callers fall back
+        # instead of typing into it.
+        #
+        # Clearing before a failed `ensure_session` is right too: the session
+        # is gone either way, and nothing should trust its old round trip.
+        brain.clear_validation_marker(state.name)
+
     if not tmux_claude.ensure_session(spec=spec):
         health.record_failure(state.component,
                               tmux_claude.last_error() or "session would not start")
@@ -181,12 +195,9 @@ def start_session(state: SessionState,
         return False
 
     if not existed:
-        # A fresh session inherits nothing: sweep whatever the old one left, and
-        # drop the validation marker so nothing trusts a round trip that a
-        # session which no longer exists once completed. Deleting it leaves the
-        # session at `no_marker`, which is what makes the next tick handshake it.
+        # A fresh session inherits nothing. The validation marker is already
+        # gone (cleared above, before the boot); sweep what the old one left.
         swept = brain.sweep_pending(state.name)
-        brain.clear_validation_marker(state.name)
         state.turns = 0
         # Creating a session IS a context reset, so record it as today's. An
         # empty `last_recycle_day` made every session born after
