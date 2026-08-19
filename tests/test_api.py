@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -1282,6 +1283,41 @@ class TestPublicThoughtsPrivacy:
 
 # -- Race endpoint --
 
+class _RaceSpawns:
+    """What the race workers did while subprocess.Popen was mocked.
+
+    Holds both halves of the containment invariant: the argv lists that
+    reached the mock, and the futures of every worker that could still reach
+    it. See TestRaceEndpoint._mock_popen.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.futures: list[concurrent.futures.Future] = []
+
+    def await_spawn(self) -> list[str]:
+        """Block until a worker reaches the mocked Popen, and return its argv.
+
+        Must be called *inside* the _mock_popen() block — the patch has to
+        still be installed when the pool thread reaches api.py:2049.
+
+        Unbounded in time on purpose. The second exit condition is what keeps
+        it from hanging when a worker dies before the spawn: once every
+        submitted worker is done, none can reach the boundary, so failing the
+        assertion at that point cannot leak a real process launch. An empty
+        futures list satisfies all() and fails immediately, which is correct —
+        no worker was ever submitted.
+        """
+        while not self.calls and not all(f.done() for f in self.futures):
+            time.sleep(0.01)
+        assert self.calls, "Popen was never called by the background thread"
+        return self.calls[0]
+
+    def join(self) -> None:
+        """Block until no submitted worker can reach the spawn boundary."""
+        concurrent.futures.wait(self.futures)
+
+
 class TestRaceEndpoint:
     """Tests for POST /api/v1/race/{action} and related async job plumbing."""
 
@@ -1294,63 +1330,57 @@ class TestRaceEndpoint:
         executor (api.py:2086); the Popen call happens later, on a pool thread.
         A patch scoped to the request alone is therefore uninstalled while the
         job is still pending, so the real bin/px-race gets spawned and any
-        assertion about the command races the scheduler. Exiting this block
-        waits for the spawn first, so the mock outlives the work it mocks.
+        assertion about the command races the scheduler.
 
-        Yields the list of captured argv lists; use _await_spawn to read it.
+        The invariant this enforces, literally:
+
+            While a race worker may still reach the spawn boundary, the real
+            subprocess.Popen must remain unreachable.
+
+        So the exit wait is on the worker's *future*, not on a clock, and not
+        on a proxy for the worker's progress. A bounded wait that gives up
+        would restore the real Popen while the worker is still runnable, which
+        is precisely the escape this helper exists to prevent — a test that
+        becomes dangerous when it fails unusually slowly. If the executor is
+        genuinely wedged, the job dies at the workflow's 20-minute ceiling with
+        the patch still installed, which is the safe direction to fail.
+
+        Waiting on the future also subsumes the _race_starting sentinel: the
+        worker's `finally` always clears it (api.py:2082), so a completed
+        future implies a cleared sentinel, and the next test cannot be handed
+        a spurious 409 by the guard at api.py:1984.
+
+        submit() is patched on the executor instance, test-side; production
+        code is not changed to expose the future.
         """
         from unittest.mock import patch, MagicMock
+        import pxh.api as api_mod
+
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = 0           # already finished
         mock_proc.returncode = 0
         mock_proc.communicate.return_value = (b"done\n", b"")
 
-        captured: list[list[str]] = []
+        spawns = _RaceSpawns()
 
         def fake_popen(cmd, **kwargs):
-            captured.append(cmd)
+            spawns.calls.append(cmd)
             return mock_proc
 
-        with patch("pxh.api.subprocess.Popen", side_effect=fake_popen):
+        real_submit = api_mod._executor.submit
+
+        def tracking_submit(fn, *args, **kwargs):
+            future = real_submit(fn, *args, **kwargs)
+            spawns.futures.append(future)
+            return future
+
+        with patch("pxh.api.subprocess.Popen", side_effect=fake_popen), \
+                patch.object(api_mod._executor, "submit", tracking_submit):
             try:
-                yield captured
+                yield spawns
             finally:
-                # Backstop for callers that assert nothing about the command:
-                # never uninstall the mock while a spawn is still pending.
-                self._drain(captured)
-                self._settle()
-
-    @staticmethod
-    def _drain(captured, timeout: float = 10.0) -> None:
-        deadline = time.monotonic() + timeout
-        while not captured and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-    @staticmethod
-    def _settle(timeout: float = 10.0) -> None:
-        """Wait for the _race_starting sentinel to clear before returning.
-
-        fake_popen records the argv *during* the Popen call, a few instructions
-        before the worker assigns _race_starting = False (api.py:2052). Leaving
-        the block on the capture alone can therefore hand the next test a
-        409 already_running from the guard at api.py:1984.
-        """
-        import pxh.api as api_mod
-        deadline = time.monotonic() + timeout
-        while api_mod._race_starting and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-    @classmethod
-    def _await_spawn(cls, captured, timeout: float = 10.0) -> list[str]:
-        """Block until the executor thread has called the patched Popen.
-
-        Must be called *inside* the _mock_popen() block — the patch has to
-        still be installed when the pool thread reaches api.py:2049.
-        """
-        cls._drain(captured, timeout)
-        assert captured, "Popen was never called by the background thread"
-        return captured[0]
+                spawns.join()
 
     def test_race_requires_auth(self, api_client):
         """POST /api/v1/race/map without auth returns 401."""
@@ -1366,10 +1396,10 @@ class TestRaceEndpoint:
 
     def test_race_map_returns_202(self, api_client, auth_headers):
         """POST /api/v1/race/map with auth returns 202 + job_id."""
-        with self._mock_popen() as captured:
+        with self._mock_popen() as spawns:
             resp = api_client.post("/api/v1/race/map", headers=auth_headers, json={})
             assert resp.status_code == 202
-            self._await_spawn(captured)
+            spawns.await_spawn()
         data = resp.json()
         assert data["status"] == "accepted"
         assert "job_id" in data
@@ -1408,14 +1438,14 @@ class TestRaceEndpoint:
         original_force_dry = api_mod.FORCE_DRY
         api_mod.FORCE_DRY = False
         try:
-            with self._mock_popen() as captured:
+            with self._mock_popen() as spawns:
                 resp = api_client.post(
                     "/api/v1/race/map",
                     headers=auth_headers,
                     json={"dry": True},
                 )
                 assert resp.status_code == 202
-                cmd = self._await_spawn(captured)
+                cmd = spawns.await_spawn()
         finally:
             api_mod.FORCE_DRY = original_force_dry
 
@@ -1423,11 +1453,11 @@ class TestRaceEndpoint:
 
     def test_race_job_poll(self, api_client, auth_headers):
         """After starting a race (mocked), GET /api/v1/jobs/{id} returns job status."""
-        with self._mock_popen() as captured:
+        with self._mock_popen() as spawns:
             resp = api_client.post("/api/v1/race/map", headers=auth_headers, json={})
             assert resp.status_code == 202
             job_id = resp.json()["job_id"]
-            self._await_spawn(captured)
+            spawns.await_spawn()
 
             # Poll until the background thread settles (up to 10s)
             deadline = time.monotonic() + 10.0
@@ -1447,14 +1477,51 @@ class TestRaceEndpoint:
     def test_race_invokes_bin_px_race_for_yield_alive(self, api_client, auth_headers):
         """Issue #145: race must spawn bin/px-race (which calls yield_alive),
         not python -m pxh.race directly."""
-        with self._mock_popen() as captured:
+        with self._mock_popen() as spawns:
             resp = api_client.post(
                 "/api/v1/race/map", headers=auth_headers, json={"dry": True}
             )
             assert resp.status_code == 202
-            cmd = self._await_spawn(captured)
+            cmd = spawns.await_spawn()
         assert cmd[0].endswith("/bin/px-race"), (
             f"Race must launch via bin/px-race for yield_alive; got cmd[0]={cmd[0]}"
+        )
+
+    def test_mock_popen_contains_a_worker_that_spawns_late(self):
+        """A worker that reaches the spawn boundary late must still find the
+        mock there.
+
+        Regression for the helper itself rather than for the endpoint. The
+        previous version gave up after bounded _drain()/_settle() waits and
+        unpatched with the worker still runnable, so a late spawn escaped to
+        the real bin/px-race — a test that was only dangerous when it failed
+        unusually slowly.
+
+        The worker below spawns once immediately and once after a delay. The
+        first spawn satisfies any capture-based wait, so a helper that exits on
+        the capture alone unpatches during the delay and the second spawn finds
+        the real Popen. Proving that costs ~0.4s here rather than the ~20s the
+        old bounded budget would have taken to expire.
+        """
+        import pxh.api as api_mod
+        real_popen = api_mod.subprocess.Popen
+        escaped = []
+
+        def worker():
+            api_mod.subprocess.Popen(["/bin/true"])   # satisfies the capture
+            time.sleep(0.4)
+            if api_mod.subprocess.Popen is real_popen:
+                # Record the escape; never actually launch through it.
+                escaped.append(True)
+            else:
+                api_mod.subprocess.Popen(["/bin/true"])
+
+        with self._mock_popen() as spawns:
+            api_mod._executor.submit(worker)
+
+        assert not escaped, "real subprocess.Popen became reachable mid-job"
+        assert len(spawns.calls) == 2, (
+            f"both spawns should have been contained; got {spawns.calls}"
         )
 
     def test_race_invalid_body_returns_422(self, api_client, auth_headers):
