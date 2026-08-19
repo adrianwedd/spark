@@ -520,6 +520,24 @@ class TestParseTitleBody:
 # _qa_gate() — QA circuit breaker (mirrors bin/px-post's run_qa_gate breaker)
 # ---------------------------------------------------------------------------
 
+from contextlib import contextmanager as _contextmanager
+
+
+@_contextmanager
+def _brain_says(verdict=None, unavailable=False):
+    """Stub the resident io session's answer to a blog post_qa request.
+
+    px-blog's QA gate had no resident path at all before 2026-08-19 — every
+    blog post spawned a fresh Claude to answer one yes/no question. These tests
+    drove that subprocess; they now drive the session that replaced it.
+    """
+    import pxh.brain
+    from unittest.mock import patch as _patch
+    reply = None if unavailable else {"reply": verdict}
+    with _patch.object(pxh.brain, "ask_brain", return_value=reply) as m:
+        yield m
+
+
 def _mock_run_result(stdout="YES", returncode=0, stderr=""):
     """Create a mock subprocess.CompletedProcess."""
     result = MagicMock()
@@ -546,8 +564,7 @@ class TestQaGateBreaker:
         ns, _, _ = blog_mod
         breaker = ns["_qa_breaker"]
         blog_subprocess = ns["subprocess"]
-        with patch.object(blog_subprocess, "run",
-                           side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=30)) as mock_run:
+        with _brain_says(unavailable=True) as mock_run:
             for _ in range(3):
                 assert ns["_qa_gate"]("thought") is None
             assert breaker["failures"] == 3
@@ -565,7 +582,7 @@ class TestQaGateBreaker:
         blog_subprocess = ns["subprocess"]
         breaker["failures"] = 2
 
-        with patch.object(blog_subprocess, "run", return_value=_mock_run_result("YES")):
+        with _brain_says("YES"):
             result = ns["_qa_gate"]("a good blog post")
         assert result == "pass"
         assert breaker["failures"] == 0
@@ -578,7 +595,7 @@ class TestQaGateBreaker:
         breaker["failures"] = 3
         breaker["open_until"] = 0  # already elapsed
 
-        with patch.object(blog_subprocess, "run", return_value=_mock_run_result("YES")) as mock_run:
+        with _brain_says("YES") as mock_run:
             result = ns["_qa_gate"]("thought after cooldown")
         assert mock_run.call_count == 1
         assert result == "pass"
@@ -700,7 +717,7 @@ class TestGenerationFailureCap:
         # subprocess is mocked here, so no live `claude` call is made.
         with patch.dict(os.environ, {"PX_BLOG_QA": "1"}):
             with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
-                with patch.object(blog_subprocess, "run", return_value=_mock_run_result("NO")):
+                with _brain_says("NO"):
                     post = ns["generate_post"]("daily", today, {"posts": []})
 
         assert post is None

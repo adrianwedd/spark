@@ -93,12 +93,14 @@ def test_falls_back_to_claude_when_ollama_returns_empty_response():
             return _fake_ollama_empty_cm()
         raise urllib.error.URLError("skip model-resolution probe")
 
-    with patch("subprocess.run",
-               return_value=_fake_claude(0, stdout='{"thought": "recovered via claude"}')), \
+    import pxh.brain
+    with patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
+         patch.object(pxh.brain, "ask_brain",
+                      return_value={"reply": {"thought": "recovered via claude"}}), \
          patch("urllib.request.urlopen", side_effect=urlopen_side):
         result = call_llm("prompt", "system", persona="spark")
 
-    assert "error" not in result
+    assert "error" not in result, result
     assert "recovered via claude" in result["response"]
 
 
@@ -167,15 +169,18 @@ def test_result_is_labelled_with_the_tier_that_served():
     assert result["backend"] == "ollama-m5"
 
 
-def test_claude_fallback_is_labelled_claude():
-    """M5 down, SPARK falls through to Claude — the expensive tier must be
-    identifiable, since this is the unbudgeted path."""
+def test_claude_tier_is_labelled_claude():
+    """M5 down, SPARK falls through to the resident brain — still labelled
+    `claude`, because the tier is still Claude; what changed is that it is a
+    session already running rather than a process started for this thought."""
+    import pxh.brain
     with patch("urllib.request.urlopen",
                side_effect=urllib.error.URLError("M5 unreachable")), \
-         patch("subprocess.run",
-               return_value=_fake_claude(0, stdout='{"thought": "hi", "mood": "curious"}')):
+         patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
+         patch.object(pxh.brain, "ask_brain",
+                      return_value={"reply": {"thought": "hi", "mood": "curious"}}):
         result = call_llm("prompt", "system", persona="spark")
-    assert "error" not in result
+    assert "error" not in result, result
     assert result["backend"] == "claude"
 
 

@@ -219,55 +219,57 @@ class TestRunSession:
                 cs.run_claude_session("research", "test prompt")
 
     def test_successful_session_logged(self, tmp_path):
+        """Logging is on the resident path now, and still has to happen.
+
+        This used to drive the legacy subprocess by pinning PX_BRAIN_KINDS="".
+        That off position no longer selects a slower path — it selects no path
+        at all — so the test drives the session that actually runs.
+        """
         sd = _make_state_dir(tmp_path)
         import pxh.claude_session as cs
-        mock_result = MagicMock()
-        mock_result.stdout = "test output"
-        mock_result.stderr = ""
-        mock_result.returncode = 0
+        import pxh.brain
 
-        # This test is about the legacy subprocess path, which "research" no
-        # longer takes by default — pin the routing off so it keeps testing
-        # what it was written to test rather than silently testing nothing.
-        with patch.dict(os.environ, {"PX_BRAIN_KINDS": ""}), \
-             patch.object(cs, "check_budget", return_value=None), \
-             patch("subprocess.run", return_value=mock_result), \
+        def _boom(*a, **k):
+            raise AssertionError("cold-started Claude")
+
+        with patch.object(cs, "check_budget", return_value=None), \
+             patch("subprocess.run", side_effect=_boom), \
+             patch.object(pxh.brain, "ask_brain",
+                          return_value={"reply": "test output"}), \
              patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
              patch.object(cs, "STATE_DIR", sd):
             result = cs.run_claude_session("research", "test prompt", timeout=10)
             assert result.stdout == "test output"
             assert result.returncode == 0
-            assert "haiku" in result.model_used
 
-            # Verify log was written
             log_file = sd / "claude_sessions.jsonl"
             assert log_file.exists()
             entry = json.loads(log_file.read_text().strip())
             assert entry["type"] == "research"
             assert entry["outcome"] == "success"
 
-    def test_claude_env_vars_stripped(self, tmp_path):
+    def test_no_session_type_spawns_a_process(self, tmp_path):
+        """Replaces test_claude_env_vars_stripped.
+
+        That test checked CLAUDECODE and CLAUDE_CODE_* were scrubbed from the
+        environment handed to a nested `claude -p`. There is no nested process
+        now, so there is no environment to scrub — the guarantee it was
+        approximating is simply that nothing is spawned, for any kind, routed
+        or not.
+        """
         sd = _make_state_dir(tmp_path)
         import pxh.claude_session as cs
-        captured_env = {}
 
-        def mock_run(cmd, **kwargs):
-            captured_env.update(kwargs.get("env", {}))
-            m = MagicMock()
-            m.stdout = ""
-            m.stderr = ""
-            m.returncode = 0
-            return m
+        def _boom(*a, **k):
+            raise AssertionError("cold-started Claude")
 
         with patch.object(cs, "check_budget", return_value=None), \
-             patch("subprocess.run", side_effect=mock_run), \
+             patch("subprocess.run", side_effect=_boom), \
              patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
              patch.object(cs, "STATE_DIR", sd), \
-             patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_FOO": "bar",
-                                     "PX_BRAIN_KINDS": ""}):
-            cs.run_claude_session("research", "test prompt", timeout=10)
-            assert "CLAUDECODE" not in captured_env
-            assert "CLAUDE_CODE_FOO" not in captured_env
+             patch.dict(os.environ, {"CLAUDECODE": "1", "PX_BRAIN_KINDS": ""}):
+            with pytest.raises(cs.ColdStartForbidden):
+                cs.run_claude_session("research", "test prompt", timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -525,21 +527,24 @@ def test_consolidate_quota_one_per_day(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_default_routed_types_are_the_ones_watched_in_production():
-    """The `claude -p` retirement, as far as it has actually been run.
+    """Every kind that can run resident, does.
 
-    Phase 1 was research, compose and post QA. Phase 2 added reflection, which
-    is the hot one — px-mind's tier 2, every 5 minutes — and which reads this
-    same dial from mind.call_claude rather than keeping its own.
-
-    This is a pin on the rollout, not on a preference: widening it is a
-    deliberate act, and a kind that appears here without anyone deciding to
-    move it is the failure worth catching.
+    This was a rollout pin while unlisted kinds "still took the old path".
+    There is no old path: a kind absent from this set has no backend and
+    raises. So the failure worth catching has inverted — it is no longer a
+    kind appearing here without a decision, it is a kind *missing* from here
+    and therefore disabled by accident.
     """
     from pxh import claude_session as cs
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("PX_BRAIN_KINDS", None)
         kinds = cs.brain_kinds()
-    assert kinds == {"research", "compose", "post_qa", "reflection"}
+    assert kinds == {"research", "compose", "post_qa", "reflection",
+                     "blog", "consolidate", "self_debug"}
+    # evolve is absent on purpose: it needs a git worktree, and a resident
+    # session's tool envelope is fixed at launch. Absent now means *disabled*,
+    # not "takes the old path" — there is no old path.
+    assert "evolve" not in kinds
 
 
 def test_reflection_has_no_cold_rollback_dial():
@@ -555,7 +560,7 @@ def test_reflection_has_no_cold_rollback_dial():
 
 
 def test_brain_kinds_is_read_at_call_time_not_import_time():
-    """The rollout has to be widenable — and rollback-able — without a restart."""
+    """Read at call time, so routing can be widened without a restart.\n\n    Narrowing it now *disables* a kind rather than rolling it back to a cold\n    path, so an empty dial means no backend at all — see\n    test_no_session_type_spawns_a_process."""
     from pxh import claude_session as cs
     with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,compose,blog"}):
         assert "blog" in cs._brain_kinds()

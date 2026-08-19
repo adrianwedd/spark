@@ -290,15 +290,19 @@ def test_reflection_dry_thought_contains_dry_run_marker(mind_state):
 
 
 @patch.dict(os.environ, {"PX_CLAUDE_BIN": "/usr/bin/claude"})
-def test_call_claude_logs_stdout_on_failure():
-    """When Claude exits non-zero with empty stderr, error includes stdout."""
-    from pxh.mind import call_claude_haiku
+def test_a_brain_error_is_carried_into_the_result():
+    """Replaces test_call_claude_logs_stdout_on_failure.
 
-    mock_result = MagicMock()
-    mock_result.returncode = 1
-    mock_result.stdout = "API rate limit exceeded"
-    mock_result.stderr = ""
+    That test pinned how `call_claude_haiku` surfaced a non-zero exit from a
+    `claude -p` subprocess. The subprocess is gone, but the property it cared
+    about is not: whatever went wrong has to reach the caller as an error
+    rather than as a silent empty thought.
+    """
+    from pxh import mind
+    import pxh.brain
 
-    with patch.object(pxh.mind.subprocess, "run", return_value=mock_result):
-        result = call_claude_haiku("test prompt", "test system")
-        assert "rate limit" in result.get("error", "").lower()
+    with patch.object(pxh.brain, "ask_brain", return_value=None):
+        result = mind.call_claude("test prompt", "test system")
+
+    assert "error" in result
+    assert result.get(mind.BRAIN_DEFER) is True
