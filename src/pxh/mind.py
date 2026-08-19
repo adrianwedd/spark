@@ -2359,20 +2359,19 @@ def _extract_thought_json(text: str) -> str | None:
     return None
 
 
-def _reflection_via_brain_enabled() -> bool:
-    """One dial, read at call time — see claude_session.brain_kinds()."""
-    try:
-        from pxh.claude_session import brain_kinds
-    except Exception:
-        return False
-    return "reflection" in brain_kinds()
+# `_reflection_via_brain_enabled()` lived here. It was a rollout dial whose off
+# position routed reflection back to `claude -p`. That destination is gone, so
+# the dial's only remaining function would be to silently disable reflection
+# while looking like a routing choice — a lever that does something other than
+# what its name says. PX_BRAIN_KINDS still gates the kinds that genuinely have
+# a second path; reflection is not one of them any more.
 
 
 def call_brain_reflection(prompt: str, system: str) -> dict:
     """Ask the resident Claude session for a thought.
 
     Returns the same {"response": ...} / {"error": ...} shape as
-    call_claude_haiku, so it drops into the tier chain unchanged.
+    call_brain_reflection, so it drops into the tier chain unchanged.
 
     `ask_brain` never raises and returns None for every failure — no session,
     an unvalidated one, a busy lock, a missed deadline. All of those mean the
@@ -2419,83 +2418,52 @@ def call_brain_reflection(prompt: str, system: str) -> dict:
     return {"error": "no thought JSON in brain reply"}
 
 
+# Marker on a reflection result meaning "the resident brain could not be
+# reached". Callers must treat it as a full stop, not as a cue to try the next
+# tier: a reflection is optional work, and the failure mode this replaces was
+# optional work responding to contention by adding load.
+BRAIN_DEFER = "brain_defer"
+
+
 def call_claude(prompt: str, system: str) -> dict:
-    """Reflection's Claude tier: resident session first, `claude -p` behind it.
+    """Reflection's Claude tier. Resident session, and nothing behind it.
 
-    Both are Claude and both are billed, so this is not a cost decision — it is
-    a latency and context one. A subprocess starts cold every time and knows
-    nothing of the last thought; the resident session answers from warm context
-    and is metered by ask_brain, which is the accounting tier 2 never had.
+    There used to be a `claude -p` subprocess under this, justified in a comment
+    that read: "Both are Claude and both are billed, so this is not a cost
+    decision — it is a latency and context one." That sentence was false. The
+    resident sessions run under the Max subscription; a spawned `claude -p` is
+    metered API usage, so the fallback billed money to make SPARK slower.
+
+    It was also the wrong shape. On 2026-08-19 a 5-second tmux *delivery*
+    timeout under load was reported as "brain unavailable"; this function
+    spawned a second Claude on a 4-core Pi already oversubscribed by the voice
+    turn's own Claude; the two starved each other; the 120s timeout tripped;
+    and the ladder continued into M5 and Ollama Cloud. The brain was healthy and
+    idle throughout. A rescue path that costs more than the thing it rescues
+    does not degrade — it amplifies.
+
+    So: resident brain, or defer. Reflection is the most skippable work SPARK
+    does. Failing to have a thought costs nothing.
     """
-    if _reflection_via_brain_enabled():
-        result = call_brain_reflection(prompt, system)
-        if "error" not in result:
-            return result
-        try:
-            log(f"brain reflection failed ({result['error']}), falling back to claude -p")
-        except Exception:
-            pass
-    return call_claude_haiku(prompt, system)
-
-
-def call_claude_haiku(prompt: str, system: str) -> dict:
-    """Call Claude via subprocess (`claude -p`). Simple, reliable, no tmux overhead."""
-    import shutil
-
-    claude_bin = os.environ.get("PX_CLAUDE_BIN") or shutil.which("claude")
-    if not claude_bin:
-        import glob
-        candidates = glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/claude"))
-        claude_bin = candidates[0] if candidates else None
-    if not claude_bin:
-        return {"error": "claude binary not found"}
-
-    full_prompt = f"[System: {system}]\n\n{prompt}\n\nOutput ONLY the JSON object."
-
-    # Strip Claude Code env vars to allow nested invocation
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("CLAUDE_CODE")
-           and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")}
-
-    try:
-        result = subprocess.run(
-            [claude_bin, "-p", full_prompt,
-             "--model", CLAUDE_MODEL,
-             "--no-session-persistence",
-             "--output-format", "text",
-             "--allowedTools", ""],
-            capture_output=True, text=True, timeout=120,
-            env=env, cwd=str(STATE_DIR / "spark-reflect"),
-        )
-    except subprocess.TimeoutExpired:
-        return {"error": "claude subprocess timeout (120s)"}
-    except Exception as exc:
-        return {"error": f"claude subprocess failed: {exc}"}
-
-    if result.returncode != 0:
-        stderr = (result.stderr or "")[-200:]
-        stdout = (result.stdout or "")[-200:]
-        detail = stderr or stdout  # prefer stderr, fall back to stdout
-        return {"error": f"claude exit {result.returncode}: {detail}"}
-
-    # Extract JSON from stdout (may contain preamble text before the JSON)
-    stdout = result.stdout.strip()
-    if not stdout:
-        return {"error": "claude returned empty output"}
-
-    found = _extract_thought_json(stdout)
-    if found is not None:
-        return {"response": found}
-    return {"error": f"no thought JSON in claude output ({len(stdout)}B)"}
+    result = call_brain_reflection(prompt, system)
+    if "error" not in result:
+        return result
+    return {"error": result["error"], BRAIN_DEFER: True}
 
 
 def call_llm(prompt: str, system: str, persona: str = "") -> dict:
     """Four-tier LLM fallback.
 
     Tier 1 — Ollama M5 (LAN):         primary for all personas incl. SPARK (when reachable)
-    Tier 2 — Claude Haiku (internet): SPARK fallback when M5 unreachable, or MIND_BACKEND=claude
-    Tier 3 — Ollama Cloud (internet): fallback when M5 unreachable and Claude fails
-    Tier 4 — Ollama localhost (Pi):   final fallback when all else fails
+    Tier 2 — resident spark-brain:    SPARK fallback when M5 unreachable, or MIND_BACKEND=claude
+    Tier 3 — Ollama Cloud (internet): reached only when M5 fails and no brain tier ran
+    Tier 4 — Ollama localhost (Pi):   final fallback, opt-in
+
+    **A resident-brain failure is terminal, not a tier boundary.** Tier 2
+    returning an error means the session could not be reached; tiers 3 and 4 are
+    not attempted, because a reflection is optional and the correct response to
+    a loaded Pi is less work, not a wider search. Only an M5 failure walks the
+    chain. See call_claude and CLAUDE.md's resident-only invariant.
     """
     spark_auto = MIND_BACKEND == "auto" and persona == "spark"
 
@@ -2528,7 +2496,11 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                     pass
                 claude_result["backend"] = "claude"
                 return claude_result
-            log(f"claude failed ({claude_result['error']}), falling back to ollama cloud")
+            # Stop. Reaching Ollama Cloud from here would answer "the resident
+            # session was slow to accept a keystroke" by opening an internet
+            # request from an already-loaded Pi.
+            log(f"resident brain unavailable ({claude_result['error']}), deferring reflection")
+            return claude_result
     else:
         # MIND_BACKEND=claude: Claude is primary
         try:
@@ -2546,15 +2518,13 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
                 pass
             result["backend"] = "claude"
             return result
-        log(f"claude failed ({result['error']}), falling back to ollama")
-        result = call_ollama(prompt, system)
-        if "error" not in result:
-            try:
-                _log_token_usage(prompt + system, result.get("response", ""), "ollama-m5")
-            except Exception:
-                pass
-            result["backend"] = "ollama-m5"
-            return result
+        # MIND_BACKEND=claude means the resident brain *is* the backend. If it
+        # cannot be reached the answer is to skip this thought and back off, not
+        # to go looking for a different model. Escalating here is what turned
+        # one slow keystroke into two Claude processes, an M5 timeout and a 403
+        # from Ollama Cloud — while a child waited on a different code path.
+        log(f"resident brain unavailable ({result['error']}), deferring reflection")
+        return result
 
     # Tier 3: Ollama Cloud (internet fallback)
     if OLLAMA_CLOUD_KEY:

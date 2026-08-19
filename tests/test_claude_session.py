@@ -542,15 +542,16 @@ def test_default_routed_types_are_the_ones_watched_in_production():
     assert kinds == {"research", "compose", "post_qa", "reflection"}
 
 
-def test_reflection_reads_the_same_dial_as_everything_else():
-    """One switch. Two that can disagree is how a rollback half-happens."""
-    from pxh import claude_session as cs
+def test_reflection_has_no_cold_rollback_dial():
+    """The dial's off position used to mean `claude -p`. It has no meaning now.
+
+    `mind._reflection_via_brain_enabled()` was removed with the cold path it
+    selected. Had it stayed, narrowing PX_BRAIN_KINDS would silently disable
+    reflection while still reading like a routing choice — a lever that does
+    something other than what its name says.
+    """
     from pxh import mind
-    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research"}):
-        assert "reflection" not in cs.brain_kinds()
-        assert mind._reflection_via_brain_enabled() is False
-    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,reflection"}):
-        assert mind._reflection_via_brain_enabled() is True
+    assert not hasattr(mind, "_reflection_via_brain_enabled")
 
 
 def test_brain_kinds_is_read_at_call_time_not_import_time():
