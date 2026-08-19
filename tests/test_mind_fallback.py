@@ -279,17 +279,22 @@ def test_reflection_failure_does_not_reach_ollama_cloud():
     """
     import pxh.brain
 
-    with patch("urllib.request.urlopen",
-               side_effect=urllib.error.URLError("M5 down")) as urlopen, \
+    seen_urls = []
+
+    def _record(req, *a, **kw):
+        seen_urls.append(req.full_url if hasattr(req, "full_url") else str(req))
+        raise urllib.error.URLError("M5 down")
+
+    with patch("urllib.request.urlopen", side_effect=_record), \
          patch.object(pxh.brain, "ask_brain", return_value=None), \
          patch("subprocess.run", side_effect=AssertionError("spawned a process")):
         result = call_llm("prompt", "system", persona="spark")
 
-    # At most the M5 attempt that legitimately precedes the brain tier — and
-    # never a second one, which is what Ollama Cloud would be. Asserting `== 1`
-    # would be wrong: M5's own offline backoff can skip the network entirely,
-    # so the pinned fact is the ceiling, not the exact count.
-    assert urlopen.call_count <= 1, "a cloud tier was attempted after the brain failed"
+    # Assert on *where* the requests went, not how many there were: M5 may do a
+    # model-resolution probe before generating, and its own offline backoff may
+    # skip the network entirely, so any count is a hostage to unrelated state.
+    # What must hold is that nothing reached the cloud after the brain failed.
+    assert not [u for u in seen_urls if "ollama.com" in u], seen_urls
     assert result.get(pxh.mind.BRAIN_DEFER) is True, "the brain tier did not stop the chain"
 
 
