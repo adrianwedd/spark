@@ -52,6 +52,14 @@ from pxh.mic_stream import (                          # noqa: E402
     resolve_arecord_device as _resolve_arecord_device,
 )
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore  # noqa: E402
+from pxh import wake_grant                                  # noqa: E402
+
+# How long a wake conversation stays audible without a turn. Refreshed by each
+# turn of the conversation the wake word opened, capped by
+# wake_grant.MAX_CONVERSATION_S, and closed when the conversation ends. Long
+# enough to cover an LLM round trip plus TTS, short enough that a stray
+# detection does not leave the gate ajar.
+WAKE_GRANT_TTL_S = 180.0
 
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
@@ -919,7 +927,8 @@ def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
 
 def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
                              stream, model, aplay_device: str, max_turns: int,
-                             voice_cmd: str, stt=None, whisper=None, sensevoice=None) -> None:
+                             voice_cmd: str, stt=None, whisper=None, sensevoice=None,
+                             grant_id: str | None = None) -> None:
     """Run a multi-turn conversation using Claude voice loop with a persona prompt.
 
     Uses the full Claude tool-calling pipeline but with an alternate system
@@ -956,6 +965,8 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             log(f"persona {persona_name} turn {turn}/{max_turns}: {current_text!r}")
 
             env["PX_TEXT"] = current_text
+            if grant_id:
+                wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
             result = subprocess.run(
                 [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
             )
@@ -989,6 +1000,8 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             if _END_PHRASE_RE.search(follow_text.lower()):
                 log("persona conversation: end phrase — final turn")
                 env["PX_TEXT"] = follow_text
+                if grant_id:
+                    wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
                 subprocess.run(
                     [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
                 )
@@ -1002,8 +1015,15 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
 
 
 def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
-                     stream, model, aplay_device: str, max_turns: int, stt=None, whisper=None, sensevoice=None) -> None:
-    """Run a multi-turn conversation. Blocks wake detection for its duration."""
+                     stream, model, aplay_device: str, max_turns: int, stt=None, whisper=None, sensevoice=None,
+                     grant_id: str | None = None) -> None:
+    """Run a multi-turn conversation. Blocks wake detection for its duration.
+
+    Each turn refreshes the wake grant so SPARK stays audible for as long as
+    the conversation is actually going, and no longer. Refreshing is scoped to
+    this conversation's id, so a detection elsewhere cannot prolong it and this
+    one cannot outlive wake_grant.MAX_CONVERSATION_S however chatty the room.
+    """
     if not initial_text:
         log("empty transcript — skipping")
         return
@@ -1019,6 +1039,8 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
     try:
         for turn in range(1, max_turns + 1):
             log(f"conversation turn {turn}/{max_turns}: {current_text!r}")
+            if grant_id:
+                wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
             result = subprocess.run(
                 [voice_cmd, "--max-turns", "3"],
                 input=current_text,
@@ -1062,6 +1084,8 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
             # Check for end-of-conversation phrases
             if _END_PHRASE_RE.search(follow_text.lower()):
                 log("conversation: end phrase — one final turn")
+                if grant_id:
+                    wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
                 subprocess.run(
                     [voice_cmd, "--max-turns", "3"],
                     input=follow_text,
@@ -1159,6 +1183,18 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
 
                 if any(p in text for p in all_wake_phrases if p != "[unk]") and len(text.strip().split()) >= 2:
                     log(f"wake word detected: {text!r}")
+                    # A deliberate summons opens the audible-reply window. This
+                    # is the only place a grant is ever originated: policy.py
+                    # will let an interactive reply through night silence,
+                    # quiet mode and on-call suppression while it is live, so
+                    # the thing that opens it has to be an actual detection and
+                    # nothing else. Opened here rather than after transcription
+                    # because the window has to cover recording and the LLM
+                    # round trip, which is most of its length.
+                    grant_id = wake_grant.open_grant(ttl_s=WAKE_GRANT_TTL_S)
+                    if grant_id is None:
+                        log("wake grant unavailable — reply stays subject to "
+                            "night/quiet suppression")
                     # Pre-enable speaker amp so it's warm before chime audio arrives
                     enable_speaker_amp()
                     # Chime in background while we start recording
@@ -1231,13 +1267,27 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                             routed_persona, text_out, args.dry_run,
                             stream, model, args.aplay_device, args.convo_turns,
                             args.voice_cmd, stt, whisper, sensevoice,
+                            grant_id=grant_id,
                         )
                     else:
                         # --- Standard Claude conversation ---
                         run_conversation(
                             text_out, args.voice_cmd, args.dry_run,
                             stream, model, args.aplay_device, args.convo_turns, stt, whisper, sensevoice,
+                            grant_id=grant_id,
                         )
+
+                    # The conversation is over, so the window closes now
+                    # rather than idling out — inactivity should mean silence
+                    # immediately, not silence in three minutes. Reached on
+                    # every ordinary path including an empty transcript, since
+                    # both conversation helpers return rather than raise. The
+                    # crash path is covered by systemd instead: the unit's
+                    # RuntimeDirectory is removed when it stops, taking any
+                    # orphaned grant with it, and the boot id would invalidate
+                    # one that somehow outlived even that.
+                    if grant_id:
+                        wake_grant.close_grant(grant_id)
 
                     # Stop periodic heartbeat beep now that conversation is done
                     _beep_stop.set()

@@ -7,6 +7,10 @@ not: quiet mode, night silence, and on-call/hot-mic suppression have to hold
 even when a persona prompt has fully replaced the SPARK system prompt (see
 voice_loop.py's persona swap, which does not supplement — it replaces).
 
+A wake grant (pxh.wake_grant) narrows those rules rather than punching through
+them: they continue to bind everything SPARK says on his own initiative, and
+stop binding only an audible reply to a person who just summoned him by name.
+
 This module is the chokepoint. Both dispatchers classify their own action
 vocabulary into an Effect and call evaluate() before dispatch; policy.py never
 enumerates tool or action names itself, so a new audio-producing tool only has
@@ -62,6 +66,7 @@ def evaluate(
     awareness: dict,
     now: float,
     session_available: bool = True,
+    wake_grant: bool = False,
     _depth: int = 0,
 ) -> PolicyVerdict:
     """Decide whether an action may proceed. Returns a verdict; never executes.
@@ -77,6 +82,16 @@ def evaluate(
     exists to answer, in the permissive direction, without any evidence. The
     default is True because a caller holding a session dict it actually read
     has nothing to declare.
+
+    `wake_grant` says a human deliberately summoned SPARK and the conversation
+    that opened is still live — see pxh.wake_grant. It is a capability over one
+    narrow thing, an audible interactive reply, and the rule below is written
+    so that it cannot become anything else: it is consulted only after the
+    effect has already been established as audio and only for the interactive
+    origin, so outside that intersection the verdict with a grant is the same
+    verdict as without one. Callers never assert it from their own arguments or
+    from the environment; both chokepoints load the fact independently through
+    policy_context.wake_grant_active().
 
     On a blocked verdict with suggest_presence_substitute, the caller picks a
     presence-safe action from its own vocabulary and re-evaluates *that* action
@@ -112,6 +127,26 @@ def evaluate(
     # stops being checkable.
     if not session_available:
         return _block("session_unavailable")
+
+    # Rule 0.5 — a direct summons. Deliberately *after* rule 0 and *before*
+    # rules 1-3, and that ordering is the whole design:
+    #
+    # After rule 0, because rule 0 is about evidence rather than state. A grant
+    # says someone spoke to SPARK; it is not evidence that the dysregulation
+    # protocol is off, and a caller that cannot read the session still has no
+    # basis for the claim that proceeding would assert. Being summoned does not
+    # make an unknown known.
+    #
+    # Before rules 1-3, because those three suppress SPARK *initiating* audio —
+    # at night, during a meltdown, over a call — and none of them was ever
+    # meant to leave him unable to answer someone who addressed him directly.
+    #
+    # Interactive only, so a reflection at 3am gains nothing from a
+    # conversation happening in the room. And nothing here writes: quiet mode
+    # stays set, this turn speaks through it, and quiet behaviour resumes by
+    # itself the moment the window closes. bin/tool-quiet is still the one exit.
+    if wake_grant and origin == "interactive":
+        return PolicyVerdict(allowed=True, reason="wake_grant")
 
     # Rule 1 — quiet mode / dysregulation protocol. Both origins: an active
     # meltdown does not care who initiated the turn.

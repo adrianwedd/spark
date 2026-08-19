@@ -456,6 +456,14 @@ BLACKLIST_FILES = {
     # "src/pxh/") must not silently unprotect them.
     "src/pxh/policy.py",
     "tests/test_policy_invariants.py",
+    # The wake grant is the one input that can *unblock* audio, so the module
+    # that mints and validates it, and the module both chokepoints load it
+    # through, are protected on the same footing as the rules themselves.
+    # Neither is in WHITELIST_PATTERNS today; they are named here anyway for
+    # the reason given above — a future broader pattern must not silently
+    # hand SPARK the ability to write himself a permanent 3am grant.
+    "src/pxh/wake_grant.py",
+    "src/pxh/policy_context.py",
 }
 
 BLACKLIST_PATTERNS = [
