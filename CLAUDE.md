@@ -29,9 +29,12 @@ sudo .venv/bin/python -m pytest tests/test_tools_live.py -v -s  # live hardware 
 **CI runs `pytest -m "not live"` on every PR** (`.github/workflows/tests.yml`,
 Python 3.11 to match Bookworm). Prefer it over a full local run: this repo is
 checked out on SPARK itself, so a local suite competes with the running robot
-for a memory envelope that is already tight (#218, #219) and, until #221 lands,
-writes production-shaped records into the live logs. Targeted local runs
-(`-k`, a single file) are fine; the `live` tests can only run here.
+for a memory envelope that is already tight (#218, #219). Since #221 the suite
+no longer writes production-shaped records into the live logs — `LOG_DIR` and
+the tmux socket are isolated per test — but CI remains the gate regardless: a
+suite that only ever runs in one environment cannot distinguish "my code is
+correct" from "my machine is the code". See `docs/testing.md`. Targeted local
+runs (`-k`, a single file) are fine; the `live` tests can only run here.
 
 Test deps that the robot does not need live in `requirements-dev.txt`.
 
