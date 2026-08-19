@@ -1,4 +1,6 @@
 import json
+import os
+import pwd
 import subprocess
 import sys
 from pathlib import Path
@@ -80,7 +82,7 @@ def test_tool_voice_dry_run(isolated_project):
     assert payload["dry"] is True
 
 
-def test_tool_voice_lock_timeout(isolated_project):
+def test_tool_voice_lock_timeout(isolated_project, tmp_path):
     """PX_VOICE_LOCK_TIMEOUT lets callers fail fast when voice.lock is held."""
     from filelock import FileLock
 
@@ -88,6 +90,16 @@ def test_tool_voice_lock_timeout(isolated_project):
     env["PX_DRY"] = "0"  # non-dry so the lock path is exercised
     env["PX_TEXT"] = "Lock contention test"
     env["PX_VOICE_LOCK_TIMEOUT"] = "1"
+    # A stand-in speaker, same idiom as test_policy_invariants.py:220. Without
+    # a player tool-voice takes the `not DEFAULT_PLAYER` branch at
+    # bin/tool-voice:229, never enters `with VOICE_LOCK`, and reports ok — so
+    # this test asserted lock contention only on a host that happens to have
+    # espeak installed. The lock is acquired before playback, so the stub is
+    # never actually run; it only has to exist.
+    player = tmp_path / "stub-player"
+    player.write_text("#!/usr/bin/env bash\nexit 0\n")
+    player.chmod(0o755)
+    env["PX_VOICE_PLAYER"] = str(player)
 
     log_dir = env.get("LOG_DIR", str(PROJECT_ROOT / "logs"))
     lock_path = str(Path(log_dir) / "voice.lock")
@@ -1551,4 +1563,9 @@ def test_tool_wander_sudo_env_carries_home(isolated_project, tmp_path):
     run_tool(["bin/tool-wander"], env)
 
     argv = recorded.read_text().splitlines()
-    assert "HOME=/home/pi" in argv, f"HOME not threaded into sudo env: {argv}"
+    # The invoking uid's home, not the literal /home/pi. bin/tool-wander:81
+    # reads it from pwd.getpwuid(os.getuid()) precisely so a clobbered $HOME
+    # cannot reintroduce the bug; asserting the literal pinned this robot's
+    # value instead of the code's property, and could only ever pass here.
+    expected = f"HOME={pwd.getpwuid(os.getuid()).pw_dir}"
+    assert expected in argv, f"{expected} not threaded into sudo env: {argv}"
