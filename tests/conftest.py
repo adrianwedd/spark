@@ -120,6 +120,47 @@ def _isolate_session(tmp_path, monkeypatch, request):
     monkeypatch.setenv("PX_SESSION_PATH", str(session_path))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_observability(tmp_path, monkeypatch, request):
+    """Keep test logs out of logs/ and test supervisors off the live socket.
+
+    The fifth instance of the hazard, and the one #221 turned up. The 43
+    duplicated `start` records in logs/tool-brain-daemon.log were not two
+    supervisors — they were pytest, writing production-shaped records into the
+    production log. Logs are state: a test that writes production-shaped logs
+    can falsify later forensics even if it never touches production state.
+
+    Sets LOG_DIR *and* PX_BRAIN_TMUX_SOCKET, and the pairing is the point. The
+    supervisor guard is keyed to the socket
+    (brain_daemon.supervisor_lock_path), so a synthetic socket implies a
+    synthetic guard by construction: a test cannot acquire a namespace without
+    also acquiring the guard that belongs to it. Under the old checkout-
+    relative key the reverse held — relocating the mailbox silently disabled
+    the guard — which is how the defect stayed invisible.
+
+    Bypassing the production guard is now explicit: a test that wants the real
+    socket must be marked `live`.
+
+    Set via monkeypatch.setenv at setup, so a test that owns either variable
+    itself still wins — its own setenv runs after this one. Pinned by
+    test_a_test_that_sets_its_own_log_dir_still_wins.
+
+    Escape hatch: tests marked `live` exercise the real machine and keep the
+    real log dir and socket, same as _isolate_session — isolating those would
+    have them assert against a fiction.
+    """
+    if request.node.get_closest_marker("live"):
+        return
+    # Deliberately does not create either directory. tmp_path is shared with
+    # every other fixture in the test, and `isolated_project` mkdir()s
+    # tmp_path/"logs" with the default exist_ok=False — creating it here made
+    # 360 tests die in setup with FileExistsError. log_event already does
+    # parent.mkdir(parents=True, exist_ok=True), and acquire_supervisor_lock
+    # _ensure_dir()s the socket's parent, so setting the variables is enough.
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "tmux" / "px-mind"))
+
+
 @pytest.fixture
 def isolated_project(tmp_path):
     """Creates an isolated project directory for testing."""

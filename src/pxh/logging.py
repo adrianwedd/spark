@@ -42,6 +42,16 @@ def _resolve_log_dir() -> Path:
         candidate = PROJECT_ROOT / candidate
     return candidate
 
+def log_dir() -> Path:
+    """The log directory, resolved at call time.
+
+    LOG_DIR below is bound at import, and log_event read that module global —
+    so the documented LOG_DIR override could never take effect in-process. It
+    remains as a module attribute for back-compat; new code calls this.
+    """
+    return _resolve_log_dir()
+
+
 LOG_DIR = _resolve_log_dir()
 
 
@@ -50,8 +60,9 @@ _LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per log file
 
 def log_event(name: str, payload: Mapping[str, Any]) -> None:
     """Append a structured log entry under logs/tool-<name>.log."""
-    log_path = LOG_DIR / f"tool-{name}.log"
-    lock_path = str(LOG_DIR / f"tool-{name}.log") + ".rotlock"
+    base = log_dir()
+    log_path = base / f"tool-{name}.log"
+    lock_path = str(log_path) + ".rotlock"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "ts": utc_timestamp(),
