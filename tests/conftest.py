@@ -151,12 +151,14 @@ def _isolate_observability(tmp_path, monkeypatch, request):
     """
     if request.node.get_closest_marker("live"):
         return
-    log_dir = tmp_path / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    socket_dir = tmp_path / "tmux"
-    socket_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("LOG_DIR", str(log_dir))
-    monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(socket_dir / "px-mind"))
+    # Deliberately does not create either directory. tmp_path is shared with
+    # every other fixture in the test, and `isolated_project` mkdir()s
+    # tmp_path/"logs" with the default exist_ok=False — creating it here made
+    # 360 tests die in setup with FileExistsError. log_event already does
+    # parent.mkdir(parents=True, exist_ok=True), and acquire_supervisor_lock
+    # _ensure_dir()s the socket's parent, so setting the variables is enough.
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "tmux" / "px-mind"))
 
 
 @pytest.fixture
