@@ -42,24 +42,26 @@ def _no_subprocess(monkeypatch):
     monkeypatch.setattr(voice_loop.subprocess, "Popen", _boom)
 
 
-def _stub_brain(monkeypatch, replies, delay=0.0):
-    """Install a fake pxh.brain whose ask_brain yields `replies` in order."""
+def _stub_brain(monkeypatch, replies, delay=0.0, deadline=45):
+    """Patch ask_brain on the real module, rather than swapping the module.
+
+    `run_voice_turn` does `from pxh import brain`, which reads the attribute off
+    the already-imported package — so replacing `sys.modules["pxh.brain"]` only
+    works if nothing has imported it yet. Under the full suite something always
+    has, and the stub is silently ignored while the test still passes for the
+    wrong reason. Patching the attributes is order-independent.
+    """
+    import pxh.brain
     calls = []
 
-    class _FakeBrain:
-        @staticmethod
-        def deadline_for_kind(kind):
-            return 45
+    def _ask(kind, payload, **kw):
+        calls.append((kind, payload))
+        if delay:
+            time.sleep(delay)
+        return replies[min(len(calls) - 1, len(replies) - 1)]
 
-        @staticmethod
-        def ask_brain(kind, payload, **kw):
-            calls.append((kind, payload))
-            if delay:
-                time.sleep(delay)
-            return replies[min(len(calls) - 1, len(replies) - 1)]
-
-    import sys
-    monkeypatch.setitem(sys.modules, "pxh.brain", _FakeBrain)
+    monkeypatch.setattr(pxh.brain, "ask_brain", _ask)
+    monkeypatch.setattr(pxh.brain, "deadline_for_kind", lambda kind: deadline)
     return calls
 
 
@@ -123,11 +125,7 @@ def test_slow_failure_does_not_retry(monkeypatch):
     Bounded by classified failure, not by sleeping — and never by raising the
     deadline, which would only make the child wait longer for the same answer.
     """
-    monkeypatch.setattr(voice_loop, "VOICE_TURN_KIND", "voice_turn")
-    calls = _stub_brain(monkeypatch, [None], delay=0.05)
-
-    import sys
-    sys.modules["pxh.brain"].deadline_for_kind = staticmethod(lambda k: 0.08)
+    calls = _stub_brain(monkeypatch, [None], delay=0.06, deadline=0.08)
 
     rc, _, _ = voice_loop.run_voice_turn("p", attempts=2)
     assert rc == voice_loop.VOICE_BRAIN_UNAVAILABLE
@@ -135,17 +133,13 @@ def test_slow_failure_does_not_retry(monkeypatch):
 
 
 def test_a_raising_brain_does_not_escalate(monkeypatch):
-    class _Raiser:
-        @staticmethod
-        def deadline_for_kind(kind):
-            return 45
+    import pxh.brain
 
-        @staticmethod
-        def ask_brain(*a, **k):
-            raise RuntimeError("tmux socket gone")
+    def _raise(*a, **k):
+        raise RuntimeError("tmux socket gone")
 
-    import sys
-    monkeypatch.setitem(sys.modules, "pxh.brain", _Raiser)
+    monkeypatch.setattr(pxh.brain, "ask_brain", _raise)
+    monkeypatch.setattr(pxh.brain, "deadline_for_kind", lambda kind: 45)
     rc, _, stderr = voice_loop.run_voice_turn("p")
     assert rc == voice_loop.VOICE_BRAIN_UNAVAILABLE
     assert "raised" in stderr

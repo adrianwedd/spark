@@ -275,6 +275,54 @@ def test_tool_describe_scene_dry_run(isolated_project):
     assert payload["status"] == "ok"
     assert payload["dry"] is True
     assert len(payload["description"]) > 0
+    # Undeclared caller (voice loop / MCP) defaults to interactive — the only
+    # other caller, wander's novelty escalation, always declares itself.
+    assert payload["origin"] == "interactive"
+
+
+def test_tool_describe_scene_records_declared_provenance(isolated_project):
+    """A caller (wander) that declares origin/reason/task_id gets them echoed
+    back into the payload/log, not silently dropped — this is the audit trail
+    the vision-invocation policy depends on."""
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_VISION_ORIGIN"] = "autonomous"
+    env["PX_VISION_REASON"] = "unexplained object at 30cm — no Frigate label"
+    env["PX_VISION_TASK_ID"] = "e-20260820-000000"
+    stdout = run_tool(["bin/tool-describe-scene"], env)
+    payload = parse_json(stdout)
+    assert payload["origin"] == "autonomous"
+    assert payload["reason"] == "unexplained object at 30cm — no Frigate label"
+    assert payload["task_id"] == "e-20260820-000000"
+
+
+def test_tool_describe_scene_origin_label_does_not_grant_autonomous_authority(isolated_project):
+    """PX_VISION_ORIGIN is provenance, not permission. Authority for an
+    autonomous vision call lives entirely in wander's own gate
+    (_vision_trigger + cooldown + _check_daily_vision_cap), which runs
+    in-process, before tool-describe-scene is ever invoked, against
+    exploration_meta.json. Declaring origin=autonomous on an otherwise
+    interactive call must not touch that file or change anything about the
+    call besides the label — the tool must never be able to grant itself
+    autonomous status just by reading its own environment."""
+    state_dir = isolated_project["state_dir"]
+    meta_path = state_dir / "exploration_meta.json"
+
+    env_interactive = isolated_project["env"].copy()
+    env_interactive["PX_DRY"] = "1"
+    payload_interactive = parse_json(run_tool(["bin/tool-describe-scene"], env_interactive))
+    assert not meta_path.exists()
+
+    env_autonomous = isolated_project["env"].copy()
+    env_autonomous["PX_DRY"] = "1"
+    env_autonomous["PX_VISION_ORIGIN"] = "autonomous"
+    payload_autonomous = parse_json(run_tool(["bin/tool-describe-scene"], env_autonomous))
+    assert not meta_path.exists()
+
+    assert payload_interactive["origin"] == "interactive"
+    assert payload_autonomous["origin"] == "autonomous"
+    for key in ("status", "dry", "description"):
+        assert payload_interactive[key] == payload_autonomous[key]
 
 
 def test_tool_describe_scene_rejects_another_gpio_owner(isolated_project):

@@ -1191,9 +1191,7 @@ class TestPublicChat:
         with unittest.mock.patch.object(_sp, "run", _boom), \
              unittest.mock.patch.object(_sp, "Popen", _boom), \
              unittest.mock.patch.object(_brain, "ask_brain_async", _fake_ask):
-            reply = asyncio.get_event_loop().run_until_complete(
-                _api._call_claude_public("hi there")
-            )
+            reply = asyncio.run(_api._call_claude_public("hi there"))
         assert reply == "hello from the io session"
 
     def test_public_chat_unavailable_raises_rather_than_falling_back(self):
@@ -1207,9 +1205,7 @@ class TestPublicChat:
 
         with unittest.mock.patch.object(_brain, "ask_brain_async", _unavailable):
             with pytest.raises(RuntimeError, match="unavailable"):
-                asyncio.get_event_loop().run_until_complete(
-                    _api._call_claude_public("hi")
-                )
+                asyncio.run(_api._call_claude_public("hi"))
 
     def test_rate_limit_returns_429(self, api_client):
         """After exhausting the per-IP rate limit, further requests get 429."""
@@ -1771,8 +1767,9 @@ def test_obi_chat_prompt_includes_projects_summary(monkeypatch, isolated_project
     isolated_project["state_dir"].joinpath("evolve_queue.jsonl").write_text(
         json.dumps({"id":"a","intent":"joke tool","status":"building","requester":"obi","ts":"t"}) + "\n")
     captured = {}
-    async def _cap(prompt, system_prompt=None):
+    async def _cap(prompt, system_prompt=None, kind="public_chat"):
         captured["prompt"] = prompt
+        captured["kind"] = kind
         return '{"reply":"building it!","evolve_action":"none","evolve_intent":null}'
     monkeypatch.setattr(_api, "_call_claude_public", _cap)
     from fastapi.testclient import TestClient
@@ -1780,3 +1777,6 @@ def test_obi_chat_prompt_includes_projects_summary(monkeypatch, isolated_project
         c.post("/api/v1/obi-chat", json={"message":"is my joke tool ready?"},
                headers={"Authorization":"Bearer testtoken"})
     assert "joke tool" in captured["prompt"] and "building" in captured["prompt"]
+    # Obi's chat goes to the io session's own kind, not the public one: the
+    # two carry different system prompts and different deadlines.
+    assert captured["kind"] == "obi_chat"

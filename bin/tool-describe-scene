@@ -19,6 +19,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from pxh.brain import BRAIN_SESSION, configured_model
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.logging import log_event
 from pxh.state import update_session
@@ -113,6 +114,15 @@ def run_tool(path: Path, extra_env: dict) -> tuple[int, dict]:
 def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
 
+    # Provenance: every Claude vision call must record why it happened and
+    # whether a human was waiting on it, not just that it happened. A caller
+    # that sets nothing is the on-demand path (voice loop / MCP) asking "what
+    # do you see" directly — the only other caller, wander's novelty
+    # escalation, always sets these explicitly.
+    vision_origin  = os.environ.get("PX_VISION_ORIGIN", "interactive")
+    vision_reason  = os.environ.get("PX_VISION_REASON", "")
+    vision_task_id = os.environ.get("PX_VISION_TASK_ID") or None
+
     if dry_mode:
         description = "A dry-run scene with a robot on a table."
         payload = {
@@ -120,6 +130,11 @@ def main() -> int:
             "path": None,
             "description": description,
             "dry": True,
+            "origin": vision_origin,
+            "reason": vision_reason,
+            "task_id": vision_task_id,
+            "backend": None,
+            "model": None,
         }
         log_event("describe_scene", payload)
         update_session(
@@ -227,6 +242,11 @@ def main() -> int:
             "description": description,
             "source": source,
             "dry": False,
+            "origin": vision_origin,
+            "reason": vision_reason,
+            "task_id": vision_task_id,
+            "backend": BRAIN_SESSION,
+            "model": configured_model(BRAIN_SESSION),
         }
         log_event("describe_scene", payload)
         update_session(

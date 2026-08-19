@@ -149,6 +149,8 @@ Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not ref
 
 **Vision timeouts are a strict ordering, not three independent numbers:** `wander.DESCRIBE_SCENE_TIMEOUT` (150s) must outlive `tool-describe-scene`'s whole run — its 45s Claude call plus photo capture plus its **bounded** 60s tool-voice step. `tool-voice` blocks indefinitely when another process holds the audio device, so that bound is what stops wander killing the tool mid-run. The relationship is pinned by `test_describe_scene_timeout_has_margin_over_claude`, which reads the tool's real constant rather than a literal.
 
+**Claude vision is a sparse semantic escalation, not routine perception.** Frigate labels and sonar are the continuous local perception layer and are trusted on their own — a label Frigate can already name is already information, and uploading a photo so Claude can redescribe "person" or "chair" buys nothing. Autonomous wander therefore never calls Claude vision unless `PX_WANDER_VISION_ENABLED=1` (off by default, and deliberately an env var rather than a `spark_config.py` constant — that file is px-evolve's whitelisted target, and self-evolution must not be able to propose turning autonomous vision back on). Even enabled, the only trigger left is `wander._vision_trigger`'s novelty escalation: sonar under `NOVELTY_SONAR_CM` (40cm) with **no** Frigate label at all — genuine local ambiguity, not proximity or a new label Frigate already explained — budgeted far tighter than routine perception (`NOVELTY_VISION_COOLDOWN_S`=300s, `NOVELTY_VISION_DAILY_CAP`=5/day, vs. the old eager 30s/50-day figures). Interactive `tool_describe_scene` ("what do you see") is unaffected and always available on demand. Every call — interactive or autonomous — records `origin`, `reason`, `task_id`, `backend` and `model` in `logs/tool-describe_scene.log` via `PX_VISION_ORIGIN`/`PX_VISION_REASON`/`PX_VISION_TASK_ID`, so the call graph is a `grep`/`jq` away rather than reconstructed from memory.
+
 ### Cognitive Loop (px-mind)
 
 ```bash
@@ -260,7 +262,9 @@ Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<
 
 `evolve` is **disabled**, not cold-started: it needs a git worktree and a resident session's tool envelope is fixed at launch. `px-evolve` raises `ColdStartForbidden` until the brain can hold a worktree — a deliberate outage rather than an exemption.
 
-`src/pxh/vision.py` (`describe_scene`) is the one open decision. Neither resident session can read an image today: `spark-brain` holds `tool-brain-reply`/`tool-voice`/`tool-remember`/`tool-look`, `spark-io` holds only the first, and neither has `Read`. Vision demonstrably still works (a real description at 2026-08-17T04:47:19Z), so disabling it is a genuine loss of function, and widening the privileged session's envelope is a security decision that should be taken deliberately rather than as a side effect of this migration. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
+`describe_scene` runs on `spark-brain` and reads the photo with **Claude Code's own `Read` tool**. No shim, no image-model backend, no subprocess. The payload carries one absolute path under `photos/`; the image is never inlined.
+
+**`Read` materially broadens spark-brain, and the broadening is wider than the use.** That session's cwd is the repo root, so `Read` reaches `.env`, `state/` and `~/.claude` credentials. Before it, the session could only *write*, through four named tools, and could read nothing at all. The grant is unscoped because a `Read(<glob>)` rule that fails to match does not fail closed — it raises a permission dialog into a pane nobody is attached to answer, wedging the session until the deadline. The narrowing is therefore enforced in code (`vision._within_photos`) and in the system prompt, and the envelope is pinned exactly by `tests/test_brain_envelope.py` so any future widening is a deliberate edit against a failing test. **spark-io does not get `Read`** — that trust boundary is unchanged. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
 
 **`bin/tool-describe-scene` may be a bug fix, not just a migration.** `bin/tool-wander:64` runs `px-wander` under `sudo -n`, and `wander._call_describe_scene` passes that environment straight down — so the tool's `claude -p` runs **as root**, with root's `HOME`. If root has no Claude credentials there, vision silently returns `FALLBACK_DESCRIPTION` on every real wander and nothing logs a credential error. The sudo chain is verified in the code; **the credential failure itself has not been confirmed on the robot** — check before claiming it fixed. Under the brain the root process only drops a JSON file and the authenticated `claude` runs as `pi`, which sidesteps it either way.
 
@@ -499,6 +503,7 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 | `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
 | `PX_MIND_BACKEND` | `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` |
 | `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (off by default — OOM risk) |
+| `PX_WANDER_VISION_ENABLED` | `1` = allow autonomous wander to escalate to Claude vision on genuine local ambiguity (off by default — see Wander below) |
 | `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |
 | `PX_CLAUDE_MODEL_*` | Per-session-type model overrides (e.g. `PX_CLAUDE_MODEL_EVOLVE`) |
 | `PX_EVOLVE_DRY` | `1` = skip worktree/PR (queue entry still written with `dry: true`) |

@@ -65,11 +65,41 @@ fi
 # string from the same repo root; tests/test_brain.py pins the two together.
 TOOL_BRAIN_REPLY="$PROJECT_ROOT/bin/tool-brain-reply"
 
+# ── Read, and what granting it actually costs ─────────────────────────────
+#
+# `Read` is here so the `describe_scene` kind can look at a photo SPARK just
+# took. Claude Code reads images natively; the alternative was a shim that
+# pretended to be an image model, which would be a fake capability built to
+# avoid using a real one.
+#
+# **This materially broadens spark-brain's authority, and the broadening is
+# wider than the use.** This session's cwd is the repository root, so `Read`
+# lets it read any file the `pi` user can — including `.env`, `state/`, and
+# `~/.claude` credentials. Before this line the session could only *write*
+# through four named tools and could not read anything at all.
+#
+# The grant is unscoped because a `Read(<glob>)` rule that fails to match does
+# not fail closed — it raises a permission dialog in a pane nobody is attached
+# to answer, which wedges the session until the request deadline expires. That
+# is the same failure the absolute-path comment above describes for Bash rules.
+# An unverified narrowing would therefore trade a real capability for an
+# intermittent hang. If the rule syntax is confirmed against this Claude Code
+# version, narrow this to the photos directory and tighten the test below;
+# until then the scope is pinned by intent, not by the CLI:
+#
+#   * `describe_scene` payloads carry one absolute path under $PROJECT_ROOT/photos
+#   * the system prompt tells the session to read that path and nothing else
+#   * tests/test_brain_envelope.py pins this list exactly, so any future
+#     widening is a deliberate edit against a failing test rather than a drift
+#
+# spark-io does NOT get this. It handles text from strangers, holds one tool,
+# and runs outside the repo; that boundary is unchanged.
 DEFAULT_TOOLS=(
     "Bash($TOOL_BRAIN_REPLY:*)"
     "Bash($PROJECT_ROOT/bin/tool-voice:*)"
     "Bash($PROJECT_ROOT/bin/tool-remember:*)"
     "Bash($PROJECT_ROOT/bin/tool-look:*)"
+    "Read"
 )
 if [[ -n "${PX_CLAUDE_ALLOWED_TOOLS:-}" ]]; then
     # Space-separated, one "Bash(...)" pattern per entry.

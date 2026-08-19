@@ -116,6 +116,11 @@ _BRAIN_KINDS = frozenset({
     # speech on his own schedule, so the privileged session — and like the
     # others here, answered by returning an action rather than performing one.
     "cron_say",
+    # Looking at a photo SPARK just took. The privileged session, because this
+    # is the one kind that needs Claude Code's Read tool — see the envelope note
+    # in bin/px-claude-session. The payload carries an absolute path under
+    # photos/ and nothing else; the image itself is never inlined.
+    "describe_scene",
 })
 
 # Per-kind wall-clock deadline. These bound one turn; the per-type cooldowns and
@@ -132,6 +137,11 @@ _DEADLINE_S: dict[str, int] = {
     # Nobody is waiting on a cron line. It can afford to queue behind a real
     # conversation, and if it misses this slot there are four more today.
     "cron_say": 90,
+    # Matches vision.CLAUDE_TIMEOUT, which sits inside wander's outer
+    # DESCRIBE_SCENE_TIMEOUT budget (pinned by tests/test_wander.py). A resident
+    # session should beat the cold path it replaces — that was measured at 22s
+    # warm and >45s cold — so this is headroom, not a target.
+    "describe_scene": 60,
     "reflection": 120,
     "research": 300,
     "compose": 300,

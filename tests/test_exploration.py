@@ -112,30 +112,101 @@ def test_exploration_log_trim_atomic(wander, tmp_path):
     assert len(lines) == 100
 
 
-# -- Curiosity triggers and caps --
+# -- Vision escalation: off by default, novelty-only, tightly budgeted --
 
-def test_curiosity_trigger_rate_limit(wander):
-    assert wander["PHOTO_COOLDOWN_S"] == 30
+def test_wander_vision_disabled_by_default(wander):
+    # Fixture never sets PX_WANDER_VISION_ENABLED — the off-by-default case.
+    assert wander["WANDER_VISION_ENABLED"] is False
 
 
 def test_curiosity_trigger_vision_failure_no_rate_limit(wander):
     assert wander["VISION_FAIL_MAX"] == 3
 
 
+def test_novelty_vision_budget_is_much_tighter_than_the_old_eager_one(wander):
+    # Old routine-perception budget was 30s / 50-a-day; novelty escalation
+    # must be rarer, not just relabeled.
+    assert wander["NOVELTY_VISION_COOLDOWN_S"] == 300
+    assert wander["NOVELTY_VISION_DAILY_CAP"] == 5
+
+
 def test_daily_vision_cap(wander, tmp_path):
     check = wander["_check_daily_vision_cap"]
     inc = wander["_increment_vision_count"]
-    meta = {"daily_vision_date": dt.date.today().isoformat(), "daily_vision_calls": 49}
+    meta = {"daily_vision_date": dt.date.today().isoformat(), "daily_vision_calls": 4}
     assert check(meta) is True
     meta = inc(meta)
-    assert meta["daily_vision_calls"] == 50
+    assert meta["daily_vision_calls"] == 5
     assert check(meta) is False
 
 
-def test_curiosity_trigger_new_frigate_label(wander):
-    seen = {"person"}
-    new_labels = {"cat", "person"} - seen
-    assert new_labels == {"cat"}
+def test_vision_trigger_never_fires_when_disabled(wander):
+    # PX_WANDER_VISION_ENABLED is unset in this fixture, so no combination of
+    # local evidence — however close, however unexplained — may escalate.
+    # This is the "autonomous wander can run indefinitely without invoking
+    # Claude vision" guarantee, exercised at the decision-function level
+    # rather than by driving the real hardware loop.
+    trigger = wander["_vision_trigger"]
+    sonar_readings = [0.0, 5.0, 10.0, 39.9, 40.0, 41.0, 100.0, 500.0, None]
+    label_sets = [[], ["person"], ["dog", "cat"], ["chair"]]
+    for _ in range(500):
+        for sonar_cm in sonar_readings:
+            for labels in label_sets:
+                should_escalate, reason = trigger(labels, sonar_cm)
+                assert should_escalate is False
+                assert reason == ""
+
+
+@pytest.fixture
+def wander_vision_enabled(tmp_path):
+    old_env = {}
+    patch = {
+        "PX_STATE_DIR": str(tmp_path),
+        "PROJECT_ROOT": str(PROJECT_ROOT),
+        "LOG_DIR": str(tmp_path / "logs"),
+        "PX_DRY": "1",
+        "PX_WANDER_VISION_ENABLED": "1",
+    }
+    for k, v in patch.items():
+        old_env[k] = os.environ.get(k)
+        os.environ[k] = v
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    try:
+        globs = _load_wander_helpers()
+        globs["STATE_DIR"] = tmp_path
+        yield globs
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_vision_trigger_fires_only_on_unexplained_proximity_when_enabled(wander_vision_enabled):
+    trigger = wander_vision_enabled["_vision_trigger"]
+
+    # The one genuine ambiguity: close AND Frigate has nothing to say.
+    should_escalate, reason = trigger([], 39.0)
+    assert should_escalate is True
+    assert "39" in reason
+
+    # Proximity Frigate already explains is not ambiguous — no escalation.
+    should_escalate, _ = trigger(["chair"], 20.0)
+    assert should_escalate is False
+
+    # A new/any Frigate label alone, sonar far away, is not escalated either
+    # — Frigate's own label is already the information.
+    should_escalate, _ = trigger(["person"], 200.0)
+    assert should_escalate is False
+
+    # Right at/over the threshold does not escalate (strict less-than).
+    should_escalate, _ = trigger([], 40.0)
+    assert should_escalate is False
+
+    # No sonar reading at all — nothing to be ambiguous about.
+    should_escalate, _ = trigger([], None)
+    assert should_escalate is False
 
 
 # -- State files and sonar --

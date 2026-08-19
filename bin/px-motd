@@ -191,6 +191,13 @@ def _svc_status(name: str) -> tuple[bool, str]:
         return False, ""
 
 
+# tmux servers we know about. px-mind runs SPARK's brain/io sessions on a
+# dedicated socket so they survive independently of user sessions; that also
+# means a bare `tmux attach` will never find them.
+PI_DEFAULT_SOCKET = "/tmp/tmux-1000/default"
+PI_PXMIND_SOCKET  = "/tmp/tmux-1000/px-mind"
+
+
 def _tmux_sessions() -> list[dict]:
     """PAM runs as root — explicitly target pi's tmux sockets.
 
@@ -198,10 +205,8 @@ def _tmux_sessions() -> list[dict]:
     px-mind uses a dedicated socket (-L px-mind → /tmp/tmux-1000/px-mind)
     to isolate its tmux server from user sessions.
     """
-    PI_DEFAULT = "/tmp/tmux-1000/default"
-    PI_PXMIND  = "/tmp/tmux-1000/px-mind"
     sessions = []
-    for socket_path in (PI_DEFAULT, PI_PXMIND):
+    for socket_path in (PI_DEFAULT_SOCKET, PI_PXMIND_SOCKET):
         try:
             cmd = ["tmux", "-S", socket_path, "list-sessions", "-F",
                    "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}"]
@@ -216,6 +221,12 @@ def _tmux_sessions() -> list[dict]:
                         "windows": int(parts[1]),
                         "attached": int(parts[2]) > 0,
                         "created": int(parts[3]),
+                        # Which server this session lives on. Without it the
+                        # banner prints a bare `tmux attach`, which hits the
+                        # default socket and reports "no server running" for
+                        # anything on px-mind — indistinguishable from a dead
+                        # supervisor.
+                        "socket": socket_path,
                     })
         except Exception:
             continue
@@ -462,10 +473,14 @@ def section_connectivity() -> list[str]:
 
 def section_tmux() -> list[str]:
     SESSION_INFO = {
-        "px-claude":  "SPARK reflection — monitor only",
-        "picar-x":    "voice + wake + logs",
+        "spark-brain": "SPARK's mind — live, watch only",
+        "spark-io":    "untrusted-text session — live, watch only",
+        "px-claude":   "SPARK reflection — monitor only",
+        "picar-x":     "voice + wake + logs",
     }
     OWNED = {"px-claude"}
+    # Attach to these with -r. They are supervised Claude sessions, not shells.
+    READ_ONLY = {"spark-brain", "spark-io"}
 
     sessions = _tmux_sessions()
     if not sessions:
@@ -478,14 +493,28 @@ def section_tmux() -> list[str]:
         age = _age_str(datetime.fromtimestamp(s["created"], tz=timezone.utc).isoformat())
         desc = SESSION_INFO.get(name, "")
         desc_str = f" {DIM}— {desc}{RESET}" if desc else ""
+        sock = s.get("socket", PI_DEFAULT_SOCKET)
+        sock_flag = "" if sock == PI_DEFAULT_SOCKET else f" -S {sock}"
         if name in OWNED:
             cmd = f"tail -f logs/{name}.log"
+        elif name in READ_ONLY:
+            # -r attaches read-only. These panes are SPARK's live Claude
+            # sessions: a stray "/exit" typed into one terminates the session
+            # and the supervisor has to respawn it from scratch.
+            cmd = f"tmux{sock_flag} attach -t {name} -r"
         else:
-            cmd = f"tmux attach -t {name}"
+            cmd = f"tmux{sock_flag} attach -t {name}"
         out.append(f"  {DIM}tmux{RESET}    {CYAN}❯{RESET} {BOLD}{name}{RESET}{attached}{desc_str}  {DIM}{age}{RESET}")
         out.append(f"          {CYAN}{cmd}{RESET}")
 
     session_names = {s["name"] for s in sessions}
+    if session_names & READ_ONLY:
+        # The failure this exists to prevent: "/exit" in a brain pane ends the
+        # Claude session. The supervisor does respawn it, but a bare
+        # `tmux ls` afterwards looks at the default socket, says "no server
+        # running", and reads as though the brain never came back.
+        out.append(f"          {DIM}leave a pane:{RESET} {CYAN}Ctrl-b d{RESET} "
+                   f"{DIM}— never{RESET} {CYAN}/exit{RESET}{DIM}, it ends the session{RESET}")
     if "picar-x" not in session_names:
         out.append(f"          {DIM}start voice:{RESET} {CYAN}bin/px-session{RESET}")
     return out
