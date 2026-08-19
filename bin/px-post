@@ -349,13 +349,10 @@ def _qa_trip_breaker() -> None:
         log(f"qa gate circuit breaker opened ({_qa_breaker['failures']} failures)")
 
 
-def _qa_uses_brain() -> bool:
-    """Whether post QA runs on the resident io session rather than a subprocess."""
-    try:
-        from pxh.claude_session import _brain_kinds
-    except ImportError:
-        return False
-    return "post_qa" in _brain_kinds()
+# `_qa_uses_brain()` lived here. Its False branch ran a `claude -p` subprocess,
+# which meant a narrowed PX_BRAIN_KINDS did not disable post QA — it silently
+# re-enabled a cold start. There is no second path now, so there is nothing to
+# select between.
 
 
 def _qa_via_brain(thought: str) -> str | None:
@@ -404,57 +401,20 @@ def run_qa_gate(thought: str) -> str | None:
             log(f"qa breaker: cooldown elapsed, retrying (was {_qa_breaker['failures']} consecutive failures)")
             _qa_breaker["failures"] = 0
 
-    if _qa_uses_brain():
-        try:
-            verdict = _qa_via_brain(thought)
-        except Exception as exc:  # noqa: BLE001 - QA must never stop the poster
-            log(f"qa gate error (brain): {exc}")
-            verdict = None
-        if verdict is None:
-            log("qa gate: brain did not answer — deferring this thought")
-            _qa_trip_breaker()
-            return None
-        _qa_breaker["failures"] = 0
-        return verdict
-
-    claude_bin = (os.environ.get("PX_CLAUDE_BIN")
-                  or shutil.which("claude")
-                  or "/home/pi/.local/bin/claude")
-
-    prompt = f'{QA_PROMPT}\n\nThe thought: "{thought}"'
-
-    # Strip Claude Code env vars to allow nested invocation
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("CLAUDE_CODE")
-           and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")}
-
     try:
-        result = subprocess.run(
-            [claude_bin, "-p", prompt,
-             "--no-session-persistence",
-             "--output-format", "text",
-             "--allowedTools", ""],
-            # 90s: claude CLI cold-start on the Pi is routinely 15-80s — a
-            # tighter timeout fails even when Claude is perfectly healthy.
-            capture_output=True, text=True, timeout=90, env=env,
-        )
-        if result.returncode != 0:
-            log(f"qa gate error: claude exit {result.returncode}: {result.stderr[:200]}")
-            _qa_trip_breaker()
-            return None
-        verdict = _interpret_qa(result.stdout)
-        if verdict == "ambiguous":
-            log(f"qa gate ambiguous response: {result.stdout.strip()[:100]}")
-        _qa_breaker["failures"] = 0
-        return verdict
-    except subprocess.TimeoutExpired:
-        log("qa gate timeout (90s)")
+        verdict = _qa_via_brain(thought)
+    except Exception as exc:  # noqa: BLE001 - QA must never stop the poster
+        log(f"qa gate error (brain): {exc}")
+        verdict = None
+    if verdict is None:
+        # Defer, never escalate. A post that waits for the next cycle costs
+        # nothing; a Claude spawned to judge it on a loaded Pi costs money and
+        # makes the load worse. Same reasoning as reflection's defer.
+        log("qa gate: brain did not answer — deferring this thought")
         _qa_trip_breaker()
         return None
-    except Exception as exc:
-        log(f"qa gate error: {exc}")
-        _qa_trip_breaker()
-        return None
+    _qa_breaker["failures"] = 0
+    return verdict
 
 
 CURSOR_FILE = STATE_DIR / "px-post-cursor.json"

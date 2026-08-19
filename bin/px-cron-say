@@ -101,34 +101,50 @@ def build_prompt(scene: str | None, custom_prompt: str | None) -> str:
     )
 
 
-CLAUDE_BIN = next(
-    (str(p) for p in [
-        Path("/home/pi/.local/bin/claude"),
-        Path("/usr/local/bin/claude"),
-        Path("/usr/bin/claude"),
-    ] if Path(p).exists()),
-    "claude",  # fall back to PATH lookup
-)
-
-
 def call_claude(prompt: str) -> str:
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
-    result = subprocess.run(
-        [
-            CLAUDE_BIN, "-p", prompt,
-            "--system-prompt", SYSTEM_PROMPT,
-            "--allowedTools", "",
-            "--output-format", "text",
-            "--no-session-persistence",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=env,
-    )
-    return result.stdout.strip()
+    """Ask the resident spark-brain for the scheduled line.
+
+    This ran five times a day as a cold `claude -p` — a fresh Claude process,
+    metered API usage rather than Max, spawned on a Pi that might be in the
+    middle of a conversation, to produce one sentence.
+
+    On unavailability it returns "" and the caller skips this slot. Nobody is
+    waiting on a cron line; there are four more today. Deferring is the whole
+    point — a scheduled announcement must never be the reason the Pi is busy.
+    """
+    try:
+        from pxh.brain import ask_brain
+    except Exception as exc:  # noqa: BLE001 - cron must never traceback
+        print(f"cron-say: brain import failed: {exc}", file=sys.stderr)
+        return ""
+
+    try:
+        reply = ask_brain("cron_say", {
+            "system": SYSTEM_PROMPT,
+            "prompt": prompt,
+            "respond_with": (
+                "a single tool_perform JSON object as the prompt instructs. "
+                "Do not speak or move for this request — return the object "
+                "and nothing else; the caller dispatches it."
+            ),
+        })
+    except Exception as exc:  # noqa: BLE001
+        print(f"cron-say: brain call failed: {exc}", file=sys.stderr)
+        return ""
+
+    if reply is None:
+        print("cron-say: resident brain unavailable — skipping this slot",
+              file=sys.stderr)
+        return ""
+
+    answer = reply.get("reply")
+    if isinstance(answer, str):
+        return answer.strip()
+    try:
+        import json as _j
+        return _j.dumps(answer)
+    except (TypeError, ValueError):
+        return ""
 
 
 def extract_json(text: str) -> dict | None:

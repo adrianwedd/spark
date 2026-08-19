@@ -1344,45 +1344,54 @@ _PUBLIC_CHAT_ENV_ALLOWLIST = {
 }
 
 
-def _get_claude_bin() -> str:
-    """Resolve Claude binary path at call time so PX_CLAUDE_BIN can be set after import."""
-    return (
-        os.environ.get("PX_CLAUDE_BIN")
-        or shutil.which("claude")
-        or "/home/pi/.local/bin/claude"
-    )
+# `_get_claude_bin()` and `_make_clean_env()` lived here. Both existed only to
+# launch a `claude -p` subprocess for public chat and to scrub secrets out of
+# its environment first. With the turn served by the resident io session — a
+# process that starts outside this repo, with its own environment and one tool
+# — there is no subprocess to hand an environment to, so the leak surface they
+# guarded is gone rather than merely guarded. See test_public_chat_spawns_no
+# _subprocess, which pins the stronger property their test was approximating.
 
+async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
+                              kind: str = "public_chat") -> str:
+    """Answer a chat turn on the resident io session.
 
-def _make_clean_env() -> dict:
-    return {k: v for k, v in os.environ.items() if k in _PUBLIC_CHAT_ENV_ALLOWLIST}
+    `public_chat` and `obi_chat` have been classified as io kinds in brain.py
+    since the brain was built — deadlines, session routing, the lot. This
+    function ignored all of it and shelled out to `claude -p` anyway, which is
+    the "designed on paper, bypassed in execution" failure the 2026-08-19 audit
+    turned up. The classification is now actually used.
 
+    The io session is the right one and always was: this text is typed by
+    strangers into a public box. It holds one tool, runs outside the repo, and
+    cannot reach SPARK's code, state or keys — so a payload that tries to talk
+    it into something has nothing to talk it into.
 
-async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None) -> str:
-    """Run Claude CLI in a bounded thread pool and return the reply text."""
-    loop = asyncio.get_running_loop()
-    sys_p = system_prompt if system_prompt is not None else _PUBLIC_CHAT_SYSTEM_PROMPT
+    Raises on unavailability rather than falling back. The endpoints already
+    turn an exception into "Something went quiet on my end. Try again?", which
+    is the correct answer: a public chat box going quiet costs nothing, while
+    spawning a Claude per stranger's message on a 4-core Pi is a load
+    amplifier with an open front door.
+    """
+    from pxh import brain
 
-    def _run() -> str:
-        # subprocess timeout is 1s shorter than asyncio so the thread always
-        # resolves before asyncio.wait_for cancels, avoiding orphaned threads.
-        sp_timeout = max(1, int(_PUBLIC_CHAT_TIMEOUT_S) - 1)
-        result = subprocess.run(
-            [
-                _get_claude_bin(), "-p",
-                "--allowedTools", "",
-                "--no-session-persistence",
-                "--output-format", "text",
-                "--system-prompt", sys_p,
-            ],
-            input=prompt.encode(),
-            capture_output=True,
-            timeout=sp_timeout,
-            env=_make_clean_env(),
-        )
-        if result.returncode != 0:
-            stderr = result.stderr.decode(errors="replace")[:400]
-            raise RuntimeError(f"claude exited {result.returncode}: {stderr}")
-        return result.stdout.decode().strip()
+    payload = {"prompt": prompt}
+    if system_prompt is not None:
+        payload["system"] = system_prompt
+
+    reply = await brain.ask_brain_async(kind, payload,
+                                        timeout_s=float(_PUBLIC_CHAT_TIMEOUT_S))
+    if reply is None:
+        raise RuntimeError(f"resident io session unavailable for {kind}")
+
+    answer = reply.get("reply")
+    if isinstance(answer, str):
+        return answer.strip()
+    if isinstance(answer, dict):
+        for key in ("text", "reply", "answer", "response"):
+            if isinstance(answer.get(key), str):
+                return answer[key].strip()
+    raise RuntimeError(f"unusable reply shape from {kind}: {type(answer).__name__}")
 
     return await loop.run_in_executor(_PUBLIC_CHAT_EXECUTOR, _run)
 
@@ -1617,7 +1626,8 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
 
     try:
         reply = await asyncio.wait_for(
-            _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT),
+            _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT,
+                                kind="obi_chat"),
             timeout=_PUBLIC_CHAT_TIMEOUT_S,
         )
     except (asyncio.TimeoutError, subprocess.TimeoutExpired):

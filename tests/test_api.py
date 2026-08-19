@@ -1164,40 +1164,52 @@ class TestPublicChat:
             )
         assert resp.status_code == 504
 
-    def test_make_clean_env_allowlist(self):
-        """_make_clean_env uses a strict allowlist — only safe vars pass through.
+    def test_public_chat_spawns_no_subprocess(self):
+        """The strongest form of the secret-leak guarantee: no child process.
 
-        Secrets (CLAUDE_API_KEY, PX_API_TOKEN, PX_ADMIN_PIN, PX_HA_TOKEN,
-        PX_BSKY_APP_PASSWORD, CLAUDECODE, etc.) must be excluded so a prompt
-        injection attack cannot exfiltrate them via the public chat subprocess.
+        This replaces test_make_clean_env_allowlist, which checked that secrets
+        were stripped from the environment handed to a `claude -p` subprocess.
+        Public chat now runs on the resident io session, so there is no
+        environment to hand anywhere — the io session starts outside this repo
+        with one tool and no access to SPARK's state or keys.
+
+        An env allowlist is a filter that has to be kept correct as new secrets
+        are added. Not spawning anything is not.
         """
-        from pxh.api import _make_clean_env
-        dirty = {
-            "CLAUDECODE": "1",
-            "CLAUDE_CODE_ENTRYPOINT": "cli",
-            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-            "DISABLE_CLAUDE_CODE_PROTECTIONS": "1",
-            "CLAUDE_API_KEY": "sk-ant-test",
-            "PX_API_TOKEN": "secret-token",
-            "PX_ADMIN_PIN": "1234",
-            "PX_HA_TOKEN": "ha-secret",
-            "PX_BSKY_APP_PASSWORD": "bsky-secret",
-            "PATH": "/usr/bin",
-            "HOME": "/home/pi",
-        }
-        with unittest.mock.patch.dict(os.environ, dirty, clear=True):
-            clean = _make_clean_env()
-        # All secrets must be excluded
-        assert "CLAUDECODE" not in clean
-        assert "CLAUDE_CODE_ENTRYPOINT" not in clean
-        assert "CLAUDE_API_KEY" not in clean, "API key must not be forwarded to public subprocess"
-        assert "PX_API_TOKEN" not in clean
-        assert "PX_ADMIN_PIN" not in clean
-        assert "PX_HA_TOKEN" not in clean
-        assert "PX_BSKY_APP_PASSWORD" not in clean
-        # Safe vars must pass through
-        assert clean["PATH"] == "/usr/bin"
-        assert clean["HOME"] == "/home/pi"
+        import asyncio
+        import subprocess as _sp
+        from pxh import api as _api
+
+        def _boom(*args, **kwargs):
+            raise AssertionError(f"public chat spawned a process: {args!r}")
+
+        async def _fake_ask(kind, payload, **kw):
+            assert kind in ("public_chat", "obi_chat"), kind
+            return {"reply": "hello from the io session"}
+
+        import pxh.brain as _brain
+        with unittest.mock.patch.object(_sp, "run", _boom), \
+             unittest.mock.patch.object(_sp, "Popen", _boom), \
+             unittest.mock.patch.object(_brain, "ask_brain_async", _fake_ask):
+            reply = asyncio.get_event_loop().run_until_complete(
+                _api._call_claude_public("hi there")
+            )
+        assert reply == "hello from the io session"
+
+    def test_public_chat_unavailable_raises_rather_than_falling_back(self):
+        """A quiet chat box costs nothing. A Claude per stranger's message does."""
+        import asyncio
+        from pxh import api as _api
+        import pxh.brain as _brain
+
+        async def _unavailable(kind, payload, **kw):
+            return None
+
+        with unittest.mock.patch.object(_brain, "ask_brain_async", _unavailable):
+            with pytest.raises(RuntimeError, match="unavailable"):
+                asyncio.get_event_loop().run_until_complete(
+                    _api._call_claude_public("hi")
+                )
 
     def test_rate_limit_returns_429(self, api_client):
         """After exhausting the per-IP rate limit, further requests get 429."""
