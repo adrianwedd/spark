@@ -112,6 +112,10 @@ _BRAIN_KINDS = frozenset({
     # reflection it is answered by *returning* an action object; voice_loop
     # validates it through policy and dispatches it. The session must not act.
     "voice_turn",
+    # The five-a-day scheduled announcement (bin/px-cron-say). SPARK's own
+    # speech on his own schedule, so the privileged session — and like the
+    # others here, answered by returning an action rather than performing one.
+    "cron_say",
 })
 
 # Per-kind wall-clock deadline. These bound one turn; the per-type cooldowns and
@@ -125,6 +129,9 @@ _DEADLINE_S: dict[str, int] = {
     # answer to "the brain is slow" is to hand control back and acknowledge,
     # not to keep a 7-year-old in front of a silent robot.
     "voice_turn": 45,
+    # Nobody is waiting on a cron line. It can afford to queue behind a real
+    # conversation, and if it misses this slot there are four more today.
+    "cron_say": 90,
     "reflection": 120,
     "research": 300,
     "compose": 300,

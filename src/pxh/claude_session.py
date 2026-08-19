@@ -207,6 +207,18 @@ class SessionBudgetExhausted(Exception):
     pass
 
 
+
+class ColdStartForbidden(RuntimeError):
+    """Raised when a session type has no resident route.
+
+    The resident spark-brain / spark-io sessions are SPARK's sole Claude
+    execution substrate. There is deliberately no fallback behind this: a
+    caller that cannot be served resident must fail loudly rather than quietly
+    spawn a fresh Claude, because every cold start costs more to run than the
+    session it bypasses and is metered API usage rather than Max.
+    """
+
+
 @dataclass
 class RunResult:
     stdout: str
@@ -283,21 +295,21 @@ def budget_summary() -> str:
 # ---------------------------------------------------------------------------
 
 # Which session types are served by the resident Claude session in tmux
-# (src/pxh/brain.py) rather than by a `claude -p` subprocess. This is a rollout
-# dial, not a preference: `claude -p` is on its way out of the codebase
-# entirely, and each type moves across once its behaviour through the brain has
-# been watched in production. Phase 1 is research and compose — low stakes,
-# easy to verify, and neither needs tools beyond the brain's own envelope.
+# (src/pxh/brain.py). There is no longer an "else" branch: a type absent from
+# this set does not cold-start Claude, it raises. See ColdStartForbidden below.
 #
-# Types NOT listed here still take the old path. `evolve` in particular cannot
-# move until the brain can work inside a git worktree, since a resident
-# session's tool envelope is fixed at launch and cannot be widened per call.
+# This used to be a rollout dial whose unlisted types "still take the old
+# path", and that phrasing is the whole bug — it made "not yet migrated" and
+# "may spawn a fresh Claude" the same state, so a type could sit in the second
+# one indefinitely while the docs described the first.
 #
-# `reflection` is here despite not routing through run_claude_session at all —
-# its call site is mind.call_llm's tier 2, which shells out directly. It reads
-# this same dial (via brain_kinds()) so there is one switch for the rollout
-# rather than two that can disagree.
-_DEFAULT_BRAIN_KINDS = "research,compose,post_qa,reflection"
+# `evolve` is deliberately NOT here and is therefore disabled: it needs to work
+# inside a git worktree, and a resident session's tool envelope is fixed at
+# launch and cannot be widened per call. Disabled is the honest state for it —
+# the alternative was a "legacy cold Claude" bucket, which is what this whole
+# change exists to abolish. px-evolve will raise until the brain can hold a
+# worktree; that is a known, deliberate outage, not a regression.
+_DEFAULT_BRAIN_KINDS = "research,compose,post_qa,reflection,blog,consolidate,self_debug"
 
 
 def brain_kinds() -> frozenset[str]:
@@ -388,45 +400,19 @@ def run_claude_session(
     if session_type in _brain_kinds():
         return _run_via_brain(session_type, prompt, timeout, model)
 
-    # Build command
-    cmd = [
-        os.environ.get("PX_CLAUDE_BIN", "claude"), "-p", prompt,
-        "--model", model,
-        "--no-session-persistence",
-        "--output-format", "text",
-    ]
-    if allowed_tools is not None:
-        cmd.extend(["--allowedTools", allowed_tools])
-    if skip_permissions:
-        cmd.append("--dangerously-skip-permissions")
-
-    # Strip Claude Code env vars for clean nested invocation
-    run_env = {
-        k: v for k, v in os.environ.items()
-        if not k.startswith("CLAUDE_CODE")
-        and k not in ("CLAUDECODE", "DISABLE_CLAUDE_CODE_PROTECTIONS")
-    }
-
-    start = time.monotonic()
-    try:
-        result = subprocess.run(
-            cmd, cwd=work_dir, capture_output=True, text=True,
-            timeout=timeout, env=run_env,
-        )
-        duration = time.monotonic() - start
-        outcome = "success" if result.returncode == 0 else f"exit:{result.returncode}"
-        _log_session(session_type, model, duration, result.returncode, outcome)
-        return RunResult(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            returncode=result.returncode,
-            duration_s=duration,
-            model_used=model,
-        )
-    except subprocess.TimeoutExpired:
-        duration = time.monotonic() - start
-        _log_session(session_type, model, duration, -1, "timeout")
-        raise
+    # Fail closed. The old default pointed the other way — an unrecognised kind
+    # fell through to `claude -p` — which made "I forgot to classify this" and
+    # "I decided this may cold-start Claude" the same act. That is the identical
+    # trust-direction bug already fixed for _BRAIN_KINDS vs _IO_KINDS in
+    # brain.py, and it pointed the wrong way for the same reason: the person
+    # adding a kind is exactly the person who will forget, so the default must
+    # be the safe one. An unclassified kind now has no backend at all.
+    raise ColdStartForbidden(
+        f"session_type {session_type!r} is not routed to a resident session. "
+        f"Classify it in PX_BRAIN_KINDS (currently: {sorted(_brain_kinds())}) or "
+        f"give it a non-Claude backend. Cold-starting Claude is prohibited — see "
+        f"the resident-only invariant in CLAUDE.md."
+    )
 
 
 # ---------------------------------------------------------------------------
