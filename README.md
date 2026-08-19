@@ -747,10 +747,14 @@ Every tool must: emit a single JSON object to stdout, support `PX_DRY=1`, handle
 
 ## Testing
 
+CI is the gate: every pull request runs `pytest -m "not live"` on Python 3.11.
+Read [docs/testing.md](docs/testing.md) before adding a test — and do not run
+the suite on SPARK, which is the deployment target, not the test runner.
+
 ```bash
 source .venv/bin/activate
-python -m pytest tests/                           # 1095 tests total (25 require live hardware)
-python -m pytest tests/ -m "not live"             # 1070 tests (dry-run, no hardware)
+python -m pytest tests/                           # 1459 tests total (28 require live hardware)
+python -m pytest tests/ -m "not live"             # 1431 tests (dry-run, no hardware)
 python -m pytest tests/test_tools.py -v
 python -m pytest tests/test_api.py -v
 sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (require Pi)
