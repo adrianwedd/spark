@@ -105,6 +105,13 @@ _IO_KINDS = frozenset({"post_qa", "public_chat", "obi_chat"})
 _BRAIN_KINDS = frozenset({
     "reflection", "research", "compose", "blog",
     "consolidate", "self_debug", "evolve",
+    # The "Hey Spark" turn. On the privileged session rather than io because
+    # the answer has to *be* SPARK — persona, session highlights, the thread of
+    # the current conversation — and because spark-brain already sees Obi's
+    # words in every reflection payload, so this widens no exposure. Like
+    # reflection it is answered by *returning* an action object; voice_loop
+    # validates it through policy and dispatches it. The session must not act.
+    "voice_turn",
 })
 
 # Per-kind wall-clock deadline. These bound one turn; the per-type cooldowns and
@@ -114,6 +121,10 @@ _DEADLINE_S: dict[str, int] = {
     "post_qa": 120,
     "public_chat": 60,
     "obi_chat": 60,
+    # Interactive: a child is standing there waiting. Short on purpose — the
+    # answer to "the brain is slow" is to hand control back and acknowledge,
+    # not to keep a 7-year-old in front of a silent robot.
+    "voice_turn": 45,
     "reflection": 120,
     "research": 300,
     "compose": 300,

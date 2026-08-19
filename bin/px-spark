@@ -54,9 +54,15 @@ subprocess.run(
 )
 PY
 
-# Launch Claude voice loop with SPARK system prompt
-export CODEX_CHAT_CMD="$SCRIPT_DIR/claude-voice-bridge"
+# Launch the SPARK voice loop on the resident brain.
+# Voice turns run on the resident spark-brain session — the sole permitted
+# Claude substrate (see the resident-only invariant in CLAUDE.md). There is no
+# bridge to a cold `claude -p` any more: the fossil was deleted rather than
+# deprecated, because leaving one executable is how it turns back into
+# architecture.
+export PX_VOICE_BACKEND=brain
 
 exec "$SCRIPT_DIR/codex-voice-loop" \
+    --backend brain \
     --prompt "$SCRIPT_DIR/../docs/prompts/spark-voice-system.md" \
     "$@"
