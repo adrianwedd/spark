@@ -106,25 +106,75 @@ def test_falls_back_to_claude_when_ollama_returns_empty_response():
 # ── Tier-3 fallback: Claude + M1 fail → local Ollama succeeds ──────
 
 def test_falls_back_to_local_ollama_when_m1_fails():
-    # Distinguish by URL: M5 and cloud requests fail; localhost succeeds.
-    # call_count-based mocking is fragile because _resolve_ollama_model makes
-    # extra urlopen calls (api/ps + api/tags) before the actual generate request.
+    """The Ollama chain still walks, for the personas that actually use it.
+
+    This used to run as `persona="spark"`, which no longer reaches here: for
+    SPARK the brain tier sits between M5 and the cloud, and a brain failure is
+    terminal. Tiers 3 and 4 are not dead code though — a non-SPARK persona
+    skips the brain tier entirely, so an M5 failure legitimately walks to
+    cloud and then to localhost. That distinction is the point, so the test is
+    re-pointed rather than deleted; the SPARK half is pinned by
+    test_spark_never_reaches_local_ollama_after_a_brain_failure below.
+
+    Distinguish by URL: M5 and cloud requests fail; localhost succeeds.
+    call_count-based mocking is fragile because _resolve_ollama_model makes
+    extra urlopen calls (api/ps + api/tags) before the actual generate request.
+    """
+    import pxh.brain
+
     def urlopen_side(req, timeout=30):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         if "M5.local" in url or "localhost" not in url:
             raise urllib.error.URLError("M5 unreachable")
         return _fake_ollama_cm("running on fumes")
 
+    def _never(*a, **k):
+        raise AssertionError("a non-SPARK persona reached the brain tier")
+
     # Local fallback is opt-in via PX_MIND_LOCAL_OLLAMA=1
     old_val = os.environ.get("PX_MIND_LOCAL_OLLAMA")
     os.environ["PX_MIND_LOCAL_OLLAMA"] = "1"
     try:
-        with patch("subprocess.run", return_value=_fake_claude(1, stderr="offline")), \
+        with patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
+             patch.object(pxh.brain, "ask_brain", side_effect=_never), \
+             patch("urllib.request.urlopen", side_effect=urlopen_side):
+            result = call_llm("prompt", "system", persona="vixen")
+
+        assert "error" not in result, result
+        assert "fumes" in result["response"]
+    finally:
+        if old_val is None:
+            os.environ.pop("PX_MIND_LOCAL_OLLAMA", None)
+        else:
+            os.environ["PX_MIND_LOCAL_OLLAMA"] = old_val
+
+
+def test_spark_never_reaches_local_ollama_after_a_brain_failure():
+    """Loading a model on the Pi is the largest escalation available.
+
+    Tier 4 is off by default precisely because a Pi 4 cannot hold a model
+    alongside px-wake-listen and SenseVoice without filling swap. Reaching it
+    *because the brain was slow* would be the 2026-08-19 cascade with a worse
+    ending. Enabled here on purpose: the assertion is that it stays unreached
+    even when it is available.
+    """
+    import pxh.brain
+
+    def urlopen_side(req, timeout=30):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "localhost" in url:
+            raise AssertionError("SPARK reached local ollama after a brain failure")
+        raise urllib.error.URLError("M5 unreachable")
+
+    old_val = os.environ.get("PX_MIND_LOCAL_OLLAMA")
+    os.environ["PX_MIND_LOCAL_OLLAMA"] = "1"
+    try:
+        with patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
+             patch.object(pxh.brain, "ask_brain", return_value=None), \
              patch("urllib.request.urlopen", side_effect=urlopen_side):
             result = call_llm("prompt", "system", persona="spark")
 
-        assert "error" not in result
-        assert "fumes" in result["response"]
+        assert result.get(pxh.mind.BRAIN_DEFER) is True, result
     finally:
         if old_val is None:
             os.environ.pop("PX_MIND_LOCAL_OLLAMA", None)
