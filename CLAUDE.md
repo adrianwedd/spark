@@ -217,7 +217,24 @@ Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap.
 
 ### The Brain — persistent Claude session (`src/pxh/brain.py`)
 
-**SPARK's Claude calls are migrating off `claude -p` onto a resident interactive Claude Code session.** This is a settled decision, not a tradeoff to re-argue: a one-shot subprocess throws away context on every call and cannot use SPARK's own tools. `bin/px-claude-session` is the session; `src/pxh/tmux_claude.py` drives it in tmux; `src/pxh/brain.py` is the request/reply channel.
+> ### Hard invariant — resident-only Claude
+>
+> **No production code may invoke Claude non-residently.**
+>
+> No `claude -p`. No helper whose implementation is `claude -p`. No fallback to
+> `call_claude_haiku`. No unclassified "cold Claude" kinds.
+>
+> The resident `spark-brain` / `spark-io` sessions are SPARK's **sole** Claude
+> execution substrate. Enforced by `tools/check_resident_claude.py` in CI, pinned
+> by `tests/test_resident_only_invariant.py`, and both are blacklisted from
+> px-evolve. This is not a migration, a rollout, or a preference — it is a rule,
+> and "we'll classify that one later" is how it was breached the first time.
+
+**Why it is a rule and not a preference.** A one-shot subprocess throws away context on every call and cannot use SPARK's own tools — that was the original argument, and it was not enough, because it framed the choice as latency-versus-simplicity. The load-bearing reason is that **a cold start costs more to run than the resident session it claims to be rescuing.** A resident-brain failure answered by spawning a fresh Claude on the same 4-core Pi does not degrade; it amplifies the contention that caused the failure.
+
+Observed 2026-08-19: a 5-second tmux *delivery* timeout under load was reported as "brain unavailable", reflection fell through to `claude -p`, that second Claude competed with the voice turn's own `claude -p`, both slowed, the 120s timeout tripped, and the ladder continued into Ollama M5 and Ollama Cloud (403). A child said "Hey Spark" and waited **151 seconds** for an answer. The brain was healthy and idle throughout. Every tier below the resident session made the problem worse, and each spawn was billed API usage rather than covered by the Max subscription the resident sessions run under.
+
+`bin/px-claude-session` is the session; `src/pxh/tmux_claude.py` drives it in tmux; `src/pxh/brain.py` is the request/reply channel.
 
 **Replies come back through the filesystem, never the pane.** `capture-pane` returns *rendered* terminal output — wrapping, spinners, ANSI escapes, a finite scrollback — so an answer scraped from it is at the mercy of the terminal. The session answers by running a tool instead. Pane for humans, filesystem for machines.
 
@@ -239,7 +256,7 @@ Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<
 
 **`px-brain` supervisor (`bin/px-brain`, `src/pxh/brain_daemon.py`):** owns both sessions so callers don't have to. **Its first job is holding a read-only attached tmux client per session** — 3.3a's `send-keys` fails outright when no client is attached, so without the holder injection fails precisely when nobody is watching. `TERM` must be set in the unit (`tmux attach` refuses without one). `KillMode=process` is deliberate: restarting the supervisor must not kill the sessions it supervises. It also sweeps pending requests to `dead/` on session (re)create, unwedges (Escape, then kill after `ESCAPE_GRACE_S`), and recycles context on turn count + nightly at 02:00 Hobart — **always at an idle moment**, since a `/clear` between nudge and reply loses the request. Wedge detection keys on `current.json`, never on stale inbox files (an abandoned inbox entry means a caller gave up, not that the session is stuck).
 
-**Rollout:** `PX_BRAIN_KINDS` (default `research,compose,post_qa,reflection`) selects which kinds route to the brain; everything else still takes the old path. Read at call time so the rollout can be widened or rolled back live — `bin/px-post` consults the same dial for its QA gate. `evolve` cannot move until the brain can work inside a git worktree: a resident session's tool envelope is fixed at launch and cannot be widened per call. Remaining `claude -p` call sites: `mind.py` (`call_claude_haiku` — now the *fallback* under the brain, not the primary), `api.py` (`_call_claude_public`), `bin/claude-voice-bridge`, `bin/px-blog`, `bin/px-post` (legacy branch), `bin/tool-describe-scene`, `bin/px-cron-say`. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
+**Kind routing:** `PX_BRAIN_KINDS` selects which kinds route to the brain. An unclassified kind **fails closed** — no backend, no cold start. The old default pointed the other way (unclassified → `claude -p`), which made "I forgot to classify it" and "I decided it may cold-start Claude" the same act; that is the identical trust-direction bug already fixed for `_BRAIN_KINDS` vs `_IO_KINDS` in `brain.py:97`. Read at call time so the rollout can be widened or rolled back live — `bin/px-post` consults the same dial for its QA gate. `evolve` cannot move until the brain can work inside a git worktree: a resident session's tool envelope is fixed at launch and cannot be widened per call. There is no "legacy cold Claude" bucket, and `bin/claude-voice-bridge` is **deleted rather than deprecated** — leaving fossils executable is how they turn back into architecture. Run `python tools/check_resident_claude.py --list` for the live debt map. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md`.
 
 **`bin/tool-describe-scene` may be a bug fix, not just a migration.** `bin/tool-wander:64` runs `px-wander` under `sudo -n`, and `wander._call_describe_scene` passes that environment straight down — so the tool's `claude -p` runs **as root**, with root's `HOME`. If root has no Claude credentials there, vision silently returns `FALLBACK_DESCRIPTION` on every real wander and nothing logs a credential error. The sudo chain is verified in the code; **the credential failure itself has not been confirmed on the robot** — check before claiming it fixed. Under the brain the root process only drops a JSON file and the authenticated `claude` runs as `pi`, which sidesteps it either way.
 
