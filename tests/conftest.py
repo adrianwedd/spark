@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import pytest
 from pathlib import Path
 
@@ -69,6 +70,54 @@ def _isolate_alive_heartbeat(tmp_path, monkeypatch):
     per-test tmp dir rather than repointing PX_STATE_DIR globally.
     """
     monkeypatch.setenv("PX_ALIVE_HEARTBEAT_DIR", str(tmp_path / "run-spark"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session(tmp_path, monkeypatch, request):
+    """Keep session reads and writes off the live robot's state/session.json.
+
+    The fourth instance of the hazard the three fixtures above already close,
+    and the one that stayed open longest (#210). `isolated_project` sets
+    PX_SESSION_PATH too, but it is opt-in and only isolates *subprocesses*, so
+    any in-process test reaching load_session()/update_session() resolved to
+    the running robot's own session file — reading it, and on update_session()
+    rewriting it.
+
+    That is not theoretical. It cost six `test_mind_utils` expression tests,
+    permanently red on this machine and green everywhere else: the live session
+    carries `spark_quiet_mode: true` (#209), mind.expression() is a #174
+    enforcement point, and policy.evaluate() therefore blocked each dispatch
+    before the test's own mock could fire. The failure was carried as a known
+    baseline for months, which is how a red suite stops being read at all.
+
+    Seeded from state.default_state() rather than left absent, for two reasons.
+    Readers that fail *closed* on an unreadable session (policy_context, by
+    design) would otherwise see every test as "quiet mode indeterminate" and
+    suppress; and seeding explicitly keeps the fixture from depending on
+    state/session.template.json happening to be present, which is what
+    ensure_session() would fall back to. The two agree today — checked — so
+    this changes no behaviour, only what the isolation rests on.
+
+    Set via monkeypatch.setenv at setup, so the 22 sites across 9 test files
+    that own PX_SESSION_PATH themselves still win: their setenv/os.environ
+    assignment runs after this one. Pinned by
+    test_a_test_that_sets_its_own_session_path_still_wins.
+
+    Escape hatch: tests marked `live` exercise the real machine and keep the
+    real session — isolating those would have them assert against a fiction.
+    """
+    if request.node.get_closest_marker("live"):
+        return
+    try:
+        from pxh import state
+    except ImportError:
+        return
+    session_path = tmp_path / "session" / "session.json"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.write_text(
+        json.dumps(state.default_state(), indent=2) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_path))
 
 
 @pytest.fixture
