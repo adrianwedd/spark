@@ -176,7 +176,20 @@ No pytest is run on SPARK for either.
 
 1. Two supervisors on the same socket cannot both acquire authority, including
    from different checkouts or state roots.
-2. Supervisors on different synthetic sockets coexist in tests.
+2. The namespace a supervisor claims is the pair (socket, checkout) while the
+   bridge holds, not the socket alone. Stated as four cases:
+   - same socket, different checkouts — **must contend**, on the socket lock;
+   - different sockets, different state roots — **may coexist**;
+   - different sockets, same checkout — **intentionally contend**, on the
+     legacy lock. This is the bridge's cost, and it is compatibility
+     behaviour rather than a defect: a pre-bridge binary in that checkout
+     guards on exactly that inode and knows nothing about the socket;
+   - after the legacy lock is removed, the socket alone becomes the complete
+     namespace and case 3 inverts.
+
+   The suite relies on case 2, not case 3: the autouse fixtures give every
+   test a tmp_path socket *and* a tmp_path `brain_root`, so both halves of
+   the pair differ per test and tests do not contend.
 3. Ordinary tests write no production logs.
 4. Every brain-daemon record identifies its emitting process and instance.
 5. Mixed-version migration cannot create a two-supervisor window, for every

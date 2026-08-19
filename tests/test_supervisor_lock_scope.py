@@ -15,6 +15,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +28,15 @@ if SRC.exists():
 
 from pxh import brain, brain_daemon  # noqa: E402
 from pxh import logging as pxlogging  # noqa: E402
+
+# A whole supervisor's acquire, in a process that shares nothing with this
+# one but the filesystem. Deliberately calls the real entry point rather than
+# reimplementing it: a child that took only one of the two required locks
+# would reproduce the very defect this file exists to close.
+_CHILD_ACQUIRE = """
+from pxh import brain_daemon
+print("acquired" if brain_daemon.acquire_supervisor_lock() else "refused")
+"""
 
 
 class TestSocketScopedGuard:
@@ -69,20 +79,32 @@ class TestSocketScopedGuard:
         monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", "/tmp/tmux-test/px-mind")
         spec = brain.spec_for_session(brain.IO_SESSION)
         assert spec.socket == brain.brain_socket()
-        assert str(brain_daemon.supervisor_lock_path()).startswith(spec.socket)
+        assert brain_daemon.supervisor_lock_path() == Path(
+            spec.socket + ".supervisor.lock"
+        )
 
 
 class TestContention:
-    """Acceptance criteria 1 and 2."""
+    """Acceptance criterion 1, and the four cases criterion 2 splits into.
+
+    The namespace a supervisor claims is not the socket alone while the
+    bridge holds. It is the pair (socket, checkout), because every supervisor
+    must also take its checkout's legacy lock. The four cases below state
+    that pair exhaustively; the fourth is the post-removal target, and is the
+    only one where the socket alone is the whole answer.
+    """
 
     def test_two_checkouts_on_one_socket_cannot_both_acquire(
         self, monkeypatch, tmp_path
     ):
+        """Case 1 — same socket, different checkouts: must contend.
+
+        Exactly the case the old checkout-relative key could not see, and the
+        defect #221 is about.
+        """
         monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "px-mind"))
         assert brain_daemon.acquire_supervisor_lock() is True
         try:
-            # A second supervisor, same socket, different state root — which is
-            # exactly the case the old checkout-relative key could not see.
             monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "checkout-b")
             assert brain_daemon.acquire_supervisor_lock() is False, (
                 "a second supervisor on the same socket must lose, whatever "
@@ -91,14 +113,69 @@ class TestContention:
         finally:
             brain_daemon.release_supervisor_lock()
 
-    def test_supervisors_on_different_sockets_coexist(self, monkeypatch, tmp_path):
-        """Synthetic sockets are separate namespaces; tests must not contend."""
+    def test_different_sockets_and_different_state_roots_coexist(
+        self, monkeypatch, tmp_path
+    ):
+        """Case 2 — different sockets *and* different state roots: coexist.
+
+        Run in a subprocess, and not for isolation theatre. `_supervisor_fd`
+        and `_legacy_fd` are process globals, so a second in-process
+        `acquire_supervisor_lock()` would overwrite the first supervisor's
+        fds and leak its locks for the rest of the session. A subprocess is
+        also the only form that can catch the failure mode a same-process
+        test cannot see at all: an acquire that consults process state and
+        returns True because *this* process already holds authority.
+
+        This is the case the suite itself relies on. The autouse fixtures
+        give every test a tmp_path socket *and* a tmp_path brain_root, so
+        both halves of the pair differ per test and tests never contend.
+        """
+        monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "socket-a"))
+        assert brain_daemon.acquire_supervisor_lock() is True
+        try:
+            env = dict(os.environ)
+            env["PX_BRAIN_TMUX_SOCKET"] = str(tmp_path / "socket-b")
+            # brain_root() reads PX_STATE_DIR, so this is what actually moves
+            # the child's legacy lock — the parent's brain_root is a
+            # monkeypatched attribute the child cannot inherit.
+            env["PX_STATE_DIR"] = str(tmp_path / "state-b")
+            env["PYTHONPATH"] = str(SRC)
+            proc = subprocess.run(
+                [sys.executable, "-c", _CHILD_ACQUIRE],
+                capture_output=True, text=True, env=env, timeout=30,
+            )
+            assert proc.stdout.strip() == "acquired", (
+                "a supervisor on its own socket and its own state root must "
+                f"start: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+            )
+        finally:
+            brain_daemon.release_supervisor_lock()
+
+    def test_different_sockets_in_one_checkout_contend_during_migration(
+        self, monkeypatch, tmp_path
+    ):
+        """Case 3 — different sockets, same checkout: contend, by design.
+
+        The bridge's cost, stated rather than hidden. Both supervisors must
+        take the same checkout-relative legacy lock, so the second loses even
+        though its socket is free. Pinning it is the point: the honest
+        migration-era contract is the pair, and a test that asserted plain
+        "different sockets coexist" here would be asserting a fiction that
+        only passes by skipping half of what a supervisor acquires.
+        """
         monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "socket-a"))
         assert brain_daemon.acquire_supervisor_lock() is True
         try:
             monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "socket-b"))
-            other = brain_daemon.supervisor_lock_path()
-            fd = os.open(str(other), os.O_RDWR | os.O_CREAT, 0o644)
+            assert brain_daemon.acquire_supervisor_lock() is False, (
+                "while the bridge holds, one checkout admits one supervisor "
+                "regardless of socket"
+            )
+            # And it lost on the legacy lock specifically, not the socket —
+            # otherwise this passes for the wrong reason the day the socket
+            # key regresses.
+            free = brain_daemon.supervisor_lock_path()
+            fd = os.open(str(free), os.O_RDWR | os.O_CREAT, 0o644)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # must not raise
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -106,6 +183,32 @@ class TestContention:
                 os.close(fd)
         finally:
             brain_daemon.release_supervisor_lock()
+
+    def test_after_removal_the_socket_alone_is_the_namespace(
+        self, monkeypatch, tmp_path
+    ):
+        """Case 4 — the post-removal target, as an executable contract.
+
+        The follow-up deletes `_BRIDGE_HOLDS_LEGACY_LOCK`, the legacy path
+        and this test together. Until then this is what the removal gate
+        buys: case 3 inverts, and the socket becomes the whole namespace.
+        """
+        monkeypatch.setattr(brain_daemon, "_BRIDGE_HOLDS_LEGACY_LOCK", False)
+        monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "socket-a"))
+        assert brain_daemon.acquire_supervisor_lock() is True
+        first = brain_daemon._supervisor_fd
+        try:
+            monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "socket-b"))
+            assert brain_daemon.acquire_supervisor_lock() is True, (
+                "with the legacy lock gone, one checkout admits one "
+                "supervisor per socket"
+            )
+            assert brain_daemon._legacy_fd is None
+        finally:
+            # The second acquire overwrote the globals, so release the first
+            # supervisor's fd by hand or it stays locked for the session.
+            brain_daemon.release_supervisor_lock()
+            brain_daemon._drop_lock(first)
 
 
 class TestMigrationBridge:

@@ -745,6 +745,17 @@ def supervisor_lock_path() -> Path:
     return Path(brain.brain_socket() + ".supervisor.lock")
 
 
+# The removal gate, as one constant. True for the duration of the migration;
+# the follow-up deletes this flag, `legacy_supervisor_lock_path`, and the
+# branch below that reads it, at which point the socket alone is the complete
+# namespace. Deliberately not env-readable: a guard that an operator can
+# weaken from the environment is not a guard, and the whole point of the
+# bridge is that it cannot be skipped while a pre-bridge binary can still be
+# started. Its post-removal contract is pinned by
+# test_after_removal_the_socket_alone_is_the_namespace.
+_BRIDGE_HOLDS_LEGACY_LOCK = True
+
+
 def legacy_supervisor_lock_path() -> Path:
     """The pre-bridge, checkout-relative guard.
 
@@ -851,6 +862,14 @@ def acquire_supervisor_lock() -> bool:
     post-bridge binary in checkout B, because the old binary knows nothing
     about the socket lock. That is not a regression — old-vs-old across
     checkouts is unguarded today, which is the defect being fixed.
+
+    The bridge widens the guard, and the cost is stated rather than hidden:
+    while it holds, two supervisors on *different* sockets in the *same*
+    checkout also contend, because both must take that checkout's legacy
+    lock. That is intended compatibility behaviour, not a bug — during
+    migration the namespace is the pair (socket, checkout), and only after
+    the legacy lock is removed does the socket alone become the complete
+    namespace. Both halves are pinned by TestContention.
     """
     global _supervisor_fd, _legacy_fd
     if brain._ensure_dir(brain.brain_root()) is None:
@@ -867,6 +886,11 @@ def acquire_supervisor_lock() -> bool:
         _log("supervisor_already_running", scope="socket", holder_pid_hint=hint,
              note="pid is a hint written by the holder and may be stale")
         return False
+
+    if not _BRIDGE_HOLDS_LEGACY_LOCK:
+        _supervisor_fd = fd
+        _legacy_fd = None
+        return True
 
     legacy_fd, legacy_hint = _take_lock(legacy_supervisor_lock_path())
     if legacy_fd is None:
