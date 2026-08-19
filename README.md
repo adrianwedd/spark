@@ -77,8 +77,8 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 | Launcher | Backend | Persona |
 |---|---|---|
-| `px-spark` | Claude (via `claude-voice-bridge`) | SPARK — child companion |
-| `run-voice-loop-claude` | Claude (via `claude-voice-bridge`) | Default Claude |
+| `px-spark` | resident `spark-brain` session | SPARK — child companion |
+| `run-voice-loop-claude` | resident `spark-brain` session | Default Claude |
 | `run-voice-loop` | Codex CLI | Default |
 | `run-voice-loop-ollama` | Ollama (via `codex-ollama`) | Default |
 
@@ -137,14 +137,14 @@ px-spark
  1. Sets session.persona = "spark"          (via update_session)
  2. Sets session.listening = false
  3. Speaks greeting via tool-voice          ("Hey. I'm here.")
- 4. Exports CODEX_CHAT_CMD=bin/claude-voice-bridge
+ 4. Exports PX_VOICE_BACKEND=brain
  5. Exports PX_VOICE_VARIANT=en+m3, PX_VOICE_PITCH=82, PX_VOICE_RATE=120
  6. exec bin/codex-voice-loop --prompt docs/prompts/spark-voice-system.md ...
 ```
 
 After step 6, `px-spark` is replaced by `codex-voice-loop` via `exec` (no fork). The voice loop process inherits all environment variables and owns the terminal.
 
-The `CODEX_CHAT_CMD` override is the key to persona routing: instead of calling `codex exec`, the voice loop calls `claude-voice-bridge`, which is a thin adapter that passes the prompt to the `claude` CLI with SPARK's system prompt.
+`PX_VOICE_BACKEND=brain` is the key to persona routing: instead of piping the prompt to `codex exec`, the voice loop sends a `voice_turn` request to the **resident `spark-brain` session** and gets an action object back. There is no per-turn Claude process — see the resident-only invariant in CLAUDE.md.
 
 ### 3. Wake Word Path
 
@@ -186,19 +186,19 @@ build_model_prompt()
  └── user_transcript  = session.transcript (the STT text)
 ```
 
-This prompt is piped via stdin to `claude-voice-bridge`:
+This prompt becomes the payload of a `voice_turn` request to the resident session:
 
-```bash
-claude-voice-bridge (bin/claude-voice-bridge)
- 1. Reads full prompt from stdin
- 2. Unsets CLAUDECODE + CLAUDE_CODE_ENTRYPOINT   (prevents Claude Code tool use)
- 3. Runs: claude -p "$PROMPT"
-            --system-prompt docs/prompts/spark-voice-system.md
-            --allowedTools ""
-            --output-format text
-            --no-session-persistence
- 4. Streams stdout back to voice loop
 ```
+voice_loop.run_voice_turn(prompt)
+ 1. brain.ask_brain("voice_turn", {prompt, respond_with})   # 45s deadline
+ 2. the resident spark-brain session answers by RETURNING an action object
+ 3. reply lands in state/brain/spark-brain/outbox/<id>.json
+ 4. voice_loop validates it through policy, then dispatches the tool itself
+```
+
+If the session cannot be reached, one cheap retry on a *delivery* failure, then
+a deterministic local line ("I heard you. Give me a second.") through the same
+audio policy gate — never another model.
 
 `--allowedTools ""` is critical: it prevents Claude from using any Claude Code tools. It is a pure text-completion endpoint.
 
@@ -449,7 +449,7 @@ For a typical SPARK voice interaction:
 [t=7.5s]  session.transcript saved; session.listening = true
 [t=8s]    voice_loop detects listening=true
 [t=8s]    build_model_prompt() → 4KB prompt (system + session + thoughts + transcript)
-[t=8s]    claude-voice-bridge pipes prompt to `claude -p ...`
+[t=8s]    voice_loop sends a voice_turn request to the resident brain
 [t=11s]   Claude responds → {"tool": "tool_routine", "params": {"action": "load", "name": "morning"}}
 [t=11s]   validate_action() sanitises params → env vars
 [t=11s]   execute_tool() injects SPARK voice env
@@ -786,7 +786,8 @@ The trust boundary is fixed: semantic intelligence (Claude, Ollama) proposes act
 | `PX_VOICE_DEVICE` | ALSA output device | `robothat` |
 | `PX_API_TOKEN` | REST API bearer token | from `.env` |
 | `PX_WAKE_WORD` | Wake phrase | `hey robot` |
-| `CODEX_CHAT_CMD` | Override LLM CLI command | set by launcher |
+| `CODEX_CHAT_CMD` | Override non-Claude LLM CLI (codex/ollama) | set by launcher |
+| `PX_VOICE_BACKEND` | `brain` routes voice turns to the resident session | set by launcher |
 | `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout | `30` |
 | `PX_PERSONA` | Active persona (`spark` / `vixen` / `gremlin`) | from session |
 | `PX_OLLAMA_HOST` | Ollama server for cognitive reflection | `http://M5.local:11434` |
@@ -810,7 +811,6 @@ picar-x-hacking/
 │   ├── px-{circle,drive,look,…}  # Hardware control scripts
 │   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (38 tools)
 │   ├── run-voice-loop{,-claude,-ollama}  # Voice backend launchers
-│   └── claude-voice-bridge       # Claude stdin adapter
 ├── src/pxh/                      # Python library (10 modules)
 │   ├── state.py                  # FileLock session, atomic_write, rotate_log
 │   ├── mind.py                   # Cognitive loop daemon (3,300+ lines)

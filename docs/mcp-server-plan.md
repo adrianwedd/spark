@@ -1,3 +1,10 @@
+> **Stale as of 2026-08-19.** This plan describes the voice loop as calling
+> `claude -p --no-session-persistence` per turn. It no longer does: voice turns
+> are a classified `voice_turn` request to the resident `spark-brain` session,
+> and production code may not invoke Claude non-residently at all. See the
+> resident-only invariant in CLAUDE.md. The MCP reasoning below may still be
+> worth reading; its description of the current architecture is not.
+
 # SPARK MCP Server & Agentic Architecture — Implementation Plan
 
 ## Context
