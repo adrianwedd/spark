@@ -296,6 +296,35 @@ def test_tool_describe_scene_records_declared_provenance(isolated_project):
     assert payload["task_id"] == "e-20260820-000000"
 
 
+def test_tool_describe_scene_origin_label_does_not_grant_autonomous_authority(isolated_project):
+    """PX_VISION_ORIGIN is provenance, not permission. Authority for an
+    autonomous vision call lives entirely in wander's own gate
+    (_vision_trigger + cooldown + _check_daily_vision_cap), which runs
+    in-process, before tool-describe-scene is ever invoked, against
+    exploration_meta.json. Declaring origin=autonomous on an otherwise
+    interactive call must not touch that file or change anything about the
+    call besides the label — the tool must never be able to grant itself
+    autonomous status just by reading its own environment."""
+    state_dir = isolated_project["state_dir"]
+    meta_path = state_dir / "exploration_meta.json"
+
+    env_interactive = isolated_project["env"].copy()
+    env_interactive["PX_DRY"] = "1"
+    payload_interactive = parse_json(run_tool(["bin/tool-describe-scene"], env_interactive))
+    assert not meta_path.exists()
+
+    env_autonomous = isolated_project["env"].copy()
+    env_autonomous["PX_DRY"] = "1"
+    env_autonomous["PX_VISION_ORIGIN"] = "autonomous"
+    payload_autonomous = parse_json(run_tool(["bin/tool-describe-scene"], env_autonomous))
+    assert not meta_path.exists()
+
+    assert payload_interactive["origin"] == "interactive"
+    assert payload_autonomous["origin"] == "autonomous"
+    for key in ("status", "dry", "description"):
+        assert payload_interactive[key] == payload_autonomous[key]
+
+
 def test_tool_describe_scene_rejects_another_gpio_owner(isolated_project):
     """A camera request cannot replace another process's live GPIO authority."""
     state_dir = isolated_project["state_dir"]
