@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 FALLBACK_DESCRIPTION = "I couldn't see anything right now."
@@ -32,46 +31,26 @@ CLAUDE_TIMEOUT = 60
 
 MAX_DESCRIPTION_CHARS = 300
 
-DEFAULT_CLAUDE_USER = "pi"
+PHOTOS_DIRNAME = "photos"
 
 
-def claude_user() -> str:
-    """Who owns the Claude credentials. Not root, and not necessarily the caller.
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent
 
-    Read at call time rather than bound at import, and read in exactly one
-    place: the user picks both who we drop privileges to *and* whose home the
-    binary is looked up in, so an import-time constant plus a call-time
-    override would let those two disagree — dropping to one user while
-    reaching for another user's CLI.
+
+def _within_photos(image_path: Path) -> bool:
+    """Is this a photo SPARK took, rather than an arbitrary file?
+
+    The resident session holds an unscoped `Read` (see bin/px-claude-session),
+    so this is where the intended scope is actually enforced: a path outside
+    photos/ is refused here and never reaches the session. The envelope grants
+    more than this function will ever ask for, deliberately and visibly.
     """
-    return os.environ.get("PX_CLAUDE_USER", DEFAULT_CLAUDE_USER)
-
-
-def claude_bin() -> str:
-    """Locate the CLI. Not on PATH under systemd, nor on root's PATH at all."""
-    return (os.environ.get("PX_CLAUDE_BIN")
-            or shutil.which("claude")
-            or f"/home/{claude_user()}/.local/bin/claude")
-
-
-def vision_command(prompt: str) -> list[str]:
-    """The argv for one vision call, dropping privileges if we hold them.
-
-    `runuser` rather than a `HOME=/home/pi` override on the existing sudo env:
-    the override does authenticate, but it runs the CLI *as root inside the pi
-    user's home*, leaving root-owned files in ~/.claude on every call. Once a
-    token refresh lands there root-owned, the pi user can no longer write its
-    own credentials — the same cross-UID trap health.py was redesigned around.
-    Dropping privileges keeps the blast radius to this one subprocess.
-    """
-    argv = [
-        claude_bin(), "-p", prompt,
-        "--allowedTools", "Read",
-        "--output-format", "text",
-    ]
-    if os.geteuid() == 0:
-        return ["runuser", "-u", claude_user(), "--", *argv]
-    return argv
+    try:
+        photos = (_project_root() / PHOTOS_DIRNAME).resolve()
+        return image_path.resolve().is_relative_to(photos)
+    except (OSError, ValueError):
+        return False
 
 
 def _prompt_for(image_path: Path | str) -> str:
@@ -86,29 +65,47 @@ def _prompt_for(image_path: Path | str) -> str:
 def describe_image(image_path: Path | str) -> str:
     """Describe the image, or return FALLBACK_DESCRIPTION.
 
-    Never raises and never returns the CLI's own error output: the caller
+    Runs on the resident spark-brain session, which reads the file with Claude
+    Code's own Read tool. There is no subprocess: this used to be a cold
+    `claude -p --allowedTools Read`, launched under `runuser` because wander
+    reaches it through sudo — a fresh Claude per photo, on a Pi that might be
+    in the middle of a conversation.
+
+    Only the path travels. The image is never inlined into the payload, and the
+    path must live under photos/ — the session's Read grant is wider than that,
+    so the narrowing is enforced here rather than assumed there.
+
+    Never raises and never returns the session's own error text: the caller
     speaks this string aloud and writes it to memory.
     """
-    # Run as plain `claude`, not in Claude Code mode, when called from a session.
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
+    path = Path(image_path)
+    if not _within_photos(path) or not path.exists():
+        return FALLBACK_DESCRIPTION
 
     try:
-        result = subprocess.run(
-            vision_command(_prompt_for(image_path)),
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=CLAUDE_TIMEOUT,
-        )
-    except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError):
+        from pxh.brain import ask_brain
+        reply = ask_brain("describe_scene", {
+            "image_path": str(path.resolve()),
+            "instruction": _prompt_for(path.resolve()),
+            "respond_with": (
+                'a single JSON object {"description": "..."}. Read only the '
+                "image at image_path. Do not speak, move or remember anything "
+                "for this request — the caller says it aloud."
+            ),
+        }, timeout_s=float(CLAUDE_TIMEOUT))
+    except Exception:  # noqa: BLE001 - the caller speaks whatever comes back
         return FALLBACK_DESCRIPTION
 
-    # Both halves matter. Exit code alone misses a clean-but-silent run; stdout
-    # alone turns "Not logged in" into something SPARK claims to have seen.
-    if result.returncode != 0 or not result.stdout.strip():
+    if reply is None:
+        # Defer, never escalate. A robot saying "I couldn't see anything right
+        # now" is telling the truth; one that spawns a second Claude to avoid
+        # saying it makes the Pi slower for everything else.
         return FALLBACK_DESCRIPTION
 
-    return result.stdout.strip()[:MAX_DESCRIPTION_CHARS]
+    answer = reply.get("reply")
+    if isinstance(answer, dict):
+        answer = answer.get("description") or answer.get("text") or ""
+    text = str(answer or "").strip()
+    if not text:
+        return FALLBACK_DESCRIPTION
+    return text[:MAX_DESCRIPTION_CHARS]

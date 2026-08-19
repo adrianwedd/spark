@@ -1,102 +1,147 @@
-"""Claude vision invocation: the guard, and the privilege drop.
+"""Vision on the resident brain: the guard, and what may leave the robot.
 
 Two failures live here, and both are silent by construction — the tool returns
 a plausible sentence either way, and `wander.py` stamps that sentence into
 durable memory as an `observation` at confidence 1.0. Neither can be caught by
-reading the robot's logs after the fact, so they are pinned here instead.
+reading the robot's logs after the fact, so they are pinned here.
+
+The privilege-drop tests that used to sit alongside them are gone with the
+thing they guarded. `describe_image` no longer runs `claude -p` under
+`runuser`, so there is no process to launch as the wrong user and no
+credentials to reach for in the wrong home. What replaced them is narrower and
+sharper: the session already exists, and the only question is what we hand it.
 """
 from __future__ import annotations
 
-import shlex
+from pathlib import Path
 
 import pytest
 
+import pxh.brain
 from pxh import vision
 
 
-def _fake_claude(tmp_path, stdout: str, returncode: int = 0):
-    """A real executable standing in for the claude CLI.
-
-    Deliberately a script on disk rather than a mock: the behaviour under test
-    is how `describe_image` reads a *process* result, so the process has to be
-    real for the test to mean anything.
-    """
-    path = tmp_path / "fake-claude"
-    path.write_text(
-        "#!/usr/bin/env bash\n"
-        f"printf '%s' {shlex.quote(stdout)}\n"
-        f"exit {returncode}\n"
-    )
-    path.chmod(0o755)
-    return path
-
-
 @pytest.fixture
-def image(tmp_path):
-    path = tmp_path / "scene.jpg"
-    path.write_bytes(b"\xff\xd8\xff\xd9")
-    return path
+def photo(tmp_path, monkeypatch):
+    """A file that passes the photos/ check, without writing to the real dir."""
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    img = photos / "20260819T184444.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0 not really a jpeg")
+    monkeypatch.setattr(vision, "_project_root", lambda: tmp_path)
+    return img
 
 
-def test_cli_error_text_never_becomes_a_description(tmp_path, monkeypatch, image):
-    """A non-zero exit is a failure even when the CLI printed to stdout.
+def _reply(monkeypatch, value):
+    captured = {}
 
-    This is the exact signature of the root-credential bug: `claude` prints
-    "Not logged in - Please run /login" to **stdout** and exits 1. A guard that
-    checked only for empty stdout would hand that string back, SPARK would say
-    it aloud, and it would be written to memory as something the robot saw.
+    def _ask(kind, payload, **kw):
+        captured["kind"] = kind
+        captured["payload"] = payload
+        captured["kw"] = kw
+        return value
+
+    monkeypatch.setattr(pxh.brain, "ask_brain", _ask)
+    return captured
+
+
+# ── The two silent failures ────────────────────────────────────────────────
+
+def test_an_unavailable_brain_never_becomes_a_description(photo, monkeypatch):
+    """`ask_brain` returns None for every failure. None is not a sighting.
+
+    Before this, the equivalent path spawned a second Claude to try again. A
+    robot that says "I couldn't see anything right now" is telling the truth;
+    one that adds load to avoid saying it is lying and slower.
     """
-    fake = _fake_claude(tmp_path, "Not logged in - Please run /login", returncode=1)
-    monkeypatch.setenv("PX_CLAUDE_BIN", str(fake))
-
-    result = vision.describe_image(image)
-
-    assert result == vision.FALLBACK_DESCRIPTION
-    assert "Not logged in" not in result
+    _reply(monkeypatch, None)
+    assert vision.describe_image(photo) == vision.FALLBACK_DESCRIPTION
 
 
-def test_empty_stdout_with_clean_exit_is_also_a_failure(tmp_path, monkeypatch, image):
-    """The other half of the guard: exit 0 but nothing said."""
-    fake = _fake_claude(tmp_path, "", returncode=0)
-    monkeypatch.setenv("PX_CLAUDE_BIN", str(fake))
-
-    assert vision.describe_image(image) == vision.FALLBACK_DESCRIPTION
+def test_an_empty_reply_is_also_a_failure(photo, monkeypatch):
+    """A blank answer with no error is the shape that used to get spoken."""
+    _reply(monkeypatch, {"reply": {"description": "   "}})
+    assert vision.describe_image(photo) == vision.FALLBACK_DESCRIPTION
 
 
-def test_a_real_description_is_returned_unchanged(tmp_path, monkeypatch, image):
-    fake = _fake_claude(tmp_path, "A red ball sits on a wooden table.\n")
-    monkeypatch.setenv("PX_CLAUDE_BIN", str(fake))
+def test_a_raising_brain_does_not_propagate(photo, monkeypatch):
+    """The caller speaks this string aloud; it must never see a traceback."""
+    def _boom(*a, **k):
+        raise RuntimeError("tmux socket gone")
 
-    assert vision.describe_image(image) == "A red ball sits on a wooden table."
-
-
-def test_as_pi_the_cli_is_invoked_directly(monkeypatch):
-    monkeypatch.setattr(vision.os, "geteuid", lambda: 1000)
-    monkeypatch.setenv("PX_CLAUDE_BIN", "/usr/bin/claude")
-
-    assert vision.vision_command("prompt")[0] == "/usr/bin/claude"
+    monkeypatch.setattr(pxh.brain, "ask_brain", _boom)
+    assert vision.describe_image(photo) == vision.FALLBACK_DESCRIPTION
 
 
-def test_as_root_the_cli_is_dropped_back_to_the_owning_user(monkeypatch):
-    """Under sudo the CLI must not run as root, or it reads root's empty
-    credential store and silently returns the fallback.
+def test_a_real_description_is_returned_unchanged(photo, monkeypatch):
+    _reply(monkeypatch, {"reply": {"description": "A red ball sits on a wooden table."}})
+    assert vision.describe_image(photo) == "A red ball sits on a wooden table."
 
-    `runuser` rather than a HOME override: pointing root's HOME at /home/pi
-    does authenticate, but it leaves root-owned files in the pi user's
-    ~/.claude on every run — the same cross-UID trap health.py was redesigned
-    around.
+
+def test_a_long_description_is_truncated(photo, monkeypatch):
+    _reply(monkeypatch, {"reply": {"description": "x" * 900}})
+    assert len(vision.describe_image(photo)) == vision.MAX_DESCRIPTION_CHARS
+
+
+# ── What is handed to the session ──────────────────────────────────────────
+
+def test_only_the_path_travels(photo, monkeypatch):
+    """The image is never inlined into the payload.
+
+    It would work — the session could decode a base64 blob — but it would put
+    the photo through the mailbox, the log and any future outbox dump, for no
+    gain over a path the session can already read.
     """
-    monkeypatch.setattr(vision.os, "geteuid", lambda: 0)
-    monkeypatch.setenv("PX_CLAUDE_BIN", "/usr/bin/claude")
+    captured = _reply(monkeypatch, {"reply": {"description": "ok"}})
+    vision.describe_image(photo)
 
-    cmd = vision.vision_command("prompt")
+    assert captured["kind"] == "describe_scene"
+    assert captured["payload"]["image_path"] == str(photo.resolve())
+    assert not any(isinstance(v, (bytes, bytearray))
+                   for v in captured["payload"].values())
 
-    assert cmd[:4] == ["runuser", "-u", "pi", "--"]
-    assert cmd[4] == "/usr/bin/claude"
+
+def test_the_session_is_told_to_read_only_that_path(photo, monkeypatch):
+    """The Read grant is wider than this request. The prompt says so too."""
+    captured = _reply(monkeypatch, {"reply": {"description": "ok"}})
+    vision.describe_image(photo)
+    assert "only" in captured["payload"]["respond_with"].lower()
 
 
-def test_the_drop_target_user_is_configurable(monkeypatch):
-    monkeypatch.setattr(vision.os, "geteuid", lambda: 0)
-    monkeypatch.setenv("PX_CLAUDE_USER", "spark")
+def test_the_deadline_fits_inside_wanders_budget(photo, monkeypatch):
+    """wander kills the tool at DESCRIBE_SCENE_TIMEOUT; overrunning that
+    charges for a call whose answer is thrown away."""
+    from pxh import wander
+    captured = _reply(monkeypatch, {"reply": {"description": "ok"}})
+    vision.describe_image(photo)
+    assert captured["kw"]["timeout_s"] == float(vision.CLAUDE_TIMEOUT)
+    assert vision.CLAUDE_TIMEOUT < wander.DESCRIBE_SCENE_TIMEOUT
 
-    assert vision.vision_command("prompt")[:3] == ["runuser", "-u", "spark"]
+
+# ── The scope narrowing ────────────────────────────────────────────────────
+
+def test_a_path_outside_photos_is_refused_before_the_brain(tmp_path, monkeypatch):
+    """Enforced here because the CLI grant is unscoped. See test_brain_envelope."""
+    def _never(*a, **k):
+        raise AssertionError("a non-photo path was sent to the brain")
+
+    monkeypatch.setattr(pxh.brain, "ask_brain", _never)
+    monkeypatch.setattr(vision, "_project_root", lambda: tmp_path)
+    (tmp_path / "photos").mkdir()
+    secret = tmp_path / ".env"
+    secret.write_text("PX_API_TOKEN=hunter2")
+    assert vision.describe_image(secret) == vision.FALLBACK_DESCRIPTION
+
+
+def test_a_missing_photo_is_refused_before_the_brain(photo, monkeypatch):
+    def _never(*a, **k):
+        raise AssertionError("a missing path was sent to the brain")
+
+    monkeypatch.setattr(pxh.brain, "ask_brain", _never)
+    assert vision.describe_image(photo.parent / "nope.jpg") == vision.FALLBACK_DESCRIPTION
+
+
+def test_no_subprocess_remains_in_the_module():
+    """The cold path is gone, not disabled."""
+    src = Path(vision.__file__).read_text()
+    assert "subprocess" not in src.replace("There is no subprocess", "")

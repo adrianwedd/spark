@@ -1,11 +1,23 @@
 [Unit]
 Description=Cloudflare Tunnel — api.spark.wedd.au → localhost:8420
-After=network-online.target px-api-server.service
-Wants=network-online.target px-api-server.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-EnvironmentFile=/home/pi/picar-x-hacking/.env
-ExecStart=/usr/bin/cloudflared tunnel run --token ${CF_TUNNEL_TOKEN}
+# The tunnel token is a credential, not an argument. It used to arrive via
+# EnvironmentFile=.env and ${CF_TUNNEL_TOKEN} expanded into ExecStart, which put
+# it in /proc/<pid>/cmdline — world-readable — for the life of the process.
+#
+# LoadCredential lets systemd open the root-owned 0600 file as root, before
+# dropping to User=pi, and re-expose it under %d (a per-unit tmpfs) as mode 0400
+# owned by pi. That is why the source file can stay root:root 0600 even though
+# this unit does not run as root.
+#
+# EnvironmentFile is deliberately gone: cloudflared reads TUNNEL_TOKEN, not
+# CF_TUNNEL_TOKEN, so .env supplied it nothing it could use — while placing every
+# other SPARK secret in this network-facing process's /proc/<pid>/environ.
+LoadCredential=tunnel-token:/etc/cloudflared/tunnel-token
+ExecStart=/usr/bin/cloudflared tunnel run --token-file %d/tunnel-token
 Restart=always
 RestartSec=5
 User=pi
