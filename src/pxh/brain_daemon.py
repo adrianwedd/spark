@@ -745,13 +745,12 @@ def supervisor_lock_path() -> Path:
     return Path(brain.brain_socket() + ".supervisor.lock")
 
 
-# The removal gate, as one constant. True for the duration of the migration;
-# the follow-up deletes this flag, `legacy_supervisor_lock_path`, and the
-# branch below that reads it, at which point the socket alone is the complete
-# namespace. Deliberately not env-readable: a guard that an operator can
-# weaken from the environment is not a guard, and the whole point of the
-# bridge is that it cannot be skipped while a pre-bridge binary can still be
-# started. Its post-removal contract is pinned by
+# Migration bridge — removal is gated by #224.
+# Do not remove/disable this independently; #224 owns the proof that no
+# pre-bridge binary remains runnable.
+#
+# Deliberately not env-readable: a guard an operator can weaken from the
+# environment is not a guard. Its post-removal contract is pinned by
 # test_after_removal_the_socket_alone_is_the_namespace.
 _BRIDGE_HOLDS_LEGACY_LOCK = True
 
@@ -760,9 +759,8 @@ def legacy_supervisor_lock_path() -> Path:
     """The pre-bridge, checkout-relative guard.
 
     Held in addition to the socket lock for the duration of the migration.
-    Deleted in a follow-up, permitted only once no pre-bridge binary can be
-    started — every deployed checkout and the systemd unit at or after the
-    bridge commit.
+
+    Migration bridge — removal is gated by #224.
     """
     return brain.brain_root() / ".supervisor.lock"
 
@@ -870,6 +868,8 @@ def acquire_supervisor_lock() -> bool:
     migration the namespace is the pair (socket, checkout), and only after
     the legacy lock is removed does the socket alone become the complete
     namespace. Both halves are pinned by TestContention.
+
+    Migration bridge — removal is gated by #224.
     """
     global _supervisor_fd, _legacy_fd
     if brain._ensure_dir(brain.brain_root()) is None:
