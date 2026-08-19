@@ -49,7 +49,7 @@ from typing import Any, Dict
 
 from filelock import Timeout as FileLockTimeout
 
-from pxh import policy
+from pxh import policy, wake_grant
 from pxh.state import load_session
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
@@ -119,6 +119,22 @@ def load_awareness(*, warn_prefix: str = "[policy]") -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def wake_grant_active() -> bool:
+    """Whether a wake conversation is open, as a fact read off disk.
+
+    The one place either chokepoint asks. It exists as a named function rather
+    than an inline call so both the dispatcher and the sink demonstrably load
+    the *same* fact the *same* way, and so a test can pin the call site: an
+    evolution PR that deleted the lookup and read an environment variable
+    instead fails tests/test_policy_invariants.py, which px-evolve cannot edit.
+
+    Never raises and never logs. pxh.wake_grant resolves every failure to "no
+    grant", which suppresses — the correct direction for a question that only
+    ever unblocks audio.
+    """
+    return wake_grant.is_grant_active()
+
+
 def evaluate_audio_sink(
     action: str,
     params: Dict[str, Any] | None = None,
@@ -139,6 +155,13 @@ def evaluate_audio_sink(
     declare its own effect could declare its way out of the gate, and the
     verdict would then be decided by the least trustworthy party in the chain.
 
+    The wake grant is loaded here for exactly that reason and is deliberately
+    not a parameter. It is the one input that can *unblock* audio, so it is the
+    last thing that should arrive as a caller's assertion — the sink reads the
+    document itself, checks it against this boot and this boot's clock, and
+    believes nothing anyone hands it. An environment variable can say where to
+    look; nothing it says is taken as true.
+
     A session the sink could not read suppresses rather than proceeds. The
     sink is the last boundary before the speaker, so it is the worst possible
     place to guess: there is nothing downstream to catch a wrong guess, and the
@@ -154,4 +177,5 @@ def evaluate_audio_sink(
         session_available=session.available,
         awareness=load_awareness(warn_prefix=warn_prefix),
         now=time.time(),
+        wake_grant=wake_grant_active(),
     )

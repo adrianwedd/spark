@@ -8,6 +8,15 @@ Type=simple
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/picar-x-hacking
+# Creates /run/spark/wake (tmpfs) owned by pi before ExecStart, and removes it
+# when the unit stops. The wake grant lives there and nowhere else: it is a
+# permission to speak, so it must not survive a reboot or a crash of the only
+# daemon allowed to issue one. Deliberately NOT RuntimeDirectoryPreserve — the
+# heartbeat next door is preserved because a stale heartbeat reads as stale,
+# whereas a stale grant would read as consent. Nested under the existing
+# /run/spark rather than beside it; only the final component is owned by this
+# unit, so px-alive's directory is untouched.
+RuntimeDirectory=spark/wake
 Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native

@@ -600,3 +600,417 @@ def test_delegating_producers_really_do_route_through_the_sink():
             continue
         source = (REPO_ROOT / path).read_text(encoding="utf-8")
         assert "tool-voice" in source, path
+
+
+# ---------------------------------------------------------------------------
+# Wake grant — a *capability*, not a bypass.
+#
+# "Hey Spark" permits SPARK to answer the person who deliberately summoned
+# him. That is the whole of it. The grant may unblock an audible interactive
+# reply that night silence, quiet mode or on-call suppression would otherwise
+# have swallowed; it may not widen anything else, and it may not survive the
+# conversation that opened it.
+#
+# Two properties get disproportionate attention here because both have already
+# failed on this hardware:
+#
+#   * The Pi has no RTC and the clock has been observed stepping ~49 minutes
+#     during boot as NTP corrects it. A grant whose lifetime were measured in
+#     wall time would therefore expire instantly or last most of an hour,
+#     depending on the direction of the step. Validity is bound to
+#     CLOCK_BOOTTIME instead, and the tests below prove wall time is not
+#     merely unused but *unreachable* from the validity path.
+#
+#   * The sink is the last boundary before the speaker and cannot trust its
+#     caller — that is why it exists. So the grant is a fact it reads for
+#     itself, never an argument or an environment variable it is handed.
+# ---------------------------------------------------------------------------
+
+import json as _json
+import os as _os
+import time as _time
+
+from pxh import wake_grant
+
+
+@pytest.fixture
+def grant_dir(tmp_path, monkeypatch):
+    """Point the grant at a tmp runtime dir, so no test can see the real one."""
+    d = tmp_path / "wake"
+    d.mkdir()
+    monkeypatch.setenv(wake_grant.GRANT_DIR_ENV, str(d))
+    return d
+
+
+# --- lifetime is bound to boot, never to the wall clock ---------------------
+
+def test_a_fresh_grant_is_active(grant_dir):
+    assert wake_grant.open_grant() is not None
+    assert wake_grant.is_grant_active() is True
+
+
+def test_a_grant_expires_on_boottime(grant_dir, monkeypatch):
+    wake_grant.open_grant(ttl_s=180.0)
+    later = wake_grant.boottime() + 181.0
+    monkeypatch.setattr(wake_grant, "boottime", lambda: later)
+    assert wake_grant.is_grant_active() is False
+
+
+def test_grant_validity_cannot_reach_the_wall_clock(grant_dir, monkeypatch):
+    """The strong form: not 'does not use time.time()' but 'could not'.
+
+    A grant is opened first, while the clock still works, because opening
+    records a diagnostic UTC stamp. Everything after that point must survive
+    a wall clock that raises on contact.
+    """
+    wake_grant.open_grant()
+
+    def _explode():  # pragma: no cover - the point is that it never runs
+        raise AssertionError("policy validity consulted the wall clock")
+
+    monkeypatch.setattr(_time, "time", _explode)
+    assert wake_grant.is_grant_active() is True
+
+
+@pytest.mark.parametrize("jump_s", [+3600.0, -3600.0, +49 * 60.0, -49 * 60.0])
+def test_wall_clock_jumps_do_not_change_grant_lifetime(grant_dir, monkeypatch, jump_s):
+    """NTP stepping the clock at boot must not lengthen or kill a grant."""
+    wake_grant.open_grant(ttl_s=180.0)
+    real_time = _time.time
+    monkeypatch.setattr(_time, "time", lambda: real_time() + jump_s)
+    assert wake_grant.is_grant_active() is True
+
+    # ...and it still expires exactly one TTL of *boot* time later.
+    later = wake_grant.boottime() + 181.0
+    monkeypatch.setattr(wake_grant, "boottime", lambda: later)
+    assert wake_grant.is_grant_active() is False
+
+
+def test_a_grant_from_a_previous_boot_is_invalid(grant_dir):
+    """Reboot invalidates the grant even if the file somehow outlives tmpfs.
+
+    The document is produced by the real opener and only the boot id is
+    altered, so this pins the check rather than a hand-built fixture that
+    could drift from what open_grant() actually writes.
+    """
+    wake_grant.open_grant()
+    doc = _json.loads(wake_grant.grant_path().read_text())
+    doc["boot_id"] = "00000000-0000-0000-0000-000000000000"
+    wake_grant.grant_path().write_text(_json.dumps(doc))
+    assert wake_grant.is_grant_active() is False
+
+
+def test_a_grant_with_no_boot_id_is_invalid(grant_dir):
+    wake_grant.open_grant()
+    doc = _json.loads(wake_grant.grant_path().read_text())
+    del doc["boot_id"]
+    wake_grant.grant_path().write_text(_json.dumps(doc))
+    assert wake_grant.is_grant_active() is False
+
+
+# --- fail closed ------------------------------------------------------------
+
+def test_a_missing_grant_is_inactive(grant_dir):
+    assert wake_grant.is_grant_active() is False
+
+
+def test_a_missing_runtime_directory_is_inactive(tmp_path, monkeypatch):
+    monkeypatch.setenv(wake_grant.GRANT_DIR_ENV, str(tmp_path / "nope"))
+    assert wake_grant.is_grant_active() is False
+
+
+@pytest.mark.parametrize("blob", ["", "{", "null", "[]", '{"boot_id": 3}', "not json at all"])
+def test_a_corrupt_grant_is_inactive(grant_dir, blob):
+    wake_grant.grant_path().write_text(blob)
+    assert wake_grant.is_grant_active() is False
+
+
+def test_a_grant_that_expires_before_it_opens_is_inactive(grant_dir):
+    """Nonsense ordering is treated as corruption, not as a very long window."""
+    wake_grant.open_grant()
+    doc = _json.loads(wake_grant.grant_path().read_text())
+    doc["expires_boottime"] = doc["opened_boottime"] - 1.0
+    wake_grant.grant_path().write_text(_json.dumps(doc))
+    assert wake_grant.is_grant_active() is False
+
+
+def test_the_grant_never_falls_back_to_durable_state(grant_dir, tmp_path):
+    """Unlike the heartbeat, this file must not survive a power cut.
+
+    pxh.runtime_paths deliberately falls back to state/ on hosts without
+    /run/spark. That is right for a heartbeat and wrong for a grant, so the
+    grant resolves its own path and the two must not be confused.
+    """
+    assert wake_grant.grant_path().parent == grant_dir
+    assert "state" not in wake_grant.grant_path().parts
+
+
+# --- the window is opened by a summons and closed by silence ----------------
+
+def test_refresh_extends_only_the_conversation_that_owns_the_grant(grant_dir, monkeypatch):
+    cid = wake_grant.open_grant(ttl_s=180.0)
+    doc = _json.loads(wake_grant.grant_path().read_text())
+    opened, before = doc["opened_boottime"], doc["expires_boottime"]
+
+    monkeypatch.setattr(wake_grant, "boottime", lambda: opened + 10.0)
+    assert wake_grant.refresh_grant("some-other-conversation") is False
+    unchanged = _json.loads(wake_grant.grant_path().read_text())["expires_boottime"]
+    assert unchanged == before
+
+    assert wake_grant.refresh_grant(cid) is True
+    extended = _json.loads(wake_grant.grant_path().read_text())["expires_boottime"]
+    assert extended > before
+
+
+def test_refresh_cannot_revive_an_expired_grant(grant_dir, monkeypatch):
+    """Inactivity closes the window; a late turn does not reopen it.
+
+    Only a fresh 'Hey Spark' may originate a grant, so a conversation that has
+    already lapsed has to be summoned again rather than resumed.
+    """
+    cid = wake_grant.open_grant(ttl_s=180.0)
+    opened = _json.loads(wake_grant.grant_path().read_text())["opened_boottime"]
+    monkeypatch.setattr(wake_grant, "boottime", lambda: opened + 181.0)
+    assert wake_grant.refresh_grant(cid) is False
+    assert wake_grant.is_grant_active() is False
+
+
+def test_refresh_cannot_extend_a_conversation_forever(grant_dir, monkeypatch):
+    """Turns extend the window; they do not make it unbounded.
+
+    Without this, a room with a television in it holds the gate open all
+    night one legitimate-looking turn at a time.
+    """
+    cid = wake_grant.open_grant(ttl_s=180.0)
+    opened = _json.loads(wake_grant.grant_path().read_text())["opened_boottime"]
+
+    # Refresh diligently, every 60s, well inside the TTL each time.
+    t = opened
+    while t < opened + wake_grant.MAX_CONVERSATION_S - 60.0:
+        t += 60.0
+        monkeypatch.setattr(wake_grant, "boottime", lambda t=t: t)
+        assert wake_grant.refresh_grant(cid) is True
+
+    t = opened + wake_grant.MAX_CONVERSATION_S + 1.0
+    monkeypatch.setattr(wake_grant, "boottime", lambda: t)
+    assert wake_grant.refresh_grant(cid) is False
+    assert wake_grant.is_grant_active() is False
+
+
+def test_a_new_summons_starts_a_new_conversation(grant_dir):
+    first = wake_grant.open_grant()
+    second = wake_grant.open_grant()
+    assert first != second
+    assert wake_grant.refresh_grant(first) is False
+    assert wake_grant.refresh_grant(second) is True
+
+
+def test_closing_the_grant_ends_the_window(grant_dir):
+    cid = wake_grant.open_grant()
+    wake_grant.close_grant(cid)
+    assert wake_grant.is_grant_active() is False
+
+
+def test_closing_someone_elses_grant_is_refused(grant_dir):
+    """A stale conversation ending must not silence the one that replaced it."""
+    wake_grant.open_grant()
+    second = wake_grant.open_grant()
+    wake_grant.close_grant("a-stale-conversation")
+    assert wake_grant.is_grant_active() is True
+    wake_grant.close_grant(second)
+    assert wake_grant.is_grant_active() is False
+
+
+# --- what the grant permits, and what it must not -------------------------
+
+def _verdict(*, wake, origin="interactive", effect="audio", session=None,
+             awareness=None, now=NIGHT_TS, session_available=True):
+    return policy.evaluate(
+        "tool_voice", {"text": "hello"}, effect=effect, origin=origin,
+        session={} if session is None else session,
+        awareness={} if awareness is None else awareness,
+        now=now, session_available=session_available, wake_grant=wake,
+    )
+
+
+def test_wake_grant_permits_an_audible_reply_during_night_silence():
+    assert _verdict(wake=False).reason == "night_silence"
+    v = _verdict(wake=True)
+    assert v.allowed is True
+    assert v.reason == "wake_grant"
+
+
+def test_wake_grant_permits_an_audible_reply_during_quiet_mode():
+    session = {"spark_quiet_mode": True}
+    assert _verdict(wake=False, session=session, now=DAY_TS).reason == "quiet_mode"
+    assert _verdict(wake=True, session=session, now=DAY_TS).allowed is True
+
+
+def test_wake_grant_permits_an_audible_reply_while_adrian_is_on_call():
+    aw = {"ha_context": {"adrian_on_call": True}}
+    assert _verdict(wake=False, awareness=aw, now=DAY_TS).reason == "on_call"
+    assert _verdict(wake=True, awareness=aw, now=DAY_TS).allowed is True
+
+
+def test_wake_grant_does_not_mutate_the_underlying_state():
+    """Quiet mode stays *set*. The conversation speaks through it; it does not
+    end it. bin/tool-quiet remains the only exit."""
+    session = {"spark_quiet_mode": True}
+    _verdict(wake=True, session=session, now=DAY_TS)
+    assert session == {"spark_quiet_mode": True}
+
+
+def test_wake_grant_does_not_help_autonomous_speech():
+    """A reflection at 3am is not a summons, whoever else is talking."""
+    v = _verdict(wake=True, origin="autonomous", session={"spark_quiet_mode": True},
+                 now=NIGHT_TS)
+    assert v.allowed is False
+    assert v.reason == "quiet_mode"
+
+
+def test_wake_grant_cannot_override_an_unreadable_session():
+    """Rule 0 is about evidence, not state. A grant is not evidence that the
+    dysregulation protocol is not running — it only says someone spoke."""
+    v = _verdict(wake=True, session_available=False)
+    assert v.allowed is False
+    assert v.reason == "session_unavailable"
+
+
+@pytest.mark.parametrize("effect", ["presence", "other"])
+@pytest.mark.parametrize("origin", ["interactive", "autonomous"])
+def test_wake_grant_never_decides_a_non_audio_verdict(effect, origin):
+    """Direct wake permits an answer; it confers no other authority.
+
+    Swept as a cross-product rather than asserted on one call, because the
+    claim is about the whole surface: outside interactive audio, the grant
+    must be inert — the verdict with it is the verdict without it.
+    """
+    without = _verdict(wake=False, effect=effect, origin=origin,
+                       session={"spark_quiet_mode": True})
+    with_ = _verdict(wake=True, effect=effect, origin=origin,
+                     session={"spark_quiet_mode": True})
+    assert with_ == without
+    assert with_.reason != "wake_grant"
+
+
+def test_wake_grant_never_decides_an_autonomous_audio_verdict():
+    with_ = _verdict(wake=True, origin="autonomous")
+    without = _verdict(wake=False, origin="autonomous")
+    assert with_ == without
+    assert with_.reason != "wake_grant"
+
+
+def test_the_dispatcher_consults_the_grant_it_loads_rather_than_its_caller(monkeypatch):
+    """voice_loop must not accept wake-ness from the model or the environment.
+
+    Pins the call site: the dispatcher asks policy_context for the fact, so an
+    evolution PR that deleted the lookup and read PX_* instead would fail here
+    rather than in a whitelisted test it could edit to match.
+    """
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: NIGHT_TS)
+    monkeypatch.setattr(policy_context, "wake_grant_active", lambda: False)
+    tool, _ = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool != "tool_voice"
+
+    monkeypatch.setattr(policy_context, "wake_grant_active", lambda: True)
+    tool, _ = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool == "tool_voice"
+
+
+# --- the sink, end to end, against a canary rather than a self-report -------
+
+def test_hey_spark_at_three_am_gets_an_audible_reply(sink, tmp_path):
+    d = tmp_path / "wake-3am"
+    d.mkdir()
+    _os.environ[wake_grant.GRANT_DIR_ENV] = str(d)
+    try:
+        wake_grant.open_grant()
+    finally:
+        del _os.environ[wake_grant.GRANT_DIR_ENV]
+    payload, spoke = sink(session={}, **{wake_grant.GRANT_DIR_ENV: str(d)}, **ALWAYS_NIGHT)
+    assert payload["status"] == "ok"
+    assert spoke is True
+
+
+def test_hey_spark_during_quiet_mode_speaks_and_quiet_mode_remains_set(sink, tmp_path):
+    d = tmp_path / "wake-quiet"
+    d.mkdir()
+    _os.environ[wake_grant.GRANT_DIR_ENV] = str(d)
+    try:
+        wake_grant.open_grant()
+    finally:
+        del _os.environ[wake_grant.GRANT_DIR_ENV]
+    payload, spoke = sink(session={"spark_quiet_mode": True},
+                          **{wake_grant.GRANT_DIR_ENV: str(d)})
+    assert payload["status"] == "ok"
+    assert spoke is True
+    session_after = _json.loads((tmp_path / "state" / "session.json").read_text())
+    assert session_after["spark_quiet_mode"] is True
+
+
+def test_an_expired_grant_is_silent_again(sink, tmp_path):
+    """Real expiry against the real monotonic clock — no fixture stands in for
+    the thing under test."""
+    d = tmp_path / "wake-expired"
+    d.mkdir()
+    _os.environ[wake_grant.GRANT_DIR_ENV] = str(d)
+    try:
+        wake_grant.open_grant(ttl_s=0.05)
+    finally:
+        del _os.environ[wake_grant.GRANT_DIR_ENV]
+    _time.sleep(0.15)
+    payload, spoke = sink(session={}, **{wake_grant.GRANT_DIR_ENV: str(d)}, **ALWAYS_NIGHT)
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+    assert spoke is False
+
+
+def test_a_previous_boot_grant_is_silent(sink, tmp_path):
+    d = tmp_path / "wake-oldboot"
+    d.mkdir()
+    _os.environ[wake_grant.GRANT_DIR_ENV] = str(d)
+    try:
+        wake_grant.open_grant()
+        doc = _json.loads(wake_grant.grant_path().read_text())
+        doc["boot_id"] = "00000000-0000-0000-0000-000000000000"
+        wake_grant.grant_path().write_text(_json.dumps(doc))
+    finally:
+        del _os.environ[wake_grant.GRANT_DIR_ENV]
+    payload, spoke = sink(session={}, **{wake_grant.GRANT_DIR_ENV: str(d)}, **ALWAYS_NIGHT)
+    assert payload["status"] == "suppressed"
+    assert spoke is False
+
+
+@pytest.mark.parametrize("claim", [
+    {"PX_WAKE_GRANT": "1"},
+    {"PX_WAKE_GRANT": "true"},
+    {"PX_WAKE_GRANT_ACTIVE": "1"},
+    {"PX_WAKE_TURN": "1"},
+    {"PX_WAKE_WORD": "hey spark"},
+    {"PX_ORIGIN": "wake"},
+])
+def test_no_environment_variable_can_manufacture_a_grant(sink, tmp_path, claim):
+    """An env var may say *where* to look. Nothing it says is believed.
+
+    This is the bypass the sink exists to close: anything holding a shell on
+    this box — including SPARK's own resident brain session, whose tool
+    envelope is the whole bin/ directory — can set variables.
+    """
+    empty = tmp_path / "wake-empty"
+    empty.mkdir()
+    payload, spoke = sink(session={}, **{wake_grant.GRANT_DIR_ENV: str(empty)},
+                          **claim, **ALWAYS_NIGHT)
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+    assert spoke is False
+
+
+def test_the_sink_will_not_take_wake_ness_as_an_argument():
+    """evaluate_audio_sink loads the grant itself, exactly as it pins origin
+    and effect. A caller that could pass it in could argue its way past the
+    last gate before the speaker."""
+    import inspect
+    params = inspect.signature(policy_context.evaluate_audio_sink).parameters
+    assert "wake_grant" not in params
+    source = (REPO_ROOT / "bin" / "tool-voice").read_text(encoding="utf-8")
+    assert "wake_grant" not in source

@@ -704,9 +704,15 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         session = {}
     awareness = _load_awareness_for_policy()
     now = _policy_now()
+    # Loaded, never accepted. The model proposes the action; it does not get to
+    # tell the dispatcher whether it was summoned, and neither does the
+    # environment it was launched with. Same loader the sink uses, so the two
+    # gates cannot disagree about whether a conversation is open.
+    wake = policy_context.wake_grant_active()
     verdict = policy.evaluate(
         requested_tool, params, effect=classify_effect(requested_tool, params),
         origin="interactive", session=session, awareness=awareness, now=now,
+        wake_grant=wake,
     )
     if not verdict.allowed:
         substitute_tool = "tool_emote"
@@ -717,7 +723,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             substitute_tool, substitute_params,
             effect=classify_effect(substitute_tool, substitute_params),
             origin="interactive", session=session, awareness=awareness,
-            now=now, _depth=1,
+            now=now, wake_grant=wake, _depth=1,
         )
         print(f"[voice-loop] requested={requested_tool} verdict=blocked "
               f"reason={verdict.reason} substituted={substitute_tool}",
@@ -726,6 +732,7 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             "requested": requested_tool,
             "reason": verdict.reason,
             "substituted": substitute_tool,
+            "wake_grant": wake,
             "ts": utc_timestamp(),
         })
         tool = substitute_tool
