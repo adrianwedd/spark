@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Pi (Bookworm ships 3.11.2). A version skew here would
+          # let CI pass on syntax the robot cannot run.
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      # -m "not live" deselects the hardware tests; see the marker definition in
+      # pyproject.toml. Nothing else is passed on purpose: this job exists to be
+      # an honest gate, and pre-setting LOG_DIR or PX_BYPASS_SUDO here would
+      # mask the very failures it is meant to surface.
+      - run: pytest -m "not live" -q

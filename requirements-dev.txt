@@ -1,0 +1,7 @@
+# Test-only dependencies. Kept separate from requirements.txt so the runtime
+# install on the robot stays minimal — these are needed to *run* the suite,
+# not to run SPARK.
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27      # fastapi.testclient.TestClient transport (6 test modules)
+numpy>=1.26      # tests/test_wake_audio.py builds synthetic frames

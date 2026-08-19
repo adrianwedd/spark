@@ -26,6 +26,15 @@ python -m pytest -m "not live"           # skip hardware tests
 sudo .venv/bin/python -m pytest tests/test_tools_live.py -v -s  # live hardware tests
 ```
 
+**CI runs `pytest -m "not live"` on every PR** (`.github/workflows/tests.yml`,
+Python 3.11 to match Bookworm). Prefer it over a full local run: this repo is
+checked out on SPARK itself, so a local suite competes with the running robot
+for a memory envelope that is already tight (#218, #219) and, until #221 lands,
+writes production-shaped records into the live logs. Targeted local runs
+(`-k`, a single file) are fine; the `live` tests can only run here.
+
+Test deps that the robot does not need live in `requirements-dev.txt`.
+
 Test env vars (auto-set via `conftest.py` `isolated_project` fixture): `PX_BYPASS_SUDO=1`, `LOG_DIR=<tmp>/logs`, `PX_SESSION_PATH=<tmp>/state/session.json`, `PX_VOICE_DEVICE=null`.
 
 **Critical:** bin scripts run under `/usr/bin/python3` (not venv) — picarx/robot_hat live in system site-packages.
