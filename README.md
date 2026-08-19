@@ -753,8 +753,8 @@ the suite on SPARK, which is the deployment target, not the test runner.
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/                           # 1459 tests total (28 require live hardware)
-python -m pytest tests/ -m "not live"             # 1431 tests (dry-run, no hardware)
+python -m pytest tests/                           # 1461 tests total (28 require live hardware)
+python -m pytest tests/ -m "not live"             # 1433 tests (dry-run, no hardware)
 python -m pytest tests/test_tools.py -v
 python -m pytest tests/test_api.py -v
 sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (require Pi)
