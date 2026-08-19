@@ -853,24 +853,77 @@ class TestServiceControl:
         assert resp.status_code == 400
         assert "confirm" in resp.json()["error"]
 
-    def test_service_stop_with_confirm(self, api_client, auth_headers):
-        """POST /services/{name}/stop with confirm passes gate (may fail on systemctl)."""
+    # These four tests used to assert only `status_code != 400`, with a comment
+    # reading "may be 200 or 500 depending on systemctl". That comment was the
+    # code admitting what it did: `control_service` → `_run_systemctl` →
+    # `subprocess.run(["sudo", "systemctl", ...])`, which consults `PX_DRY`
+    # nowhere. On 2026-08-19 a bare `python -m pytest` on the robot ran them
+    # and stopped, then restarted, the live px-alive daemon. Neither was
+    # marked `live`. See #217.
+    #
+    # The confirm gate is still what is under test. What changed is that the
+    # destructive boundary is now asserted rather than assumed: one test proves
+    # the argv is built correctly, the other proves it never runs.
+
+    def test_service_stop_with_confirm_never_reaches_the_service_manager(
+        self, api_client, auth_headers, refused_privileged_commands
+    ):
+        """The confirm gate passes — and the OS still never sees the command.
+
+        `refused_privileged_commands` is the artefact. It holds the exact argv
+        the endpoint constructed, recorded at the point of refusal, which is
+        proof of *both* halves: the request got past the gate, and nothing ran.
+        No downstream `PX_DRY` check could establish the second half, because
+        on this path there is no downstream `PX_DRY` check.
+        """
         resp = api_client.post(
             "/api/v1/services/px-alive/stop",
             headers=auth_headers,
             json={"confirm": True},
         )
-        # Won't be 400 — confirm gate passed (may be 200 or 500 depending on systemctl)
-        assert resp.status_code != 400
 
-    def test_service_start_no_confirm_needed(self, api_client, auth_headers):
-        """POST /services/{name}/start does not require confirm."""
+        assert resp.status_code != 400, "the confirm gate rejected a confirmed stop"
+        assert ["sudo", "systemctl", "stop", "px-alive"] in refused_privileged_commands
+        assert resp.status_code == 500
+        assert "live robot" in resp.json()["error"]
+
+    def test_service_stop_with_confirm_builds_the_right_systemctl_argv(
+        self, api_client, auth_headers
+    ):
+        """The success path, with the boundary patched rather than refused.
+
+        Kept separate from the test above so a future change that makes the
+        endpoint succeed differently fails on argv, not on a refusal message.
+        """
+        completed = subprocess.CompletedProcess(args=[], returncode=0,
+                                                stdout="", stderr="")
+        with unittest.mock.patch("pxh.api.subprocess.run",
+                                 return_value=completed) as run:
+            resp = api_client.post(
+                "/api/v1/services/px-alive/stop",
+                headers=auth_headers,
+                json={"confirm": True},
+            )
+
+        assert resp.status_code == 200
+        assert run.call_args.args[0] == ["sudo", "systemctl", "stop", "px-alive"]
+
+    def test_service_start_no_confirm_needed(
+        self, api_client, auth_headers, refused_privileged_commands
+    ):
+        """POST /services/{name}/start does not require confirm.
+
+        This is the other half of the 2026-08-19 pair: the stop test stopped
+        px-alive and this one started it again, which is why the journal shows
+        a restart rather than an outage.
+        """
         resp = api_client.post(
             "/api/v1/services/px-alive/start",
             headers=auth_headers,
         )
-        # start doesn't require confirm — should not be 400 for missing confirm
+
         assert resp.status_code != 400 or "confirm" not in resp.json().get("error", "")
+        assert ["sudo", "systemctl", "start", "px-alive"] in refused_privileged_commands
 
 
 class TestPinVerify:

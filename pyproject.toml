@@ -1,7 +1,23 @@
 [tool.pytest.ini_options]
 markers = [
-    "live: tests that require PiCar-X hardware (run with sudo, deselect with -m 'not live')",
+    "live: tests that drive the real PiCar-X — hardware, sudo, the service manager, billed calls. Opt in with -m live.",
 ]
+# `not live` is the DEFAULT, not a flag you have to remember. On 2026-08-19 a
+# bare `python -m pytest` on the robot executed the live suite and reached
+# `sudo systemctl stop px-alive` through the API's service-control endpoint;
+# px-alive then fought its own watchdog while the box was already loaded, and
+# the brcmfmac SDIO control path started timing out. See #217.
+#
+# `-m` is a store-action option, so a `-m` on the command line replaces this
+# rather than combining with it:
+#     python -m pytest                        # hermetic (this default)
+#     python -m pytest -m live                # live tests only, deliberately
+#     python -m pytest -m "live or not live"  # genuinely everything
+#
+# This is only the first of two layers. It contains tests that *announce* they
+# need hardware; tests/conftest.py refuses the privileged OS call itself, for
+# the ones nobody classified. Pinned by tests/test_suite_containment.py.
+addopts = ["-m", "not live"]
 # Bare `pytest` from the repo root must be correct: the local run is this
 # project's real gate (there is no pytest CI workflow). Without testpaths it
 # collected the .worktrees/ checkouts and died with 229 `import file mismatch`

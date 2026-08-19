@@ -1,6 +1,9 @@
 import sys
 import os
 import json
+import shlex
+import shutil
+import subprocess
 import pytest
 from pathlib import Path
 
@@ -152,3 +155,150 @@ def isolated_project(tmp_path):
         "state_dir": state_dir,
         "session_path": session_path,
     }
+
+# ── The destructive OS boundary ─────────────────────────────────────────────
+
+class PrivilegedCommandRefused(RuntimeError):
+    """A test tried to run a privileged command against the live machine."""
+
+
+# Names that escalate privilege, control services, control power, or kill
+# processes. Everything here appears in `src/pxh` today or is one rename away
+# from it: api.py runs `sudo systemctl`, `sudo /usr/bin/systemctl reboot` and
+# `sudo /sbin/shutdown`; mind.py runs `sudo -n systemctl start px-alive` and
+# `sudo shutdown -h now`; vision.py runs `runuser`.
+#
+# Deliberately a *small* set. This is not an attempt to sandbox the suite —
+# tests legitimately spawn python, bash and every `bin/tool-*`. It is a guard
+# on the specific boundary that cost us a running robot.
+_PRIVILEGED_NAMES = frozenset({
+    "sudo", "su", "doas", "runuser", "pkexec",
+    "systemctl", "systemd-run", "service", "telinit",
+    "shutdown", "reboot", "halt", "poweroff",
+    "pkill", "killall",
+})
+
+# Where the *real* ones live. A privileged name resolving anywhere else is a
+# stub the test installed itself, which is a legitimate way to assert on argv
+# without touching the machine — tests/test_tools.py does exactly that.
+_SYSTEM_BIN_DIRS = ("/bin", "/sbin", "/usr/bin", "/usr/sbin",
+                    "/usr/local/bin", "/usr/local/sbin")
+
+
+def _resolves_to_a_real_privileged_binary(args, env, shell) -> bool:
+    """True when this argv would reach a real privileged binary on this host.
+
+    Fails closed: an unresolvable privileged name is refused rather than left
+    to raise FileNotFoundError, so a stripped PATH can never become a way to
+    launder one past the guard (CLAUDE.md invariant 6).
+    """
+    if shell:
+        raw = args if isinstance(args, (str, bytes)) else (list(args) or [""])[0]
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        try:
+            parts = shlex.split(raw)
+        except ValueError:
+            return False
+        exe = parts[0] if parts else ""
+    else:
+        seq = [args] if isinstance(args, (str, bytes, os.PathLike)) else list(args)
+        if not seq:
+            return False
+        exe = seq[0]
+
+    exe = os.fspath(exe)
+    if isinstance(exe, bytes):
+        exe = exe.decode("utf-8", "replace")
+    if os.path.basename(exe) not in _PRIVILEGED_NAMES:
+        return False
+
+    if os.sep in exe:
+        resolved = exe
+    else:
+        search_path = (env or os.environ).get("PATH") or os.defpath
+        resolved = shutil.which(exe, path=search_path)
+        if resolved is None:
+            return True  # unknown fails closed
+
+    real = os.path.realpath(resolved)
+    return any(real.startswith(d + os.sep) for d in _SYSTEM_BIN_DIRS)
+
+
+def _record_argv(args, shell):
+    if shell or isinstance(args, (str, bytes, os.PathLike)):
+        return args if isinstance(args, str) else os.fspath(args)
+    return [os.fspath(a) if not isinstance(a, str) else a for a in args]
+
+
+@pytest.fixture(autouse=True)
+def _refuse_the_destructive_boundary(request, monkeypatch):
+    """Refuse privileged OS commands, whether or not the test was marked live.
+
+    The fourth isolation fixture above closes *state* leaks. This one closes
+    an *action* leak, and it is the layer that does not depend on anybody
+    having classified the test correctly.
+
+    On 2026-08-19 a bare `python -m pytest` on this robot ran
+    `test_service_stop_with_confirm`, which POSTs to the API's service-control
+    endpoint with `confirm: true`. That endpoint calls `_run_systemctl`, which
+    runs `sudo systemctl stop px-alive` — and consults `PX_DRY` nowhere. The
+    daemon stopped. `test_service_start_no_confirm_needed` then started it
+    again. Neither test was marked `live`, so `-m "not live"` would not have
+    saved us either; that is the whole reason this guard is a second, separate
+    mechanism rather than more markers.
+
+    Guarding `subprocess.Popen` covers `run`, `call`, `check_call`,
+    `check_output` and `os.popen`, which all construct one. `os.system` does
+    not, so it is patched separately. Asyncio's `subprocess_exec` and a raw
+    `os.execv` are *not* covered — no call site uses them, and a guard that
+    claims more than it does is worse than one with a stated edge.
+
+    Tests marked `live` keep real access: that is what they are for.
+    """
+    refused: list = []
+    if request.node.get_closest_marker("live"):
+        yield refused
+        return
+
+    real_popen = subprocess.Popen
+
+    class _GuardedPopen(real_popen):
+        def __init__(self, args=None, *rest, **kw):
+            argv = kw.get("args", args)
+            shell = kw.get("shell", False)
+            if _resolves_to_a_real_privileged_binary(argv, kw.get("env"), shell):
+                recorded = _record_argv(argv, shell)
+                refused.append(recorded)
+                raise PrivilegedCommandRefused(
+                    f"refused {recorded!r}: an unmarked test may not run a "
+                    f"privileged command against the live robot. Mark the test "
+                    f"`live` if it genuinely must, or patch the boundary."
+                )
+            super().__init__(args, *rest, **kw)
+
+    monkeypatch.setattr(subprocess, "Popen", _GuardedPopen)
+
+    real_system = os.system
+
+    def _guarded_system(command):
+        if _resolves_to_a_real_privileged_binary(command, None, True):
+            refused.append(command)
+            raise PrivilegedCommandRefused(
+                f"refused {command!r}: an unmarked test may not run a "
+                f"privileged command against the live robot."
+            )
+        return real_system(command)
+
+    monkeypatch.setattr(os, "system", _guarded_system)
+    yield refused
+
+
+@pytest.fixture
+def refused_privileged_commands(_refuse_the_destructive_boundary):
+    """Every privileged command this test tried to run and did not.
+
+    The artefact: asserting on this proves the argv was *constructed* and
+    never *executed*, which no amount of `PX_DRY` downstream can prove.
+    """
+    return _refuse_the_destructive_boundary
