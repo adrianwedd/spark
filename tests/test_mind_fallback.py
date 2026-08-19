@@ -14,21 +14,20 @@ from pxh.mind import call_llm, _reset_state
 
 @pytest.fixture(autouse=True)
 def _pin_claude_binary(monkeypatch):
-    """Make the Claude tier reachable without a `claude` on PATH.
+    """A canary: nothing in the Claude tier may resolve a binary any more.
 
-    Every test here patches `subprocess.run` to fake the CLI, but
-    `call_claude_haiku` resolves the binary *before* it gets there
-    (`mind.py:2445`: PX_CLAUDE_BIN, then shutil.which, then a ~/.nvm glob).
-    On this robot `claude` is installed, so the tier ran and the mock fired;
-    on any host without it the tier short-circuits to "claude binary not
-    found" and falls through to the next one — so four tests asserting the
-    Claude fallback passed here for an environmental reason rather than the
-    reason they state, and failed everywhere else.
+    This originally existed because `call_claude_haiku` resolved the CLI
+    *before* the mocked `subprocess.run` got a look in, so on this robot the
+    tier ran and on any host without `claude` installed it short-circuited —
+    four tests passing for an environmental reason rather than the one they
+    stated. That helper is gone; the tier is the resident session now, and
+    nothing here looks up a binary at all.
 
-    The path is deliberately one that does not exist. subprocess.run is
-    mocked, so it is never executed; if a future test forgets that mock it
-    gets a loud FileNotFoundError instead of silently exercising a different
-    tier, which is the failure mode this fixture exists to close.
+    The variable is kept, still pointing at a path that does not exist,
+    because that makes it a regression detector: if a future change
+    reintroduces binary resolution under this tier, it resolves to nothing and
+    fails loudly instead of quietly working on a developer machine where
+    `claude` happens to be installed.
     """
     monkeypatch.setenv("PX_CLAUDE_BIN", "/nonexistent/claude-under-test")
 
