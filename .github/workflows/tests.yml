@@ -29,6 +29,14 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
+      # Resident-only Claude. Runs before pytest and prints the whole debt map
+      # rather than the first failure, so a red build says *which* production
+      # paths still cold-start Claude. Deliberately its own step: buried in a
+      # pytest summary this reads as one failing test instead of a standing
+      # architectural violation.
+      - name: resident-only Claude invariant
+        run: python tools/check_resident_claude.py
+
       # -m "not live" deselects the hardware tests; see the marker definition in
       # pyproject.toml. Nothing else is passed on purpose: this job exists to be
       # an honest gate, and pre-setting LOG_DIR or PX_BYPASS_SUDO here would

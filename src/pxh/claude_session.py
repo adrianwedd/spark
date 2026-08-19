@@ -464,6 +464,14 @@ BLACKLIST_FILES = {
     # hand SPARK the ability to write himself a permanent 3am grant.
     "src/pxh/wake_grant.py",
     "src/pxh/policy_context.py",
+    # Resident-only Claude. The scanner and the suite that calls it are
+    # protected together and for the same reason the policy pair is: an
+    # evolution PR that may edit either one can satisfy the invariant by
+    # weakening the thing that checks it. The rule this pins — that the
+    # resident sessions are the only Claude substrate — is constitutional,
+    # not a preference to be re-argued by a future PR.
+    "tools/check_resident_claude.py",
+    "tests/test_resident_only_invariant.py",
 }
 
 BLACKLIST_PATTERNS = [
