@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import unittest.mock
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1284,16 +1285,72 @@ class TestPublicThoughtsPrivacy:
 class TestRaceEndpoint:
     """Tests for POST /api/v1/race/{action} and related async job plumbing."""
 
+    @contextmanager
     def _mock_popen(self):
-        """Return a context manager that patches subprocess.Popen with a mock
-        that simulates a quickly-finishing process."""
+        """Patch subprocess.Popen for the lifetime of the background job, not
+        just the request that queues it.
+
+        /api/v1/race/{action} returns 202 as soon as _run_race is handed to the
+        executor (api.py:2086); the Popen call happens later, on a pool thread.
+        A patch scoped to the request alone is therefore uninstalled while the
+        job is still pending, so the real bin/px-race gets spawned and any
+        assertion about the command races the scheduler. Exiting this block
+        waits for the spawn first, so the mock outlives the work it mocks.
+
+        Yields the list of captured argv lists; use _await_spawn to read it.
+        """
         from unittest.mock import patch, MagicMock
         mock_proc = MagicMock()
         mock_proc.pid = 99999
         mock_proc.poll.return_value = 0           # already finished
         mock_proc.returncode = 0
         mock_proc.communicate.return_value = (b"done\n", b"")
-        return patch("pxh.api.subprocess.Popen", return_value=mock_proc)
+
+        captured: list[list[str]] = []
+
+        def fake_popen(cmd, **kwargs):
+            captured.append(cmd)
+            return mock_proc
+
+        with patch("pxh.api.subprocess.Popen", side_effect=fake_popen):
+            try:
+                yield captured
+            finally:
+                # Backstop for callers that assert nothing about the command:
+                # never uninstall the mock while a spawn is still pending.
+                self._drain(captured)
+                self._settle()
+
+    @staticmethod
+    def _drain(captured, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + timeout
+        while not captured and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    @staticmethod
+    def _settle(timeout: float = 10.0) -> None:
+        """Wait for the _race_starting sentinel to clear before returning.
+
+        fake_popen records the argv *during* the Popen call, a few instructions
+        before the worker assigns _race_starting = False (api.py:2052). Leaving
+        the block on the capture alone can therefore hand the next test a
+        409 already_running from the guard at api.py:1984.
+        """
+        import pxh.api as api_mod
+        deadline = time.monotonic() + timeout
+        while api_mod._race_starting and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    @classmethod
+    def _await_spawn(cls, captured, timeout: float = 10.0) -> list[str]:
+        """Block until the executor thread has called the patched Popen.
+
+        Must be called *inside* the _mock_popen() block — the patch has to
+        still be installed when the pool thread reaches api.py:2049.
+        """
+        cls._drain(captured, timeout)
+        assert captured, "Popen was never called by the background thread"
+        return captured[0]
 
     def test_race_requires_auth(self, api_client):
         """POST /api/v1/race/map without auth returns 401."""
@@ -1309,9 +1366,10 @@ class TestRaceEndpoint:
 
     def test_race_map_returns_202(self, api_client, auth_headers):
         """POST /api/v1/race/map with auth returns 202 + job_id."""
-        with self._mock_popen():
+        with self._mock_popen() as captured:
             resp = api_client.post("/api/v1/race/map", headers=auth_headers, json={})
-        assert resp.status_code == 202
+            assert resp.status_code == 202
+            self._await_spawn(captured)
         data = resp.json()
         assert data["status"] == "accepted"
         assert "job_id" in data
@@ -1345,62 +1403,42 @@ class TestRaceEndpoint:
 
     def test_race_dry_field_honored(self, api_client, auth_headers):
         """POST /api/v1/race/map with dry:true includes --dry-run in the command."""
-        from unittest.mock import patch, MagicMock
-        mock_proc = MagicMock()
-        mock_proc.pid = 99999
-        mock_proc.poll.return_value = 0
-        mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (b"", b"")
-
-        captured_calls = []
-
-        def fake_popen(cmd, **kwargs):
-            captured_calls.append(cmd)
-            return mock_proc
-
         # Ensure FORCE_DRY is off so the body dry field is respected
         import pxh.api as api_mod
         original_force_dry = api_mod.FORCE_DRY
         api_mod.FORCE_DRY = False
         try:
-            with patch("pxh.api.subprocess.Popen", side_effect=fake_popen):
+            with self._mock_popen() as captured:
                 resp = api_client.post(
                     "/api/v1/race/map",
                     headers=auth_headers,
                     json={"dry": True},
                 )
+                assert resp.status_code == 202
+                cmd = self._await_spawn(captured)
         finally:
             api_mod.FORCE_DRY = original_force_dry
 
-        assert resp.status_code == 202
-        # Wait briefly for background thread to call Popen
-        import time
-        deadline = time.monotonic() + 5.0
-        while not captured_calls and time.monotonic() < deadline:
-            time.sleep(0.05)
-
-        assert captured_calls, "Popen was never called by the background thread"
-        cmd = captured_calls[0]
         assert "--dry-run" in cmd, f"Expected --dry-run in command: {cmd}"
 
     def test_race_job_poll(self, api_client, auth_headers):
         """After starting a race (mocked), GET /api/v1/jobs/{id} returns job status."""
-        import time
-        with self._mock_popen():
+        with self._mock_popen() as captured:
             resp = api_client.post("/api/v1/race/map", headers=auth_headers, json={})
-        assert resp.status_code == 202
-        job_id = resp.json()["job_id"]
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
+            self._await_spawn(captured)
 
-        # Poll until the background thread settles (up to 10s)
-        deadline = time.monotonic() + 10.0
-        last_status = None
-        while time.monotonic() < deadline:
-            r = api_client.get(f"/api/v1/jobs/{job_id}", headers=auth_headers)
-            assert r.status_code == 200
-            last_status = r.json()["status"]
-            if last_status in ("complete", "error"):
-                break
-            time.sleep(0.1)
+            # Poll until the background thread settles (up to 10s)
+            deadline = time.monotonic() + 10.0
+            last_status = None
+            while time.monotonic() < deadline:
+                r = api_client.get(f"/api/v1/jobs/{job_id}", headers=auth_headers)
+                assert r.status_code == 200
+                last_status = r.json()["status"]
+                if last_status in ("complete", "error"):
+                    break
+                time.sleep(0.1)
 
         assert last_status in ("running", "complete", "error"), (
             f"Unexpected job status: {last_status}"
@@ -1409,29 +1447,12 @@ class TestRaceEndpoint:
     def test_race_invokes_bin_px_race_for_yield_alive(self, api_client, auth_headers):
         """Issue #145: race must spawn bin/px-race (which calls yield_alive),
         not python -m pxh.race directly."""
-        from unittest.mock import patch, MagicMock
-        mock_proc = MagicMock()
-        mock_proc.pid = 99999
-        mock_proc.poll.return_value = 0
-        mock_proc.returncode = 0
-        mock_proc.communicate.return_value = (b"", b"")
-        captured = []
-
-        def fake_popen(cmd, **kwargs):
-            captured.append(cmd)
-            return mock_proc
-
-        with patch("pxh.api.subprocess.Popen", side_effect=fake_popen):
+        with self._mock_popen() as captured:
             resp = api_client.post(
                 "/api/v1/race/map", headers=auth_headers, json={"dry": True}
             )
-        assert resp.status_code == 202
-        import time
-        deadline = time.monotonic() + 5.0
-        while not captured and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert captured
-        cmd = captured[0]
+            assert resp.status_code == 202
+            cmd = self._await_spawn(captured)
         assert cmd[0].endswith("/bin/px-race"), (
             f"Race must launch via bin/px-race for yield_alive; got cmd[0]={cmd[0]}"
         )
