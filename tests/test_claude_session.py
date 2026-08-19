@@ -430,15 +430,38 @@ class TestBlogSessionType:
 # ---------------------------------------------------------------------------
 
 
+# budget_summary()'s _today_entries() filters by Hobart *calendar day*, not a
+# rolling window. Fixtures built from _ts_ago() ("N seconds before the real
+# wall clock") flip from "today" to "yesterday" whenever the suite happens to
+# run within N seconds of Hobart midnight -- with offsets up to 30000s (8h20m)
+# that's most of every night (#213). Freeze the clock both sides see to a
+# fixed Hobart noon instead, so the offsets always land in the same frozen
+# "today" no matter what wall-clock time CI actually runs at.
+_FROZEN_HOBART_NOON = dt.datetime(2026, 6, 15, 12, 0, tzinfo=ZoneInfo("Australia/Hobart"))
+
+
+class _FrozenDatetime(dt.datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return _FROZEN_HOBART_NOON.astimezone(tz) if tz else _FROZEN_HOBART_NOON.replace(tzinfo=None)
+
+
+def _ts_frozen_ago(seconds: int) -> str:
+    """Return an ISO timestamp `seconds` before the frozen anchor above."""
+    t = _FROZEN_HOBART_NOON.astimezone(dt.timezone.utc) - dt.timedelta(seconds=seconds)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class TestBudgetSummary:
     def test_reports_global_and_per_type_counts(self, tmp_path):
         import pxh.claude_session as cs
         sd = _make_state_dir(tmp_path)
         _write_session_log(sd, [
-            {"ts": _ts_ago(3600), "type": "blog"},
-            {"ts": _ts_ago(7200), "type": "research"},
+            {"ts": _ts_frozen_ago(3600), "type": "blog"},
+            {"ts": _ts_frozen_ago(7200), "type": "research"},
         ])
-        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"):
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
+                patch.object(cs.dt, "datetime", _FrozenDatetime):
             s = cs.budget_summary()
         assert "2/8" in s
         assert "research 1/3" in s
@@ -449,11 +472,12 @@ class TestBudgetSummary:
         sd = _make_state_dir(tmp_path)
         # research at quota (3 used), spaced out beyond cooldowns
         _write_session_log(sd, [
-            {"ts": _ts_ago(30000), "type": "research"},
-            {"ts": _ts_ago(20000), "type": "research"},
-            {"ts": _ts_ago(10000), "type": "research"},
+            {"ts": _ts_frozen_ago(30000), "type": "research"},
+            {"ts": _ts_frozen_ago(20000), "type": "research"},
+            {"ts": _ts_frozen_ago(10000), "type": "research"},
         ])
-        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"):
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
+                patch.object(cs.dt, "datetime", _FrozenDatetime):
             s = cs.budget_summary()
         assert "research" in s
         # research must be marked unavailable in some form
