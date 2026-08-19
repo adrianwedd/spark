@@ -275,6 +275,25 @@ def test_tool_describe_scene_dry_run(isolated_project):
     assert payload["status"] == "ok"
     assert payload["dry"] is True
     assert len(payload["description"]) > 0
+    # Undeclared caller (voice loop / MCP) defaults to interactive — the only
+    # other caller, wander's novelty escalation, always declares itself.
+    assert payload["origin"] == "interactive"
+
+
+def test_tool_describe_scene_records_declared_provenance(isolated_project):
+    """A caller (wander) that declares origin/reason/task_id gets them echoed
+    back into the payload/log, not silently dropped — this is the audit trail
+    the vision-invocation policy depends on."""
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_VISION_ORIGIN"] = "autonomous"
+    env["PX_VISION_REASON"] = "unexplained object at 30cm — no Frigate label"
+    env["PX_VISION_TASK_ID"] = "e-20260820-000000"
+    stdout = run_tool(["bin/tool-describe-scene"], env)
+    payload = parse_json(stdout)
+    assert payload["origin"] == "autonomous"
+    assert payload["reason"] == "unexplained object at 30cm — no Frigate label"
+    assert payload["task_id"] == "e-20260820-000000"
 
 
 def test_tool_describe_scene_rejects_another_gpio_owner(isolated_project):

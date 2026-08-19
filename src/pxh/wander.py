@@ -45,8 +45,22 @@ EXPLORE_STEP_TIMEOUT   = 30
 # test_describe_scene_timeout_has_margin_over_claude checks the surplus, not
 # just the sign, so raising one without the other fails the suite by name.
 DESCRIBE_SCENE_TIMEOUT = 165
-PHOTO_COOLDOWN_S       = 30
-DAILY_VISION_CAP       = 50
+
+# Claude vision is a sparse, expensive, privacy-sensitive escalation layer,
+# not routine perception — Frigate labels and sonar are. Autonomous wander
+# must not call it at all unless this is explicitly turned on: an env var,
+# not a spark_config.py constant, because spark_config.py is px-evolve's
+# whitelisted target and a self-evolution PR must not be able to propose
+# turning autonomous vision back on. Off by default until the curiosity
+# policy this budgets for is designed on purpose, not discovered eager.
+WANDER_VISION_ENABLED  = os.environ.get("PX_WANDER_VISION_ENABLED", "0") == "1"
+# A sonar reading this close with NO Frigate label at all is the one thing
+# local perception cannot explain on its own — see _vision_trigger. Much
+# tighter than routine perception's own cadence: this budgets a rare
+# escalation, not a curiosity loop.
+NOVELTY_SONAR_CM          = 40.0
+NOVELTY_VISION_COOLDOWN_S = 300
+NOVELTY_VISION_DAILY_CAP  = 5
 VISION_FAIL_MAX        = 3
 STUCK_THRESHOLD        = 3
 BATTERY_STALE_S        = 60
@@ -404,13 +418,38 @@ def _write_observation(entry: dict) -> None:
     append_jsonl_capped(STATE_DIR / "observations.jsonl", [entry], OBS_CAP)
 
 
-def _call_describe_scene(dry: bool) -> dict:
+def _vision_trigger(frigate_labels: list[str], sonar_cm: float | None) -> tuple[bool, str]:
+    """Decide whether this step's local evidence justifies escalating to
+    Claude vision. Returns (should_escalate, reason).
+
+    Routine perception is trusted on its own: a Frigate label wander has
+    already seen this walk, or one Frigate can name at all, is already
+    information — uploading a photo so Claude can redescribe "person" or
+    "chair" back to us buys nothing. The one thing local perception cannot
+    resolve is sonar reporting something very close that Frigate has no
+    label for — no camera-side account of what's there at all. That
+    genuine ambiguity is the only autonomous escalation left, and even it
+    is gated off entirely unless WANDER_VISION_ENABLED is set.
+    """
+    if not WANDER_VISION_ENABLED:
+        return False, ""
+    if sonar_cm is not None and sonar_cm < NOVELTY_SONAR_CM and not frigate_labels:
+        return True, f"unexplained object at {sonar_cm:.0f}cm — no Frigate label"
+    return False, ""
+
+
+def _call_describe_scene(dry: bool, origin: str, reason: str, task_id: str) -> dict:
     env = os.environ.copy()
     env["PX_DRY"] = "1" if dry else "0"
     # Onboard speech only: routed Nest speech can take 90s+ and would blow
     # DESCRIBE_SCENE_TIMEOUT, killing the tool mid-run and charging a
     # spurious vision failure toward VISION_FAIL_MAX.
     env["PX_VOICE_NO_ROUTE"] = "1"
+    # Provenance for tool-describe-scene's log_event — every Claude vision
+    # call must record why it happened and whether a human was waiting on it.
+    env["PX_VISION_ORIGIN"] = origin
+    env["PX_VISION_REASON"] = reason
+    env["PX_VISION_TASK_ID"] = task_id
     try:
         result = subprocess.run(
             [str(BIN_DIR / "tool-describe-scene")],
@@ -460,7 +499,7 @@ def _check_daily_vision_cap(meta: dict) -> bool:
     today = dt.date.today().isoformat()
     if meta.get("daily_vision_date") != today:
         return True
-    return meta.get("daily_vision_calls", 0) < DAILY_VISION_CAP
+    return meta.get("daily_vision_calls", 0) < NOVELTY_VISION_DAILY_CAP
 
 
 def _increment_vision_count(meta: dict) -> dict:
@@ -1134,7 +1173,6 @@ def main(argv: list[str]) -> int:
             nav_buffer = []
             observations = []
             last_photo_time = 0.0
-            seen_labels = set()
             frigate_available = True
             frigate_warned = False
             vision_fail_streak = 0
@@ -1210,34 +1248,33 @@ def main(argv: list[str]) -> int:
                         _flush_nav_entries(nav_buffer, explore_id)
                         nav_buffer.clear()
 
-                    # Curiosity trigger (photo) — only "new label" and "object < 100cm"
-                    # triggers for now; heading-based triggers are gone with heading
-                    # tracking (replaced by Task 11's directive-window logic).
+                    # Vision escalation. Frigate + sonar are the continuous,
+                    # local, free perception layer; Claude vision is a sparse
+                    # semantic escalation, not routine perception's narrator —
+                    # so this whole block is a no-op unless WANDER_VISION_ENABLED
+                    # is explicitly set (see its definition for why that is an
+                    # env var and not a spark_config.py constant). Interactive
+                    # "what do you see" requests never go through here at all —
+                    # they call tool_describe_scene directly, on demand.
                     now = time.time()
                     should_photo = False
                     photo_reason = ""
 
-                    if not photos_disabled and not dry:
+                    if not photos_disabled and not dry and WANDER_VISION_ENABLED:
                         meta = _load_exploration_meta()
                         if not _check_daily_vision_cap(meta):
                             if not photos_disabled:
                                 log("explore: daily vision cap reached — photos disabled")
                                 photos_disabled = True
-                        elif (now - last_photo_time) >= PHOTO_COOLDOWN_S:
-                            new_labels = set(frigate_labels) - seen_labels
-                            if new_labels:
-                                should_photo = True
-                                photo_reason = f"new label: {', '.join(new_labels)}"
-
-                            if not should_photo:
-                                sonar_cm = entry["sonar_cm"]
-                                if sonar_cm is not None and sonar_cm < 100:
-                                    should_photo = True
-                                    photo_reason = f"object at {sonar_cm:.0f}cm"
+                        elif (now - last_photo_time) >= NOVELTY_VISION_COOLDOWN_S:
+                            should_photo, photo_reason = _vision_trigger(
+                                frigate_labels, entry["sonar_cm"])
 
                     if should_photo:
-                        log(f"explore: photo trigger — {photo_reason}")
-                        scene = _call_describe_scene(dry)
+                        log(f"explore: vision trigger — {photo_reason}")
+                        scene = _call_describe_scene(
+                            dry, origin="autonomous", reason=photo_reason,
+                            task_id=explore_id)
                         desc = scene.get("description", FALLBACK_DESCRIPTION)
                         vision_failed = (desc == FALLBACK_DESCRIPTION)
 
@@ -1249,7 +1286,6 @@ def main(argv: list[str]) -> int:
                         else:
                             vision_fail_streak = 0
                             last_photo_time = now
-                            seen_labels.update(frigate_labels)
 
                             meta = _load_exploration_meta()
                             meta = _increment_vision_count(meta)

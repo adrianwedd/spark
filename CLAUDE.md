@@ -149,6 +149,8 @@ Keeps robot alive when idle. Holds a **persistent Picarx handle** — do not ref
 
 **Vision timeouts are a strict ordering, not three independent numbers:** `wander.DESCRIBE_SCENE_TIMEOUT` (150s) must outlive `tool-describe-scene`'s whole run — its 45s Claude call plus photo capture plus its **bounded** 60s tool-voice step. `tool-voice` blocks indefinitely when another process holds the audio device, so that bound is what stops wander killing the tool mid-run. The relationship is pinned by `test_describe_scene_timeout_has_margin_over_claude`, which reads the tool's real constant rather than a literal.
 
+**Claude vision is a sparse semantic escalation, not routine perception.** Frigate labels and sonar are the continuous local perception layer and are trusted on their own — a label Frigate can already name is already information, and uploading a photo so Claude can redescribe "person" or "chair" buys nothing. Autonomous wander therefore never calls Claude vision unless `PX_WANDER_VISION_ENABLED=1` (off by default, and deliberately an env var rather than a `spark_config.py` constant — that file is px-evolve's whitelisted target, and self-evolution must not be able to propose turning autonomous vision back on). Even enabled, the only trigger left is `wander._vision_trigger`'s novelty escalation: sonar under `NOVELTY_SONAR_CM` (40cm) with **no** Frigate label at all — genuine local ambiguity, not proximity or a new label Frigate already explained — budgeted far tighter than routine perception (`NOVELTY_VISION_COOLDOWN_S`=300s, `NOVELTY_VISION_DAILY_CAP`=5/day, vs. the old eager 30s/50-day figures). Interactive `tool_describe_scene` ("what do you see") is unaffected and always available on demand. Every call — interactive or autonomous — records `origin`, `reason`, `task_id`, `backend` and `model` in `logs/tool-describe_scene.log` via `PX_VISION_ORIGIN`/`PX_VISION_REASON`/`PX_VISION_TASK_ID`, so the call graph is a `grep`/`jq` away rather than reconstructed from memory.
+
 ### Cognitive Loop (px-mind)
 
 ```bash
@@ -501,6 +503,7 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 | `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
 | `PX_MIND_BACKEND` | `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` |
 | `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (off by default — OOM risk) |
+| `PX_WANDER_VISION_ENABLED` | `1` = allow autonomous wander to escalate to Claude vision on genuine local ambiguity (off by default — see Wander below) |
 | `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |
 | `PX_CLAUDE_MODEL_*` | Per-session-type model overrides (e.g. `PX_CLAUDE_MODEL_EVOLVE`) |
 | `PX_EVOLVE_DRY` | `1` = skip worktree/PR (queue entry still written with `dry: true`) |
