@@ -206,13 +206,18 @@ def test_token_usage_backend_defaults_to_unknown(tmp_path, monkeypatch):
     assert data["by_backend"]["unknown"]["call_count"] == 1
 
 
-# ── Tier 2 is the resident brain, with `claude -p` behind it ───────────────
+# ── Tier 2 is the resident brain, with NOTHING behind it ──────────────────
 #
-# Reflection's Claude tier was the last hot path still shelling out to
-# `claude -p` on every call: a fresh process, a cold context, no metering, and
-# ~10s of startup before it says a word. The resident session answers from
-# warm context and `ask_brain` meters it. These tests pin the ordering and,
-# more importantly, the fallback — a brain that is down must be invisible.
+# There used to be a `claude -p` subprocess here, and these tests used to pin
+# it. The old comment said "a brain that is down must be invisible" — that was
+# the bug, stated as a requirement. Making a down brain invisible meant
+# spawning a fresh Claude on a Pi that was already saturated, which is how one
+# slow tmux keystroke became two competing Claude processes, a 120s timeout, an
+# M5 timeout and a 403 from Ollama Cloud (2026-08-19).
+#
+# A down brain is now *visible and cheap*: reflection defers and backs off.
+# Reflection is the most skippable work SPARK does; failing to have a thought
+# costs nothing, and a loaded Pi should be doing less, not searching wider.
 
 def _brain_reply(obj):
     """Shape of what ask_brain() hands back: the session's JSON under 'reply'."""
@@ -244,31 +249,57 @@ def test_reflection_claude_tier_prefers_the_resident_brain():
     assert not any("-p" in (cmd or []) for cmd in ran), ran
 
 
-def test_reflection_falls_back_to_claude_p_when_the_brain_is_unavailable():
-    """ask_brain() returns None for every failure; that must mean 'old path'."""
+def test_reflection_defers_when_the_brain_is_unavailable():
+    """A resident-brain failure is terminal. No process, no wider search."""
     import pxh.brain
+
+    spawned = []
 
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
          patch.object(pxh.brain, "ask_brain", return_value=None), \
-         patch("subprocess.run",
-               return_value=_fake_claude(0, stdout='{"thought": "from claude -p"}')):
+         patch("subprocess.run", side_effect=lambda *a, **k: spawned.append(a)):
         result = call_llm("prompt", "system", persona="spark")
 
-    assert "error" not in result, result
-    assert "from claude -p" in result["response"]
-    assert result["backend"] == "claude"
+    assert "error" in result
+    assert result.get(pxh.mind.BRAIN_DEFER) is True, result
+    assert spawned == [], f"reflection spawned a process: {spawned}"
 
 
-def test_reflection_brain_routing_is_read_at_call_time():
-    """PX_BRAIN_KINDS is a live dial — dropping reflection rolls it back."""
+def test_reflection_failure_does_not_reach_ollama_cloud():
+    """The 403 in the 2026-08-19 cascade was reached *from* a brain failure.
+
+    Tier 3 exists for an M5 failure, not as a rescue for the resident session.
+    Opening an internet request because a keystroke was slow is the escalation
+    this whole change removes.
+    """
+    import pxh.brain
+
+    with patch("urllib.request.urlopen",
+               side_effect=urllib.error.URLError("M5 down")) as urlopen, \
+         patch.object(pxh.brain, "ask_brain", return_value=None), \
+         patch("subprocess.run", side_effect=AssertionError("spawned a process")):
+        result = call_llm("prompt", "system", persona="spark")
+
+    # At most the M5 attempt that legitimately precedes the brain tier — and
+    # never a second one, which is what Ollama Cloud would be. Asserting `== 1`
+    # would be wrong: M5's own offline backoff can skip the network entirely,
+    # so the pinned fact is the ceiling, not the exact count.
+    assert urlopen.call_count <= 1, "a cloud tier was attempted after the brain failed"
+    assert result.get(pxh.mind.BRAIN_DEFER) is True, "the brain tier did not stop the chain"
+
+
+def test_narrowing_the_dial_cannot_restore_a_cold_path():
+    """There is no rollback destination any more, so the dial cannot open one.
+
+    PX_BRAIN_KINDS used to be able to route reflection back to `claude -p`.
+    Whatever it is set to now, no process may be spawned.
+    """
     import pxh.brain
 
     with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,compose"}), \
          patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
-         patch.object(pxh.brain, "ask_brain") as ask, \
-         patch("subprocess.run",
-               return_value=_fake_claude(0, stdout='{"thought": "old path"}')):
+         patch.object(pxh.brain, "ask_brain", return_value=None), \
+         patch("subprocess.run", side_effect=AssertionError("spawned a process")):
         result = call_llm("prompt", "system", persona="spark")
 
-    assert ask.call_count == 0
-    assert "old path" in result["response"]
+    assert "error" in result
