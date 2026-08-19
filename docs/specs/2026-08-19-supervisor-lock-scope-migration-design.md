@@ -185,7 +185,8 @@ No pytest is run on SPARK for either.
      behaviour rather than a defect: a pre-bridge binary in that checkout
      guards on exactly that inode and knows nothing about the socket;
    - after the legacy lock is removed, the socket alone becomes the complete
-     namespace and case 3 inverts.
+     namespace and case 3 inverts. **Removal is gated by #224**, which owns
+     the proof that no pre-bridge binary remains runnable.
 
    The suite relies on case 2, not case 3: the autouse fixtures give every
    test a tmp_path socket *and* a tmp_path `brain_root`, so both halves of
