@@ -20,12 +20,28 @@ RuntimeDirectory=spark/wake
 Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
-Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
+# bin/claude-voice-bridge — the LLM backend behind every wake-triggered
+# conversation — guards on `command -v claude` and then execs `claude -p`.
+# bin/px-env exports PYTHONPATH but never PATH, so this line is the only thing
+# that puts the binary in reach of the unit, and claude lives solely in
+# ~/.local/bin (a symlink into ~/.local/share/claude/versions/). Drop the entry
+# and the bridge fails its own guard with {"error": "claude not found on PATH"}
+# on every summons — deterministically, not intermittently.
+Environment=PATH=/home/pi/.local/bin:/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
 # Ensure PulseAudio is running (idempotent) and audio hardware is ready
 ExecStartPre=/usr/bin/pulseaudio --start
 ExecStartPre=/bin/sleep 3
 ExecStart=/home/pi/picar-x-hacking/bin/px-wake-listen
-Restart=on-failure
+# The wake listener is a required always-on sensor: while it is down SPARK
+# cannot hear a summons at all, and nothing else reports that. main() returns 0
+# on paths that are not failures — notably the PID-file guard losing a startup
+# race against a still-live instance, and normal exit from the listen loop — so
+# on-failure would leave the robot silently deaf after either. An explicit
+# `systemctl stop` still stops it: systemd never restarts a unit that was
+# deliberately stopped, under any policy. The cost is a RestartSec loop in the
+# genuine duplicate-instance case, which is loud in the journal and strictly
+# better than a robot that has quietly stopped listening.
+Restart=always
 RestartSec=10
 # Kill entire process group (bash + python child) on stop
 KillMode=control-group
