@@ -407,6 +407,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Command used to transcribe microphone input when --input-mode=voice",
     )
     parser.add_argument(
+        "--backend",
+        choices=("brain", "command"),
+        default=os.environ.get("PX_VOICE_BACKEND", "command"),
+        help=(
+            "brain: run the turn on the resident spark-brain session (the only "
+            "permitted way to reach Claude). command: pipe the prompt to an "
+            "external non-Claude CLI such as codex or ollama."
+        ),
+    )
+    parser.add_argument(
         "--codex-cmd",
         default=os.environ.get("CODEX_CHAT_CMD", "codex exec --full-auto -"),
         help="Command used to invoke the Codex CLI",
@@ -636,6 +646,112 @@ def run_codex(command_spec: str, prompt: str, timeout: Optional[float] = None) -
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return 1, "", f"run_codex timed out after {timeout}s"
+
+
+# Sentinel return code meaning "the resident brain could not be reached".
+# Distinct from a non-zero model exit so the caller can tell "SPARK has nothing
+# to say" from "SPARK could not be asked", and answer the second one.
+VOICE_BRAIN_UNAVAILABLE = 2
+
+VOICE_TURN_KIND = "voice_turn"
+
+# Deterministic availability acknowledgement. Local machinery: a constant, not
+# a model. It is not an answer and must never be recorded as one — it tells a
+# child standing in front of a silent robot that he was heard, and returns
+# control. Silence is the wrong failure mode for a direct summons; a second
+# model tier is the wrong fix for a busy one.
+VOICE_UNAVAILABLE_ACK = "I heard you. Give me a second."
+
+
+def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
+    """One conversation turn on the resident brain.
+
+    Returns run_codex's (rc, stdout, stderr) shape so the turn loop below is
+    unchanged, with VOICE_BRAIN_UNAVAILABLE for "could not be asked".
+
+    **Retry is bounded by attempt count and by how the attempt failed, never by
+    sleeping.** `ask_brain` still collapses every failure into None (delivery
+    timeout, absent session, unvalidated session, lock contention, real request
+    timeout), so until brain.py preserves failure identity this uses the one
+    signal available: elapsed time. An attempt that returns well inside its
+    deadline did not think and fail — it failed to *deliver*, which is the
+    contention case a cheap immediate retry actually fixes. An attempt that
+    consumed its deadline means the brain is genuinely saturated, and asking it
+    twice would add load while a child waits. That one gets acknowledged, not
+    repeated.
+
+    Nothing here escalates. There is no second model, no subprocess, no cloud
+    tier: a resident-brain failure must reduce work, and every tier that used
+    to sit under this path cost more to run than the session it was rescuing.
+    """
+    from pxh import brain
+
+    deadline_s = float(brain.deadline_for_kind(VOICE_TURN_KIND))
+    fast_failure_s = deadline_s / 2
+
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            reply = brain.ask_brain(VOICE_TURN_KIND, {
+                "prompt": prompt,
+                # The resident session's own prompt tells it to answer by
+                # acting. A voice turn is the opposite: voice_loop validates
+                # the action through policy and dispatches it, so a session
+                # that speaks here makes it happen twice — and does it without
+                # passing the audio gate.
+                "respond_with": (
+                    "a single JSON object of the form {\"tool\": ..., \"params\": {...}} "
+                    "exactly as the prompt instructs. Do not speak, move or "
+                    "remember anything for this request — return the object "
+                    "and nothing else."
+                ),
+            })
+        except Exception as exc:  # noqa: BLE001 - the loop must survive the brain
+            return VOICE_BRAIN_UNAVAILABLE, "", f"brain call raised: {exc}"
+
+        elapsed = time.monotonic() - started
+        if reply is not None:
+            answer = reply.get("reply")
+            try:
+                text = answer if isinstance(answer, str) else json.dumps(answer)
+            except (TypeError, ValueError):
+                return 1, "", "brain reply is not serialisable"
+            return 0, text, ""
+
+        if elapsed >= fast_failure_s or attempt == attempts:
+            return (VOICE_BRAIN_UNAVAILABLE, "",
+                    f"resident brain unavailable after {attempt} attempt(s) "
+                    f"({elapsed:.1f}s on the last)")
+        print(f"[voice-loop] brain delivery failed in {elapsed:.1f}s; one retry",
+              file=sys.stderr)
+
+    return VOICE_BRAIN_UNAVAILABLE, "", "resident brain unavailable"
+
+
+def acknowledge_unavailable(dry_run: bool = False) -> bool:
+    """Speak the deterministic acknowledgement, through the audio policy sink.
+
+    Deliberately routed through validate_action/execute_tool rather than
+    straight at the speaker: quiet mode, night silence and the on-call gate
+    bind this line exactly as they bind anything SPARK says. An availability
+    acknowledgement is not an exemption from the dysregulation protocol — if
+    policy says no audio, the correct outcome here is still silence.
+
+    Only reached under an active wake grant (checked by the caller), because
+    this answers a direct summons and nothing else.
+    """
+    action = {"tool": "tool_voice", "params": {"text": VOICE_UNAVAILABLE_ACK}}
+    try:
+        tool, env_overrides = validate_action(action)
+    except VoiceLoopError as exc:
+        print(f"[voice-loop] acknowledgement blocked by policy: {exc}")
+        return False
+    try:
+        execute_tool(tool, env_overrides, dry_run)
+    except VoiceLoopError as exc:
+        print(f"[voice-loop] acknowledgement failed: {exc}")
+        return False
+    return True
 
 
 def extract_action(text: str) -> Optional[Dict[str, Any]]:
@@ -1129,7 +1245,10 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             # Extend heartbeat well past expected LLM call duration so the
             # watchdog doesn't fire during a legitimately long subprocess.
             heartbeat_val[0] = time.monotonic() + 300.0
-        rc, stdout, stderr = run_codex(args.codex_cmd, prompt)
+        if args.backend == "brain":
+            rc, stdout, stderr = run_voice_turn(prompt)
+        else:
+            rc, stdout, stderr = run_codex(args.codex_cmd, prompt)
         with heartbeat_lock:
             heartbeat_val[0] = time.monotonic()
         if rc == 0 and stdout.strip():
@@ -1150,8 +1269,21 @@ def supervisor_loop(args: argparse.Namespace) -> None:
                 },
             )
 
+        if rc == VOICE_BRAIN_UNAVAILABLE:
+            # Acknowledge and stop. Not `continue`: another lap would re-ask a
+            # brain we just established cannot answer, which is the escalation
+            # this whole change exists to remove. The wake grant is what makes
+            # this a direct summons rather than SPARK volunteering; without one
+            # there is nobody waiting and the right answer is silence.
+            print(f"[voice-loop] {stderr.strip()}")
+            if policy_context.wake_grant_active():
+                acknowledge_unavailable(args.dry_run)
+            else:
+                print("[voice-loop] no active wake grant; staying silent")
+            break
+
         if rc != 0:
-            print(f"[voice-loop] Codex CLI exited with {rc}: {stderr.strip()}")
+            print(f"[voice-loop] model backend exited with {rc}: {stderr.strip()}")
             continue
 
         action = extract_action(stdout)

@@ -20,8 +20,11 @@ RuntimeDirectory=spark/wake
 Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
-# bin/claude-voice-bridge — the LLM backend behind every wake-triggered
-# conversation — guards on `command -v claude` and then execs `claude -p`.
+# Wake-triggered conversation runs on the resident spark-brain session, which
+# this unit reaches through tmux — not by starting Claude. The PATH below is
+# retained rather than trimmed: it was banked from the running unit in #229 and
+# still supplies tmux/script, and narrowing it is a separate change with its own
+# blast radius. What it no longer needs to supply is ~/.local/bin/claude.
 # bin/px-env exports PYTHONPATH but never PATH, so this line is the only thing
 # that puts the binary in reach of the unit, and claude lives solely in
 # ~/.local/bin (a symlink into ~/.local/share/claude/versions/). Drop the entry
