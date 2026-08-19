@@ -214,13 +214,34 @@ def deadline_for_kind(kind: str) -> int:
     return _DEADLINE_S.get(kind, DEFAULT_DEADLINE_S)
 
 
+def brain_socket() -> str:
+    """The tmux socket every brain session runs on, and therefore the thing
+    the supervisor guard is scoped to.
+
+    One resolution with two consumers — the session spec below and
+    brain_daemon.supervisor_lock_path() — so the guard cannot drift from the
+    resource it guards.
+
+    PX_BRAIN_TMUX_SOCKET is the canonical seam because that is what the spec
+    actually consumes. PX_CLAUDE_TMUX_SOCKET is read here directly rather than
+    through tmux_claude.SOCKET, which is bound at import (tmux_claude.py:43)
+    and so cannot see a later override — repaired for this path only; the
+    general pattern is tracked separately.
+    """
+    return (
+        os.environ.get("PX_BRAIN_TMUX_SOCKET")
+        or os.environ.get("PX_CLAUDE_TMUX_SOCKET")
+        or tmux_claude.SOCKET
+    )
+
+
 def spec_for_session(session: str) -> tmux_claude.SessionSpec:
     """tmux configuration for one session, including its launcher envelope.
 
     The io session's envelope is the security property: one tool, and a cwd
     outside the repository so a prompt-injected turn has nothing local to read.
     """
-    socket = os.environ.get("PX_BRAIN_TMUX_SOCKET", tmux_claude.SOCKET)
+    socket = brain_socket()
     if session == IO_SESSION:
         cwd = session_dir(IO_SESSION)
         return tmux_claude.SessionSpec(

@@ -126,9 +126,42 @@ class SessionState:
         return _HEALTH_COMPONENT.get(self.name, f"px-brain-{self.name}")
 
 
-def _log(event: str, **fields: Any) -> None:
+def _read_boot_id() -> str:
+    """The kernel's boot id.
+
+    Earns its place on this host specifically: there is no RTC, timesyncd
+    stepped the clock ~49 minutes forward at 11:17:37 on 2026-08-19, and
+    boot_id is the one member of the identity tuple a clock step cannot move.
+    """
     try:
-        log_event("brain-daemon", {"event": event, **fields})
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+_INSTANCE_ID = uuid.uuid4().hex[:12]   # distinguishes instances across PID reuse
+_BOOT_ID = _read_boot_id()
+
+
+def _log(event: str, **fields: Any) -> None:
+    """Emit one brain-daemon record, identified by its emitting process.
+
+    Records carried `ts` and `event` and nothing else, which is what allowed
+    pytest output to masquerade as a concurrency event in #221: 43 duplicated
+    `start` records read as two supervisors when they were one test suite.
+    pid alone is not enough across a restart, and a wall-clock ts is not
+    enough on a host whose clock steps.
+    """
+    try:
+        log_event("brain-daemon", {
+            "event": event,
+            "pid": os.getpid(),
+            "instance": _INSTANCE_ID,
+            "boot_id": _BOOT_ID,
+            **fields,
+        })
     except Exception:  # noqa: BLE001 - never let logging stop the supervisor
         pass
 
@@ -695,42 +728,48 @@ def tick(states: dict[str, SessionState]) -> None:
 # closing it would drop the lock: flock is released on the last close of the
 # file, so a local variable going out of scope would silently unguard us.
 _supervisor_fd: int | None = None
+_legacy_fd: int | None = None
 
 
 def supervisor_lock_path() -> Path:
+    """The guard, keyed to the socket it guards.
+
+    Was brain_root()/".supervisor.lock" — checkout-relative, while the socket
+    is host-global. flock is per-inode, so that gave each checkout a private
+    guard contending with nothing, and let a fixture that relocated the
+    mailbox silently relocate the guard along with it (#221).
+
+    /tmp is correct here: the guard must not outlive the tmux server it
+    guards, and neither survives a reboot.
+    """
+    return Path(brain.brain_socket() + ".supervisor.lock")
+
+
+def legacy_supervisor_lock_path() -> Path:
+    """The pre-bridge, checkout-relative guard.
+
+    Held in addition to the socket lock for the duration of the migration.
+    Deleted in a follow-up, permitted only once no pre-bridge binary can be
+    started — every deployed checkout and the systemd unit at or after the
+    bridge commit.
+    """
     return brain.brain_root() / ".supervisor.lock"
 
 
-def acquire_supervisor_lock() -> bool:
-    """Take the single-instance guard. False means another supervisor has it.
+def _take_lock(path: Path) -> tuple[int | None, str]:
+    """flock `path` exclusively, non-blocking.
 
-    `bin/px-brain` has had no guard at all, and the obvious way to get two
-    supervisors is an operator running it in a shell to watch it while systemd
-    already has one. The damage is not subtle: `start_session`, `sweep_pending`,
-    `kill_session` and `check_wedge` all run outside the per-session
-    single-flight lock, so one supervisor can sweep the other's in-flight
-    handshake into `dead/`.
-
-    flock rather than px-mind's PID-file-plus-`/proc` pattern because a
-    supervisor that can be SIGKILLed wants a guard the kernel releases at death
-    — no stale-PID window, no PID-reuse `cmdline` check to get subtly wrong. And
-    stdlib `fcntl` rather than `filelock` because this runs under
-    `/usr/bin/python3`, where `brain.py` already carries an `ImportError` path
-    that degrades to "no lock available"; a guard that can silently become no
-    guard is not a guard.
+    Returns (fd, "") on success, or (None, hint) where hint is the holder's
+    pid or the errno that stopped us. LOCK_NB throughout: the dual acquire
+    below must not be able to deadlock, and a lost race should fail fast
+    rather than block a supervisor for the length of it.
     """
-    global _supervisor_fd
-    if brain._ensure_dir(brain.brain_root()) is None:
-        _log("supervisor_lock_unavailable", reason="brain root not writable")
-        return False
-    path = supervisor_lock_path()
     try:
         # No O_TRUNC: truncating before we hold the lock would erase the
         # winner's pid, which is the only hint the loser gets.
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as exc:
-        _log("supervisor_lock_unavailable", reason=str(exc))
-        return False
+        return None, str(exc)
     try:
         # 0666, not the validation marker's 0644: the marker has exactly one
         # writer and carries a claim another uid could forge, so it stays
@@ -758,26 +797,21 @@ def acquire_supervisor_lock() -> bool:
                 os.close(fd)
             except OSError:
                 pass
-        _log("supervisor_already_running", holder_pid_hint=hint,
-             note="pid is a hint written by the holder and may be stale")
-        return False
+        return None, hint
     try:
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)
     except OSError:
         pass
-    _supervisor_fd = fd
-    return True
+    return fd, ""
 
 
-def release_supervisor_lock() -> None:
-    """Drop the guard. For tests — the daemon holds it until it exits."""
-    global _supervisor_fd
-    if _supervisor_fd is None:
+def _drop_lock(fd: int | None) -> None:
+    if fd is None:
         return
     try:
-        fcntl.flock(_supervisor_fd, fcntl.LOCK_UN)
+        fcntl.flock(fd, fcntl.LOCK_UN)
     except OSError:
         pass
     finally:
@@ -786,9 +820,76 @@ def release_supervisor_lock() -> None:
         # unreachable fd, and every later acquire in this process fails
         # forever.
         try:
-            os.close(_supervisor_fd)
+            os.close(fd)
         except OSError:
             pass
+
+
+def acquire_supervisor_lock() -> bool:
+    """Take the single-instance guard. False means another supervisor has it.
+
+    `bin/px-brain` has had no guard at all, and the obvious way to get two
+    supervisors is an operator running it in a shell to watch it while systemd
+    already has one. The damage is not subtle: `start_session`, `sweep_pending`,
+    `kill_session` and `check_wedge` all run outside the per-session
+    single-flight lock, so one supervisor can sweep the other's in-flight
+    handshake into `dead/`.
+
+    flock rather than px-mind's PID-file-plus-`/proc` pattern because a
+    supervisor that can be SIGKILLed wants a guard the kernel releases at death
+    — no stale-PID window, no PID-reuse `cmdline` check to get subtly wrong. And
+    stdlib `fcntl` rather than `filelock` because this runs under
+    `/usr/bin/python3`, where `brain.py` already carries an `ImportError` path
+    that degrades to "no lock available"; a guard that can silently become no
+    guard is not a guard.
+
+    Both locks, socket first then legacy, for the duration of the migration.
+    Changing the key while an incumbent holds only the legacy lock would
+    itself open a two-supervisor window, and operator ordering (`systemctl
+    stop` before the swap) is not sufficient on its own. One case stays open
+    and no bridge can close it: a pre-bridge binary in checkout A against a
+    post-bridge binary in checkout B, because the old binary knows nothing
+    about the socket lock. That is not a regression — old-vs-old across
+    checkouts is unguarded today, which is the defect being fixed.
+    """
+    global _supervisor_fd, _legacy_fd
+    if brain._ensure_dir(brain.brain_root()) is None:
+        _log("supervisor_lock_unavailable", reason="brain root not writable")
+        return False
+
+    socket_lock = supervisor_lock_path()
+    if brain._ensure_dir(socket_lock.parent) is None:
+        _log("supervisor_lock_unavailable", reason="socket dir not writable")
+        return False
+
+    fd, hint = _take_lock(socket_lock)
+    if fd is None:
+        _log("supervisor_already_running", scope="socket", holder_pid_hint=hint,
+             note="pid is a hint written by the holder and may be stale")
+        return False
+
+    legacy_fd, legacy_hint = _take_lock(legacy_supervisor_lock_path())
+    if legacy_fd is None:
+        # Release the socket lock before refusing. A supervisor that correctly
+        # declines to start must not leave the socket guarded by a process
+        # that is not supervising it — nothing could ever start again.
+        _drop_lock(fd)
+        _log("supervisor_already_running", scope="legacy",
+             holder_pid_hint=legacy_hint,
+             note="a pre-bridge supervisor holds the checkout-relative guard")
+        return False
+
+    _supervisor_fd = fd
+    _legacy_fd = legacy_fd
+    return True
+
+
+def release_supervisor_lock() -> None:
+    """Drop both guards. For tests — the daemon holds them until it exits."""
+    global _supervisor_fd, _legacy_fd
+    _drop_lock(_legacy_fd)
+    _drop_lock(_supervisor_fd)
+    _legacy_fd = None
     _supervisor_fd = None
 
 
