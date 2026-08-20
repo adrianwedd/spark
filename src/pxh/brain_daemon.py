@@ -106,6 +106,56 @@ def journal_path() -> Path:
     return brain.brain_root() / "journal.md"
 
 
+def _recycle_state_path() -> Path:
+    """Where last_recycle_day is persisted across supervisor restarts.
+
+    Without this, a restart creates a fresh SessionState with
+    last_recycle_day='', and if it's after NIGHTLY_RECYCLE_HOUR the
+    new supervisor clears a healthy session that was already recycled
+    today (#226). The file lives in brain_root() so it follows the
+    same isolation as every other brain state file.
+    """
+    return brain.brain_root() / "recycle_state.json"
+
+
+def save_recycle_state(state: SessionState) -> None:
+    """Persist last_recycle_day so a supervisor restart preserves it.
+
+    Never raises: this sits under the supervisor loop. A failed write
+    means the next restart may spuriously recycle once — a minor cost
+    compared to crashing the supervisor.
+    """
+    try:
+        path = _recycle_state_path()
+        if brain._ensure_dir(brain.brain_root()) is None:
+            return
+        atomic_write(path, json.dumps({
+            "session": state.name,
+            "last_recycle_day": state.last_recycle_day,
+        }, indent=2))
+    except OSError:
+        pass
+
+
+def load_recycle_state(state: SessionState) -> None:
+    """Load persisted last_recycle_day into state, if available.
+
+    Called once on supervisor startup, before the first tick evaluates
+    nightly_due. A missing or corrupt file is silently ignored — the
+    worst case is a single spurious recycle, not a crash.
+    """
+    try:
+        path = _recycle_state_path()
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    day = data.get("last_recycle_day")
+    if isinstance(day, str) and day:
+        state.last_recycle_day = day
+
+
 @dataclass
 class SessionState:
     """Per-session bookkeeping the loop carries between ticks."""
@@ -255,6 +305,7 @@ def start_session(state: SessionState,
         # the handshake that a create is supposed to be followed by.
         local = now_local or datetime.now(HOBART)
         state.last_recycle_day = local.strftime("%Y-%m-%d")
+        save_recycle_state(state)
         _log("session_created", session=state.name, swept=swept)
         if swept:
             # A sweep means requests were in flight when the session died.
@@ -616,6 +667,7 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
         state.last_recycle_at = time.monotonic()
         if nightly_due:
             state.last_recycle_day = day
+            save_recycle_state(state)
     finally:
         try:
             lock.release()
@@ -965,6 +1017,18 @@ def run(once: bool = False) -> int:
     ensure_journal()
     states = {name: SessionState(name=name)
               for name in (brain.BRAIN_SESSION,)}
+    # Load persisted recycle state before the first tick, so a supervisor
+    # restart after NIGHTLY_RECYCLE_HOUR does not spuriously /clear a
+    # healthy session that was already recycled today (#226).
+    for state in states.values():
+        load_recycle_state(state)
+    # Reap orphaned read-only holder clients left by previous supervisor
+    # restarts before starting new ones, so exactly one holder per session
+    # exists after startup (#227).
+    specs = [brain.spec_for_session(name) for name in states]
+    reaped = tmux_claude.reap_stale_holders(specs)
+    if reaped:
+        _log("reaped_stale_holders", count=reaped)
     _log("start", sessions=list(states), tick_s=TICK_S, started=utc_timestamp())
     while True:
         tick(states)

@@ -270,6 +270,54 @@ def kill_session(spec: SessionSpec | None = None) -> bool:
     return _tmux("kill-session", "-t", s.name, socket=s.socket) is not None
 
 
+def reap_stale_holders(sessions: list[SessionSpec]) -> int:
+    """Detach orphaned read-only clients left by previous supervisor restarts.
+
+    KillMode=process means the supervisor's subprocess dies but the tmux
+    attach-session -r clients it spawned survive as orphans (#227). Over
+    multiple restarts these accumulate — one per restart — and each holds
+    a /dev/pts that keeps send-keys' "current client" logic satisfied but
+    wastes resources and clutters `tmux list-clients`.
+
+    Called once on supervisor startup, BEFORE new holders are started, so
+    the new holder is the only client after this runs. Detaches all
+    read-only clients for each managed session — safe because the old
+    supervisor's process is dead; any clients found here are orphans by
+    definition. Never kills the session itself: detach-client only
+    disconnects the terminal, not the session.
+
+    Returns the number of clients detached.
+    """
+    reaped = 0
+    for spec in sessions:
+        s = _spec(spec)
+        # On tmux 3.3a, #{client_read_only} returns empty (not 0/1), so we
+        # detect read-only clients by checking client_flags for "read-only".
+        # The holder's attach-session -r sets the read-only flag; a human
+        # attaching interactively does not.
+        out = _tmux("list-clients", "-t", s.name, "-F",
+                    "#{client_name}\t#{session_name}\t#{client_flags}",
+                    socket=s.socket)
+        if not out:
+            continue
+        for line in out.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            tty, session_name, flags = parts[0], parts[1], parts[2]
+            if session_name != s.name:
+                continue
+            if "read-only" not in flags:
+                # Don't touch read-write clients — those are humans attached
+                # interactively, not holder orphans.
+                continue
+            # Detach this orphaned read-only client. This disconnects the
+            # terminal but does NOT kill the session.
+            if _tmux("detach-client", "-t", tty, socket=s.socket) is not None:
+                reaped += 1
+    return reaped
+
+
 class HolderClient:
     """Keeps one read-only client attached so send-keys works on tmux 3.3a.
 

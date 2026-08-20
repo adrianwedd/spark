@@ -1367,3 +1367,284 @@ def test_a_dead_sessions_validation_is_dropped_before_the_new_one_boots(
     assert seen["marker"] is None, (
         "a booting session inherited the dead one's validation: "
         f"{seen['marker']}")
+
+
+# ---------------------------------------------------------------------------
+# Supervisor restart preserves recycle state (#226)
+# ---------------------------------------------------------------------------
+
+def test_a_supervisor_restart_does_not_spuriously_recycle_a_healthy_session(
+        fake_tmux, monkeypatch):
+    """#226: last_recycle_day was process-local, so a restart created a fresh
+    SessionState with last_recycle_day=''. If it was after NIGHTLY_RECYCLE_HOUR,
+    nightly_due evaluated True and /clear'd a healthy session that was already
+    recycled today — throwing away context the restart was supposed to preserve.
+
+    The fix persists last_recycle_day to recycle_state.json. On restart, the
+    new supervisor loads it before the first tick, so nightly_due evaluates
+    False and the session's context survives.
+    """
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+
+    # Simulate: the previous supervisor recycled today, then restarted.
+    today = datetime(2026, 8, 20, 3, 0, tzinfo=brain_daemon.HOBART)
+    prev_state = _state(session)
+    prev_state.last_recycle_day = today.strftime("%Y-%m-%d")
+    brain_daemon.save_recycle_state(prev_state)
+
+    # A new supervisor starts: fresh SessionState, loads persisted state.
+    new_state = _state(session)
+    assert new_state.last_recycle_day == ""
+    brain_daemon.load_recycle_state(new_state)
+    assert new_state.last_recycle_day == today.strftime("%Y-%m-%d"), \
+        "load_recycle_state must restore last_recycle_day from the file"
+
+    # Now the first tick runs, well after NIGHTLY_RECYCLE_HOUR. Without the
+    # fix, nightly_due would be True and the session would be /clear'd.
+    later = datetime(2026, 8, 20, 12, 0, tzinfo=brain_daemon.HOBART)
+    brain_daemon.maybe_recycle(new_state, later)
+    assert fake_tmux.injected == [], \
+        "a session already recycled today must not be recycled again on restart"
+
+
+def test_the_nightly_recycle_still_fires_once_a_day_with_persisted_state(
+        fake_tmux, monkeypatch):
+    """The fix for #226 must not prevent the actual nightly recycle. After
+    a restart that loads persisted state for today, the next day's recycle
+    must still fire.
+    """
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+
+    today = datetime(2026, 8, 20, 3, 0, tzinfo=brain_daemon.HOBART)
+    state = _state(session)
+    state.last_recycle_day = today.strftime("%Y-%m-%d")
+    brain_daemon.save_recycle_state(state)
+
+    # Restart: new state, loads persisted
+    new_state = _state(session)
+    brain_daemon.load_recycle_state(new_state)
+
+    # Today: no recycle (already done)
+    brain_daemon.maybe_recycle(new_state, today.replace(hour=12))
+    assert len(fake_tmux.injected) == 0
+
+    # Next day: recycle fires
+    brain_daemon.maybe_recycle(
+        new_state, today.replace(day=21, hour=2, minute=30))
+    assert len(fake_tmux.injected) == 1, \
+        "a new day must still get a nightly recycle with persisted state"
+
+
+def test_save_and_load_recycle_state_roundtrip(tmp_path, monkeypatch):
+    """save_recycle_state writes a JSON file that load_recycle_state reads back."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "brain")
+
+    state = brain_daemon.SessionState(name="spark-brain")
+    state.last_recycle_day = "2026-08-20"
+    brain_daemon.save_recycle_state(state)
+
+    loaded = brain_daemon.SessionState(name="spark-brain")
+    assert loaded.last_recycle_day == ""
+    brain_daemon.load_recycle_state(loaded)
+    assert loaded.last_recycle_day == "2026-08-20"
+
+
+def test_load_recycle_state_handles_missing_file(tmp_path, monkeypatch):
+    """A missing recycle_state.json is the normal case on first boot —
+    the supervisor starts with last_recycle_day='' and proceeds normally."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "brain")
+
+    state = brain_daemon.SessionState(name="spark-brain")
+    brain_daemon.load_recycle_state(state)
+    assert state.last_recycle_day == ""
+
+
+def test_load_recycle_state_handles_corrupt_file(tmp_path, monkeypatch):
+    """A corrupt recycle_state.json must not crash the supervisor."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "brain")
+
+    brain._ensure_dir(brain.brain_root())
+    (brain.brain_root() / "recycle_state.json").write_text("{not json")
+    state = brain_daemon.SessionState(name="spark-brain")
+    brain_daemon.load_recycle_state(state)
+    assert state.last_recycle_day == ""
+
+
+def test_run_loads_recycle_state_on_startup(fake_tmux, monkeypatch):
+    """The production entry point (run) must load persisted recycle state
+    before the first tick, so a restart does not spuriously recycle."""
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: True)
+
+    # Simulate persisted state from a previous supervisor that recycled today
+    state = brain_daemon.SessionState(name=brain.BRAIN_SESSION)
+    today = datetime.now(brain_daemon.HOBART).strftime("%Y-%m-%d")
+    state.last_recycle_day = today
+    brain_daemon.save_recycle_state(state)
+
+    # run(once=True) creates fresh SessionStates and loads persisted state
+    assert brain_daemon.run(once=True) == 0
+
+    # The recycle_state.json must still exist (start_session may overwrite it
+    # on session creation, but the session already exists so it shouldn't)
+    assert brain_daemon._recycle_state_path().exists()
+
+
+# ---------------------------------------------------------------------------
+# Stale holder reaping on supervisor restart (#227)
+# ---------------------------------------------------------------------------
+
+class _FakeTmuxClients:
+    """A fake tmux that tracks attached clients, for holder reaping tests.
+
+    The base _FakeTmux doesn't model list-clients/detach-client because
+    only the holder-reaping code uses them.
+    """
+
+    def __init__(self, sessions_clients):
+        # sessions_clients: {session_name: [(tty, "ro"), (tty, "rw"), ...]}
+        self.sessions_clients = sessions_clients
+        self.detached = []
+        self.killed_sessions = []
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(tmux_claude, "_tmux", self._tmux)
+        # Keep session_exists working so reap_stale_holders can target the session
+        monkeypatch.setattr(tmux_claude, "session_exists",
+                            lambda spec=None: self._name(spec) in self.sessions_clients)
+        return self
+
+    @staticmethod
+    def _name(spec):
+        return spec.name if spec is not None else "spark-brain"
+
+    def _tmux(self, *args, timeout=5.0, socket=None):
+        if not args:
+            return None
+        cmd = args[0]
+
+        if cmd == "list-clients":
+            # Args: -t <session> -F <format>
+            target = args[2] if len(args) > 2 and args[1] == "-t" else None
+            if target not in self.sessions_clients:
+                return None
+            lines = []
+            for tty, mode in self.sessions_clients[target]:
+                # Build flags string: read-only clients have "read-only" in flags
+                flags = "attached,focused,ignore-size,read-only,UTF-8" if mode == "ro" \
+                    else "attached,focused,ignore-size,UTF-8"
+                lines.append(f"{tty}\t{target}\t{flags}")
+            return "\n".join(lines) + "\n"
+
+        if cmd == "detach-client":
+            # Args: -t <tty>
+            tty = args[2] if len(args) > 2 and args[1] == "-t" else None
+            self.detached.append(tty)
+            # Remove from sessions_clients
+            for sess, clients in self.sessions_clients.items():
+                self.sessions_clients[sess] = [
+                    (t, m) for t, m in clients if t != tty
+                ]
+            return ""
+
+        if cmd == "kill-session":
+            target = args[2] if len(args) > 2 else None
+            self.killed_sessions.append(target)
+            self.sessions_clients.pop(target, None)
+            return ""
+
+        return None
+
+
+def test_reap_stale_holders_detaches_orphaned_read_only_clients(monkeypatch):
+    """#227: On supervisor restart, orphaned read-only holder clients from
+    previous restarts must be detached. KillMode=process means the holder
+    subprocess survives the supervisor's death, so without reaping they
+    accumulate — one per restart.
+    """
+    spec = brain.spec_for_session(brain.BRAIN_SESSION)
+    fake = _FakeTmuxClients({
+        "spark-brain": [
+            ("/dev/pts/2", "ro"),   # orphan from restart 1
+            ("/dev/pts/5", "ro"),   # orphan from restart 2
+            ("/dev/pts/6", "ro"),   # orphan from restart 3
+        ],
+    })
+    fake.install(monkeypatch)
+
+    reaped = tmux_claude.reap_stale_holders([spec])
+    assert reaped == 3, f"all 3 orphaned read-only clients must be detached, got {reaped}"
+    assert sorted(fake.detached) == ["/dev/pts/2", "/dev/pts/5", "/dev/pts/6"]
+    assert fake.killed_sessions == [], \
+        "reap must never kill the session itself"
+
+
+def test_reap_stale_holders_leaves_read_write_clients_alone(monkeypatch):
+    """A human attached interactively (read-write) must not be detached.
+    Only read-only holder orphans are reaped."""
+    spec = brain.spec_for_session(brain.BRAIN_SESSION)
+    fake = _FakeTmuxClients({
+        "spark-brain": [
+            ("/dev/pts/2", "ro"),   # orphan holder
+            ("/dev/pts/3", "rw"),   # human watching
+        ],
+    })
+    fake.install(monkeypatch)
+
+    reaped = tmux_claude.reap_stale_holders([spec])
+    assert reaped == 1, "only the read-only orphan must be detached"
+    assert fake.detached == ["/dev/pts/2"]
+    # The human's client must still be attached
+    assert ("/dev/pts/3", "rw") in fake.sessions_clients["spark-brain"]
+
+
+def test_reap_stale_holders_does_not_kill_the_session(monkeypatch):
+    """The hard invariant: spark-brain must survive holder cleanup. detach-client
+    only disconnects the terminal, it must never touch the session."""
+    spec = brain.spec_for_session(brain.BRAIN_SESSION)
+    fake = _FakeTmuxClients({
+        "spark-brain": [
+            ("/dev/pts/2", "ro"),
+            ("/dev/pts/5", "ro"),
+        ],
+    })
+    fake.install(monkeypatch)
+
+    tmux_claude.reap_stale_holders([spec])
+    assert fake.killed_sessions == [], \
+        "the spark-brain session must NOT be killed during holder cleanup"
+    assert "spark-brain" in fake.sessions_clients, \
+        "the session must still exist after reaping"
+
+
+def test_reap_stale_holders_with_no_clients_is_a_noop(monkeypatch):
+    """A fresh session with no attached clients — nothing to reap."""
+    spec = brain.spec_for_session(brain.BRAIN_SESSION)
+    fake = _FakeTmuxClients({"spark-brain": []})
+    fake.install(monkeypatch)
+
+    reaped = tmux_claude.reap_stale_holders([spec])
+    assert reaped == 0
+    assert fake.detached == []
+
+
+def test_run_reaps_stale_holders_before_starting_new_ones(fake_tmux, monkeypatch):
+    """The production entry point must call reap_stale_holders on startup,
+    so a restart leaves exactly one holder per session."""
+    monkeypatch.setattr(brain_daemon, "run_handshake",
+                        lambda state, reason: True)
+
+    reaped_called = []
+    monkeypatch.setattr(tmux_claude, "reap_stale_holders",
+                        lambda specs: reaped_called.append(len(specs)) or 0)
+
+    assert brain_daemon.run(once=True) == 0
+    assert reaped_called == [1], \
+        "run() must call reap_stale_holders with the managed session specs"
