@@ -110,3 +110,24 @@ def test_roadmap_is_specific_to_current_spark_not_generic_robotics_bingo():
         "central knowledge base syncing maps/logs",
     ):
         assert retired not in roadmap
+
+
+def test_homepage_runtime_roadmap_matches_current_issue_linked_priorities():
+    init_js = _read("js/init.js")
+
+    for current in (
+        "Deepen one persistent robot",
+        "Separate Obi companion UI from Adrian/admin UI",
+        "Retire canned pseudo-agency",
+        "Finish GPIO lease migration",
+        "Persistent spatial memory",
+        "Autonomous docking + energy awareness",
+    ):
+        assert current in init_js
+
+    for retired in (
+        "Reinforcement learning \"dream buffer\"",
+        "multi-car demos",
+        "Central knowledge base syncing maps and logs",
+    ):
+        assert retired not in init_js
