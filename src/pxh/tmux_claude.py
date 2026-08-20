@@ -291,22 +291,25 @@ def reap_stale_holders(sessions: list[SessionSpec]) -> int:
     reaped = 0
     for spec in sessions:
         s = _spec(spec)
-        # List clients for this session. Format: "/dev/pts/N: session [WxH ...] (attached,...,read-only,...)"
+        # On tmux 3.3a, #{client_read_only} returns empty (not 0/1), so we
+        # detect read-only clients by checking client_flags for "read-only".
+        # The holder's attach-session -r sets the read-only flag; a human
+        # attaching interactively does not.
         out = _tmux("list-clients", "-t", s.name, "-F",
-                    "#{client_name} #{session_name} #{?client_read_only,ro,rw}",
+                    "#{client_name}\t#{session_name}\t#{client_flags}",
                     socket=s.socket)
         if not out:
             continue
         for line in out.strip().splitlines():
-            parts = line.split()
+            parts = line.split("\t")
             if len(parts) < 3:
                 continue
-            tty, session_name, mode = parts[0], parts[1], parts[2]
-            if mode != "ro":
+            tty, session_name, flags = parts[0], parts[1], parts[2]
+            if session_name != s.name:
+                continue
+            if "read-only" not in flags:
                 # Don't touch read-write clients — those are humans attached
                 # interactively, not holder orphans.
-                continue
-            if session_name != s.name:
                 continue
             # Detach this orphaned read-only client. This disconnects the
             # terminal but does NOT kill the session.

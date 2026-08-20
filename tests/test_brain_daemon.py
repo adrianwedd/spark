@@ -1533,13 +1533,14 @@ class _FakeTmuxClients:
         if cmd == "list-clients":
             # Args: -t <session> -F <format>
             target = args[2] if len(args) > 2 and args[1] == "-t" else None
-            fmt = args[4] if len(args) > 4 and args[3] == "-F" else ""
             if target not in self.sessions_clients:
                 return None
             lines = []
             for tty, mode in self.sessions_clients[target]:
-                ro = "ro" if mode == "ro" else "rw"
-                lines.append(f"{tty} {target} {ro}")
+                # Build flags string: read-only clients have "read-only" in flags
+                flags = "attached,focused,ignore-size,read-only,UTF-8" if mode == "ro" \
+                    else "attached,focused,ignore-size,UTF-8"
+                lines.append(f"{tty}\t{target}\t{flags}")
             return "\n".join(lines) + "\n"
 
         if cmd == "detach-client":
