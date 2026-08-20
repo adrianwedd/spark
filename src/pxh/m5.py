@@ -1,9 +1,4 @@
-"""Pinned, contention-aware access to SPARK's dedicated M5 Ollama model.
-
-This module deliberately does not inspect ``/api/ps`` or ``/api/tags``.  The
-model is an operator decision (``PX_M5_SPARK_MODEL``), not an opportunity to
-borrow whichever workload Adrian already has resident in Ollama.
-"""
+"""Contention-aware access to a configured or already-resident M5 model."""
 from __future__ import annotations
 
 import json
@@ -74,6 +69,20 @@ def _configured_model() -> str | None:
     return model
 
 
+def _resident_model(mode: str) -> str | None:
+    """Return only a model `/api/ps` proves loaded; never consult `/api/tags`."""
+    response = urllib.request.urlopen(f"{M5_HOST}/api/ps", timeout=3)
+    body = json.loads(response.read())
+    models = body.get("models", []) if isinstance(body, dict) else []
+    if models and isinstance(models[0], dict) and isinstance(models[0].get("name"), str):
+        return models[0]["name"]
+    if mode == "resident":
+        default = os.environ.get("PX_M5_SPARK_DEFAULT", "").strip()
+        if default and default.lower() not in {"auto", "resident", "resident-only"}:
+            return default
+    return None
+
+
 def _record_request(kind: str, status: M5Status, duration_ms: int) -> None:
     """Best-effort request evidence, keyed by workload kind and session."""
     if not _ensure_dir():
@@ -137,8 +146,8 @@ def circuit_summary() -> dict:
 def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = None) -> M5Result:
     """Run one no-tools turn on the pinned M5 model, without ever waiting in line."""
     started = time.monotonic()
-    model = _configured_model()
-    if model is None:
+    mode = _configured_model()
+    if mode is None:
         return _result("bad_response", kind=kind, started=started,
                        error="PX_M5_SPARK_MODEL must name a model explicitly (not auto)")
 
@@ -159,6 +168,13 @@ def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = Non
             status = circuit.get("status")
             if status in ("timeout", "offline", "bad_response"):
                 return _result(status, kind=kind, started=started, error="M5 circuit open")
+        try:
+            model = _resident_model(mode) if mode in {"resident", "resident-only"} else mode
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            _open_circuit("offline")
+            return _result("offline", kind=kind, started=started, error=str(exc))
+        if model is None:
+            return _result("busy", kind=kind, started=started, error="no resident M5 model")
         payload = json.dumps({
             "model": model,
             "prompt": prompt,
