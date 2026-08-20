@@ -35,7 +35,9 @@ What it does, in order of how much it matters:
    mid-handshake is self-recovering and needs no special handling: the
    session disappears, the next tick reads `session_absent`, recreates,
    sweeps and handshakes with a fresh id. Stated so nobody adds machinery
-   for it.
+   for it. A handshake does not count toward context-recycle turns, and a
+   failed one does not kill the session — see the comments in
+   `run_handshake` for both.
 
 Health is reported per session (`px-brain`, `px-brain-io`) so a wedged or
 missing session is visible without reading tmux by hand.
@@ -48,7 +50,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -203,6 +205,17 @@ def start_session(state: SessionState,
                   now_local: datetime | None = None) -> bool:
     """Bring one session up and attach its holder. Idempotent per tick."""
     spec = brain.spec_for_session(state.name)
+    # Only matters at actual session creation — tmux_claude.ensure_session
+    # only applies -e env args on new-session, not on an idempotent recheck
+    # — but harmless to set unconditionally. Lets px-claude-session's exit
+    # log (bin/px-claude-session) name which supervisor process and boot
+    # started it, which is exactly the axis a comparison between spark-brain
+    # and spark-io needs after a death.
+    spec = replace(spec, env={
+        **spec.env,
+        "PX_BRAIN_SUPERVISOR_INSTANCE": _INSTANCE_ID,
+        "PX_BRAIN_SUPERVISOR_BOOT_ID": _BOOT_ID,
+    })
     brain.ensure_mailbox(state.name)
 
     existed = tmux_claude.session_exists(spec)
@@ -389,12 +402,19 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                 health.record_success(state.component,
                                       detail={"model": model, "attempt": attempt})
                 _log("handshake_ok", session=session, attempt=attempt, model=model)
-                # Handshakes count toward CONTEXT_TURNS too (spec §2.7).
-                # count_turns() cannot see this turn on its own — current.json
-                # is written and removed entirely inside this function, after
-                # count_turns() already ran for this tick — so it is counted
-                # here instead.
-                state.turns += 1
+                # Deliberately NOT state.turns += 1. The original design (spec
+                # §2.7, docs/superpowers/specs/2026-08-17-brain-handshake-
+                # validation-design.md) counted a handshake as a turn like any
+                # other, reasoning that it is a real turn of context. A
+                # 2026-08-20 audit of session recreations found the practical
+                # effect instead: a session doing nothing but answering health
+                # checks ages into a context recycle on protocol traffic
+                # alone. CONTEXT_TURNS exists to bound growth from real work
+                # (see count_turns(), which only counts caller requests); a
+                # handshake is supervisor plumbing and must not spend that
+                # budget. Pinned by
+                # test_twenty_successful_handshakes_alone_never_trigger_a_recycle.
+                #
                 # The quiet window's job is done: the thing it was protecting
                 # (a slow recycle turn) is over, one way or another, by the
                 # time a handshake succeeds. Clearing it here means the window
@@ -402,8 +422,27 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                 state.last_recycle_at = 0.0
                 return True
 
-        # Attempts exhausted. Kill it: the next tick sees session_absent,
-        # recreates, sweeps, and handshakes with a new id.
+        # Attempts exhausted. Earlier this killed the session outright — see
+        # docs/superpowers/specs/2026-08-17-brain-handshake-validation-
+        # design.md §2.3 step 7 — on the theory that a session failing to
+        # answer a handshake is broken and should be replaced. A 2026-08-20
+        # audit of session recreations found 6 of 19 traced to exactly this
+        # branch: a slow or momentarily confused session, not a dead one,
+        # killed by its own diagnostic. A failed handshake is proof the
+        # session is not currently trustable, not proof the process must
+        # die.
+        #
+        # So: clear the marker — every reader now sees no_marker, and
+        # ask_brain will not route to this session — and record the
+        # failure, but leave the session and its holder alone. The next
+        # tick's handshake_reason() sees no_marker and tries again on its
+        # own schedule (§2.3's third trigger, unaffected by this change).
+        # If the session really is wedged rather than merely unvalidated,
+        # check_wedge() is the path that kills it — on the concrete
+        # evidence of a live caller request past its deadline, not on a
+        # diagnostic ping failing twice. Pinned by
+        # test_a_silent_session_is_escaped_and_retried_but_not_killed and
+        # test_a_failed_handshake_leaves_the_holder_attached.
         health.record_failure(
             state.component,
             f"handshake failed after {brain.HANDSHAKE_ATTEMPTS} attempts")
@@ -411,10 +450,6 @@ def run_handshake(state: SessionState, reason: str) -> bool:
              attempts=brain.HANDSHAKE_ATTEMPTS, request=request_id)
         brain.clear_validation_marker(session)
         brain.cleanup_request(session, request_id)
-        tmux_claude.kill_session(spec)
-        if state.holder is not None:
-            state.holder.stop()
-            state.holder = None  # attached to a session that no longer exists
         return False
     finally:
         try:

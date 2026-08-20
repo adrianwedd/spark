@@ -125,7 +125,139 @@ unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null || true
 PROMPT_TEXT="$(cat "$PROMPT_FILE")"
 PROMPT_TEXT="${PROMPT_TEXT//\{\{TOOL_BRAIN_REPLY\}\}/$TOOL_BRAIN_REPLY}"
 
-exec "$CLAUDE_BIN" \
+# ── Exit instrumentation ───────────────────────────────────────────────────
+#
+# spark-brain has vanished from tmux with no repo-owned kill path 12 times in
+# one audit. `exec`ing claude (the old ending of this script) makes that
+# unanswerable by construction: once claude replaces this process there is
+# nothing left running to notice how or when it stopped, and tmux just closes
+# the pane. This keeps a thin wrapper alive across the child's whole
+# lifetime instead, so an exit — however it happens — lands a record that
+# survives the pane's own death. Do not go back to a bare `exec` here.
+CLAUDE_VERSION="$("$CLAUDE_BIN" --version 2>/dev/null | head -n1 || echo unknown)"
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)"
+# /proc/uptime, not `date`: this host has no RTC and timesyncd has stepped
+# its wall clock by tens of minutes mid-session (see
+# brain_daemon._read_boot_id). A duration from two `date` reads can be wrong
+# in either direction across a step; uptime cannot step.
+START_UPTIME_S="$(awk '{print $1}' /proc/uptime 2>/dev/null || echo 0)"
+START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+
+_log_claude_session_event() {
+    # Every dynamic value travels through an env var, never through the
+    # heredoc text itself — a stderr tail is arbitrary process output and may
+    # contain quotes, `$`, backticks or control bytes that would otherwise be
+    # re-interpreted by bash or corrupt hand-built JSON. python does the
+    # escaping, and log_event() gives this the same locking and 5 MB
+    # rotation every other daemon log already has, in
+    # logs/tool-claude-session.log.
+    PXCS_EVENT="$1" /usr/bin/python3 <<'PYEOF' || true
+import os
+
+try:
+    from pxh.logging import log_event
+
+    def _num(name):
+        val = os.environ.get(name)
+        if val in (None, ""):
+            return None
+        try:
+            return float(val) if "." in val else int(val)
+        except ValueError:
+            return val
+
+    payload = {
+        "event": os.environ.get("PXCS_EVENT"),
+        "session": os.environ.get("PXCS_SESSION"),
+        "pid": _num("PXCS_PID"),
+        "model": os.environ.get("PXCS_MODEL"),
+        "claude_version": os.environ.get("PXCS_CLAUDE_VERSION"),
+        "cwd": os.environ.get("PXCS_CWD"),
+        "tool_count": _num("PXCS_TOOL_COUNT"),
+        "boot_id": os.environ.get("PXCS_BOOT_ID"),
+        "supervisor_instance": os.environ.get("PXCS_SUPERVISOR_INSTANCE") or None,
+        "supervisor_boot_id": os.environ.get("PXCS_SUPERVISOR_BOOT_ID") or None,
+        "start_ts": os.environ.get("PXCS_START_TS"),
+        "end_ts": os.environ.get("PXCS_END_TS"),
+        "duration_s": _num("PXCS_DURATION_S"),
+        "exit_code": _num("PXCS_EXIT_CODE"),
+        "signal": _num("PXCS_SIGNAL"),
+        "stderr_tail": os.environ.get("PXCS_STDERR_TAIL") or None,
+    }
+    log_event("claude-session", {k: v for k, v in payload.items() if v is not None})
+except Exception:  # noqa: BLE001 - instrumentation must never break the launch
+    pass
+PYEOF
+}
+
+STDERR_LOG="${PX_STATE_DIR:-$PROJECT_ROOT/state}/brain/$BRAIN_SESSION/last_stderr.log"
+mkdir -p "$(dirname "$STDERR_LOG")" 2>/dev/null || true
+: > "$STDERR_LOG" 2>/dev/null || true
+
+# Backgrounded, then waited on: this is what makes $! the real claude PID and
+# $? its real exit status (128+signal if a signal killed it), instead of
+# `exec` replacing this process outright. Stderr is teed rather than
+# redirected outright so a human attached to the pane still sees it live;
+# only a copy goes to disk. No job control is enabled in this script, so the
+# backgrounded child stays in this process's own group and the terminal's
+# foreground group — it does not lose the pty.
+set +e
+"$CLAUDE_BIN" \
     --model "$MODEL" \
     --allowedTools "${TOOLS[@]}" \
-    --append-system-prompt "$PROMPT_TEXT"
+    --append-system-prompt "$PROMPT_TEXT" \
+    2> >(tee -a "$STDERR_LOG" >&2) &
+CLAUDE_PID=$!
+
+PXCS_SESSION="$BRAIN_SESSION" \
+PXCS_PID="$CLAUDE_PID" \
+PXCS_MODEL="$MODEL" \
+PXCS_CLAUDE_VERSION="$CLAUDE_VERSION" \
+PXCS_CWD="$PWD" \
+PXCS_TOOL_COUNT="${#TOOLS[@]}" \
+PXCS_BOOT_ID="$BOOT_ID" \
+PXCS_SUPERVISOR_INSTANCE="${PX_BRAIN_SUPERVISOR_INSTANCE:-}" \
+PXCS_SUPERVISOR_BOOT_ID="${PX_BRAIN_SUPERVISOR_BOOT_ID:-}" \
+PXCS_START_TS="$START_TS" \
+    _log_claude_session_event start
+
+wait "$CLAUDE_PID"
+CLAUDE_STATUS=$?
+wait  # let the stderr tee subshell finish flushing before we read its file
+# `set -e` is deliberately NOT restored below this point. Everything from
+# here on is instrumentation racing to log an exit that already happened;
+# the one thing that must not happen is this script dying to an errexit
+# from e.g. a transient `awk`/`date` hiccup before it reaches the final
+# `exit "$CLAUDE_STATUS"` — that would silently swap a real exit code for
+# whatever bash does on an uncaught errexit, defeating the entire point.
+
+END_UPTIME_S="$(awk '{print $1}' /proc/uptime 2>/dev/null || echo 0)"
+END_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+DURATION_S="$(awk -v a="$START_UPTIME_S" -v b="$END_UPTIME_S" 'BEGIN{printf "%.3f", b-a}' 2>/dev/null || echo 0)"
+
+EXIT_CODE=""
+SIGNAL=""
+if [[ "$CLAUDE_STATUS" -gt 128 ]]; then
+    SIGNAL=$((CLAUDE_STATUS - 128))
+else
+    EXIT_CODE="$CLAUDE_STATUS"
+fi
+
+STDERR_TAIL="$(tail -c 4000 "$STDERR_LOG" 2>/dev/null || true)"
+
+PXCS_SESSION="$BRAIN_SESSION" \
+PXCS_PID="$CLAUDE_PID" \
+PXCS_MODEL="$MODEL" \
+PXCS_CLAUDE_VERSION="$CLAUDE_VERSION" \
+PXCS_BOOT_ID="$BOOT_ID" \
+PXCS_SUPERVISOR_INSTANCE="${PX_BRAIN_SUPERVISOR_INSTANCE:-}" \
+PXCS_SUPERVISOR_BOOT_ID="${PX_BRAIN_SUPERVISOR_BOOT_ID:-}" \
+PXCS_START_TS="$START_TS" \
+PXCS_END_TS="$END_TS" \
+PXCS_DURATION_S="$DURATION_S" \
+PXCS_EXIT_CODE="$EXIT_CODE" \
+PXCS_SIGNAL="$SIGNAL" \
+PXCS_STDERR_TAIL="$STDERR_TAIL" \
+    _log_claude_session_event exit
+
+exit "$CLAUDE_STATUS"
