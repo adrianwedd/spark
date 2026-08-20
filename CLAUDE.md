@@ -3,6 +3,10 @@
 This file provides the canonical engineering constitution for Claude Code,
 Codex, and every coding agent working in this repository.
 
+## Execution Default
+
+Act, verify, continue. Once a goal is authorised, perform all reversible in-scope steps needed to complete it. Routine repository actions implied by an authorised engineering goal — branch, commit, push, open/update PR, and CI — inherit that authorization and do not require a second approval. Ask only for genuinely missing decisions, unapproved destructive/external actions, credentials, or unsensed physical-safety facts. Never ask merely to reconfirm the goal.
+
 ## Project Overview
 
 Helper scripts and Python library for a SunFounder PiCar-X robot built by Adrian and Obi together — with Obi, not for him. The system runs on a Raspberry Pi and uses a voice loop (Claude / Codex / Ollama) to control the car via spoken commands, with two jailbroken personas (GREMLIN and VIXEN) and a three-layer cognitive architecture that gives the robot an inner life. Adrian and Claude wrote the code; Codex and Gemini helped with QA.

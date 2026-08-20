@@ -1,21 +1,16 @@
 # Agent Operations Guide
 
-`CLAUDE.md` is the canonical engineering constitution for every coding agent,
-including Codex. Read it first and do not duplicate it here.
+`CLAUDE.md` is the canonical engineering constitution for every coding agent. Read it first and do not duplicate it here.
 
-## Codex Workflow
+## Agent Workflow
 
 1. Activate the virtualenv: `source .venv/bin/activate`.
-2. Run `bin/px-diagnostics --no-motion` when operating on SPARK hardware; on
-   another host, record unavailable hardware binaries as environmental context
-   and use focused tests instead.
-3. Keep implementation logic in `src/pxh/` or Python-backed `bin/` helpers;
-   add focused pytest coverage and run `python -m pytest` before a commit.
-4. Preserve the safety and routing invariants in `CLAUDE.md`, especially the
-   absolute ban on `claude -p` and the resident-session envelope.
+2. Hardware diagnostics (`bin/px-diagnostics`) are only required when the task actually touches hardware.
+3. Run targeted local tests (`python -m pytest -k test_name`). The CI pipeline is the full-suite gate; do not run the full suite locally on SPARK.
+4. Preserve dirty work: keep unrelated files and staging exact-path as you found them.
+5. Continue through environmental limitations when equivalent evidence exists rather than stopping.
 
 ## Local Notes
 
 - `PX_BYPASS_SUDO=1` and `LOG_DIR=logs_test` make subprocess tests safe.
-- Update operator documentation alongside behavior changes; avoid duplicating
-  constitutional instructions from `CLAUDE.md`.
+- Update operator documentation when a change makes existing operator guidance inaccurate; avoid duplicating constitutional instructions from `CLAUDE.md`.
