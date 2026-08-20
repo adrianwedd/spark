@@ -1,3 +1,7 @@
+> [!WARNING]
+> **FOSSIL RECORD**
+> This file describes the October-2025 Codex-voice / explicit-confirmation-gate strategy and is preserved for historical context only. It does not reflect the current operational strategy.
+
 # PiCar-X Voice Agent Strategy
 
 ## 1. Safety and Trustworthiness
