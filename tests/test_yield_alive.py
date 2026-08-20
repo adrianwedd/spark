@@ -117,21 +117,22 @@ def test_yield_alive_returns_success_when_px_alive_exits(long_poll_env):
     returns 0 as before — the fix must not break the normal path.
     """
     log_dir = long_poll_env
-    # Spawn a shell process that exits on SIGUSR1 — shell exits are
-    # near-instant, unlike Python which needs an interpreter tick to
-    # process signals (unreliable on loaded CI runners within 5s).
+    # Spawn a process via setsid that exits on SIGUSR1.  setsid makes it
+    # a session leader, so when it exits init reaps it immediately and
+    # /proc/{pid} disappears — matching how systemd reaps px-alive.
+    # Without setsid, the process becomes a zombie under pytest, and
+    # /proc/{pid} persists, causing yield_alive to see it as "still alive".
     proc = subprocess.Popen(
-        ["bash", "-c", "trap 'exit 0' USR1; sleep 60"],
+        ["setsid", "bash", "-c", "trap 'exit 0' USR1; sleep 60"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
     pid_file = log_dir / "px-alive.pid"
     pid_file.write_text(str(proc.pid))
     try:
-        # poll_iters=25 gives the full 5s window — the process needs
-        # time to receive SIGUSR1, run the handler, and exit.  3 iters
-        # (0.6s) is not enough on CI runners where signal delivery is
-        # slow under load.
+        # Use the full 5s poll window — the process needs time to
+        # receive SIGUSR1 and exit.
         result = _source_and_call(log_dir, poll_iters="25")
         assert result.returncode == 0, (
             f"yield_alive should return 0 when px-alive exits cleanly, "
