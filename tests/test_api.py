@@ -1183,16 +1183,17 @@ class TestPublicChat:
         def _boom(*args, **kwargs):
             raise AssertionError(f"public chat spawned a process: {args!r}")
 
-        async def _fake_ask(kind, payload, **kw):
-            assert kind in ("public_chat", "obi_chat"), kind
-            return {"reply": "hello from the io session"}
+        from pxh.m5 import M5Result
 
-        import pxh.brain as _brain
+        def _fake_ask(kind, prompt, system, **kw):
+            assert kind in ("public_chat", "obi_chat"), kind
+            return M5Result("available", response="hello from M5")
+
         with unittest.mock.patch.object(_sp, "run", _boom), \
              unittest.mock.patch.object(_sp, "Popen", _boom), \
-             unittest.mock.patch.object(_brain, "ask_brain_async", _fake_ask):
+             unittest.mock.patch("pxh.m5.ask_m5", _fake_ask):
             reply = asyncio.run(_api._call_claude_public("hi there"))
-        assert reply == "hello from the io session"
+        assert reply == "hello from M5"
 
     def test_public_chat_unavailable_raises_rather_than_falling_back(self):
         """A quiet chat box costs nothing. A Claude per stranger's message does."""

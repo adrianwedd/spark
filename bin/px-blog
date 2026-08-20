@@ -677,25 +677,18 @@ def _qa_gate(text: str) -> str | None:
             log(f"qa breaker: cooldown elapsed, retrying (was {_qa_breaker['failures']} consecutive failures)")
             _qa_breaker["failures"] = 0
 
-    # Blog QA runs on the resident io session, the same unprivileged channel
-    # px-post uses. The text being judged is SPARK's own, but the judgement is
-    # a public-facing decision and nothing here needs repo access.
-    #
-    # This gate had no resident path at all before 2026-08-19 — it was a pure
-    # `claude -p`, so every blog post spawned a fresh Claude on the Pi to ask a
-    # yes/no question.
     prompt = ('Is this blog post from a small robot appropriate to publish publicly?\n'
               'Check for: offensive content, personal information leaks, factual errors.\n'
               'Answer only YES or NO. Nothing else.\n\n'
               f'The post:\n{text[:3000]}')
     try:
-        from pxh.brain import ask_brain
-        reply = ask_brain("post_qa", {"instruction": prompt, "thought": text[:3000]})
+        from pxh.m5 import ask_m5
+        result = ask_m5("blog_qa", prompt, "")
     except Exception as exc:  # noqa: BLE001 - QA must never stop the blogger
-        log(f"qa gate error (brain): {exc}")
-        reply = None
+        log(f"qa gate error (M5): {exc}")
+        result = None
 
-    if reply is None:
+    if result is None or result.status != "available":
         # Defer. An unpublished post is not a failure; it is next cycle's post.
         log("qa gate: brain did not answer — deferring this post")
         _qa_breaker["failures"] += 1
@@ -704,10 +697,7 @@ def _qa_gate(text: str) -> str | None:
             log(f"qa breaker: OPEN after {_qa_breaker['failures']} failures — skipping for {_qa_breaker['cooldown']}s")
         return None
 
-    answer = reply.get("reply")
-    if isinstance(answer, dict):
-        answer = answer.get("verdict") or answer.get("answer") or ""
-    resp = str(answer).strip().lower()
+    resp = result.response.strip().lower()
     _qa_breaker["failures"] = 0
     if resp.startswith("yes"):
         return "pass"

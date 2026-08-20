@@ -355,24 +355,12 @@ def _qa_trip_breaker() -> None:
 # select between.
 
 
-def _qa_via_brain(thought: str) -> str | None:
-    """Ask the io session. Returns a verdict, or None if it did not answer.
+def _qa_via_m5(thought: str) -> str | None:
+    """Ask the pinned M5 model; failures defer publication without fallback."""
+    from pxh.m5 import ask_m5
 
-    Post QA runs on the *unprivileged* session by design: the text being judged
-    is SPARK's own, but the judgement is a public-facing decision and the same
-    channel handles genuinely untrusted input. Nothing here needs repo access.
-    """
-    from pxh.brain import ask_brain
-
-    reply = ask_brain("post_qa", {"instruction": QA_PROMPT, "thought": thought})
-    if reply is None:
-        return None
-    answer = reply.get("reply")
-    if isinstance(answer, dict):
-        # A structured reply is the preferred shape; fall back to any string
-        # field that looks like the verdict.
-        answer = answer.get("verdict") or answer.get("answer") or ""
-    return _interpret_qa(str(answer))
+    result = ask_m5("post_qa", QA_PROMPT + "\n\nThought:\n" + thought, "")
+    return _interpret_qa(result.response) if result.status == "available" else None
 
 
 def run_qa_gate(thought: str) -> str | None:
@@ -402,7 +390,7 @@ def run_qa_gate(thought: str) -> str | None:
             _qa_breaker["failures"] = 0
 
     try:
-        verdict = _qa_via_brain(thought)
+        verdict = _qa_via_m5(thought)
     except Exception as exc:  # noqa: BLE001 - QA must never stop the poster
         log(f"qa gate error (brain): {exc}")
         verdict = None

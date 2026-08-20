@@ -18,10 +18,10 @@ from pxh import brain, claude_session
 @pytest.mark.parametrize("kind,session", [
     ("voice_turn", brain.BRAIN_SESSION),
     ("cron_say", brain.BRAIN_SESSION),
-    ("reflection", brain.BRAIN_SESSION),
-    ("public_chat", brain.IO_SESSION),
-    ("obi_chat", brain.IO_SESSION),
-    ("post_qa", brain.IO_SESSION),
+    ("reflection", brain.M5_SESSION),
+    ("public_chat", brain.M5_SESSION),
+    ("obi_chat", brain.M5_SESSION),
+    ("post_qa", brain.M5_SESSION),
 ])
 def test_kind_is_classified_and_routed(kind, session):
     assert brain.is_classified_kind(kind)
@@ -31,7 +31,7 @@ def test_kind_is_classified_and_routed(kind, session):
 def test_every_classified_kind_has_a_deadline():
     """A kind with no deadline silently inherits 300s — five minutes of a
     daemon loop blocked on optional work."""
-    for kind in brain._BRAIN_KINDS | brain._IO_KINDS:
+    for kind in brain._BRAIN_KINDS | brain._IO_KINDS | brain._M5_KINDS:
         assert brain.deadline_for_kind(kind) > 0
 
 

@@ -208,11 +208,11 @@ def test_unparseable_reply_degrades_to_a_timeout(_live_pane, monkeypatch):
 # Session routing and the trust boundary
 # ---------------------------------------------------------------------------
 
-def test_untrusted_kinds_route_to_the_io_session():
-    """Text SPARK did not write never reaches the privileged session."""
+def test_migrated_untrusted_kinds_route_to_m5_not_a_resident_session():
+    """Stage 1 keeps untrusted text away from both resident session envelopes."""
     for kind in ("post_qa", "public_chat", "obi_chat"):
-        assert brain.session_for_kind(kind) == brain.IO_SESSION, kind
-    for kind in ("research", "compose", "evolve", "reflection"):
+        assert brain.session_for_kind(kind) == brain.M5_SESSION, kind
+    for kind in ("research", "compose", "evolve"):
         assert brain.session_for_kind(kind) == brain.BRAIN_SESSION, kind
 
 
@@ -249,7 +249,8 @@ def test_every_kind_with_a_deadline_is_explicitly_classified():
     cheap to fix rather than after it has shipped.
     """
     unclassified = [k for k in brain._DEADLINE_S
-                    if k not in brain._IO_KINDS and k not in brain._BRAIN_KINDS]
+                    if k not in brain._IO_KINDS and k not in brain._M5_KINDS
+                    and k not in brain._BRAIN_KINDS]
     assert unclassified == [], (
         f"kinds with a deadline but no trust classification: {unclassified}")
 

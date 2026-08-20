@@ -1354,7 +1354,7 @@ _PUBLIC_CHAT_ENV_ALLOWLIST = {
 
 async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
                               kind: str = "public_chat") -> str:
-    """Answer a chat turn on the resident io session.
+    """Answer a chat turn on the pinned M5 model, with no tool envelope.
 
     `public_chat` and `obi_chat` have been classified as io kinds in brain.py
     since the brain was built — deadlines, session routing, the lot. This
@@ -1373,27 +1373,17 @@ async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
     spawning a Claude per stranger's message on a 4-core Pi is a load
     amplifier with an open front door.
     """
-    from pxh import brain
+    from pxh.m5 import ask_m5
 
-    payload = {"prompt": prompt}
-    if system_prompt is not None:
-        payload["system"] = system_prompt
-
-    reply = await brain.ask_brain_async(kind, payload,
-                                        timeout_s=float(_PUBLIC_CHAT_TIMEOUT_S))
-    if reply is None:
-        raise RuntimeError(f"resident io session unavailable for {kind}")
-
-    answer = reply.get("reply")
-    if isinstance(answer, str):
-        return answer.strip()
-    if isinstance(answer, dict):
-        for key in ("text", "reply", "answer", "response"):
-            if isinstance(answer.get(key), str):
-                return answer[key].strip()
-    raise RuntimeError(f"unusable reply shape from {kind}: {type(answer).__name__}")
-
-    return await loop.run_in_executor(_PUBLIC_CHAT_EXECUTOR, _run)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        _PUBLIC_CHAT_EXECUTOR,
+        lambda: ask_m5(kind, prompt, system_prompt or _PUBLIC_CHAT_SYSTEM_PROMPT,
+                       timeout_s=float(_PUBLIC_CHAT_TIMEOUT_S)),
+    )
+    if result.status != "available":
+        raise RuntimeError(f"M5 unavailable for {kind}: {result.status}")
+    return result.response
 
 
 def _build_public_context() -> str:

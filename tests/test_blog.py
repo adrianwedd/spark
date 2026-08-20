@@ -525,16 +525,16 @@ from contextlib import contextmanager as _contextmanager
 
 @_contextmanager
 def _brain_says(verdict=None, unavailable=False):
-    """Stub the resident io session's answer to a blog post_qa request.
+    """Stub the pinned M5 answer to a blog QA request.
 
     px-blog's QA gate had no resident path at all before 2026-08-19 — every
     blog post spawned a fresh Claude to answer one yes/no question. These tests
     drove that subprocess; they now drive the session that replaced it.
     """
-    import pxh.brain
+    from pxh.m5 import M5Result
     from unittest.mock import patch as _patch
-    reply = None if unavailable else {"reply": verdict}
-    with _patch.object(pxh.brain, "ask_brain", return_value=reply) as m:
+    result = M5Result("offline") if unavailable else M5Result("available", response=str(verdict))
+    with _patch("pxh.m5.ask_m5", return_value=result) as m:
         yield m
 
 
