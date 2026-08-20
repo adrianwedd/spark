@@ -516,7 +516,7 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 |---|---|
 | `PX_DRY` | `1` = dry-run. **Default is live when unset.** |
 | `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
-| `PX_M5_SPARK_MODEL` | Required pinned M5 model for reflection, public/Obi chat, and publication QA; `auto` is rejected. |
+| `PX_M5_SPARK_MODEL` | M5 model for reflection, public/Obi chat, and publication QA: an explicit model, `resident`, or `resident-only`; `auto` is rejected. `resident` uses only `/api/ps`-proven residency and may use explicit `PX_M5_SPARK_DEFAULT` when none is loaded. |
 | `PX_MIND_BACKEND` | Legacy introspection field; it does not alter Stage 1 reflection routing. |
 | `PX_WANDER_VISION_ENABLED` | `1` = allow autonomous wander to escalate to Claude vision on genuine local ambiguity (off by default — see Wander below) |
 | `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |

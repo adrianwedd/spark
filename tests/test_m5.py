@@ -47,6 +47,40 @@ def test_auto_model_is_rejected_without_a_network_probe(monkeypatch, _isolated_m
     assert "must name a model" in result.error
 
 
+def test_resident_mode_uses_only_the_model_proven_loaded_by_api_ps(monkeypatch, _isolated_m5):
+    """Borrowing is allowed only from Ollama's resident set, never /api/tags."""
+    monkeypatch.setenv("PX_M5_SPARK_MODEL", "resident")
+    ps = MagicMock()
+    ps.read.return_value = json.dumps({"models": [{"name": "qwen3.8:27b"}]}).encode()
+    generate = _response("thought")
+    with patch("urllib.request.urlopen", side_effect=[ps, generate]) as request:
+        assert _isolated_m5.ask_m5("reflection", "prompt", "system").status == "available"
+    payload = json.loads(request.call_args_list[1].args[0].data)
+    assert payload["model"] == "qwen3.8:27b"
+    assert all("/api/tags" not in str(call) for call in request.call_args_list)
+
+
+def test_resident_only_defers_when_nothing_is_loaded(monkeypatch, _isolated_m5):
+    monkeypatch.setenv("PX_M5_SPARK_MODEL", "resident-only")
+    ps = MagicMock()
+    ps.read.return_value = b'{"models": []}'
+    with patch("urllib.request.urlopen", return_value=ps) as request:
+        result = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert result.status == "busy"
+    assert request.call_count == 1
+
+
+def test_resident_uses_explicit_default_only_when_nothing_is_loaded(monkeypatch, _isolated_m5):
+    monkeypatch.setenv("PX_M5_SPARK_MODEL", "resident")
+    monkeypatch.setenv("PX_M5_SPARK_DEFAULT", "llama3.2:1b")
+    ps = MagicMock()
+    ps.read.return_value = b'{"models": []}'
+    generate = _response("thought")
+    with patch("urllib.request.urlopen", side_effect=[ps, generate]) as request:
+        assert _isolated_m5.ask_m5("reflection", "prompt", "system").status == "available"
+    assert json.loads(request.call_args_list[1].args[0].data)["model"] == "llama3.2:1b"
+
+
 def test_busy_process_shared_gate_returns_immediately_without_a_network_probe(_isolated_m5):
     """A held lock means occupied, not queued; the peer must not touch M5."""
     lock_path = _isolated_m5.m5_lock_path()
