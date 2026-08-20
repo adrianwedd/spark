@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# px-brain — supervisor for SPARK's resident Claude sessions.
+# px-brain — supervisor for SPARK's resident Claude session.
 #
 #   bin/px-brain [--once]
 #
-# Keeps spark-brain (privileged) and spark-io (untrusted input) alive, holds the
-# attached tmux client that 3.3a's send-keys requires, sweeps abandoned requests
-# on restart, unwedges stuck sessions and recycles context at idle moments.
+# Keeps spark-brain alive, holds the attached tmux client that 3.3a's
+# send-keys requires, sweeps abandoned requests on restart, unwedges a stuck
+# session and recycles context at idle moments.
 #
-# Watch either session live:
+# Watch it live:
 #   tmux -S /tmp/tmux-1000/px-mind attach -t spark-brain   (detach: Ctrl-b d)
 #
 # Only one supervisor may run: an flock guard on state/brain/.supervisor.lock

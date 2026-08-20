@@ -6,8 +6,8 @@
     No `claude -p`. No helper whose implementation is `claude -p`. No fallback
     to `call_claude_haiku`. No unclassified "cold Claude" kinds.
 
-The resident `spark-brain` / `spark-io` sessions are SPARK's sole Claude
-execution substrate. A cold `claude -p` throws away context on every call,
+The resident `spark-brain` session is SPARK's sole Claude execution
+substrate. A cold `claude -p` throws away context on every call,
 cannot use SPARK's tools, is unmetered, and — the reason this guard exists
 rather than a docs paragraph — is *more* expensive to run than the resident
 session it claims to be rescuing. A resident-brain failure that responds by
@@ -263,8 +263,8 @@ def main(argv: list[str] | None = None) -> int:
         for v in items:
             print(f"    :{v.line}  [{v.kind}] {v.detail}")
         print()
-    print("Every one of these cold-starts Claude. The resident spark-brain /")
-    print("spark-io sessions are the only permitted Claude substrate.")
+    print("Every one of these cold-starts Claude. The resident spark-brain")
+    print("session is the only permitted Claude substrate.")
     return 0 if args.list else 1
 
 

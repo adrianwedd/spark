@@ -49,15 +49,14 @@ def test_read_is_the_only_non_bash_capability():
     assert non_bash == ["Read"]
 
 
-def test_the_io_session_gets_no_read():
-    """spark-io chews text from strangers. The trust boundary is unchanged.
-
-    Its envelope comes from PX_CLAUDE_ALLOWED_TOOLS, set by the supervisor, not
-    from DEFAULT_TOOLS — this pins that the launcher still honours that split.
-    """
+def test_the_envelope_has_no_per_call_override_hook():
+    """PX_CLAUDE_ALLOWED_TOOLS used to let the supervisor hand `spark-io` a
+    different, narrower envelope. Stage 2 (#242) removed both the session and
+    the hook — a launcher that still honours an env override is one edit away
+    from a session started with an envelope nobody tested."""
     body = LAUNCHER.read_text()
-    assert "PX_CLAUDE_ALLOWED_TOOLS" in body
-    assert 'if [[ -n "${PX_CLAUDE_ALLOWED_TOOLS:-}" ]]; then' in body
+    assert "PX_CLAUDE_ALLOWED_TOOLS" not in body
+    assert "PX_CLAUDE_CWD" not in body
 
 
 def test_the_scope_narrowing_lives_in_code_not_the_cli_rule():

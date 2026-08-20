@@ -25,7 +25,7 @@ import shutil
 
 from pxh import brain
 
-for session in (brain.BRAIN_SESSION, brain.IO_SESSION):
+for session in (brain.BRAIN_SESSION,):
     state = brain.session_state(session)
     marker = brain.read_validation_marker(session) or {}
     age = brain._marker_age_s(marker) if marker else float("inf")

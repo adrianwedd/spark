@@ -1,5 +1,5 @@
 [Unit]
-Description=SPARK resident Claude sessions (brain + io) supervisor
+Description=SPARK resident Claude session supervisor
 After=network.target
 StartLimitBurst=5
 StartLimitIntervalSec=300

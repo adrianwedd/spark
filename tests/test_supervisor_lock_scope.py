@@ -77,7 +77,7 @@ class TestSocketScopedGuard:
     def test_sessions_and_the_guard_resolve_the_same_socket(self, monkeypatch):
         """Keyed off literally the same call, so the two cannot drift."""
         monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", "/tmp/tmux-test/px-mind")
-        spec = brain.spec_for_session(brain.IO_SESSION)
+        spec = brain.spec_for_session(brain.BRAIN_SESSION)
         assert spec.socket == brain.brain_socket()
         assert brain_daemon.supervisor_lock_path() == Path(
             spec.socket + ".supervisor.lock"

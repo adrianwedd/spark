@@ -225,6 +225,11 @@ def test_an_unclassified_kind_can_never_reach_the_privileged_session():
     dangerous mistake, which is exactly backwards: the person adding a kind
     that chews text from strangers is the person most likely to forget.
 
+    Since Stage 2 (#242) removed the unprivileged `spark-io` session, there is
+    no longer a safe session to fall back to at all — `session_for_kind` must
+    refuse outright rather than pick between two sessions, one of which no
+    longer exists.
+
     Typos, near-misses and case differences are the realistic shape of this —
     they are not *unknown* to a human reading the diff, only to the frozenset.
     """
@@ -237,8 +242,8 @@ def test_an_unclassified_kind_can_never_reach_the_privileged_session():
         "../evolve",           # a kind built from untrusted input
     )
     for kind in invented:
-        assert brain.session_for_kind(kind) != brain.BRAIN_SESSION, (
-            f"unclassified kind {kind!r} routed to the privileged session")
+        with pytest.raises(ValueError):
+            brain.session_for_kind(kind)
 
 
 def test_every_kind_with_a_deadline_is_explicitly_classified():
@@ -249,8 +254,7 @@ def test_every_kind_with_a_deadline_is_explicitly_classified():
     cheap to fix rather than after it has shipped.
     """
     unclassified = [k for k in brain._DEADLINE_S
-                    if k not in brain._IO_KINDS and k not in brain._M5_KINDS
-                    and k not in brain._BRAIN_KINDS]
+                    if k not in brain._M5_KINDS and k not in brain._BRAIN_KINDS]
     assert unclassified == [], (
         f"kinds with a deadline but no trust classification: {unclassified}")
 
@@ -279,14 +283,20 @@ def test_ask_brain_refuses_an_unclassified_kind_outright(_live_pane):
         "slow refusal means the request was sent and merely went unanswered")
 
 
-def test_io_session_holds_exactly_one_tool_and_no_repo_access():
-    """The io envelope IS the security property — assert it, don't assume it."""
-    spec = brain.spec_for_session(brain.IO_SESSION)
-    tools = spec.env["PX_CLAUDE_ALLOWED_TOOLS"]
-    assert "tool-brain-reply" in tools
-    assert tools.count("Bash(") == 1, f"io session must hold one tool, got {tools}"
-    assert not Path(spec.cwd).samefile(ROOT) if Path(spec.cwd).exists() else True
-    assert str(ROOT) != spec.cwd, "io session must not run at the repo root"
+def test_ask_brain_refuses_an_m5_kind_it_would_otherwise_route(_live_pane):
+    """The Stage 2 trust boundary: M5 kinds are classified — session_for_kind
+    correctly names M5_SESSION for them — but ask_brain must still refuse
+    before injecting anything. Untrusted text stays off Claude Code entirely;
+    it is not merely routed to a different, still-Claude, destination.
+    """
+    started = time.monotonic()
+    assert brain.ask_brain("public_chat", {"message": "hi"}, timeout_s=5) is None
+    elapsed = time.monotonic() - started
+
+    assert [line for line in _live_pane if "NEW REQUEST" in line] == [], (
+        f"an M5-classified kind was nudged into the privileged session: {_live_pane}")
+    assert elapsed < 2.0, (
+        f"refusal must be immediate, not a {elapsed:.1f}s deadline wait")
 
 
 # ---------------------------------------------------------------------------
@@ -296,10 +306,8 @@ def test_io_session_holds_exactly_one_tool_and_no_repo_access():
 # about to run, by prefix. `Bash(/abs/bin/tool-brain-reply:*)` therefore admits
 # an absolute invocation and nothing else — a bare or repo-relative spelling
 # misses the pattern and raises a permission dialog, which is a wedge, because
-# nothing is attached to answer it. So the nudge, both system prompts and both
-# allowlists have to say one identical absolute thing. Relative could never
-# have worked for the io session in any case: its cwd is deliberately outside
-# the repository, so `bin/tool-brain-reply` does not resolve there at all.
+# nothing is attached to answer it. So the nudge and the system prompt have to
+# say one identical absolute thing.
 # ---------------------------------------------------------------------------
 
 def _launch_argv(tmp_path, env_extra):
@@ -359,20 +367,10 @@ def test_nudge_and_allowlist_agree_on_the_absolute_spelling():
         [brain.TOOL_BRAIN_REPLY]
 
 
-def test_io_allowlist_is_the_shared_constant():
-    spec = brain.spec_for_session(brain.IO_SESSION)
-    assert spec.env["PX_CLAUDE_ALLOWED_TOOLS"] == brain.TOOL_BRAIN_REPLY_ALLOW
-
-
-@pytest.mark.parametrize("session", [brain.BRAIN_SESSION, brain.IO_SESSION])
-def test_launcher_renders_one_absolute_reply_spelling(tmp_path, session):
+def test_launcher_renders_one_absolute_reply_spelling(tmp_path):
     """End to end across the language boundary: what bash actually hands
     `claude` must match what Python tells the session to type."""
-    extra = {"PX_BRAIN_SESSION": session}
-    if session == brain.IO_SESSION:
-        extra["PX_CLAUDE_ALLOWED_TOOLS"] = \
-            brain.spec_for_session(brain.IO_SESSION).env["PX_CLAUDE_ALLOWED_TOOLS"]
-        extra["PX_CLAUDE_CWD"] = str(tmp_path / "io-cwd")
+    extra = {"PX_BRAIN_SESSION": brain.BRAIN_SESSION}
     tools, prompt = _launch_argv(tmp_path, extra)
 
     assert brain.TOOL_BRAIN_REPLY_ALLOW in tools, tools
@@ -494,23 +492,23 @@ def _run_tool_stdin(session: str, request_id: str, raw_payload: str):
 ])
 def test_reply_tool_rejects_ids_that_are_not_bare_uuids(_mailbox, bad_id):
     """The id becomes a filename. This is the path-traversal guard."""
-    brain.ensure_mailbox(brain.IO_SESSION)
-    out = _run_tool(brain.IO_SESSION, bad_id, '{"a": 1}')
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    out = _run_tool(brain.BRAIN_SESSION, bad_id, '{"a": 1}')
     payload = json.loads(out.stdout.strip().splitlines()[-1])
     assert payload["status"] == "error", payload
-    assert not list(brain.outbox_dir(brain.IO_SESSION).glob("*")), \
+    assert not list(brain.outbox_dir(brain.BRAIN_SESSION).glob("*")), \
         "a rejected id must not write anything"
 
 
 def test_reply_tool_rejects_an_id_nobody_is_waiting_on(_mailbox):
     """Without this, a valid uuid is a write primitive aimed at the outbox."""
-    brain.ensure_mailbox(brain.IO_SESSION)
-    out = _run_tool(brain.IO_SESSION, str(uuid.uuid4()), '{"a": 1}')
+    brain.ensure_mailbox(brain.BRAIN_SESSION)
+    out = _run_tool(brain.BRAIN_SESSION, str(uuid.uuid4()), '{"a": 1}')
     assert json.loads(out.stdout.strip().splitlines()[-1])["status"] == "error"
 
 
 def test_reply_tool_rejects_non_json_and_oversized_payloads(_mailbox):
-    session = brain.IO_SESSION
+    session = brain.BRAIN_SESSION
     brain.ensure_mailbox(session)
     rid = str(uuid.uuid4())
     (brain.inbox_dir(session) / f"{rid}.json").write_text("{}")
@@ -536,7 +534,7 @@ def test_reply_tool_accepts_a_payload_the_environment_could_not_carry(_mailbox):
     object contract every tool has, and making the tool's own size guard
     unreachable dead code. Sized above the kernel limit and below our own.
     """
-    session = brain.IO_SESSION
+    session = brain.BRAIN_SESSION
     brain.ensure_mailbox(session)
     rid = str(uuid.uuid4())
     (brain.inbox_dir(session) / f"{rid}.json").write_text("{}")
@@ -554,7 +552,7 @@ def test_reply_tool_accepts_a_payload_the_environment_could_not_carry(_mailbox):
 
 
 def test_reply_tool_retires_the_request_on_success(_mailbox):
-    session = brain.IO_SESSION
+    session = brain.BRAIN_SESSION
     brain.ensure_mailbox(session)
     rid = str(uuid.uuid4())
     (brain.inbox_dir(session) / f"{rid}.json").write_text("{}")
@@ -717,8 +715,7 @@ def test_validation_budget_fits_inside_the_staleness_window():
 
     assert brain.STARTUP_CEILING_S is tmux_claude.STARTUP_TIMEOUT_S, \
         "there is ONE glyph wait per session start and it lives in ensure_session"
-    ceiling = 0.6 * min(health.STALE_AFTER_S["px-brain"],
-                        health.STALE_AFTER_S["px-brain-io"])
+    ceiling = 0.6 * health.STALE_AFTER_S["px-brain"]
     assert brain.VALIDATION_CEILING_S == ceiling
     budget = (brain.STARTUP_CEILING_S + brain.SETTLE_S
               + brain.HANDSHAKE_ATTEMPTS * brain.HANDSHAKE_TIMEOUT_S)

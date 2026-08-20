@@ -151,7 +151,9 @@ def test_timeout_and_bad_response_open_the_circuit(_isolated_m5):
 
 
 def test_success_records_kind_and_session_telemetry(_isolated_m5):
-    """Stage 2 needs an auditable proof that no work reaches spark-io."""
+    """Stage 2 (#242) needed an auditable proof that untrusted text never
+    reaches the privileged brain session — this is the M5 half of it: routed
+    kinds are metered by route, and the meter never carries the prompt text."""
     with patch("urllib.request.urlopen", return_value=_response("hello")):
         assert _isolated_m5.ask_m5("public_chat", "prompt", "system").status == "available"
     meter = _isolated_m5.meter_summary()
