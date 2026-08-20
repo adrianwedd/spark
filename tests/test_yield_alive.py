@@ -117,12 +117,11 @@ def test_yield_alive_returns_success_when_px_alive_exits(long_poll_env):
     returns 0 as before — the fix must not break the normal path.
     """
     log_dir = long_poll_env
-    # Spawn a process that exits on SIGUSR1
+    # Spawn a shell process that exits on SIGUSR1 — shell exits are
+    # near-instant, unlike Python which needs an interpreter tick to
+    # process signals (unreliable on loaded CI runners within 5s).
     proc = subprocess.Popen(
-        ["python3", "-c",
-         "import signal, time; "
-         "signal.signal(signal.SIGUSR1, lambda *_: exit(0)); "
-         "time.sleep(60)"],
+        ["bash", "-c", "trap 'exit 0' USR1; sleep 60"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
