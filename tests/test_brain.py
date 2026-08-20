@@ -304,8 +304,10 @@ def test_io_session_holds_exactly_one_tool_and_no_repo_access():
 def _launch_argv(tmp_path, env_extra):
     """Run bin/px-claude-session with a stub `claude` and capture its argv.
 
-    The launcher `exec`s the binary, so a stub that dumps its arguments shows
-    exactly what the real session would have been started with — including the
+    The launcher hands the binary its argv (backgrounded and waited on, not
+    `exec`'d, so its exit instrumentation has something left running to
+    observe how it stops), so a stub that dumps its arguments shows exactly
+    what the real session would have been started with — including the
     rendered system prompt, which is the half of the interface a unit test on
     the Python side cannot see.
     """
@@ -318,6 +320,12 @@ def _launch_argv(tmp_path, env_extra):
     env.update({"PX_CLAUDE_BIN": str(stub), "ARGV_OUT": str(argv_out)})
     env.pop("PX_CLAUDE_TMUX_PROMPT", None)
     env.pop("PX_CLAUDE_ALLOWED_TOOLS", None)
+    # The launcher's exit instrumentation writes
+    # state/brain/<session>/last_stderr.log. Without an explicit override
+    # here PX_STATE_DIR falls through to this checkout's real state/ —
+    # the same class of live-state pollution LOG_DIR isolation exists to
+    # prevent elsewhere in this suite.
+    env["PX_STATE_DIR"] = str(tmp_path / "state")
     env.update(env_extra)
 
     run = subprocess.run([str(ROOT / "bin" / "px-claude-session")],

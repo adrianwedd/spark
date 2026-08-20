@@ -144,6 +144,27 @@ def test_a_holder_is_attached_to_every_session(fake_tmux, monkeypatch):
     assert all(s.holder is not None and s.holder.alive() for s in states.values())
 
 
+def test_start_session_passes_supervisor_identity_to_the_launcher_env(fake_tmux, monkeypatch):
+    """The launcher's own exit log can only name which supervisor started it
+    if the supervisor tells it — useful when comparing spark-brain against
+    spark-io after a death, since both run under the same supervisor
+    process and the same tmux server."""
+    captured = {}
+    real_ensure = tmux_claude.ensure_session
+
+    def _capture(timeout_s=None, spec=None):
+        captured["spec"] = spec
+        return real_ensure(timeout_s=timeout_s, spec=spec)
+
+    monkeypatch.setattr(tmux_claude, "ensure_session", _capture)
+    state = _state(brain.BRAIN_SESSION)
+    assert brain_daemon.start_session(state) is True
+
+    env = captured["spec"].env
+    assert env["PX_BRAIN_SUPERVISOR_INSTANCE"] == brain_daemon._INSTANCE_ID
+    assert env["PX_BRAIN_SUPERVISOR_BOOT_ID"] == brain_daemon._BOOT_ID
+
+
 def test_a_dead_holder_is_restarted(fake_tmux):
     state = _state()
     brain_daemon.start_session(state)
@@ -404,6 +425,33 @@ def test_turns_are_counted_once_per_request(fake_tmux):
     assert state.turns == 2
 
 
+def test_twenty_successful_handshakes_alone_never_trigger_a_recycle(
+        fake_tmux, _fast_handshake, monkeypatch):
+    """CONTEXT_TURNS bounds cognitive-context growth from real work. A
+    2026-08-20 audit found handshakes counted toward it too (spec §2.7),
+    so a session doing nothing but answering health checks could age into
+    a context recycle on protocol traffic alone. This pins the fix at the
+    behavioural level, not just the counter: even after CONTEXT_TURNS
+    successful handshakes, maybe_recycle must not inject a recycle turn."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    state = _state(session)
+    for _ in range(brain_daemon.CONTEXT_TURNS):
+        assert brain_daemon.run_handshake(state, "no_marker") is True
+
+    assert state.turns == 0, "a handshake must never increment turns"
+
+    now_local = datetime(2026, 8, 20, 12, 0, tzinfo=brain_daemon.HOBART)
+    state.last_recycle_day = now_local.strftime("%Y-%m-%d")  # nightly not due
+    injected_before = len(fake_tmux.injected)
+    brain_daemon.maybe_recycle(state, now_local)
+    assert len(fake_tmux.injected) == injected_before, \
+        "maybe_recycle must not inject a journal+/clear turn on handshake traffic alone"
+
+
 # ---------------------------------------------------------------------------
 # Robustness
 # ---------------------------------------------------------------------------
@@ -523,10 +571,15 @@ def test_a_reply_with_the_wrong_nonce_does_not_validate(fake_tmux, _fast_handsha
     assert brain.session_state(session) != brain.VALIDATED
 
 
-def test_a_silent_session_is_escaped_retried_then_killed(fake_tmux, _fast_handshake, monkeypatch):
-    """The handshake does its own escalation. It cannot rely on check_wedge,
-    which clears itself the moment the glyph is back — exactly the case a
-    permission dialog produces."""
+def test_a_silent_session_is_escaped_and_retried_but_not_killed(
+        fake_tmux, _fast_handshake, monkeypatch):
+    """The handshake still does its own per-attempt escalation — Escape
+    between retries — but exhausting HANDSHAKE_ATTEMPTS no longer kills a
+    session that is merely unvalidated. A 2026-08-20 audit found this kill
+    branch caused 6 of 19 session recreations on its own; a failed
+    handshake is proof the session cannot currently be trusted, not proof
+    the process must die. Only check_wedge, on a real stuck caller
+    request, may kill."""
     session = brain.BRAIN_SESSION
     fake_tmux.sessions.add(session)
     brain.ensure_mailbox(session)
@@ -535,8 +588,8 @@ def test_a_silent_session_is_escaped_retried_then_killed(fake_tmux, _fast_handsh
 
     assert brain_daemon.run_handshake(_state(session), "no_marker") is False
     assert (session, "Escape") in fake_tmux.keys
-    assert session in fake_tmux.killed
-    assert brain.session_state(session) == brain.SESSION_ABSENT
+    assert session not in fake_tmux.killed
+    assert brain.session_state(session) == brain.NO_MARKER
 
 
 def test_a_retry_re_nudges_the_same_request_id(fake_tmux, _fast_handshake, monkeypatch):
@@ -555,9 +608,10 @@ def test_a_retry_re_nudges_the_same_request_id(fake_tmux, _fast_handshake, monke
     assert len(ids) == 1, f"a retry must re-nudge the same id, saw {ids}"
 
 
-def test_a_handshake_after_a_kill_uses_a_fresh_id(fake_tmux, _fast_handshake, monkeypatch):
-    """The sweep and the new handshake would otherwise handle one id in both
-    roles — one moving it to dead/, the other waiting on it."""
+def test_two_failed_handshakes_use_a_fresh_id_each_time(fake_tmux, _fast_handshake, monkeypatch):
+    """Each run_handshake call mints its own uuid4 regardless of whether the
+    previous attempt's session survived — it does now, see
+    test_a_silent_session_is_escaped_and_retried_but_not_killed."""
     session = brain.BRAIN_SESSION
     brain.ensure_mailbox(session)
     monkeypatch.setattr(tmux_claude, "inject",
@@ -666,9 +720,9 @@ def test_run_handshake_sweeps_the_request_the_stale_marker_names(fake_tmux, _fas
     assert not (brain.inbox_dir(session) / f"{orphan_id}.json").exists()
 
 
-def test_a_killed_handshake_stops_and_drops_the_holder(fake_tmux, _fast_handshake, monkeypatch):
-    """The holder is attached to a session that no longer exists after a kill.
-    Leaving it in place would leak a client attached to nothing."""
+def test_a_failed_handshake_leaves_the_holder_attached(fake_tmux, _fast_handshake, monkeypatch):
+    """A failed handshake no longer kills the session, so the holder must
+    not be stopped either — it still has something to hold."""
     session = brain.BRAIN_SESSION
     fake_tmux.sessions.add(session)
     brain.ensure_mailbox(session)
@@ -681,8 +735,8 @@ def test_a_killed_handshake_stops_and_drops_the_holder(fake_tmux, _fast_handshak
     state.holder = holder
 
     assert brain_daemon.run_handshake(state, "no_marker") is False
-    assert holder.alive() is False
-    assert state.holder is None
+    assert holder.alive() is True
+    assert state.holder is holder
 
 
 @pytest.mark.parametrize("prompt", ["spark-brain-system.md", "spark-io-system.md"])
