@@ -33,7 +33,7 @@ All helper scripts live in `~/picar-x-hacking/bin`. Each script is designed to b
 | `px-api-server` | Launches the REST API (FastAPI + uvicorn) on port 8420. Sources `px-env` and `.env` (for `PX_API_TOKEN`). Supports `--dry-run`, `--port`, `--host`. Must always be used instead of bare uvicorn. |
 | `tool-api-start` | Daemonises `px-api-server` in the background; writes PID to `logs/px-api-server.pid`. Respects `PX_DRY`. |
 | `tool-api-stop` | Sends SIGTERM to the API server via PID file; waits for clean shutdown. |
-| `run-voice-loop-claude` | Wrapper that pins `CODEX_CHAT_CMD` to `bin/claude-voice-bridge` and uses `docs/prompts/claude-voice-system.md` as the system prompt. |
+| `run-voice-loop-claude` | Launches the voice loop with Claude Code as the backend. Routes voice turns to the resident `spark-brain` session via `PX_VOICE_BACKEND=brain` (no cold `claude -p`). Uses `docs/prompts/claude-voice-system.md` as the system prompt. |
 
 
 All motion-capable helpers include `--dry-run` (or honour `PX_DRY`) so you can review planned actions before spinning the wheels. Always confirm the car is on blocks prior to running live motion. Use `sudo -E bin/<script>` to ensure the virtualenv and path configuration remain intact under sudo.

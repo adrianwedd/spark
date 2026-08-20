@@ -48,7 +48,6 @@ Comprehensive documentation for every script in `bin/` and every module in `src/
    - [bin/run-voice-loop](#binrun-voice-loop)
    - [bin/run-voice-loop-claude](#binrun-voice-loop-claude)
    - [bin/run-voice-loop-ollama](#binrun-voice-loop-ollama)
-   - [bin/claude-voice-bridge](#binclaude-voice-bridge)
    - [bin/codex-ollama](#bincodex-ollama)
 10. [Wake Word and STT](#wake-word-and-stt)
     - [bin/px-wake-listen](#binpx-wake-listen)
@@ -896,7 +895,7 @@ bin/run-voice-loop [--input-mode text|voice] [--dry-run] [--auto-log] [--max-tur
 
 ### bin/run-voice-loop-claude
 
-**Purpose:** Launch the voice loop using Claude Code (`claude -p`) as the LLM backend instead of Codex CLI.
+**Purpose:** Launch the voice loop using Claude Code as the LLM backend, via the resident `spark-brain` session.
 
 **Usage:**
 ```bash
@@ -904,9 +903,11 @@ bin/run-voice-loop-claude [--input-mode text|voice] [--dry-run] [--max-turns N] 
 ```
 
 **What it does:**
-1. Sets `CODEX_CHAT_CMD="$SCRIPT_DIR/claude-voice-bridge"` — substitutes Claude for Codex.
-2. Passes `--prompt docs/prompts/claude-voice-system.md` as the system prompt.
+1. Sets `PX_VOICE_BACKEND=brain` — voice turns route to the resident `spark-brain` session (the sole permitted Claude substrate; see the resident-only invariant in CLAUDE.md).
+2. Passes `--backend brain --prompt docs/prompts/claude-voice-system.md` to `codex-voice-loop`.
 3. Calls `codex-voice-loop` with all remaining arguments forwarded.
+
+There is no cold `claude -p` path — `bin/claude-voice-bridge` was deleted (not deprecated) when voice turns moved to the resident brain.
 
 **Example (single non-interactive turn):**
 ```bash
@@ -932,29 +933,6 @@ bin/run-voice-loop-ollama [same flags as run-voice-loop]
 | `CODEX_OLLAMA_TEMPERATURE` | `0.2` | Sampling temperature |
 | `CODEX_OLLAMA_NUM_PREDICT` | `64` | Max tokens to generate |
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
-
----
-
-### bin/claude-voice-bridge
-
-**Purpose:** stdin→stdout adapter that lets `voice_loop.py` use Claude Code (`claude -p`) as its LLM backend.
-
-**Usage:** Called by `run-voice-loop-claude` via `CODEX_CHAT_CMD`. Not typically invoked directly.
-
-**What it does:**
-1. Unsets `CLAUDECODE` and `CLAUDE_CODE_ENTRYPOINT` so that a nested `claude -p` invocation is permitted from within a Claude Code session.
-2. Reads the full prompt from stdin.
-3. Calls:
-   ```bash
-   claude -p "$PROMPT" \
-     --system-prompt "You are a robot assistant controller..." \
-     --allowedTools "" \
-     --output-format text \
-     --no-session-persistence
-   ```
-4. Claude's response (JSON action object) goes to stdout, which `voice_loop.py` reads.
-
-**Why `--allowedTools ""`:** Prevents Claude from invoking file/shell tools; all robot actions go through the JSON tool dispatch system instead.
 
 ---
 

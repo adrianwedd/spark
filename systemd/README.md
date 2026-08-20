@@ -1,6 +1,6 @@
 # systemd units
 
-Service units for the eleven SPARK daemons (see CLAUDE.md "Systemd Services").
+Service units for the twelve SPARK daemons (see CLAUDE.md "Systemd Services").
 Install to `/etc/systemd/system/` on the Pi, then `daemon-reload` + `enable --now`.
 
 Units are plain `cp`'d, not symlinked — the checked-in file and the deployed

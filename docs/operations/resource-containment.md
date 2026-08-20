@@ -46,43 +46,14 @@ The goal that produced this PR referenced a "banked containment" commit,
 limits. No memory/CPU containment code existed anywhere in the repo before
 this PR — it was designed from scratch against a fresh live measurement.
 
-## A stale-process finding made during baseline measurement
-
-While re-measuring `px-brain.service`'s cgroup for this PR, both resident
-Claude processes were found still running the **pre-#242 two-session
-architecture** (`spark-brain` + `spark-io`) at 19:33 AEST on 2026-08-20 —
-over an hour after #242 (which deletes `spark-io`) merged at 18:22. Process
-start times (17:45) predate the merge: the host's most recent reboot (which
-picked up #218's cmdline fix) happened before #242 landed on `master`, and
-`px-brain.service`'s `Restart=always` supervisor is a long-running process
-that doesn't re-read code from disk on its own — the same "stale running
-process" pattern already logged from `px-mind` post-#232.
-
-`systemctl restart px-brain` was run to deploy the merged supervisor code.
-Because `KillMode=process` deliberately does not kill the tmux sessions it
-supervises (documented in `systemd/px-brain.service`), this did **not** kill
-the stale `spark-io` session — it only restarted the supervisor's own Python
-process, which re-attached to the sessions already running. The two-session
-state was accepted as this PR's "before" baseline rather than forced to
-collapse: forcing a session recycle calls `tmux_claude.kill_session()`, which
-sits inside the `#226` wedge/recycle machinery this goal explicitly excludes.
-The pending nightly recycle (02:00 Hobart) will collapse it to the single
-`spark-brain` session for real; `px-brain`'s `MemoryHigh`/`MemoryMax` are
-sized with that in mind (see its drop-in's comment header).
-
-The restart did clear `spark-brain`'s handshake validation marker
-(`no_marker` immediately after, `validating` ~20s later, `validated` again
-~50s after the restart) — expected per the documented state machine, not a
-regression. Confirmed recovered before any further work.
-
-## Baseline (measured live, 2026-08-20T19:33 AEST)
+## Baseline (measured live, 2026-08-20)
 
 `systemctl show <unit> -p MemoryCurrent` (authoritative cgroup accounting,
 now that #218 restored it) plus process RSS/PSS from `/proc/<pid>/smaps_rollup`:
 
 | Service | MemoryCurrent | RSS | PSS | Notes |
 |---|---:|---:|---:|---|
-| px-brain | 852M | — | — | stale 2-session state (`spark-brain` ~498M + `spark-io` ~421M); see above |
+| px-brain | ~500M | — | — | single spark-brain session (post-#242); see drop-in comment for sizing |
 | px-wake-listen | 522M | 571M | 561M | #219's named outlier; ~446M single anon heap, matches prior finding |
 | px-tts-glados | 501M | 485M | 474M | new finding — comparably sized to wake-listen, not previously characterized |
 | px-frigate-stream | 122M | — | — | 41 tasks (go2rtc + ffmpeg + rpicam-vid) |
@@ -107,25 +78,11 @@ io:     some avg10=28.34 avg60=48.56 avg300=37.18
 cpu:    some avg10=6.15  avg60=5.19  avg300=4.16
 ```
 
-### Concurrent live event during measurement
-
-A real "hey vixen" wake word fired mid-investigation; `px-wake-listen` sent
-`sudo kill` to `px-alive` to yield the GPIO lease for the voice turn per
-normal design. `px-alive` missed its 15s watchdog during that shutdown and
-was killed/auto-restarted by systemd (restart counter reached 5 since boot).
-This is the previously-tracked `#205` `yield_alive` race, unrelated to this
-PR's changes — logged here only because it happened live during baseline
-capture and is a second, independent illustration of a latency-sensitive
-daemon losing a race under the same kind of pressure #217 investigates.
-**Not fixed by this PR** (explicitly out of scope), but `px-alive`'s raised
-`CPUWeight` in this PR's containment set is a plausible (unverified)
-mitigating factor for next time.
-
 ## Design table
 
 | Service | MemoryHigh | MemoryMax | CPUWeight | Rationale (full text in each drop-in) |
 |---|---:|---:|---:|---|
-| px-brain | 960M | 1536M | 150 | above current 2-session state; ~3x expected single-session steady state; raised priority — #217's strongest evidence implicates this process losing scheduler contention |
+| px-brain | 960M | 1536M | 150 | ~3x expected single-session steady state; raised priority — #217's strongest evidence implicates this process losing scheduler contention |
 | px-wake-listen | 640M | 1024M | default | High ~1.1x steady state; Max ~12% above documented 900M peak (#219) |
 | px-tts-glados | 576M | 768M | default | conservative multiple; no documented peak exists (new finding) |
 | px-frigate-stream | 224M | 384M | 50 | bursty; lowered priority — should yield under contention |
