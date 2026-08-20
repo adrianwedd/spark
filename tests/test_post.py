@@ -298,17 +298,17 @@ from contextlib import contextmanager
 
 @contextmanager
 def _brain_says(verdict=None, unavailable=False):
-    """Stub the resident io session's answer to a post_qa request.
+    """Stub the pinned M5 answer to a post_qa request.
 
     These tests used to drive `subprocess.run` through px-post's legacy branch,
     selected by setting PX_BRAIN_KINDS="". That branch ran `claude -p`, so the
     dial's off position did not disable post QA — it silently re-enabled a cold
     start. There is only one path now, so there is nothing to select between.
     """
-    import pxh.brain
+    from pxh.m5 import M5Result
     from unittest.mock import patch as _patch
-    reply = None if unavailable else {"reply": verdict}
-    with _patch.object(pxh.brain, "ask_brain", return_value=reply) as m:
+    result = M5Result("offline") if unavailable else M5Result("available", response=str(verdict))
+    with _patch("pxh.m5.ask_m5", return_value=result) as m:
         yield m
 
 
@@ -952,33 +952,30 @@ def test_watchdog_stale_detection():
 # ---------------------------------------------------------------------------
 
 @patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
-def test_qa_gate_uses_the_io_session_not_a_subprocess():
-    """post_qa judges text that goes public. It runs on the unprivileged
-    session, and it must not spawn `claude -p` to do it."""
-    from pxh import brain
+def test_qa_gate_uses_pinned_m5_not_a_subprocess():
+    """post_qa uses the pinned M5 model and never starts Claude."""
 
     def _boom(*a, **k):
         raise AssertionError("QA gate spawned a subprocess")
 
     with patch.object(_POST["subprocess"], "run", _boom), \
-         patch.object(brain, "ask_brain", return_value={"reply": "YES"}) as ask:
+        patch("pxh.m5.ask_m5", return_value=__import__("pxh.m5", fromlist=["M5Result"]).M5Result("available", response="YES")) as ask:
         assert run_qa_gate("I see a bird on the fence") == "pass"
     assert ask.call_args[0][0] == "post_qa", "must route to the post_qa kind"
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
-def test_qa_gate_accepts_a_structured_verdict():
-    """A resident session naturally replies with JSON; both shapes are read."""
-    from pxh import brain
-    with patch.object(brain, "ask_brain", return_value={"reply": {"verdict": "NO"}}):
+def test_qa_gate_accepts_m5_verdict():
+    from pxh.m5 import M5Result
+    with patch("pxh.m5.ask_m5", return_value=M5Result("available", response="NO")):
         assert run_qa_gate("sonar: 42cm") == "rejected"
 
 
 @patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
 def test_qa_gate_still_defaults_ambiguous_to_pass():
     """QA is a safety net, not a quality bar — unchanged by the move."""
-    from pxh import brain
-    with patch.object(brain, "ask_brain", return_value={"reply": "Maybe?"}):
+    from pxh.m5 import M5Result
+    with patch("pxh.m5.ask_m5", return_value=M5Result("available", response="Maybe?")):
         assert run_qa_gate("hmm not sure") == "ambiguous"
 
 

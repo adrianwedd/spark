@@ -2452,111 +2452,23 @@ def call_claude(prompt: str, system: str) -> dict:
 
 
 def call_llm(prompt: str, system: str, persona: str = "") -> dict:
-    """Four-tier LLM fallback.
+    """Use the pinned M5 model for reflection, or defer.
 
-    Tier 1 — Ollama M5 (LAN):         primary for all personas incl. SPARK (when reachable)
-    Tier 2 — resident spark-brain:    SPARK fallback when M5 unreachable, or MIND_BACKEND=claude
-    Tier 3 — Ollama Cloud (internet): reached only when M5 fails and no brain tier ran
-    Tier 4 — Ollama localhost (Pi):   final fallback, opt-in
-
-    **A resident-brain failure is terminal, not a tier boundary.** Tier 2
-    returning an error means the session could not be reached; tiers 3 and 4 are
-    not attempted, because a reflection is optional and the correct response to
-    a loaded Pi is less work, not a wider search. Only an M5 failure walks the
-    chain. See call_claude and CLAUDE.md's resident-only invariant.
+    Reflection is optional work.  It must neither queue behind a prior M5 turn
+    nor widen into a resident Claude, Ollama Cloud, or Pi-local model fallback.
     """
-    spark_auto = MIND_BACKEND == "auto" and persona == "spark"
+    from pxh.m5 import ask_m5
 
-    # Tier 1: M5 Ollama (LAN) — primary for all personas including SPARK
-    if MIND_BACKEND != "claude":
-        result = call_ollama(prompt, system)
-        if "error" not in result:
-            try:
-                _log_token_usage(prompt + system, result.get("response", ""), "ollama-m5")
-            except Exception:
-                pass
-            result["backend"] = "ollama-m5"
-            return result
-
-        # Tier 2: Claude Haiku — SPARK fallback when M5 is unreachable
-        if spark_auto:
-            log(f"M5 ollama failed ({result['error']}), falling back to claude")
-            try:
-                claude_result = call_claude(prompt, system)
-            except Exception as exc:
-                try:
-                    log(f"claude crashed ({exc}), continuing to cloud ollama")
-                except Exception:
-                    pass
-                claude_result = {"error": str(exc)}
-            if "error" not in claude_result:
-                try:
-                    _log_token_usage(prompt + system, claude_result.get("response", ""), "claude")
-                except Exception:
-                    pass
-                claude_result["backend"] = "claude"
-                return claude_result
-            # Stop. Reaching Ollama Cloud from here would answer "the resident
-            # session was slow to accept a keystroke" by opening an internet
-            # request from an already-loaded Pi.
-            log(f"resident brain unavailable ({claude_result['error']}), deferring reflection")
-            return claude_result
-    else:
-        # MIND_BACKEND=claude: Claude is primary
+    result = ask_m5("reflection", prompt, system)
+    if result.status == "available":
         try:
-            result = call_claude(prompt, system)
-        except Exception as exc:
-            try:
-                log(f"claude crashed ({exc}), falling back to ollama")
-            except Exception:
-                pass
-            result = {"error": str(exc)}
-        if "error" not in result:
-            try:
-                _log_token_usage(prompt + system, result.get("response", ""), "claude")
-            except Exception:
-                pass
-            result["backend"] = "claude"
-            return result
-        # MIND_BACKEND=claude means the resident brain *is* the backend. If it
-        # cannot be reached the answer is to skip this thought and back off, not
-        # to go looking for a different model. Escalating here is what turned
-        # one slow keystroke into two Claude processes, an M5 timeout and a 403
-        # from Ollama Cloud — while a child waited on a different code path.
-        log(f"resident brain unavailable ({result['error']}), deferring reflection")
-        return result
-
-    # Tier 3: Ollama Cloud (internet fallback)
-    if OLLAMA_CLOUD_KEY:
-        log(f"M5 ollama failed ({result['error']}), falling back to ollama cloud")
-        result = call_ollama(prompt, system,
-                             host=OLLAMA_CLOUD_HOST,
-                             model=_CLOUD_MODEL_ENV,
-                             auth_token=OLLAMA_CLOUD_KEY)
-        if "error" not in result:
-            try:
-                _log_token_usage(prompt + system, result.get("response", ""), "ollama-cloud")
-            except Exception:
-                pass
-            result["backend"] = "ollama-cloud"
-            return result
-
-    # Tier 4: local Pi Ollama — disabled by default (Pi 4 RAM too small;
-    # loading a model alongside px-wake-listen/SenseVoice fills swap and OOMs).
-    # Enable with PX_MIND_LOCAL_OLLAMA=1 if running on a beefier Pi.
-    if os.environ.get("PX_MIND_LOCAL_OLLAMA") == "1":
-        log(f"ollama cloud failed ({result['error']}), falling back to local ollama")
-        result = call_ollama(prompt, system, host=LOCAL_OLLAMA_HOST, model=LOCAL_MODEL)
-        if "error" not in result:
-            try:
-                _log_token_usage(prompt + system, result.get("response", ""), "ollama-local")
-            except Exception:
-                pass
-            result["backend"] = "ollama-local"
-            return result
-
-    log(f"all tiers failed ({result['error']}), skipping reflection")
-    return result
+            _log_token_usage(prompt + system, result.response, "ollama-m5")
+        except Exception:
+            pass
+        return {"response": result.response, "backend": "ollama-m5"}
+    log(f"M5 reflection {result.status}: {result.error}; deferring")
+    return {"error": result.error or result.status, "m5_status": result.status,
+            BRAIN_DEFER: True}
 
 
 # Awareness keys allowed into the reflection prompt's JSON dump. See the

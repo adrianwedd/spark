@@ -30,6 +30,7 @@ def _pin_claude_binary(monkeypatch):
     `claude` happens to be installed.
     """
     monkeypatch.setenv("PX_CLAUDE_BIN", "/nonexistent/claude-under-test")
+    monkeypatch.setenv("PX_M5_SPARK_MODEL", "spark:fixed")
 
 
 @pytest.fixture(autouse=True)
@@ -37,8 +38,11 @@ def _clean_mind_state(tmp_path):
     old_log = getattr(pxh.mind, "LOG_FILE", None)
     pxh.mind.LOG_FILE = tmp_path / "px-mind.log"
     _reset_state()
+    from pxh import m5
+    m5.reset_for_tests()
     yield
     _reset_state()
+    m5.reset_for_tests()
     if old_log is not None:
         pxh.mind.LOG_FILE = old_log
 
@@ -74,7 +78,7 @@ def _fake_ollama_empty_cm(done_reason: str = "length"):
 
 # ── Tier-2 fallback: Claude fails → M1 Ollama succeeds ─────────────
 
-def test_falls_back_to_m1_ollama_when_claude_fails():
+def test_reflection_uses_pinned_m5_without_claude():
     with patch("subprocess.run", return_value=_fake_claude(1, stderr="auth error")), \
          patch("urllib.request.urlopen", return_value=_fake_ollama_cm("quantum foam")):
         result = call_llm("prompt", "system", persona="spark")
@@ -85,7 +89,7 @@ def test_falls_back_to_m1_ollama_when_claude_fails():
 # ── M5 returns HTTP 200 but an empty completion (thinking model burned the
 # whole token budget on reasoning) → must be treated as failure, not success ──
 
-def test_falls_back_to_claude_when_ollama_returns_empty_response():
+def test_empty_m5_response_defers_without_claude():
     def urlopen_side(req, timeout=30):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         if url.endswith("/api/generate"):
@@ -99,13 +103,12 @@ def test_falls_back_to_claude_when_ollama_returns_empty_response():
          patch("urllib.request.urlopen", side_effect=urlopen_side):
         result = call_llm("prompt", "system", persona="spark")
 
-    assert "error" not in result, result
-    assert "recovered via claude" in result["response"]
+    assert result.get(pxh.mind.BRAIN_DEFER) is True
 
 
 # ── Tier-3 fallback: Claude + M1 fail → local Ollama succeeds ──────
 
-def test_falls_back_to_local_ollama_when_m1_fails():
+def test_non_spark_reflection_defers_when_m5_fails():
     """The Ollama chain still walks, for the personas that actually use it.
 
     This used to run as `persona="spark"`, which no longer reaches here: for
@@ -140,8 +143,7 @@ def test_falls_back_to_local_ollama_when_m1_fails():
              patch("urllib.request.urlopen", side_effect=urlopen_side):
             result = call_llm("prompt", "system", persona="vixen")
 
-        assert "error" not in result, result
-        assert "fumes" in result["response"]
+        assert result.get(pxh.mind.BRAIN_DEFER) is True
     finally:
         if old_val is None:
             os.environ.pop("PX_MIND_LOCAL_OLLAMA", None)
@@ -218,7 +220,7 @@ def test_result_is_labelled_with_the_tier_that_served():
     assert result["backend"] == "ollama-m5"
 
 
-def test_claude_tier_is_labelled_claude():
+def test_m5_failure_never_uses_claude():
     """M5 down, SPARK falls through to the resident brain — still labelled
     `claude`, because the tier is still Claude; what changed is that it is a
     session already running rather than a process started for this thought."""
@@ -229,8 +231,7 @@ def test_claude_tier_is_labelled_claude():
          patch.object(pxh.brain, "ask_brain",
                       return_value={"reply": {"thought": "hi", "mood": "curious"}}):
         result = call_llm("prompt", "system", persona="spark")
-    assert "error" not in result, result
-    assert result["backend"] == "claude"
+    assert result.get(pxh.mind.BRAIN_DEFER) is True
 
 
 def test_token_usage_is_split_by_backend(tmp_path, monkeypatch):
@@ -278,7 +279,7 @@ def _brain_reply(obj):
     return {"id": "x", "reply": obj}
 
 
-def test_reflection_claude_tier_prefers_the_resident_brain():
+def test_reflection_m5_failure_does_not_use_resident_brain():
     """With the brain up, the Claude tier must not spawn a subprocess at all."""
     import pxh.brain
 
@@ -295,11 +296,8 @@ def test_reflection_claude_tier_prefers_the_resident_brain():
          patch("subprocess.run", side_effect=_record):
         result = call_llm("prompt", "system", persona="spark")
 
-    assert "error" not in result, result
-    assert "from the brain" in result["response"]
-    assert result["backend"] == "claude"
-    assert ask.call_count == 1
-    assert ask.call_args.args[0] == "reflection"
+    assert result.get(pxh.mind.BRAIN_DEFER) is True
+    assert ask.call_count == 0
     assert not any("-p" in (cmd or []) for cmd in ran), ran
 
 

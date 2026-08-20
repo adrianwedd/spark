@@ -66,6 +66,7 @@ except ImportError:  # pragma: no cover
 
 BRAIN_SESSION = "spark-brain"
 IO_SESSION = "spark-io"
+M5_SESSION = "m5"
 
 # The one spelling of the reply tool, and the allowlist pattern that admits it.
 #
@@ -89,7 +90,8 @@ TOOL_BRAIN_REPLY_ALLOW = f"Bash({TOOL_BRAIN_REPLY}:*)"
 # being QA'd, a stranger's message to the public chat endpoint — and that text
 # reaches a session holding exactly one tool, from a scratch cwd, with no
 # repository access.
-_IO_KINDS = frozenset({"post_qa", "public_chat", "obi_chat"})
+_IO_KINDS = frozenset()
+_M5_KINDS = frozenset({"reflection", "post_qa", "blog_qa", "public_chat", "obi_chat"})
 
 # Kinds whose payload SPARK itself wrote or assembled, and which therefore run
 # on the privileged session — SPARK's tools, at the repo root.
@@ -103,7 +105,7 @@ _IO_KINDS = frozenset({"post_qa", "public_chat", "obi_chat"})
 # it outright rather than quietly serving it from the sandbox — a silent
 # downgrade would let the omission ship unnoticed.
 _BRAIN_KINDS = frozenset({
-    "reflection", "research", "compose", "blog",
+    "research", "compose", "blog",
     "consolidate", "self_debug", "evolve",
     # The "Hey Spark" turn. On the privileged session rather than io because
     # the answer has to *be* SPARK — persona, session highlights, the thread of
@@ -222,7 +224,7 @@ def _log(event: str, **fields: Any) -> None:
 
 def is_classified_kind(kind: str) -> bool:
     """Has someone actually decided how far this kind is trusted?"""
-    return kind in _IO_KINDS or kind in _BRAIN_KINDS
+    return kind in _IO_KINDS or kind in _M5_KINDS or kind in _BRAIN_KINDS
 
 
 def session_for_kind(kind: str) -> str:
@@ -233,6 +235,8 @@ def session_for_kind(kind: str) -> str:
     function must give, because a future caller that skips ask_brain must not
     be handed the privileged session by omission.
     """
+    if kind in _M5_KINDS:
+        return M5_SESSION
     if kind in _BRAIN_KINDS:
         return BRAIN_SESSION
     return IO_SESSION
@@ -695,6 +699,10 @@ def ask_brain(
         return None
 
     session = session_for_kind(kind)
+    if session == M5_SESSION:
+        _log("brain_unavailable", kind=kind, session=session,
+             reason="M5 kinds must not enter a resident mailbox")
+        return None
     if timeout_s is None:
         timeout_s = float(deadline_for_kind(kind))
 

@@ -1,6 +1,7 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides the canonical engineering constitution for Claude Code,
+Codex, and every coding agent working in this repository.
 
 ## Project Overview
 
@@ -159,7 +160,12 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer architecture:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session + calendar + Frigate → `state/awareness.json`
-- **Layer 2 — Reflection** (on transition or every 5min idle): all personas use Ollama on M5 as primary (`http://M5.local:11434` — the UDR7 stopped serving the bare `M5` hostname; verified live 2026-08-15, `getent hosts M5` returns nothing while `M5.local` resolves to 192.168.0.249. A bare `M5` makes tier 1 fail instantly and silently spends money on tier 2). Tiers: Ollama M5 → resident spark-brain (SPARK only) → Ollama Cloud → Pi localhost (opt-in, off by default — Pi 4 OOM risk). **A resident-brain failure is terminal, not a tier boundary** — reflection defers and backs off rather than reaching the cloud tier, because the correct response to a loaded Pi is less work, not a wider search. Only an M5 failure walks the chain. Writes to `state/thoughts.jsonl`. **Tier 2 is the resident brain, with nothing behind it** (`mind.call_claude` → `call_brain_reflection`, kind `reflection`). `ask_brain` returning None means defer, marked `brain_defer` on the result. The session is told, in `docs/prompts/spark-brain-system.md`, that a `reflection` turn is answered by *returning* the thought rather than acting on it; the caller dispatches the `action` field itself, so a session that speaks during reflection makes it happen twice.
+- **Layer 2 — Reflection** (on transition or every 5min idle): a pinned M5
+  Ollama model (`PX_M5_SPARK_MODEL`, never `auto`) handles reflection through a
+  process-shared nonblocking gate. `busy` defers without opening the circuit;
+  timeout, offline, and malformed responses open a five-minute monotonic
+  circuit. Reflection never falls back to Claude, Ollama Cloud, or Pi-local
+  Ollama. Writes to `state/thoughts.jsonl` only after a valid M5 response.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. Thoughts with `action=message_obi` are **redacted** in `thoughts-spark.jsonl` (written as `[private message to Obi]`) so the private DM content never reaches the public `/api/v1/public/thoughts` endpoint.
 - **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
@@ -244,7 +250,12 @@ Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<
 
 **Readiness is a proven round trip, never the prompt glyph.** The glyph renders identically for a session that is actually listening and for one sitting behind a permission dialog it cannot answer — that collapse is the bug this file used to document as the design. `bin/px-brain` sends one real request through `tool-brain-reply` and requires one real reply echoing a nonce, recording the outcome in `validation.json`. `brain.session_state()` derives one of four strings from that marker at read time, never stored: `validated` (a real round trip landed on the model the marker records — noticing that the *configured* model has since changed is `handshake_reason`'s separate job, and is what triggers a re-handshake), `validating` (a handshake is in flight, or aged out if it's been too long), `no_marker` (the session is up but has never proven it can answer, or its marker just expired), `session_absent` (tmux has no such session). `ask_brain()` only proceeds on `validated`. `bin/px-brain-status` prints all four states plus the model and marker age in one command — start there before attaching to a pane. The supervisor itself is guarded by an `fcntl` flock keyed to the tmux socket it guards — `<socket>.supervisor.lock`, i.e. `/tmp/tmux-1000/px-mind.supervisor.lock` — so a second copy started by hand refuses to run rather than racing the systemd-managed one for the same sessions. Keyed to the socket, not the checkout: `flock` is per-inode, and the old `state/brain/.supervisor.lock` gave each of this host's checkouts a private guard that contended with nothing (#221). During migration the supervisor holds the legacy checkout-relative lock as well, so a pre-bridge binary in the same checkout still loses the race. The cost of that bridge is stated rather than hidden: while it holds, two supervisors on *different* sockets in the *same* checkout also contend, because both must take that checkout's legacy lock. The migration-era namespace is the pair (socket, checkout); only once the legacy lock is removed does the socket alone become the whole namespace.
 
-**Two sessions, and the split is a trust boundary, not load balancing.** `spark-brain` runs at the repo root with SPARK's tools. `spark-io` handles text SPARK did not write (`post_qa`, `public_chat`, `obi_chat` — see `_IO_KINDS`) from a cwd *outside* the repository with exactly one tool, `tool-brain-reply`. **A new kind that handles untrusted input must be added to `_IO_KINDS`** — the default is the privileged session, so forgetting is the dangerous direction.
+**Stage 1 keeps two resident sessions, but `spark-io` receives no legitimate
+work.** `spark-brain` remains at the repo root for voice and high-value visual
+kinds. `post_qa`, `blog_qa`, `public_chat`, and `obi_chat` use the pinned M5
+model with no tools; their per-kind/per-session meters establish when
+`spark-io` is genuinely idle. Do not remove `spark-io` until the separate
+Stage 2 proof and memory measurement.
 
 **Critical gotchas:**
 - **`ask_brain()` returns `None` on every failure and never raises.** None means "fall back" — callers drop to the Ollama tiers exactly as they do today when Claude is unreachable. There is deliberately no exception path; this sits under daemons.
@@ -501,8 +512,8 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 |---|---|
 | `PX_DRY` | `1` = dry-run. **Default is live when unset.** |
 | `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
-| `PX_MIND_BACKEND` | `auto` (SPARK→Claude, others→Ollama), `claude`, or `ollama` |
-| `PX_MIND_LOCAL_OLLAMA` | `1` = enable local Pi Ollama fallback (off by default — OOM risk) |
+| `PX_M5_SPARK_MODEL` | Required pinned M5 model for reflection, public/Obi chat, and publication QA; `auto` is rejected. |
+| `PX_MIND_BACKEND` | Legacy introspection field; it does not alter Stage 1 reflection routing. |
 | `PX_WANDER_VISION_ENABLED` | `1` = allow autonomous wander to escalate to Claude vision on genuine local ambiguity (off by default — see Wander below) |
 | `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |
 | `PX_CLAUDE_MODEL_*` | Per-session-type model overrides (e.g. `PX_CLAUDE_MODEL_EVOLVE`) |
@@ -510,7 +521,6 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 | `PX_POST_QA` | `0` = skip Claude QA gate (testing) |
 | `PX_HA_DEBUG` | `1` = verbose HA fetch logging |
 | `PX_HOME_LAT` / `PX_HOME_LON` | Home coords for Find Hub at-home detection (defaults: `-43.13567`, `147.11840`) |
-| `OLLAMA_CLOUD_API_KEY` | Enables Tier 3 Ollama Cloud fallback in px-mind |
 | `PX_VOICE_LOCK_TIMEOUT` | Voice output lock timeout in seconds (default: 30) |
 
 ## Multi-Model QA
