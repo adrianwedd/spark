@@ -75,13 +75,32 @@ def test_exploration_state_is_not_gpio_authority(tmp_path):
 
 
 def test_guard_keeps_legitimate_owner_live_then_releases(tmp_path):
-    """The guard refresh thread keeps its lease live until explicit cleanup."""
+    """The guard refresh thread keeps its lease live until explicit cleanup.
+
+    Instead of sleeping a fixed wall-clock duration and hoping the refresh
+    thread ran in time (which flakes under load — #239), we poll for the
+    observable effect: ``expires_at`` advancing beyond the initial TTL,
+    proving at least one refresh succeeded.  A generous timeout bounds the
+    wait so a broken refresh thread still fails the test deterministically.
+    """
     store = GpioLeaseStore(tmp_path, pid_alive=lambda _pid: True)
     guard = GpioLeaseGuard(store, "voice", ttl_s=0.08, refresh_s=0.02, pid=1060)
 
     assert guard.acquire() is True
     lease_id = store.current()["lease_id"]
-    time.sleep(0.12)
+    initial_expires = store.current()["expires_at"]
+
+    # Wait for the refresh thread to extend expires_at — deterministic
+    # synchronization instead of a fixed sleep that races the scheduler.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        current = store.current()
+        if current is not None and current["expires_at"] > initial_expires:
+            break
+        time.sleep(0.005)
+    else:
+        pytest.fail("refresh thread did not extend expires_at within 5s")
+
     assert store.current() is not None
     assert store.release("wrong-token") is False
     assert store.current()["lease_id"] == lease_id
