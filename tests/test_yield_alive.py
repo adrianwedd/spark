@@ -129,7 +129,11 @@ def test_yield_alive_returns_success_when_px_alive_exits(long_poll_env):
     pid_file = log_dir / "px-alive.pid"
     pid_file.write_text(str(proc.pid))
     try:
-        result = _source_and_call(log_dir, poll_iters="3")
+        # poll_iters=25 gives the full 5s window — the process needs
+        # time to receive SIGUSR1, run the handler, and exit.  3 iters
+        # (0.6s) is not enough on CI runners where signal delivery is
+        # slow under load.
+        result = _source_and_call(log_dir, poll_iters="25")
         assert result.returncode == 0, (
             f"yield_alive should return 0 when px-alive exits cleanly, "
             f"got {result.returncode}. stderr: {result.stderr[:500]}"
