@@ -1,8 +1,9 @@
-"""Editorial invariants for the public SPARK story."""
+"""Editorial invariants for the public SPARK story and canonical roadmap."""
 from pathlib import Path
 
 
-SITE = Path(__file__).resolve().parents[1] / "site"
+ROOT = Path(__file__).resolve().parents[1]
+SITE = ROOT / "site"
 
 
 def _read(relative: str) -> str:
@@ -69,3 +70,43 @@ def test_homepage_metadata_matches_new_story():
     assert "SPARK — a robot that stays around" in page
     assert "persistent embodied agent" in page
     assert '"@type": "WebSite"' in page
+
+
+def test_repository_readme_leads_with_current_architecture():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert readme.startswith("# SPARK\n")
+    assert "A robot that stays around." in readme
+    assert "one resident Claude brain" in readme
+    assert "Reflection | M5/Ollama" in readme
+    assert "Production forbids cold `claude -p` paths" in readme
+
+    for retired in (
+        "# PiCar-X Hacking",
+        "### The Three Brains",
+        "Claude-powered robot companion",
+        "Four backends share the same",
+    ):
+        assert retired not in readme
+
+
+def test_roadmap_is_specific_to_current_spark_not_generic_robotics_bingo():
+    roadmap = (ROOT / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+
+    for current in (
+        "Separate Obi companion UI from Adrian/admin UI",
+        "Retire legacy pseudo-agency",
+        "Finish GPIO lease migration",
+        "Persistent spatial memory",
+        "Explain “why did you do/say that?”",
+        "Autonomous docking + energy awareness",
+    ):
+        assert current in roadmap
+
+    for retired in (
+        "reinforcement learning with a simulation “dream buffer”",
+        "policy sharing across fleet units",
+        "multi-car choreographed demos",
+        "central knowledge base syncing maps/logs",
+    ):
+        assert retired not in roadmap
