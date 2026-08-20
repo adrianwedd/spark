@@ -65,7 +65,6 @@ except ImportError:  # pragma: no cover
 # --------------------------------------------------------------------------
 
 BRAIN_SESSION = "spark-brain"
-IO_SESSION = "spark-io"
 M5_SESSION = "m5"
 
 # The one spelling of the reply tool, and the allowlist pattern that admits it.
@@ -74,9 +73,7 @@ M5_SESSION = "m5"
 # by prefix — so this pattern admits an absolute invocation and nothing else. A
 # bare `tool-brain-reply` or a repo-relative `bin/tool-brain-reply` misses it and
 # raises a permission dialog instead, which is a wedge: the session is waiting on
-# a human who isn't there, while a daemon waits on the session. Absolute is also
-# the only spelling that can work for the io session at all, whose cwd is
-# deliberately outside the repository.
+# a human who isn't there, while a daemon waits on the session.
 #
 # Everything that names the tool derives from here: both allowlists, the nudge,
 # and — via the {{TOOL_BRAIN_REPLY}} placeholder that bin/px-claude-session
@@ -86,11 +83,12 @@ TOOL_BRAIN_REPLY = str(Path(PROJECT_ROOT) / "bin" / "tool-brain-reply")
 TOOL_BRAIN_REPLY_ALLOW = f"Bash({TOOL_BRAIN_REPLY}:*)"
 
 # Which session handles which kind of request. This is a trust boundary, not
-# load balancing: `io` kinds carry text SPARK did not write — a social post
+# load balancing: `m5` kinds carry text SPARK did not write — a social post
 # being QA'd, a stranger's message to the public chat endpoint — and that text
-# reaches a session holding exactly one tool, from a scratch cwd, with no
-# repository access.
-_IO_KINDS = frozenset()
+# runs on a no-tools local model that cannot read the repository, rather than
+# on the privileged Claude session. Stage 1 (#238) moved every such kind onto
+# M5; Stage 2 (#242) removed the `spark-io` Claude session that used to hold
+# them, once the meter proved it had carried zero legitimate requests since.
 _M5_KINDS = frozenset({"reflection", "post_qa", "blog_qa", "public_chat", "obi_chat"})
 
 # Kinds whose payload SPARK itself wrote or assembled, and which therefore run
@@ -102,17 +100,17 @@ _M5_KINDS = frozenset({"reflection", "post_qa", "blog_qa", "public_chat", "obi_c
 # the person adding a kind that chews text from strangers is exactly the person
 # who will forget, and the mistake pointed the wrong way. Now an unclassified
 # kind cannot reach the privileged session by any path, and `ask_brain` refuses
-# it outright rather than quietly serving it from the sandbox — a silent
-# downgrade would let the omission ship unnoticed.
+# it outright rather than quietly serving it from a downgraded backend — a
+# silent downgrade would let the omission ship unnoticed.
 _BRAIN_KINDS = frozenset({
     "research", "compose", "blog",
     "consolidate", "self_debug", "evolve",
-    # The "Hey Spark" turn. On the privileged session rather than io because
-    # the answer has to *be* SPARK — persona, session highlights, the thread of
-    # the current conversation — and because spark-brain already sees Obi's
-    # words in every reflection payload, so this widens no exposure. Like
-    # reflection it is answered by *returning* an action object; voice_loop
-    # validates it through policy and dispatches it. The session must not act.
+    # The "Hey Spark" turn. On the privileged session because the answer has
+    # to *be* SPARK — persona, session highlights, the thread of the current
+    # conversation — and because spark-brain already sees Obi's words in
+    # every reflection payload, so this widens no exposure. Like reflection
+    # it is answered by *returning* an action object; voice_loop validates it
+    # through policy and dispatches it. The session must not act.
     "voice_turn",
     # The five-a-day scheduled announcement (bin/px-cron-say). SPARK's own
     # speech on his own schedule, so the privileged session — and like the
@@ -161,8 +159,8 @@ LOCK_WAIT_S = float(os.environ.get("PX_BRAIN_LOCK_WAIT_S", "10"))
 
 POLL_INTERVAL_S = 0.25
 
-# Replies are answers, not payloads. A cap keeps a runaway session (or a
-# hijacked io session) from filling the SD card through the reply channel.
+# Replies are answers, not payloads. A cap keeps a runaway or hijacked session
+# from filling the SD card through the reply channel.
 MAX_REPLY_BYTES = 256 * 1024
 
 # --------------------------------------------------------------------------
@@ -185,11 +183,10 @@ HANDSHAKE_ATTEMPTS = int(os.environ.get("PX_BRAIN_HANDSHAKE_ATTEMPTS", "2"))
 
 # Total time one validation may consume. NOT derived from systemd: px-brain is
 # Type=simple with no TimeoutStartSec and no WatchdogSec, so systemd has no
-# slowness timeout to breach. What binds is that tick() walks both sessions in
-# one thread, so time spent validating one is time the other is not getting a
-# health write. The 0.6 leaves margin for the rest of the tick.
-VALIDATION_CEILING_S = 0.6 * min(health.STALE_AFTER_S["px-brain"],
-                                 health.STALE_AFTER_S["px-brain-io"])
+# slowness timeout to breach. What binds is that tick() spends time validating
+# instead of writing a health record. The 0.6 leaves margin for the rest of
+# the tick.
+VALIDATION_CEILING_S = 0.6 * health.STALE_AFTER_S["px-brain"]
 
 # The four states. These exact strings reach log lines and px-brain-status,
 # because the vocabulary a human uses to describe the fault should be the
@@ -224,22 +221,25 @@ def _log(event: str, **fields: Any) -> None:
 
 def is_classified_kind(kind: str) -> bool:
     """Has someone actually decided how far this kind is trusted?"""
-    return kind in _IO_KINDS or kind in _M5_KINDS or kind in _BRAIN_KINDS
+    return kind in _M5_KINDS or kind in _BRAIN_KINDS
 
 
 def session_for_kind(kind: str) -> str:
-    """Route a kind to its session, defaulting to the LEAST privileged one.
+    """Route a kind to its session.
 
-    `ask_brain` refuses unclassified kinds before it gets here, so the fallback
-    is defence in depth rather than a working path — but it is the answer this
-    function must give, because a future caller that skips ask_brain must not
-    be handed the privileged session by omission.
+    `ask_brain` refuses unclassified kinds before it gets here, so raising is
+    defence in depth rather than a working path — but it is what this function
+    must do for one, because a future caller that skips `ask_brain` must not be
+    handed the privileged session by omission. There is no unprivileged
+    resident session left to fall back to (Stage 2, #242, removed `spark-io`
+    once M5 had absorbed everything it used to carry) — the only safe default
+    for an unclassified kind is to refuse to answer the question at all.
     """
     if kind in _M5_KINDS:
         return M5_SESSION
     if kind in _BRAIN_KINDS:
         return BRAIN_SESSION
-    return IO_SESSION
+    raise ValueError(f"unclassified kind: {kind!r}")
 
 
 def deadline_for_kind(kind: str) -> int:
@@ -268,27 +268,20 @@ def brain_socket() -> str:
 
 
 def spec_for_session(session: str) -> tmux_claude.SessionSpec:
-    """tmux configuration for one session, including its launcher envelope.
+    """tmux configuration for the resident session, including its launcher
+    envelope.
 
-    The io session's envelope is the security property: one tool, and a cwd
-    outside the repository so a prompt-injected turn has nothing local to read.
+    Takes `session` for symmetry with the mailbox helpers below, though only
+    BRAIN_SESSION exists to name now — the untrusted-text session (`spark-io`)
+    this also used to configure was removed in Stage 2 (#242) once M5 had
+    absorbed every kind that used to need it. Its envelope was the security
+    property: one tool, and a cwd outside the repository so a prompt-injected
+    turn had nothing local to read; that boundary is now M5's, which holds no
+    tools and no filesystem access at all rather than a scoped set of either.
     """
-    socket = brain_socket()
-    if session == IO_SESSION:
-        cwd = session_dir(IO_SESSION)
-        return tmux_claude.SessionSpec(
-            name=IO_SESSION,
-            socket=socket,
-            cwd=str(cwd),
-            env={
-                "PX_BRAIN_SESSION": IO_SESSION,
-                "PX_CLAUDE_ALLOWED_TOOLS": TOOL_BRAIN_REPLY_ALLOW,
-                "PX_CLAUDE_CWD": str(cwd),
-            },
-        )
     return tmux_claude.SessionSpec(
         name=BRAIN_SESSION,
-        socket=socket,
+        socket=brain_socket(),
         cwd=str(PROJECT_ROOT),
         env={"PX_BRAIN_SESSION": BRAIN_SESSION},
     )

@@ -474,13 +474,12 @@ def section_connectivity() -> list[str]:
 def section_tmux() -> list[str]:
     SESSION_INFO = {
         "spark-brain": "SPARK's mind — live, watch only",
-        "spark-io":    "untrusted-text session — live, watch only",
         "px-claude":   "SPARK reflection — monitor only",
         "picar-x":     "voice + wake + logs",
     }
     OWNED = {"px-claude"}
     # Attach to these with -r. They are supervised Claude sessions, not shells.
-    READ_ONLY = {"spark-brain", "spark-io"}
+    READ_ONLY = {"spark-brain"}
 
     sessions = _tmux_sessions()
     if not sessions:

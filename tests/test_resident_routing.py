@@ -31,7 +31,7 @@ def test_kind_is_classified_and_routed(kind, session):
 def test_every_classified_kind_has_a_deadline():
     """A kind with no deadline silently inherits 300s — five minutes of a
     daemon loop blocked on optional work."""
-    for kind in brain._BRAIN_KINDS | brain._IO_KINDS | brain._M5_KINDS:
+    for kind in brain._BRAIN_KINDS | brain._M5_KINDS:
         assert brain.deadline_for_kind(kind) > 0
 
 
@@ -39,8 +39,9 @@ def test_every_classified_kind_has_a_deadline():
 
 def test_unrouted_kind_does_not_cold_start(monkeypatch):
     """The trust direction. Absent from the routing set must mean "no backend",
-    never "spawn a fresh Claude" — the same fix already made for _BRAIN_KINDS
-    vs _IO_KINDS, applied to the one place that still defaulted open."""
+    never "spawn a fresh Claude" — the same fix already made for
+    brain.session_for_kind (it raises rather than defaulting to a session),
+    applied to the one place that still defaulted open."""
     monkeypatch.setenv("PX_BRAIN_KINDS", "research")
 
     def _boom(*a, **k):

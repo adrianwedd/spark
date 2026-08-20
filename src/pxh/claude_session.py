@@ -211,8 +211,8 @@ class SessionBudgetExhausted(Exception):
 class ColdStartForbidden(RuntimeError):
     """Raised when a session type has no resident route.
 
-    The resident spark-brain / spark-io sessions are SPARK's sole Claude
-    execution substrate. There is deliberately no fallback behind this: a
+    The resident spark-brain session is SPARK's sole Claude execution
+    substrate. There is deliberately no fallback behind this: a
     caller that cannot be served resident must fail loudly rather than quietly
     spawn a fresh Claude, because every cold start costs more to run than the
     session it bypasses and is metered API usage rather than Max.
@@ -403,10 +403,11 @@ def run_claude_session(
     # Fail closed. The old default pointed the other way — an unrecognised kind
     # fell through to `claude -p` — which made "I forgot to classify this" and
     # "I decided this may cold-start Claude" the same act. That is the identical
-    # trust-direction bug already fixed for _BRAIN_KINDS vs _IO_KINDS in
-    # brain.py, and it pointed the wrong way for the same reason: the person
-    # adding a kind is exactly the person who will forget, so the default must
-    # be the safe one. An unclassified kind now has no backend at all.
+    # trust-direction bug already fixed for brain.py's own kind classification
+    # (session_for_kind raises rather than defaulting to a session), and it
+    # pointed the wrong way for the same reason: the person adding a kind is
+    # exactly the person who will forget, so the default must be the safe one.
+    # An unclassified kind now has no backend at all.
     raise ColdStartForbidden(
         f"session_type {session_type!r} is not routed to a resident session. "
         f"Classify it in PX_BRAIN_KINDS (currently: {sorted(_brain_kinds())}) or "

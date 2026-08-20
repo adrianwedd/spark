@@ -38,7 +38,7 @@ class _FakeTmux:
 
     def __init__(self, ready=True, exists=False):
         self.ready = ready
-        self.sessions = {"spark-brain", "spark-io"} if exists else set()
+        self.sessions = {"spark-brain"} if exists else set()
         self.injected = []
         self.keys = []
         self.killed = []
@@ -139,16 +139,15 @@ def test_a_holder_is_attached_to_every_session(fake_tmux, monkeypatch):
     attached. The stub reports success without writing a marker; this test
     only reads `state.holder`, never the marker, so that's fine here."""
     monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
-    states = {n: _state(n) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
+    states = {n: _state(n) for n in (brain.BRAIN_SESSION,)}
     brain_daemon.tick(states)
     assert all(s.holder is not None and s.holder.alive() for s in states.values())
 
 
 def test_start_session_passes_supervisor_identity_to_the_launcher_env(fake_tmux, monkeypatch):
     """The launcher's own exit log can only name which supervisor started it
-    if the supervisor tells it — useful when comparing spark-brain against
-    spark-io after a death, since both run under the same supervisor
-    process and the same tmux server."""
+    if the supervisor tells it — useful when comparing a session's restarts
+    against the supervisor process and tmux server that started it."""
     captured = {}
     real_ensure = tmux_claude.ensure_session
 
@@ -466,14 +465,18 @@ def test_a_tick_never_raises(monkeypatch, fake_tmux):
     brain_daemon.tick({brain.BRAIN_SESSION: _state()})  # must not raise
 
 
-def test_run_once_completes_a_single_pass(fake_tmux, monkeypatch):
-    # Not about the handshake — stub it so the pass doesn't block on a real,
-    # unanswered validation. The stub reports success without writing a
-    # marker; this test only checks which sessions got created, not their
-    # validation state.
+def test_run_manages_exactly_one_resident_session(fake_tmux, monkeypatch):
+    """Stage 2 (#242): the second (`spark-io`) session is gone. A regression
+    here would mean it silently came back.
+
+    Not about the handshake — stub it so the pass doesn't block on a real,
+    unanswered validation. The stub reports success without writing a
+    marker; this test only checks which sessions got created, not their
+    validation state.
+    """
     monkeypatch.setattr(brain_daemon, "run_handshake", lambda state, reason: True)
     assert brain_daemon.run(once=True) == 0
-    assert set(fake_tmux.created) == {brain.BRAIN_SESSION, brain.IO_SESSION}
+    assert set(fake_tmux.created) == {brain.BRAIN_SESSION}
 
 
 def test_the_journal_is_seeded(fake_tmux, monkeypatch):
@@ -483,13 +486,14 @@ def test_the_journal_is_seeded(fake_tmux, monkeypatch):
     assert brain_daemon.journal_path().exists()
 
 
-def test_both_sessions_report_health_separately():
-    """One wedged session must be visible without the other masking it."""
+def test_the_io_health_component_is_gone():
+    """Stage 2 (#242) removed `spark-io`. Its health component must not be
+    silently re-expected — a `stale`/`missing` report for a component nothing
+    ever writes again is a false alarm nobody could ever clear."""
     from pxh import health
     assert "px-brain" in health.STALE_AFTER_S
-    assert "px-brain-io" in health.STALE_AFTER_S
+    assert "px-brain-io" not in health.STALE_AFTER_S
     assert _state(brain.BRAIN_SESSION).component == "px-brain"
-    assert _state(brain.IO_SESSION).component == "px-brain-io"
 
 
 # ---------------------------------------------------------------------------
@@ -739,12 +743,11 @@ def test_a_failed_handshake_leaves_the_holder_attached(fake_tmux, _fast_handshak
     assert state.holder is holder
 
 
-@pytest.mark.parametrize("prompt", ["spark-brain-system.md", "spark-io-system.md"])
-def test_both_prompts_explain_the_handshake_with_the_placeholder(prompt):
+def test_the_prompt_explains_the_handshake_with_the_placeholder():
     """A session that does not know how to answer a handshake cannot be
     validated, and the placeholder is the only spelling that is right in both
     the prompt and the allowlist."""
-    text = (ROOT / "docs" / "prompts" / prompt).read_text()
+    text = (ROOT / "docs" / "prompts" / "spark-brain-system.md").read_text()
     assert "handshake" in text.lower()
     assert "payload.echo" in text
     assert "tool-brain-reply" not in text.replace("{{TOOL_BRAIN_REPLY}}", ""), \
@@ -805,14 +808,22 @@ def test_a_model_mismatch_triggers_a_transition(fake_tmux, monkeypatch):
     assert called == ["model_change"]
 
 
+# Production's `run()` starts exactly one session now (Stage 2, #242, removed
+# `spark-io`), but `tick()`/`_validate_one()` are still generic over whatever
+# `states` dict they're handed — the fairness algorithm below is real,
+# reusable machinery, not `spark-io`-specific, so it is worth pinning against
+# an arbitrary second session rather than deleting outright.
+_OTHER_SESSION = "spark-test-second"
+
+
 def test_at_most_one_session_is_validated_per_tick(fake_tmux, monkeypatch):
     """Two back-to-back validations in one tick would double the sibling's
     health blackout against its 300s staleness window."""
-    fake_tmux.sessions.update({brain.BRAIN_SESSION, brain.IO_SESSION})
+    fake_tmux.sessions.update({brain.BRAIN_SESSION, _OTHER_SESSION})
     called = []
     monkeypatch.setattr(brain_daemon, "run_handshake",
                         lambda state, reason: called.append(state.name) or False)
-    states = {n: _state(n, real_clock=True) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
+    states = {n: _state(n, real_clock=True) for n in (brain.BRAIN_SESSION, _OTHER_SESSION)}
     brain_daemon.tick(states)
     assert len(called) == 1
 
@@ -820,9 +831,9 @@ def test_at_most_one_session_is_validated_per_tick(fake_tmux, monkeypatch):
 def test_a_failing_session_cannot_starve_a_healthy_one(fake_tmux, monkeypatch):
     """The level trigger changed the failure shape: edge-triggered validation is
     self-limiting, level-triggered is self-perpetuating. First-in-iteration-order
-    would hand every tick to a crash-looping spark-brain forever, and spark-io
+    would hand every tick to a crash-looping session forever, and its sibling
     would report failure for never having had a turn."""
-    fake_tmux.sessions.update({brain.BRAIN_SESSION, brain.IO_SESSION})
+    fake_tmux.sessions.update({brain.BRAIN_SESSION, _OTHER_SESSION})
     called = []
 
     def _fail(state, reason):
@@ -831,14 +842,14 @@ def test_a_failing_session_cannot_starve_a_healthy_one(fake_tmux, monkeypatch):
         return False
 
     monkeypatch.setattr(brain_daemon, "run_handshake", _fail)
-    states = {n: _state(n, real_clock=True) for n in (brain.BRAIN_SESSION, brain.IO_SESSION)}
+    states = {n: _state(n, real_clock=True) for n in (brain.BRAIN_SESSION, _OTHER_SESSION)}
     for _ in range(6):
         brain_daemon.tick(states)
 
     brain_n = called.count(brain.BRAIN_SESSION)
-    io_n = called.count(brain.IO_SESSION)
-    assert io_n > 0, "a session that never gets a turn reports failure for no fault of its own"
-    assert abs(brain_n - io_n) <= 1, f"validation must alternate, saw {called}"
+    other_n = called.count(_OTHER_SESSION)
+    assert other_n > 0, "a session that never gets a turn reports failure for no fault of its own"
+    assert abs(brain_n - other_n) <= 1, f"validation must alternate, saw {called}"
 
 
 def test_health_success_requires_validation_not_a_glyph(fake_tmux, monkeypatch):
@@ -1261,7 +1272,9 @@ def test_px_brain_status_prints_the_state_vocabulary_and_free_space(tmp_path, mo
     result = subprocess.run([str(ROOT / "bin" / "px-brain-status")],
                             capture_output=True, text=True, timeout=30, env=env)
     assert result.returncode == 0, result.stderr
-    assert "spark-brain" in result.stdout and "spark-io" in result.stdout
+    assert "spark-brain" in result.stdout
+    assert "spark-io" not in result.stdout, \
+        "spark-io was removed in Stage 2 (#242) — status must not still expect it"
     assert any(word in result.stdout
                for word in ("session_absent", "no_marker", "validating", "validated"))
     assert "free" in result.stdout.lower()

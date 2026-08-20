@@ -41,8 +41,8 @@ import check_resident_claude as guard  # noqa: E402
 def test_no_cold_claude_in_production():
     """No production path may cold-start Claude.
 
-    The resident spark-brain / spark-io sessions are the sole Claude execution
-    substrate. A cold `claude -p` discards context per call, cannot use SPARK's
+    The resident spark-brain session is the sole Claude execution substrate.
+    A cold `claude -p` discards context per call, cannot use SPARK's
     tools, is unmetered, and costs more to run than the resident session it
     purports to rescue — so a resident-brain failure that spawns one amplifies
     the contention that caused the failure instead of degrading.

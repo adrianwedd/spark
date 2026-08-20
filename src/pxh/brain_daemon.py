@@ -1,4 +1,4 @@
-"""px-brain — the supervisor that keeps SPARK's resident Claude sessions alive.
+"""px-brain — the supervisor that keeps SPARK's resident Claude session alive.
 
 `brain.ask_brain()` deliberately does not own the sessions. It is called from
 inside other daemons, on their timing, and a request path that also has to
@@ -16,7 +16,7 @@ daemon's first job; everything else is housekeeping around it.
 What it does, in order of how much it matters:
 
 1. **Hold a read-only client per session** so injection works at all.
-2. **Ensure both sessions exist**, restarting either if it dies.
+2. **Ensure the session exists**, restarting it if it dies.
 3. **Sweep on (re)create** — pending requests move to `dead/`. Callers own
    their own timeout and have long since fallen back; replaying their requests
    would spend budget answering questions nobody is waiting for.
@@ -39,8 +39,12 @@ What it does, in order of how much it matters:
    failed one does not kill the session — see the comments in
    `run_handshake` for both.
 
-Health is reported per session (`px-brain`, `px-brain-io`) so a wedged or
-missing session is visible without reading tmux by hand.
+Health is reported per session component (`px-brain`) so a wedged or missing
+session is visible without reading tmux by hand. `states` below is still keyed
+by session name rather than hardcoded to one, so a second resident session
+could be added the same way `spark-io` once was — but Stage 2 (#242) removed
+`spark-io` itself, once the meter proved M5 had absorbed every kind it used to
+carry and it had answered zero real requests since.
 """
 
 from __future__ import annotations
@@ -95,7 +99,6 @@ RECYCLE_QUIET_S = brain.HANDSHAKE_TIMEOUT_S
 
 _HEALTH_COMPONENT = {
     brain.BRAIN_SESSION: "px-brain",
-    brain.IO_SESSION: "px-brain-io",
 }
 
 
@@ -209,8 +212,8 @@ def start_session(state: SessionState,
     # only applies -e env args on new-session, not on an idempotent recheck
     # — but harmless to set unconditionally. Lets px-claude-session's exit
     # log (bin/px-claude-session) name which supervisor process and boot
-    # started it, which is exactly the axis a comparison between spark-brain
-    # and spark-io needs after a death.
+    # started it, useful when comparing a session's restarts against the
+    # supervisor's own.
     spec = replace(spec, env={
         **spec.env,
         "PX_BRAIN_SUPERVISOR_INSTANCE": _INSTANCE_ID,
@@ -961,7 +964,7 @@ def run(once: bool = False) -> int:
         return 1
     ensure_journal()
     states = {name: SessionState(name=name)
-              for name in (brain.BRAIN_SESSION, brain.IO_SESSION)}
+              for name in (brain.BRAIN_SESSION,)}
     _log("start", sessions=list(states), tick_s=TICK_S, started=utc_timestamp())
     while True:
         tick(states)
