@@ -29,6 +29,12 @@ jobs:
 
       - run: pip install -r requirements-dev.txt
 
+      # Install Chromium for Playwright browser-based layout tests
+      # (tests/test_site_layout.py). The tests skip gracefully if the browser
+      # binary is missing, but installing it here makes them part of the CI gate.
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
       # Resident-only Claude. Runs before pytest and prints the whole debt map
       # rather than the first failure, so a red build says *which* production
       # paths still cold-start Claude. Deliberately its own step: buried in a
