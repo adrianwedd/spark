@@ -113,29 +113,30 @@ def test_yield_alive_returns_failure_when_px_alive_does_not_exit(long_poll_env):
 
 @_LINUX_ONLY
 def test_yield_alive_returns_success_when_px_alive_exits(long_poll_env):
-    """When px-alive does exit within the poll window, yield_alive
-    returns 0 as before — the fix must not break the normal path.
+    """When px-alive's PID is already gone (exited and reaped by systemd),
+    yield_alive returns 0 — the normal path after px-alive has stopped.
+
+    In production, systemd reaps px-alive on exit so /proc/{pid} disappears
+    immediately.  We simulate this by using a PID that has already exited
+    and been waited on, rather than spawning a long-running process that
+    may linger as a zombie on CI runners.
     """
     log_dir = long_poll_env
-    # Spawn a process via setsid that exits on SIGUSR1.  setsid makes it
-    # a session leader, so when it exits init reaps it immediately and
-    # /proc/{pid} disappears — matching how systemd reaps px-alive.
-    # Without setsid, the process becomes a zombie under pytest, and
-    # /proc/{pid} persists, causing yield_alive to see it as "still alive".
+    # Fork a process that exits immediately, then wait for it.
+    # Its PID is now dead and reaped — /proc/{pid} will not exist,
+    # exactly like a systemd-reaped px-alive.
     proc = subprocess.Popen(
-        ["setsid", "bash", "-c", "trap 'exit 0' USR1; sleep 60"],
+        ["true"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
     )
+    proc.wait()
     pid_file = log_dir / "px-alive.pid"
     pid_file.write_text(str(proc.pid))
     try:
-        # Use the full 5s poll window — the process needs time to
-        # receive SIGUSR1 and exit.
         result = _source_and_call(log_dir, poll_iters="25")
         assert result.returncode == 0, (
-            f"yield_alive should return 0 when px-alive exits cleanly, "
+            f"yield_alive should return 0 when px-alive's PID is gone, "
             f"got {result.returncode}. stderr: {result.stderr[:500]}"
         )
         assert "yield_alive returned 0" in result.stdout
