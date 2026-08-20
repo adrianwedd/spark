@@ -47,11 +47,20 @@ yield_alive() {
             kill -USR1 "$pid" 2>/dev/null || true
             # Poll until px-alive actually exits — sleep 1 is not reliable
             # because gaze animations can take 2-3s to complete.
+            # PX_YIELD_ALIVE_POLL_ITERS is a test seam only (default 25).
+            local poll_iters="${PX_YIELD_ALIVE_POLL_ITERS:-25}"
             local i
-            for i in $(seq 25); do
+            for i in $(seq "$poll_iters"); do
                 [[ -d "/proc/$pid" ]] || break
                 sleep 0.2
             done
+            # If px-alive is still alive after the poll loop, it did not
+            # release GPIO5 — returning success would let the caller race
+            # px-alive for the reset_mcu pin (#205).  Fail hard instead.
+            if [[ -d "/proc/$pid" ]]; then
+                echo "yield_alive: px-alive (PID $pid) did not exit within 5s; aborting to protect GPIO exclusivity" >&2
+                return 1
+            fi
             # px.close() does NOT release GPIO5 (reset_mcu pin) — only
             # full process exit does. lgpiod also needs time to reclaim
             # the pin after client fd closes. 2s is empirically safe.
