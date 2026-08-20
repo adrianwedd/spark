@@ -18,7 +18,7 @@ SPARK is not a therapist, a tutor, or an assistant. It's a robot friend that hap
 - **Meltdown protocol** — Three S's: Safety, Silence, Space. Robot goes quiet and stays present. No words.
 - **Sideways engagement** — when demand-avoidance is high, SPARK narrates rather than instructs, lets curiosity do the work
 
-SPARK runs on Claude (via `run-voice-loop-claude` / `px-spark`), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en+m3`, pitch 82, rate 120) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
+SPARK runs on Claude (via `px-spark` / `run-voice-loop-claude`, both routing to the resident `spark-brain` session), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en+m3`, pitch 82, rate 120) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
 
 ```bash
 bin/px-spark [--dry-run] [--input-mode voice|text]
@@ -60,7 +60,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
            │                            │                            │
     ┌──────▼──────┐  ┌─────────────────▼────────────────┐  ┌───────▼───────┐
     │  tool-*     │  │         px-env                    │  │  REST API     │
-    │  38 tools   │  │  PYTHONPATH · LOG_DIR · venv      │  │  :8420        │
+    │  42 tools   │  │  PYTHONPATH · LOG_DIR · venv      │  │  :8420        │
     │  JSON out   │  │  yield_alive() · PX_VOICE_DEVICE  │  │  Bearer auth  │
     └──────┬──────┘  └──────────────────────────────────┘  └───────────────┘
            │
@@ -73,7 +73,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 ### The Three Brains
 
-**Voice Loop** — The reactive mind. Listens for commands, calls LLMs, dispatches tools. Three backends share the same `pxh.voice_loop` core:
+**Voice Loop** — The reactive mind. Listens for commands, calls LLMs, dispatches tools. Four backends share the same `pxh.voice_loop` core:
 
 | Launcher | Backend | Persona |
 |---|---|---|
@@ -84,7 +84,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 **Cognitive Loop (`px-mind`)** — The subconscious. Runs continuously in the background:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session state + time of day. Detects transitions.
-- **Layer 2 — Reflection** (on transition or every 5min idle): Claude Haiku via persistent tmux session (SPARK persona) or Ollama gemma4:e4b on M5.local (others). Generates a thought with mood, suggested action, and salience score.
+- **Layer 2 — Reflection** (on transition or every 5min idle): a pinned M5 Ollama model (`PX_M5_SPARK_MODEL`) handles reflection — never Claude, never `auto`. Generates a thought with mood, suggested action, and salience score.
 - **Layer 3 — Expression** (2 min cooldown): dispatches to tools — speak, look around, remember something important. Photo capture (`tool-describe-scene`) is on-request only, not autonomous.
 
 **Idle-Alive (`px-alive`)** — The autonomic nervous system. Keeps the robot looking alive when nothing else is happening: random gaze drifts every 10–25s, pan sweeps every 3–8min, proximity reaction at <35cm. Holds a persistent Picarx handle; yields GPIO via SIGUSR1 when tools need the servos.
@@ -107,16 +107,21 @@ This section traces the complete data flow from power-on to a robot response, an
 
 ### 1. Boot Sequence
 
-Seven systemd services start automatically:
+Twelve systemd services start automatically:
 
 ```
 Boot
  ├── px-alive.service           (root)   — claims Picarx() GPIO handle; starts gaze drift loop
  ├── px-wake-listen.service     (pi)     — loads Vosk wake word model; starts mic capture loop
  ├── px-battery-poll.service    (root)   — polls Robot HAT ADC every 30s → state/battery.json; plays rising/falling sweep tones on plug/unplug with voice announcement; escalating warnings + emergency shutdown at 10%
+ ├── px-mind.service            (pi)     — cognitive loop daemon (awareness → reflection → expression)
+ ├── px-brain.service           (pi)     — resident Claude session supervisor (spark-brain; KillMode=process)
  ├── px-api-server.service      (pi)     — REST API + SPARK web dashboard on port 8420
- ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via Claude, posts to Bluesky + local feed
+ ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via M5, posts to Bluesky + local feed
  ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration (stops px-alive to claim libcamera)
+ ├── px-evolve.service          (pi)     — self-evolution daemon (on-failure restart; proposes PRs, never auto-merges)
+ ├── px-blog.service            (pi)     — scheduled blog writer (daily/weekly/monthly/essay)
+ ├── px-tts-glados.service      (pi)     — GLaDOS TTS server on :7861 for GREMLIN persona
  └── cloudflared.service        (pi)     — Cloudflare Tunnel (spark-api.wedd.au → localhost:8420)
 ```
 
@@ -198,11 +203,10 @@ voice_loop.run_voice_turn(prompt)
 
 If the session cannot be reached, one cheap retry on a *delivery* failure, then
 a deterministic local line ("I heard you. Give me a second.") through the same
-audio policy gate — never another model.
+audio policy gate — never another model. There is no cold `claude -p` fallback
+(see the resident-only invariant in CLAUDE.md).
 
-`--allowedTools ""` is critical: it prevents Claude from using any Claude Code tools. It is a pure text-completion endpoint.
-
-The voice loop captures all stdout and scans it for a JSON action object. It uses `JSONDecoder.raw_decode()` with a multi-line fallback scan — so Claude can reason in plain text above the action, and the final JSON is extracted cleanly:
+The voice loop captures the response and scans it for a JSON action object. It uses `JSONDecoder.raw_decode()` with a multi-line fallback scan — so Claude can reason in plain text above the action, and the final JSON is extracted cleanly:
 
 ```json
 {"tool": "tool_voice", "params": {"text": "Obi! Guess what? A teaspoon of neutron star weighs a billion tonnes."}}
@@ -212,7 +216,7 @@ The voice loop captures all stdout and scans it for a JSON action object. It use
 
 ```python
 validate_action(tool_name, raw_params)
- ├── ALLOWED_TOOLS whitelist check              (38 tools; KeyError = reject)
+ ├── ALLOWED_TOOLS whitelist check              (42 tools; KeyError = reject)
  ├── per-tool param sanitisation:
  │    • type coercion (str → int where needed)
  │    • range clamping (speed 0-60, duration 1-12s, pan -90..90, etc.)
@@ -288,7 +292,7 @@ px-mind (every cycle, ~60s)
  │    │    • awareness snapshot
  │    │    • last 3 moods + actions from thoughts-spark.jsonl (not full thought text)
  │    │    • random topic seed from 20 creative prompts (science, wonder, universe)
- │    ├── LLM call: Claude Haiku via tmux session (SPARK) or Ollama gemma4:e4b (others, temperature=1.3)
+ │    ├── LLM call: pinned M5 Ollama model (PX_M5_SPARK_MODEL, never auto; never Claude)
  │    ├── anti-repetition check via difflib (>75% similarity = suppress)
  │    ├── parse JSON: {thought, mood, action, salience}
  │    ├── append to state/thoughts-spark.jsonl
@@ -341,7 +345,7 @@ px-post (every 60s poll, every 300s flush)
  ├── is_duplicate()       — difflib similarity ≥ 0.75 against recent posts → reject
  ├── queue_thought()      — append to state/post_queue.jsonl
  └── flush_queue()        — one entry per cycle:
-      ├── run_qa_gate()   — Claude CLI binary YES/NO quality check (15s timeout)
+      ├── run_qa_gate()   — M5 Ollama YES/NO quality check (post_qa kind)
       ├── write_feed()    — append to state/feed.json (served by /api/v1/public/feed)
       └── BlueskyClient   — post to Bluesky (truncate at 300 chars, word boundary)
 ```
@@ -481,7 +485,7 @@ source .venv/bin/activate
 # 4. Dry-run a tool to verify the setup
 PX_DRY=1 bin/tool-status
 
-# 5. Run tests (1070 dry-run, no hardware needed)
+# 5. Run tests (1626 dry-run, no hardware needed)
 python -m pytest tests/ -m "not live"
 
 # 6. Launch SPARK (Claude voice companion)
@@ -502,9 +506,14 @@ bin/px-spark --dry-run
 sudo systemctl status px-alive             # Idle gaze drift daemon
 sudo systemctl status px-wake-listen       # Wake word listener
 sudo systemctl status px-battery-poll      # Battery voltage poller (writes state/battery.json)
+sudo systemctl status px-mind              # Cognitive loop daemon (awareness → reflection → expression)
+sudo systemctl status px-brain             # Resident Claude session supervisor (spark-brain)
 sudo systemctl status px-api-server        # REST API + web dashboard (:8420)
 sudo systemctl status px-post              # Social posting daemon (Bluesky)
 sudo systemctl status px-frigate-stream    # Frigate camera RTSP stream
+sudo systemctl status px-evolve            # Self-evolution daemon (proposes PRs)
+sudo systemctl status px-blog              # Scheduled blog writer
+sudo systemctl status px-tts-glados        # GLaDOS TTS server (:7861, GREMLIN persona)
 sudo systemctl status cloudflared          # Cloudflare Tunnel
 ```
 
@@ -753,8 +762,8 @@ the suite on SPARK, which is the deployment target, not the test runner.
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/                           # 1461 tests total (28 require live hardware)
-python -m pytest tests/ -m "not live"             # 1433 tests (dry-run, no hardware)
+python -m pytest tests/                           # 1652 tests total (26 require live hardware)
+python -m pytest tests/ -m "not live"             # 1626 tests (dry-run, no hardware)
 python -m pytest tests/test_tools.py -v
 python -m pytest tests/test_api.py -v
 sudo .venv/bin/python -m pytest tests/ -m live -v  # live hardware tests (require Pi)
@@ -809,7 +818,7 @@ picar-x-hacking/
 │   ├── px-post                   # Social posting daemon (Bluesky + local feed)
 │   ├── px-statusline             # Claude Code statusbar script
 │   ├── px-{circle,drive,look,…}  # Hardware control scripts
-│   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (38 tools)
+│   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (42 tools)
 │   ├── run-voice-loop{,-claude,-ollama}  # Voice backend launchers
 ├── src/pxh/                      # Python library (10 modules)
 │   ├── state.py                  # FileLock session, atomic_write, rotate_log
@@ -825,7 +834,7 @@ picar-x-hacking/
 │   ├── css/colors.css            # Mood colour palette (CSS vars)
 │   ├── js/config.js              # API base URL config
 │   └── workers/og-rewrite.js     # Cloudflare Worker for OG images
-├── tests/                        # 1095 tests (25 require live hardware)
+├── tests/                        # 1652 tests (26 require live hardware)
 ├── docs/prompts/
 │   ├── spark-voice-system.md     # SPARK persona (child companion)
 │   ├── claude-voice-system.md    # Default Claude voice loop
@@ -839,9 +848,13 @@ picar-x-hacking/
 │   ├── px-wake-listen.service
 │   ├── px-battery-poll.service
 │   ├── px-mind.service
+│   ├── px-brain.service
 │   ├── px-api-server.service
 │   ├── px-post.service
 │   ├── px-frigate-stream.service
+│   ├── px-evolve.service
+│   ├── px-blog.service
+│   ├── px-tts-glados.service
 │   └── cloudflared.service
 ├── sounds/                       # Bundled audio
 ├── models/                       # STT models (gitignored, ~500MB)
