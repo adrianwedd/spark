@@ -556,6 +556,127 @@ def meter_summary() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Turn health (#258) — durable, per-request, immune to supervisor tick timing
+# --------------------------------------------------------------------------
+#
+# brain_daemon's context-recycle used to count turns by re-reading
+# current.json on a 10s supervisor tick and counting a request only if some
+# tick's read happened to catch it in flight. A request that both starts and
+# finishes between two ticks is invisible to that scheme by construction — it
+# was observed live driving ~34 real voice_turns without state.turns coming
+# anywhere near CONTEXT_TURNS, so the session's context bloated well past what
+# the recycle was supposed to bound, plausibly contributing to the Claude-side
+# auto-compaction behind the 2026-08-20 4h43m outage.
+#
+# The fix moves the count into the one place a request cannot be missed: the
+# caller's own process, at the moment `ask_brain` actually delivers the turn
+# (inject succeeded), under the single-flight lock `ask_brain` already holds
+# for the whole call. Two independent supervisor problems read this file:
+# turns-since-last-reset (context-recycle, unchanged threshold/behaviour) and
+# consecutive-slow-or-timed-out turns (a second self-heal trigger for a
+# session that stays `validated` — so the supervisor never handshakes it —
+# but answers too slowly for its callers to see any failure at all).
+
+def _turn_health_path(session: str) -> Path:
+    return session_dir(session) / "turns.json"
+
+
+# How much of a kind's own per-call deadline a delivered turn may consume
+# before it counts as "slow" for the validated-but-slow self-heal detector.
+# Expressed as a fraction of the caller's own deadline_for_kind rather than one
+# absolute number because kinds range from voice_turn's 45s to evolve's 1800s.
+# Calibrated against 121 real voice_turn completions logged in production
+# (2026-08 window, `logs/*.log` brain_reply events): p50=14.0s, p90=27.5s,
+# max=49.2s against a 45s deadline. 0.8 sits comfortably above the observed
+# p90 — normal traffic will not trip it — while leaving real margin before the
+# hard timeout, so sustained degradation is caught before every turn starts
+# failing outright.
+SELF_HEAL_SLOW_FRACTION = float(
+    os.environ.get("PX_BRAIN_SELF_HEAL_SLOW_FRACTION", "0.8"))
+
+
+def record_turn_completion(session: str, *, slow: bool) -> None:
+    """Durably record that one real (non-handshake) turn was delivered.
+
+    Called by `ask_brain` once per delivered request (inject succeeded),
+    whether it ended in a reply or a caller-side timeout — either way the
+    turn happened and consumed real context. Never called for a request whose
+    inject itself failed, matching the existing turn-counting semantics that
+    only ever counted delivered work.
+
+    `count` is a monotonic total feeding `brain_daemon.count_turns` (turns
+    since the last reset). `consecutive_slow` feeds the validated-but-slow
+    self-heal detector and is reset to 0 by `reset_consecutive_slow_turns`
+    whenever a recycle actually lands — the same reset a real reply already
+    gives `consecutive_handshake_failures`.
+    """
+    if _ensure_dir(session_dir(session)) is None:
+        return
+    path = _turn_health_path(session)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    count = data.get("count", 0)
+    if not isinstance(count, int):
+        count = 0
+    consecutive_slow = data.get("consecutive_slow", 0)
+    if not isinstance(consecutive_slow, int):
+        consecutive_slow = 0
+    count += 1
+    consecutive_slow = consecutive_slow + 1 if slow else 0
+    try:
+        atomic_write(path, json.dumps({
+            "count": count,
+            "consecutive_slow": consecutive_slow,
+            "updated_ts": utc_timestamp(),
+        }, indent=2))
+    except OSError:
+        pass
+
+
+def read_turn_health(session: str) -> dict[str, int]:
+    """`{"count": N, "consecutive_slow": M}` — both 0 if unreadable."""
+    empty = {"count": 0, "consecutive_slow": 0}
+    try:
+        data = json.loads(_turn_health_path(session).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    count = data.get("count", 0)
+    consecutive_slow = data.get("consecutive_slow", 0)
+    return {
+        "count": count if isinstance(count, int) else 0,
+        "consecutive_slow": consecutive_slow if isinstance(consecutive_slow, int) else 0,
+    }
+
+
+def reset_consecutive_slow_turns(session: str) -> None:
+    """Zero the slow-turn streak once a recycle actually lands.
+
+    Whatever was making the session slow is what the recycle exists to fix;
+    carrying the streak across it would let stale pre-recycle history
+    immediately re-trigger the same self-heal.
+    """
+    data = read_turn_health(session)
+    if data["consecutive_slow"] == 0:
+        return
+    if _ensure_dir(session_dir(session)) is None:
+        return
+    try:
+        atomic_write(_turn_health_path(session), json.dumps({
+            "count": data["count"],
+            "consecutive_slow": 0,
+            "updated_ts": utc_timestamp(),
+        }, indent=2))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
 # The request
 # --------------------------------------------------------------------------
 
@@ -786,16 +907,25 @@ def ask_brain(
                       reason=tmux_claude.last_error() or "inject failed")
             return None
 
+        # The turn was actually delivered from here on, whatever happens next
+        # — record it durably (see "Turn health" above) so the supervisor's
+        # context-recycle and validated-but-slow detector cannot miss it
+        # regardless of tick timing (#258).
+        slow_threshold_s = SELF_HEAL_SLOW_FRACTION * timeout_s
+
         while time.time() < deadline:
             reply = collect_reply(session, request_id)
             if reply is not None:
+                duration_s = time.monotonic() - started
                 _log("brain_reply", kind=kind, session=session,
-                          duration_s=round(time.monotonic() - started, 2))
+                          duration_s=round(duration_s, 2))
+                record_turn_completion(session, slow=duration_s >= slow_threshold_s)
                 return reply
             time.sleep(POLL_INTERVAL_S)
 
         _log("brain_timeout", kind=kind, session=session,
                   timeout_s=timeout_s)
+        record_turn_completion(session, slow=True)
         return None
     finally:
         cleanup_request(session, request_id)

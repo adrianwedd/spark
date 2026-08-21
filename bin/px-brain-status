@@ -30,10 +30,13 @@ for session in (brain.BRAIN_SESSION,):
     marker = brain.read_validation_marker(session) or {}
     age = brain._marker_age_s(marker) if marker else float("inf")
     age_text = "-" if age == float("inf") else f"{age:.0f}s"
+    turn_health = brain.read_turn_health(session)
     print(f"{session:<12} {state:<15} "
           f"model={marker.get('model') or '-'} "
           f"attempt={marker.get('attempt', '-')} "
-          f"marker_age={age_text}")
+          f"marker_age={age_text} "
+          f"turns_total={turn_health['count']} "
+          f"consecutive_slow={turn_health['consecutive_slow']}")
 
 try:
     usage = shutil.disk_usage(brain.brain_root().parent)
