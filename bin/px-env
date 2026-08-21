@@ -36,6 +36,23 @@ if [[ -d "$PROJECT_ROOT/.venv" && -z "${VIRTUAL_ENV:-}" ]]; then
     source "$PROJECT_ROOT/.venv/bin/activate"
 fi
 
+# Read alive_heartbeat.json's `ts` field and print its age in whole seconds,
+# or nothing if the file is missing/unreadable/malformed. Only called in the
+# (rare) slow-teardown tail below, never on the fast path.
+_yield_alive_heartbeat_age_s() {
+    local heartbeat_file="$1"
+    [[ -f "$heartbeat_file" ]] || return 0
+    python3 -c '
+import json, sys, time
+try:
+    with open(sys.argv[1]) as f:
+        ts = float(json.load(f)["ts"])
+    print(int(time.time() - ts))
+except Exception:
+    pass
+' "$heartbeat_file" 2>/dev/null
+}
+
 # Signal px-alive to release its Picarx/GPIO handle so a tool can use servos.
 # Usage: yield_alive  (call before opening Picarx in any tool script)
 yield_alive() {
@@ -55,20 +72,74 @@ yield_alive() {
             # unconditionally so both root and non-root callers work the
             # same way (sudo to root-signal-root is a harmless no-op).
             sudo -n kill -USR1 "$pid" 2>/dev/null || true
-            # Poll until px-alive actually exits — sleep 1 is not reliable
-            # because gaze animations can take 2-3s to complete.
-            # PX_YIELD_ALIVE_POLL_ITERS is a test seam only (default 25).
+
+            # Phase 1: fast poll for the common case — px-alive exits
+            # cleanly inside the original ~5s budget (gaze animations take
+            # 2-3s to settle). PX_YIELD_ALIVE_POLL_ITERS is a test seam
+            # only (default 25 * 0.2s = 5s).
             local poll_iters="${PX_YIELD_ALIVE_POLL_ITERS:-25}"
             local i
             for i in $(seq "$poll_iters"); do
                 [[ -d "/proc/$pid" ]] || break
                 sleep 0.2
             done
-            # If px-alive is still alive after the poll loop, it did not
-            # release GPIO5 — returning success would let the caller race
-            # px-alive for the reset_mcu pin (#205).  Fail hard instead.
+
+            # Phase 2: still alive past the fast window. Camera/GPIO
+            # teardown (#261) is now heartbeat-protected against systemd's
+            # own watchdog and can legitimately outlast phase 1 (observed
+            # live: 8.75s and 14s) — a caller that gives up here on a bare
+            # timer either races px-alive for GPIO5 (the pre-#250 bug) or
+            # aborts a yield that was seconds from succeeding (#205's
+            # remaining gap). Keep waiting only while px-alive is
+            # *provably* still working: alive_heartbeat.json must be
+            # advancing — px-alive beats it every HEARTBEAT_EVERY_S=2s
+            # during teardown via _with_heartbeat(). A stalled heartbeat
+            # means wedged, not slow, and fails fast rather than waiting
+            # out the full budget. Still bounded overall by
+            # PX_YIELD_ALIVE_MAX_WAIT_S so a caller can never hang
+            # indefinitely, even against a heartbeat that never stops.
             if [[ -d "/proc/$pid" ]]; then
-                echo "yield_alive: px-alive (PID $pid) did not exit within 5s; aborting to protect GPIO exclusivity" >&2
+                local heartbeat_file="${PX_YIELD_ALIVE_HEARTBEAT_FILE:-}"
+                if [[ -z "$heartbeat_file" ]]; then
+                    heartbeat_file="${PX_ALIVE_HEARTBEAT_DIR:-/run/spark}/alive_heartbeat.json"
+                    [[ -f "$heartbeat_file" ]] || heartbeat_file="${PX_STATE_DIR:-$PROJECT_ROOT/state}/alive_heartbeat.json"
+                fi
+                # Evidence-based ceiling: ~2x the worst live teardown observed
+                # (14s), not the 2-3s gaze-animation figure the original 5s
+                # budget was sized against.
+                local max_wait_s="${PX_YIELD_ALIVE_MAX_WAIT_S:-30}"
+                # 3x HEARTBEAT_EVERY_S (2s) — margin for a missed beat or two
+                # without mistaking a slow one for a wedged one.
+                local stale_after_s="${PX_YIELD_ALIVE_HEARTBEAT_STALE_S:-6}"
+                local fast_window_ds=$(( poll_iters * 2 ))
+                local phase2_budget_ds=$(( (max_wait_s * 10) - fast_window_ds ))
+                local phase2_iters=$(( phase2_budget_ds > 0 ? phase2_budget_ds / 5 : 0 ))
+                local j
+                for j in $(seq 0 "$phase2_iters"); do
+                    [[ -d "/proc/$pid" ]] || break
+                    local age
+                    age=$(_yield_alive_heartbeat_age_s "$heartbeat_file")
+                    if [[ -z "$age" ]]; then
+                        echo "yield_alive: px-alive (PID $pid) did not exit within the fast poll window and no heartbeat evidence is available to prove continued progress; aborting to protect GPIO exclusivity" >&2
+                        return 1
+                    fi
+                    if (( age > stale_after_s )); then
+                        echo "yield_alive: px-alive (PID $pid) heartbeat is stale (${age}s, threshold ${stale_after_s}s) — appears wedged mid-teardown, not shutting down; aborting to protect GPIO exclusivity" >&2
+                        return 1
+                    fi
+                    if (( j == phase2_iters )); then
+                        echo "yield_alive: px-alive (PID $pid) still shutting down (heartbeat fresh, ${age}s old) after ${max_wait_s}s total; aborting to protect GPIO exclusivity" >&2
+                        return 1
+                    fi
+                    sleep 0.5
+                done
+            fi
+
+            # If px-alive is still alive here, it did not release GPIO5 —
+            # returning success would let the caller race px-alive for the
+            # reset_mcu pin (#205). Fail hard instead.
+            if [[ -d "/proc/$pid" ]]; then
+                echo "yield_alive: px-alive (PID $pid) did not exit; aborting to protect GPIO exclusivity" >&2
                 return 1
             fi
             # px.close() does NOT release GPIO5 (reset_mcu pin) — only
