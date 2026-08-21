@@ -54,7 +54,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -104,6 +104,19 @@ CONTEXT_TURNS = int(os.environ.get("PX_BRAIN_CONTEXT_TURNS", "20"))
 SELF_HEAL_HANDSHAKE_FAILURES = int(
     os.environ.get("PX_BRAIN_SELF_HEAL_FAILURES", "3"))
 
+# Consecutive slow-or-timed-out real turns (see brain.record_turn_completion)
+# before the supervisor treats a *validated* session as degraded (#258). The
+# handshake-failure counter above only fires while the supervisor is actually
+# handshaking — but a session with a fresh marker is never handshaked at all,
+# so one that stays validated while quietly taking too long on every real
+# voice_turn produces no failure the supervisor can see; every turn just times
+# out and the caller falls back, indefinitely. Three mirrors
+# SELF_HEAL_HANDSHAKE_FAILURES for the same reason: a single slow turn is
+# normal variance (one real 49s voice_turn was logged among 121, against a
+# 45s-scaled slow threshold), and reacting to it would recycle context that
+# was never actually a problem.
+SELF_HEAL_SLOW_TURNS = int(os.environ.get("PX_BRAIN_SELF_HEAL_SLOW_TURNS", "3"))
+
 # Nightly recycle window opens at this hour, Hobart time. It does not close:
 # if overnight work (research, compose — both NIGHT_ALLOWED_ACTIONS) keeps the
 # brain busy past dawn, the recycle waits for idle rather than preempting a
@@ -139,7 +152,8 @@ def _recycle_state_path() -> Path:
 
 
 def save_recycle_state(state: SessionState) -> None:
-    """Persist last_recycle_day so a supervisor restart preserves it.
+    """Persist last_recycle_day and turns_baseline so a supervisor restart
+    preserves both.
 
     Never raises: this sits under the supervisor loop. A failed write
     means the next restart may spuriously recycle once — a minor cost
@@ -152,17 +166,22 @@ def save_recycle_state(state: SessionState) -> None:
         atomic_write(path, json.dumps({
             "session": state.name,
             "last_recycle_day": state.last_recycle_day,
+            "turns_baseline": state.turns_baseline,
         }, indent=2))
     except OSError:
         pass
 
 
 def load_recycle_state(state: SessionState) -> None:
-    """Load persisted last_recycle_day into state, if available.
+    """Load persisted last_recycle_day and turns_baseline into state, if
+    available.
 
     Called once on supervisor startup, before the first tick evaluates
-    nightly_due. A missing or corrupt file is silently ignored — the
-    worst case is a single spurious recycle, not a crash.
+    nightly_due or count_turns. A missing or corrupt file is silently
+    ignored — the worst case for last_recycle_day is a single spurious
+    recycle; for turns_baseline, missing means the loaded default of 0 is
+    used, which is also this function's fallback for a file that predates
+    turns_baseline (#258) — never a crash.
     """
     try:
         path = _recycle_state_path()
@@ -174,6 +193,9 @@ def load_recycle_state(state: SessionState) -> None:
     day = data.get("last_recycle_day")
     if isinstance(day, str) and day:
         state.last_recycle_day = day
+    baseline = data.get("turns_baseline")
+    if isinstance(baseline, int):
+        state.turns_baseline = baseline
 
 
 @dataclass
@@ -183,10 +205,15 @@ class SessionState:
     name: str
     holder: tmux_claude.HolderClient | None = None
     turns: int = 0
+    # brain.read_turn_health(name)["count"] as of the last reset (session
+    # creation or any landed recycle). state.turns is derived from the
+    # durable counter minus this baseline — see count_turns(). Persisted
+    # alongside last_recycle_day so a supervisor restart does not lose track
+    # (#226's fix, extended to turn accounting by #258).
+    turns_baseline: int = 0
     wedged_since: float | None = None
     escaped_at: float | None = None
     last_recycle_day: str = ""
-    seen_request_ids: set[str] = field(default_factory=set)
     # When this session last had a handshake attempted (monotonic). Validation
     # goes to whoever has waited longest — see _validate_one in tick().
     last_validation_attempt: float = 0.0
@@ -324,6 +351,13 @@ def start_session(state: SessionState,
         # gone (cleared above, before the boot); sweep what the old one left.
         swept = brain.sweep_pending(state.name)
         state.turns = 0
+        # A fresh tmux session inherits none of the old mailbox's turn
+        # history (or slow-turn streak) even though the durable counter file
+        # is keyed by session name and outlives the recreate — rebase here so
+        # count_turns starts this incarnation at 0, and drop any pre-existing
+        # slow-turn streak the old incarnation may have left behind.
+        state.turns_baseline = brain.read_turn_health(state.name)["count"]
+        brain.reset_consecutive_slow_turns(state.name)
         # Creating a session IS a context reset, so record it as today's. An
         # empty `last_recycle_day` made every session born after
         # NIGHTLY_RECYCLE_HOUR instantly "nightly due": it spent its first turn
@@ -672,10 +706,16 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
         if not _inject_recycle(state, reason):
             return
         state.turns = 0
+        state.turns_baseline = brain.read_turn_health(state.name)["count"]
+        brain.reset_consecutive_slow_turns(state.name)
         state.last_recycle_at = time.monotonic()
         if nightly_due:
             state.last_recycle_day = day
-            save_recycle_state(state)
+        # Persisted on every landed recycle, not just nightly ones: turns_baseline
+        # must survive a supervisor restart regardless of which recycle reset it,
+        # or a restart shortly after a turns-based recycle would reload a stale
+        # (smaller) baseline and misjudge how much real context growth is new.
+        save_recycle_state(state)
     finally:
         try:
             lock.release()
@@ -714,21 +754,35 @@ def _inject_recycle(state: SessionState, reason: str) -> bool:
 
 
 def maybe_self_heal(state: SessionState) -> None:
-    """Recycle a session that has failed too many handshakes in a row.
+    """Recycle a session that is degraded by either of two independent signals.
 
-    The recovery path for the degraded-session failure that run_handshake and
-    check_wedge both deliberately leave alone (see SELF_HEAL_HANDSHAKE_FAILURES).
-    Same idle+lock+journal/clear machinery as maybe_recycle, triggered by the
-    consecutive-failure counter rather than turn count — because a context reset
-    is what demonstrably recovers the "narrates the reply instead of running it"
-    state, and nothing else in the loop will.
+    1. Too many consecutive failed handshakes (SELF_HEAL_HANDSHAKE_FAILURES) —
+       the recovery path for the failure run_handshake and check_wedge both
+       deliberately leave alone. This is the original 4h43m-outage detector: a
+       context-exhausted session that narrates `tool-brain-reply` as pane text
+       instead of running it never replies, so every handshake times out.
+
+    2. Too many consecutive slow-or-timed-out *real* turns
+       (SELF_HEAL_SLOW_TURNS, brain.read_turn_health) — a session that stays
+       `validated` is never handshaked at all (handshake_reason only fires on
+       no_marker/model_change), so a session that quietly answers every real
+       voice_turn too slowly to beat its deadline produces no failure signal
+       detector (1) can ever see. Every caller just times out and falls back,
+       indefinitely (#258).
+
+    Both land on the same recovery: same idle+lock+journal/clear machinery as
+    maybe_recycle, because a context reset is what demonstrably recovers the
+    narrating-instead-of-running state, and nothing else in the loop will.
 
     Never mid-request, and non-blocking on the lock, for the same reasons
     maybe_recycle is: a /clear between a nudge and a reply loses the request,
     and stalling the supervisor for a caller's whole deadline is worse than
     waiting for the next tick.
     """
-    if state.consecutive_handshake_failures < SELF_HEAL_HANDSHAKE_FAILURES:
+    consecutive_slow = brain.read_turn_health(state.name)["consecutive_slow"]
+    handshake_due = state.consecutive_handshake_failures >= SELF_HEAL_HANDSHAKE_FAILURES
+    slow_due = consecutive_slow >= SELF_HEAL_SLOW_TURNS
+    if not (handshake_due or slow_due):
         return
     if not _is_idle(state):
         return
@@ -744,17 +798,22 @@ def maybe_self_heal(state: SessionState) -> None:
         return
 
     try:
-        _log("self_heal", session=state.name,
-             consecutive=state.consecutive_handshake_failures)
+        reason = "handshake_failures" if handshake_due else "slow_turns"
+        _log("self_heal", session=state.name, reason=reason,
+             consecutive_handshake=state.consecutive_handshake_failures,
+             consecutive_slow=consecutive_slow)
         if not _inject_recycle(state, "self_heal"):
             return
-        # A landed recycle is the recovery attempt. Reset the counter so the
-        # next window of failures is measured fresh against the cleared
-        # context, and reset turns/last_recycle_at exactly as maybe_recycle
-        # does — the context is gone either way.
+        # A landed recycle is the recovery attempt. Reset both detectors so
+        # the next window of degradation is measured fresh against the
+        # cleared context, and reset turns/baseline/last_recycle_at exactly
+        # as maybe_recycle does — the context is gone either way.
         state.turns = 0
+        state.turns_baseline = brain.read_turn_health(state.name)["count"]
+        brain.reset_consecutive_slow_turns(state.name)
         state.last_recycle_at = time.monotonic()
         state.consecutive_handshake_failures = 0
+        save_recycle_state(state)
     finally:
         try:
             lock.release()
@@ -763,16 +822,25 @@ def maybe_self_heal(state: SessionState) -> None:
 
 
 def count_turns(state: SessionState) -> None:
-    """Count requests as turns, so recycling tracks real context growth."""
-    current = _read_current(state.name)
-    if current is None:
-        return
-    request_id = current.get("id")
-    if isinstance(request_id, str) and request_id not in state.seen_request_ids:
-        state.seen_request_ids.add(request_id)
-        state.turns += 1
-        if len(state.seen_request_ids) > 500:
-            state.seen_request_ids.clear()
+    """Refresh state.turns from the durable per-request counter (#258).
+
+    The previous implementation sampled current.json once per 10s tick and
+    counted a request only if some tick's read happened to catch it in
+    flight — a request whose whole lifecycle (write, answer, cleanup) fits
+    inside one tick interval is invisible to that scheme by construction, and
+    this was observed live: ~34 real voice_turns drove state.turns nowhere
+    near CONTEXT_TURNS, so context bloated well past the recycle's intended
+    bound. brain.record_turn_completion runs synchronously in the caller's
+    own process at delivery time, under the same single-flight lock ask_brain
+    already holds for the whole request, so nothing can slip between ticks.
+
+    state.turns is turns-since-baseline, not the raw counter: the counter is
+    monotonic for the life of the mailbox, and turns_baseline is rebased to
+    it on every reset (session creation or any landed recycle) — see
+    start_session, maybe_recycle, maybe_self_heal.
+    """
+    total = brain.read_turn_health(state.name)["count"]
+    state.turns = max(0, total - state.turns_baseline)
 
 
 def handshake_reason(state: SessionState) -> str | None:
@@ -906,7 +974,11 @@ def tick(states: dict[str, SessionState]) -> None:
         try:
             if brain.session_state(state.name) == brain.VALIDATED:
                 health.record_success(state.component, min_interval_s=60,
-                                      detail={"turns": state.turns})
+                                      detail={
+                                          "turns": state.turns,
+                                          "consecutive_slow_turns":
+                                              brain.read_turn_health(state.name)["consecutive_slow"],
+                                      })
         except Exception as exc:  # noqa: BLE001
             _log("tick_error", session=state.name, error=str(exc))
             health.record_failure(state.component, str(exc))

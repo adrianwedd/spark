@@ -414,14 +414,83 @@ def test_a_busy_brain_delays_the_nightly_recycle_rather_than_preempting(fake_tmu
 
 
 def test_turns_are_counted_once_per_request(fake_tmux):
+    """count_turns reads the durable counter ask_brain writes (#258), not
+    current.json — so re-observing the same delivered turns across many
+    ticks must not inflate the count."""
     session = brain.BRAIN_SESSION
     state = _state(session)
-    _write_current(session, request_id="abc")
+    brain.ensure_mailbox(session)
+    brain.record_turn_completion(session, slow=False)
     for _ in range(5):
         brain_daemon.count_turns(state)
-    _write_current(session, request_id="def")
+    assert state.turns == 1
+    brain.record_turn_completion(session, slow=False)
     brain_daemon.count_turns(state)
     assert state.turns == 2
+
+
+def test_a_turn_faster_than_the_tick_interval_is_still_counted(fake_tmux):
+    """#258: the old count_turns sampled current.json once per 10s tick and
+    missed any request whose whole lifecycle (write, answer, cleanup) fit
+    inside one tick — observed live driving ~34 real voice_turns without
+    state.turns ever approaching CONTEXT_TURNS. Simulate a burst of requests
+    that each start and finish between two ticks (no current.json ever
+    observed) and confirm every one is still counted, because the counter is
+    written by the caller at delivery time, not sampled by the supervisor."""
+    session = brain.BRAIN_SESSION
+    state = _state(session)
+    brain.ensure_mailbox(session)
+
+    # No current.json exists at any point the supervisor looks — each
+    # request's ask_brain call started and fully completed between ticks.
+    for _ in range(brain_daemon.CONTEXT_TURNS + 5):
+        brain.record_turn_completion(session, slow=False)
+        brain_daemon.count_turns(state)  # a tick that observes nothing in flight
+
+    assert state.turns == brain_daemon.CONTEXT_TURNS + 5, \
+        "a burst of sub-tick-interval requests must not be under-counted"
+
+
+def test_turns_baseline_rebases_on_session_creation(fake_tmux):
+    """A brand-new tmux session must not inherit turn history from whatever
+    the mailbox counted before it existed — mirrors state.turns = 0 on
+    creation, but for the durable counter's baseline."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    for _ in range(10):
+        brain.record_turn_completion(session, slow=False)
+
+    state = _state(session)
+    assert brain_daemon.start_session(state)
+    brain_daemon.count_turns(state)
+    assert state.turns == 0, \
+        "a freshly created session must start at turns=0 despite prior mailbox history"
+
+
+def test_turns_baseline_survives_a_supervisor_restart(fake_tmux):
+    """Mirrors #226's last_recycle_day fix: a supervisor restart must not
+    lose track of turns_baseline, or a restart shortly after a turns-based
+    recycle would recompute turns against a stale (smaller) baseline and
+    misjudge how much context growth is actually new."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    for _ in range(50):
+        brain.record_turn_completion(session, slow=False)
+
+    prev_state = _state(session)
+    prev_state.turns_baseline = 50
+    brain_daemon.save_recycle_state(prev_state)
+
+    for _ in range(3):
+        brain.record_turn_completion(session, slow=False)
+
+    new_state = _state(session)
+    assert new_state.turns_baseline == 0
+    brain_daemon.load_recycle_state(new_state)
+    assert new_state.turns_baseline == 50, \
+        "load_recycle_state must restore turns_baseline from the file"
+    brain_daemon.count_turns(new_state)
+    assert new_state.turns == 3
 
 
 def test_twenty_successful_handshakes_alone_never_trigger_a_recycle(
@@ -793,6 +862,67 @@ def test_self_heal_recycles_after_enough_consecutive_failures(fake_tmux):
         "at the threshold, the session is recycled to recover it"
     assert state.consecutive_handshake_failures == 0, \
         "the recycle is the recovery attempt; the next window is measured fresh"
+
+
+def test_self_heal_recycles_a_validated_but_slow_session(fake_tmux):
+    """#258: a session that stays `validated` is never handshaked at all
+    (handshake_reason only fires on no_marker/model_change), so a session
+    that quietly answers every real voice_turn too slowly to beat its
+    deadline produces no consecutive_handshake_failures — the original #256
+    detector cannot see it. brain.record_turn_completion's consecutive_slow
+    counter is the second signal that feeds the same self-heal path."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    assert state.consecutive_handshake_failures == 0, "not a handshake-failure scenario"
+
+    for _ in range(brain_daemon.SELF_HEAL_SLOW_TURNS - 1):
+        brain.record_turn_completion(session, slow=True)
+    brain_daemon.maybe_self_heal(state)
+    assert not any("/clear" in text for _, text in fake_tmux.injected), \
+        "below the threshold, no recycle"
+
+    brain.record_turn_completion(session, slow=True)  # reaches the threshold
+    brain_daemon.maybe_self_heal(state)
+    assert any("/clear" in text for _, text in fake_tmux.injected), \
+        "a validated-but-slow session must self-heal even with zero handshake failures"
+    assert brain.read_turn_health(session)["consecutive_slow"] == 0, \
+        "the recycle is the recovery attempt; the next window is measured fresh"
+
+
+def test_a_single_slow_turn_does_not_trigger_self_heal(fake_tmux):
+    """One slow turn is normal variance — a real 49s voice_turn was logged in
+    production among 121 (p90=27.5s against a 45s deadline). Reacting to a
+    single outlier would recycle context that was never actually degraded."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+
+    brain.record_turn_completion(session, slow=True)
+    brain.record_turn_completion(session, slow=False)  # a fast turn clears the streak
+    brain_daemon.maybe_self_heal(state)
+    assert fake_tmux.injected == [], "an isolated slow turn followed by a fast one must not self-heal"
+
+
+def test_self_heal_by_slow_turns_recovers_real_tool_execution(fake_tmux, _fast_handshake, monkeypatch):
+    """Proves the recycle actually returns the session to answering handshakes
+    for real (a reply lands), not just that a /clear keystroke was sent —
+    the same standard #256's handshake-failure recovery is held to."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+
+    for _ in range(brain_daemon.SELF_HEAL_SLOW_TURNS):
+        brain.record_turn_completion(session, slow=True)
+    brain_daemon.maybe_self_heal(state)
+    assert any("/clear" in text for _, text in fake_tmux.injected)
+
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+    assert brain_daemon.run_handshake(state, "no_marker") is True, \
+        "post-recycle, the session must answer a real handshake again"
 
 
 def test_self_heal_never_recycles_mid_request(fake_tmux):

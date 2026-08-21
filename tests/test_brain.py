@@ -470,6 +470,111 @@ def test_meter_counts_every_request(_live_pane):
 
 
 # ---------------------------------------------------------------------------
+# Turn health (#258) — the durable, per-request signal brain_daemon's
+# context-recycle and validated-but-slow self-heal detector both read
+# ---------------------------------------------------------------------------
+
+def test_ask_brain_records_a_delivered_turn_even_on_a_timeout(_live_pane):
+    """A caller-side timeout is not "nothing happened" — the nudge was
+    injected and the session spent real context on it, so it must still be
+    counted (#258's fix for count_turns's tick-sampling gap), and an
+    unambiguous miss counts as slow for the self-heal detector too."""
+    session = brain.session_for_kind("research")
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=0.2) is None
+    health = brain.read_turn_health(session)
+    assert health["count"] == 1
+    assert health["consecutive_slow"] == 1
+
+
+def test_ask_brain_never_counts_a_request_whose_inject_failed(monkeypatch, _live_pane):
+    """Only a turn actually delivered to the session should count — matching
+    the pre-existing turn-counting semantics count_turns always had."""
+    session = brain.session_for_kind("research")
+    monkeypatch.setattr(tmux_claude, "inject", lambda text, spec=None: False)
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=0.2) is None
+    assert brain.read_turn_health(session)["count"] == 0
+
+
+def test_ask_brain_marks_a_fast_reply_as_not_slow(_live_pane):
+    session = brain.session_for_kind("research")
+
+    def _fast_brain():
+        request_id = _pending_id(session)
+        _reply_via_tool(session, request_id, {"ok": True})
+
+    threading.Thread(target=_fast_brain, daemon=True).start()
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=15) is not None
+    health = brain.read_turn_health(session)
+    assert health["count"] == 1
+    assert health["consecutive_slow"] == 0
+
+
+def test_ask_brain_marks_a_reply_past_the_slow_fraction_as_slow(_live_pane):
+    """A reply that lands but eats most of its own deadline is degradation
+    the supervisor needs to see even though the caller got an answer —
+    SELF_HEAL_SLOW_FRACTION (0.8) of a 5s deadline is 4s. Writes the outbox
+    reply directly rather than through the real tool-brain-reply subprocess:
+    this test is about the threshold arithmetic, and subprocess-spawn jitter
+    would make a real round trip an unreliable clock for it."""
+    session = brain.session_for_kind("research")
+
+    def _slow_brain():
+        request_id = _pending_id(session)
+        time.sleep(4.3)
+        brain.ensure_mailbox(session)
+        (brain.outbox_dir(session) / f"{request_id}.json").write_text(
+            json.dumps({"id": request_id, "reply": {"ok": True}}))
+
+    threading.Thread(target=_slow_brain, daemon=True).start()
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=5) is not None
+    assert brain.read_turn_health(session)["consecutive_slow"] == 1
+
+
+def test_consecutive_slow_streak_resets_on_a_fast_reply(_live_pane):
+    """The streak measures a *run* of degraded turns; one real fast answer
+    proves the session recovered on its own and starts it over — the same
+    principle as consecutive_handshake_failures."""
+    session = brain.session_for_kind("research")
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=0.2) is None  # times out -> slow
+    assert brain.read_turn_health(session)["consecutive_slow"] == 1
+
+    def _fast_brain():
+        request_id = _pending_id(session)
+        _reply_via_tool(session, request_id, {"ok": True})
+
+    threading.Thread(target=_fast_brain, daemon=True).start()
+    assert brain.ask_brain("research", {"q": 2}, timeout_s=15) is not None
+    health = brain.read_turn_health(session)
+    assert health["consecutive_slow"] == 0
+    assert health["count"] == 2
+
+
+def test_reset_consecutive_slow_turns_preserves_the_total_count():
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    brain.record_turn_completion(session, slow=True)
+    brain.record_turn_completion(session, slow=True)
+    brain.reset_consecutive_slow_turns(session)
+    health = brain.read_turn_health(session)
+    assert health["consecutive_slow"] == 0
+    assert health["count"] == 2, "resetting the streak must not touch the turn total"
+
+
+def test_read_turn_health_defaults_when_unwritten():
+    assert brain.read_turn_health("no-such-session") == {"count": 0, "consecutive_slow": 0}
+
+
+def test_turn_health_survives_corrupt_json(monkeypatch, tmp_path):
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    brain._turn_health_path(session).write_text("{not json")
+    assert brain.read_turn_health(session) == {"count": 0, "consecutive_slow": 0}
+    # A write after a corrupt read must recover rather than propagate the corruption.
+    brain.record_turn_completion(session, slow=False)
+    assert brain.read_turn_health(session) == {"count": 1, "consecutive_slow": 0}
+
+
+# ---------------------------------------------------------------------------
 # tool-brain-reply validation — the io session's only tool
 # ---------------------------------------------------------------------------
 
