@@ -509,7 +509,7 @@ def test_acquire_heartbeat_keeps_beating_during_a_slow_picarx_construction(isola
         time.sleep(0.35)
         return "picarx-handle"
 
-    result = alive["_with_acquire_heartbeat"](_slow_acquire)
+    result = alive["_with_heartbeat"](_slow_acquire)
 
     assert result == "picarx-handle"
     assert beats, "a 0.35s blocking acquisition produced no heartbeat at all"
@@ -529,7 +529,7 @@ def test_acquire_heartbeat_stops_beating_once_acquisition_returns(isolated_proje
     alive["write_alive_heartbeat"] = lambda mode, now=None: beats.append(mode)
     alive["HEARTBEAT_EVERY_S"] = 0.05
 
-    alive["_with_acquire_heartbeat"](lambda: "fast")
+    alive["_with_heartbeat"](lambda: "fast")
     count_at_return = len(beats)
     time.sleep(0.3)  # several beat intervals — nothing should fire post-return
 
@@ -756,6 +756,60 @@ def test_ease_call_sites_publish_distinguishable_modes():
         f"ease() calls with no explicit mode at lines {bare} — these inherit "
         f'the "running" default and become indistinguishable from the loop-top beat'
     )
+
+
+def test_camera_teardown_is_heartbeat_protected_at_every_call_site():
+    """stop_face_detection()/drop_px() must never run un-beaten.
+
+    Observed live 2026-08-21, minutes after the make_px()-acquisition fix
+    shipped: a routine yield_alive from px-cron-say delivered SIGUSR1
+    successfully (proving that fix works), px-alive logged "stopping so it
+    can run" and began teardown, and 14s later systemd's watchdog killed it
+    anyway (SIGABRT) — the same restart-storm shape, relocated from
+    acquisition to teardown, because stop_face_detection()'s
+    Vilib.camera_close() is itself a blocking call with no heartbeat and it
+    runs on every yield, every SIGTERM, every idle_loop exit, and again in
+    main()'s own outer finally. This pins all four call sites to the
+    heartbeat-wrapped form so a future edit can't quietly reintroduce a bare
+    call.
+    """
+    body = (PROJECT_ROOT / "bin" / "px-alive").read_text()
+
+    yield_path = '_with_heartbeat(lambda: (drop_px(), stop_face_detection()))'
+    finally_path = (
+        '_with_heartbeat(lambda: (drop_px(), stop_face_detection() if face_active else None))'
+    )
+    shutdown_path = '_with_heartbeat(stop_face_detection)'
+
+    assert yield_path in body, "SIGUSR1 mid-loop teardown lost its heartbeat wrapper"
+    assert finally_path in body, "idle_loop's finally-block teardown lost its heartbeat wrapper"
+    assert body.count(shutdown_path) == 2, (
+        "_shutdown()'s and main()'s own camera-release calls must both stay "
+        "heartbeat-wrapped"
+    )
+
+    # Every remaining direct Call node to stop_face_detection() must sit on a
+    # line that also mentions _with_heartbeat — this fails loudly if a new
+    # bare call site is added elsewhere without being wrapped. drop_px() alone
+    # is not checked here: release_px() deliberately skips the slow px.close()
+    # reset and only closes the ultrasonic handle, so it isn't implicated in
+    # the observed blocking (only stop_face_detection()'s Vilib.camera_close()
+    # is — see the I2C-backoff drop_px(force_reset_on_reacquire=True) call,
+    # which stays bare on purpose).
+    source = body.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    tree = ast.parse(source)
+    bare_teardown_calls = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "stop_face_detection"
+    ]
+    source_lines = source.splitlines()
+    for lineno in bare_teardown_calls:
+        line = source_lines[lineno - 1]
+        assert "_with_heartbeat" in line, (
+            f"unwrapped teardown call at line {lineno}: {line!r}"
+        )
 
 
 def test_gap_buckets_keep_the_distribution_a_single_extremum_discards(tmp_path):
