@@ -601,6 +601,39 @@ def release_px(px) -> None:
     # process exits; the MCU keeps driving servos in the meantime.
 
 
+def _with_acquire_heartbeat(fn):
+    """Run fn() while beating every HEARTBEAT_EVERY_S, for a blocking Picarx
+    construction that must never silently outlast the watchdog.
+
+    make_px() blocks synchronously inside Picarx.__init__ (I2C), and the
+    first acquisition after ANY park (a foreign-lease wait at startup, or an
+    I2C-backoff reacquire) has no heartbeat protection of its own: the
+    pre-loop lease park beats every LEASE_RECHECK_S while parked, but the
+    moment the park ends and idle_loop resumes, nothing beats again until
+    the acquisition returns. Observed live 2026-08-21: a 7m53s "voice" GPIO
+    lease cleared, idle_loop resumed, and the very next acquisition went
+    silent long enough for systemd to kill the start (TimeoutStartSec) — a
+    genuine acquisition, not a wedge, but indistinguishable from one
+    without a beat inside the call. This closes that gap exactly the way
+    ease() already does for long servo motions.
+    """
+    stop_beat = threading.Event()
+
+    def _beat() -> None:
+        while not stop_beat.wait(HEARTBEAT_EVERY_S):
+            write_alive_heartbeat("acquiring_picarx")
+
+    beat_thread = threading.Thread(
+        target=_beat, daemon=True, name="px-alive-acquire-heartbeat"
+    )
+    beat_thread.start()
+    try:
+        return fn()
+    finally:
+        stop_beat.set()
+        beat_thread.join(timeout=2.0)
+
+
 def safe_distance() -> float | None:
     """Open Picarx briefly just to read sonar, then release. None on failure."""
     px = None
@@ -729,7 +762,7 @@ def idle_loop(args) -> None:
     def get_px():
         nonlocal px, _force_next_reset
         if px is None:
-            px = make_px(force_reset=_force_next_reset)
+            px = _with_acquire_heartbeat(lambda: make_px(force_reset=_force_next_reset))
             log(f"acquired Picarx handle (reset={'hard' if _force_next_reset else 'skipped'})")
             _force_next_reset = False
             # The acquisition that just returned is the one that can overrun

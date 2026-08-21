@@ -164,3 +164,22 @@ def test_yield_alive_dead_pid_is_success(long_poll_env):
     result = _source_and_call(log_dir)
     assert result.returncode == 0
     assert "yield_alive returned 0" in result.stdout
+
+
+def test_yield_alive_signals_via_sudo():
+    """The USR1 signal must go through sudo, or every non-root caller silently no-ops.
+
+    px-alive runs as root; a bare `kill -USR1 $pid` from a non-root caller
+    (most bin/tool-*, bin/px-* scripts run as `pi`) fails EPERM and was
+    swallowed by `|| true`, so px-alive never actually saw the yield and the
+    caller degraded into the 5s poll timeout below (a #250-class
+    regression). Confirmed live: tool-perform.log and tool-emote.log show
+    dozens of "did not exit within 5s; aborting to protect GPIO exclusivity"
+    failures. `pi` already holds passwordless sudo on this host, so routing
+    through it fixes both root and non-root callers uniformly.
+    """
+    body = (PROJECT_ROOT / "bin" / "px-env").read_text()
+    assert "sudo -n kill -USR1 \"$pid\"" in body, (
+        "yield_alive must signal px-alive via sudo — a bare kill silently "
+        "fails for every non-root caller"
+    )

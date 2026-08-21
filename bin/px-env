@@ -44,7 +44,17 @@ yield_alive() {
         local pid
         pid=$(<"$pid_file")
         if [[ -d "/proc/$pid" ]]; then
-            kill -USR1 "$pid" 2>/dev/null || true
+            # px-alive runs as root; a bare `kill` from a non-root caller
+            # (most bin/tool-*, bin/px-* scripts) fails EPERM and is
+            # swallowed by `|| true`, so px-alive never sees the signal and
+            # every yield silently degrades into the 5s poll timeout below
+            # (#250-class regression — confirmed live via tool-perform.log/
+            # tool-emote.log: "did not exit within 5s; aborting to protect
+            # GPIO exclusivity", dozens of occurrences). `pi` already has
+            # passwordless sudo for this host's automation; route through it
+            # unconditionally so both root and non-root callers work the
+            # same way (sudo to root-signal-root is a harmless no-op).
+            sudo -n kill -USR1 "$pid" 2>/dev/null || true
             # Poll until px-alive actually exits — sleep 1 is not reliable
             # because gaze animations can take 2-3s to complete.
             # PX_YIELD_ALIVE_POLL_ITERS is a test seam only (default 25).
