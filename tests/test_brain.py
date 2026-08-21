@@ -367,6 +367,21 @@ def test_nudge_and_allowlist_agree_on_the_absolute_spelling():
         [brain.TOOL_BRAIN_REPLY]
 
 
+def test_the_nudge_says_to_run_the_reply_not_type_it():
+    """The 2026-08-20 outage: a context-degraded session typed the reply
+    command as pane text 300+ times instead of running it as a tool, and the
+    pane rendered both identically so nothing caught it for 4h43m. The nudge
+    must tell the session to RUN the command and that typing it delivers
+    nothing — the earlier bare 'reply with: <command>' wording invited exactly
+    the narration that broke it."""
+    line = brain.nudge_line(brain.BRAIN_SESSION, "abc")
+    lowered = line.lower()
+    assert "run" in lowered, "the nudge must say to run the command"
+    # It must warn that typing/narrating the command achieves nothing.
+    assert "typing" in lowered or "text delivers nothing" in lowered, \
+        "the nudge must say that typing the command as text delivers nothing"
+
+
 def test_launcher_renders_one_absolute_reply_spelling(tmp_path):
     """End to end across the language boundary: what bash actually hands
     `claude` must match what Python tells the session to type."""

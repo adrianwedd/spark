@@ -84,6 +84,26 @@ HANDSHAKE_POLL_S = float(os.environ.get("PX_BRAIN_HANDSHAKE_POLL_S", "0.25"))
 # journal, not from the context window.
 CONTEXT_TURNS = int(os.environ.get("PX_BRAIN_CONTEXT_TURNS", "20"))
 
+# Consecutive failed handshakes before the supervisor recycles the session's
+# context to recover it. This is the missing self-heal behind the 2026-08-20
+# 4h43m outage (#226-adjacent): a context-exhausted Haiku session began
+# *narrating* the reply command as pane text instead of running it as a tool,
+# so every handshake and every caller request timed out — for 123 consecutive
+# handshakes. Nothing escalated, because run_handshake deliberately does not
+# kill (a failed handshake is not proof the process is dead, #237), handshakes
+# do not advance CONTEXT_TURNS, and check_wedge keys only on a live *caller*
+# request whose current.json the caller's own finally: had already removed. A
+# /clear demonstrably recovers the degraded state (observed live twice: the
+# session recovered within one tick of the 2026-08-20 17:25 turn-recycle, and
+# again the moment a manual /clear landed on 2026-08-21). So: after this many
+# consecutive exhausted-attempt failures, recycle context at the next idle
+# moment. At ~135s per failed handshake that bounds the blind window to a few
+# minutes instead of until the 02:00 nightly recycle. A kill would cost far
+# more on this 4-core Pi than a /clear (see brain.py's resident-only rationale),
+# so the recovery is a context reset, not a process restart.
+SELF_HEAL_HANDSHAKE_FAILURES = int(
+    os.environ.get("PX_BRAIN_SELF_HEAL_FAILURES", "3"))
+
 # Nightly recycle window opens at this hour, Hobart time. It does not close:
 # if overnight work (research, compose — both NIGHT_ALLOWED_ACTIONS) keeps the
 # brain busy past dawn, the recycle waits for idle rather than preempting a
@@ -175,6 +195,12 @@ class SessionState:
     # in the very same tick — this is how it holds off nudging the pane it
     # just made busy with the journal+/clear turn. See RECYCLE_QUIET_S.
     last_recycle_at: float = 0.0
+    # Consecutive exhausted-attempt handshake failures. Reset to 0 by any
+    # handshake_ok; drives the self-heal recycle once it reaches
+    # SELF_HEAL_HANDSHAKE_FAILURES. Only the exhausted-attempts branch of
+    # run_handshake increments it — a lock-busy defer is not a failure of the
+    # session and must not count toward recycling it.
+    consecutive_handshake_failures: int = 0
 
     @property
     def component(self) -> str:
@@ -474,6 +500,9 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                 # time a handshake succeeds. Clearing it here means the window
                 # cannot outlive the recycle it exists to protect.
                 state.last_recycle_at = 0.0
+                # A real round trip landed: whatever degraded the session is
+                # gone, so the self-heal counter starts over.
+                state.consecutive_handshake_failures = 0
                 return True
 
         # Attempts exhausted. Earlier this killed the session outright — see
@@ -497,11 +526,13 @@ def run_handshake(state: SessionState, reason: str) -> bool:
         # diagnostic ping failing twice. Pinned by
         # test_a_silent_session_is_escaped_and_retried_but_not_killed and
         # test_a_failed_handshake_leaves_the_holder_attached.
+        state.consecutive_handshake_failures += 1
         health.record_failure(
             state.component,
             f"handshake failed after {brain.HANDSHAKE_ATTEMPTS} attempts")
         _log("handshake_failed", session=session,
-             attempts=brain.HANDSHAKE_ATTEMPTS, request=request_id)
+             attempts=brain.HANDSHAKE_ATTEMPTS, request=request_id,
+             consecutive=state.consecutive_handshake_failures)
         brain.clear_validation_marker(session)
         brain.cleanup_request(session, request_id)
         return False
@@ -637,37 +668,93 @@ def maybe_recycle(state: SessionState, now_local: datetime) -> None:
         return
 
     try:
-        spec = brain.spec_for_session(state.name)
         reason = "nightly" if nightly_due else "turns"
-        _log("recycle", session=state.name, reason=reason, turns=state.turns)
-
-        # Marker first, then the keystroke. A supervisor killed between the two
-        # drops the lock at process death and leaves no marker, so the next
-        # reader sees `no_marker`, falls back, and the next tick re-handshakes —
-        # rather than injecting into a session whose context has just gone.
-        brain.clear_validation_marker(state.name)
-
-        # Journal before clearing — the other order throws away the thing the
-        # journal was supposed to preserve.
-        landed = tmux_claude.inject(
-            f"Before anything else: append anything worth keeping to {journal_path()}, "
-            "then run /clear.", spec=spec)
-        if not landed:
-            # The marker is already gone — that is fine, it makes the next
-            # tick handshake this session, same as any other no_marker. But
-            # turns, last_recycle_day and last_recycle_at must not move: they
-            # are the bookkeeping for a recycle that landed, and advancing
-            # them here would make the supervisor think it recycled — and
-            # wait another CONTEXT_TURNS to try again — while the context was
-            # never actually cleared.
-            _log("recycle_inject_failed", session=state.name,
-                 error=tmux_claude.last_error())
+        if not _inject_recycle(state, reason):
             return
         state.turns = 0
         state.last_recycle_at = time.monotonic()
         if nightly_due:
             state.last_recycle_day = day
             save_recycle_state(state)
+    finally:
+        try:
+            lock.release()
+        except (RuntimeError, OSError):
+            pass
+
+
+def _inject_recycle(state: SessionState, reason: str) -> bool:
+    """Clear the marker and inject the journal-then-/clear turn. Caller holds
+    the single-flight lock and owns the post-recycle bookkeeping.
+
+    Returns whether the keystroke landed. On a failed inject the marker is
+    already gone — that is fine, it makes the next tick handshake this session,
+    same as any other no_marker — but the caller must NOT advance any recycle
+    bookkeeping, or the supervisor would believe it recycled while the context
+    was never cleared.
+    """
+    spec = brain.spec_for_session(state.name)
+    _log("recycle", session=state.name, reason=reason, turns=state.turns)
+
+    # Marker first, then the keystroke. A supervisor killed between the two
+    # drops the lock at process death and leaves no marker, so the next
+    # reader sees `no_marker`, falls back, and the next tick re-handshakes —
+    # rather than injecting into a session whose context has just gone.
+    brain.clear_validation_marker(state.name)
+
+    # Journal before clearing — the other order throws away the thing the
+    # journal was supposed to preserve.
+    landed = tmux_claude.inject(
+        f"Before anything else: append anything worth keeping to {journal_path()}, "
+        "then run /clear.", spec=spec)
+    if not landed:
+        _log("recycle_inject_failed", session=state.name,
+             error=tmux_claude.last_error())
+    return landed
+
+
+def maybe_self_heal(state: SessionState) -> None:
+    """Recycle a session that has failed too many handshakes in a row.
+
+    The recovery path for the degraded-session failure that run_handshake and
+    check_wedge both deliberately leave alone (see SELF_HEAL_HANDSHAKE_FAILURES).
+    Same idle+lock+journal/clear machinery as maybe_recycle, triggered by the
+    consecutive-failure counter rather than turn count — because a context reset
+    is what demonstrably recovers the "narrates the reply instead of running it"
+    state, and nothing else in the loop will.
+
+    Never mid-request, and non-blocking on the lock, for the same reasons
+    maybe_recycle is: a /clear between a nudge and a reply loses the request,
+    and stalling the supervisor for a caller's whole deadline is worse than
+    waiting for the next tick.
+    """
+    if state.consecutive_handshake_failures < SELF_HEAL_HANDSHAKE_FAILURES:
+        return
+    if not _is_idle(state):
+        return
+
+    lock = brain._lock_for(state.name)
+    if lock is None:
+        _log("self_heal_deferred", session=state.name, reason="filelock unavailable")
+        return
+    try:
+        lock.acquire(timeout=0)
+    except Exception:  # noqa: BLE001 - filelock's Timeout, or an OSError
+        _log("self_heal_deferred", session=state.name, reason="lock busy")
+        return
+
+    try:
+        _log("self_heal", session=state.name,
+             consecutive=state.consecutive_handshake_failures)
+        if not _inject_recycle(state, "self_heal"):
+            return
+        # A landed recycle is the recovery attempt. Reset the counter so the
+        # next window of failures is measured fresh against the cleared
+        # context, and reset turns/last_recycle_at exactly as maybe_recycle
+        # does — the context is gone either way.
+        state.turns = 0
+        state.last_recycle_at = time.monotonic()
+        state.consecutive_handshake_failures = 0
     finally:
         try:
             lock.release()
@@ -799,6 +886,17 @@ def tick(states: dict[str, SessionState]) -> None:
         _validate_one(live)
     except Exception as exc:  # noqa: BLE001
         _log("tick_error", session="_validate_one", error=str(exc))
+
+    # Self-heal after validation, so a handshake that just exhausted its
+    # attempts this tick is counted before we decide whether to recycle. A
+    # recycle here clears the marker; the health check below then reads
+    # no_marker and records neither success nor failure for this tick, which
+    # is correct — the session is mid-recovery, not healthy and not dead.
+    for state in live:
+        try:
+            maybe_self_heal(state)
+        except Exception as exc:  # noqa: BLE001
+            _log("tick_error", session=state.name, error=str(exc))
 
     # Health after validation, so a session validated this tick reports it
     # immediately. Conditional on the marker and never on the glyph: a
