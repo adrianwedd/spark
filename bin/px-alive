@@ -601,21 +601,30 @@ def release_px(px) -> None:
     # process exits; the MCU keeps driving servos in the meantime.
 
 
-def _with_acquire_heartbeat(fn):
-    """Run fn() while beating every HEARTBEAT_EVERY_S, for a blocking Picarx
-    construction that must never silently outlast the watchdog.
+def _with_heartbeat(fn):
+    """Run fn() while beating every HEARTBEAT_EVERY_S, for any blocking call
+    that must never silently outlast the watchdog.
 
-    make_px() blocks synchronously inside Picarx.__init__ (I2C), and the
-    first acquisition after ANY park (a foreign-lease wait at startup, or an
-    I2C-backoff reacquire) has no heartbeat protection of its own: the
-    pre-loop lease park beats every LEASE_RECHECK_S while parked, but the
-    moment the park ends and idle_loop resumes, nothing beats again until
-    the acquisition returns. Observed live 2026-08-21: a 7m53s "voice" GPIO
-    lease cleared, idle_loop resumed, and the very next acquisition went
-    silent long enough for systemd to kill the start (TimeoutStartSec) — a
-    genuine acquisition, not a wedge, but indistinguishable from one
-    without a beat inside the call. This closes that gap exactly the way
-    ease() already does for long servo motions.
+    Originally added for make_px(), which blocks synchronously inside
+    Picarx.__init__ (I2C): the first acquisition after ANY park (a
+    foreign-lease wait at startup, or an I2C-backoff reacquire) has no
+    heartbeat protection of its own — the pre-loop lease park beats every
+    LEASE_RECHECK_S while parked, but the moment the park ends and idle_loop
+    resumes, nothing beats again until the acquisition returns. Observed live
+    2026-08-21: a 7m53s "voice" GPIO lease cleared, idle_loop resumed, and the
+    very next acquisition went silent long enough for systemd to kill the
+    start (TimeoutStartSec) — a genuine acquisition, not a wedge.
+
+    Also wraps camera/GPIO teardown (stop_face_detection()'s
+    Vilib.camera_close(), drop_px()) for the same reason: Vilib's camera
+    close is a blocking call with no heartbeat of its own, and it runs on
+    every yield (SIGUSR1), every SIGTERM, and every loop exit. Observed live
+    2026-08-21, minutes after the make_px() fix above shipped: a routine
+    yield_alive from px-cron-say's tool_perform delivered SIGUSR1
+    successfully (confirming that fix), px-alive logged "stopping so it can
+    run" and began teardown, and 14s later systemd's watchdog killed it
+    anyway (SIGABRT) — the exact restart-storm shape, just relocated from
+    acquisition to teardown. This closes that gap the same way.
     """
     stop_beat = threading.Event()
 
@@ -762,7 +771,7 @@ def idle_loop(args) -> None:
     def get_px():
         nonlocal px, _force_next_reset
         if px is None:
-            px = _with_acquire_heartbeat(lambda: make_px(force_reset=_force_next_reset))
+            px = _with_heartbeat(lambda: make_px(force_reset=_force_next_reset))
             log(f"acquired Picarx handle (reset={'hard' if _force_next_reset else 'skipped'})")
             _force_next_reset = False
             # The acquisition that just returned is the one that can overrun
@@ -824,8 +833,7 @@ def idle_loop(args) -> None:
             # Check yield flag — clean exit between iterations (not mid-I2C)
             if _yield_requested:
                 log("SIGUSR1: tool needs GPIO — stopping so it can run")
-                drop_px()
-                stop_face_detection()
+                _with_heartbeat(lambda: (drop_px(), stop_face_detection()))
                 sys.exit(0)
 
             now = time.monotonic()
@@ -1021,9 +1029,7 @@ def idle_loop(args) -> None:
 
             time.sleep(0.5)
     finally:
-        drop_px()
-        if face_active:
-            stop_face_detection()
+        _with_heartbeat(lambda: (drop_px(), stop_face_detection() if face_active else None))
 
 
 def main(argv) -> int:
@@ -1074,7 +1080,7 @@ def main(argv) -> int:
     def _shutdown(sig, _frame):
         log(f"received signal {sig} — shutting down")
         _safe_unlink_pid()
-        stop_face_detection()  # release camera before process exit
+        _with_heartbeat(stop_face_detection)  # release camera before process exit
         sys.exit(0)  # finally block in idle_loop handles drop_px
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -1156,7 +1162,7 @@ def main(argv) -> int:
         return 1
     finally:
         if not args.no_face:
-            stop_face_detection()
+            _with_heartbeat(stop_face_detection)
         _safe_unlink_pid()
         log("stopped")
     return 0
