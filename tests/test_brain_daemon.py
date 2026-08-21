@@ -743,6 +743,74 @@ def test_a_failed_handshake_leaves_the_holder_attached(fake_tmux, _fast_handshak
     assert state.holder is holder
 
 
+def test_a_successful_handshake_resets_the_self_heal_counter(
+        fake_tmux, _fast_handshake, monkeypatch):
+    """The counter measures a *run* of failures; any real round trip proves the
+    session is answering again and starts it over."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    state = _state(session)
+    state.consecutive_handshake_failures = 2
+    assert brain_daemon.run_handshake(state, "no_marker") is True
+    assert state.consecutive_handshake_failures == 0
+
+
+def test_each_exhausted_handshake_increments_the_self_heal_counter(
+        fake_tmux, _fast_handshake, monkeypatch):
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject",
+                        _echo_when_nudged(fake_tmux, session, answer=False))
+
+    state = _state(session)
+    for expected in (1, 2, 3):
+        assert brain_daemon.run_handshake(state, "no_marker") is False
+        assert state.consecutive_handshake_failures == expected
+
+
+def test_self_heal_recycles_after_enough_consecutive_failures(fake_tmux):
+    """The recovery path behind the 4h43m outage: run_handshake never kills and
+    check_wedge keys only on a live caller request, so a context-degraded
+    session that fails every handshake has no escalation but this one. Once the
+    counter reaches the threshold, an idle session gets a journal+/clear."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+
+    state.consecutive_handshake_failures = brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES - 1
+    brain_daemon.maybe_self_heal(state)
+    assert not any("/clear" in text for _, text in fake_tmux.injected), \
+        "below the threshold, no recycle"
+
+    state.consecutive_handshake_failures = brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES
+    brain_daemon.maybe_self_heal(state)
+    assert any("/clear" in text for _, text in fake_tmux.injected), \
+        "at the threshold, the session is recycled to recover it"
+    assert state.consecutive_handshake_failures == 0, \
+        "the recycle is the recovery attempt; the next window is measured fresh"
+
+
+def test_self_heal_never_recycles_mid_request(fake_tmux):
+    """A /clear between a caller's nudge and its reply loses the request. Even
+    over the failure threshold, a live request withholds the self-heal."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    _write_current(session)  # a request is in flight
+    state = _state(session)
+    state.consecutive_handshake_failures = brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES + 5
+
+    brain_daemon.maybe_self_heal(state)
+    assert not any("/clear" in text for _, text in fake_tmux.injected)
+    assert state.consecutive_handshake_failures >= brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES, \
+        "a withheld self-heal must not reset the counter — the session is still degraded"
+
+
 def test_the_prompt_explains_the_handshake_with_the_placeholder():
     """A session that does not know how to answer a handshake cannot be
     validated, and the placeholder is the only spelling that is right in both

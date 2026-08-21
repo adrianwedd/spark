@@ -582,9 +582,18 @@ def _relax_lock_mode(session: str) -> None:
 
 
 def nudge_line(session: str, request_id: str) -> str:
+    # "reply with: <command>" was the old wording, and on 2026-08-20 a
+    # context-exhausted Haiku session took it literally for 4h43m: it typed
+    # the command into the pane as prose — 300+ times — and never once ran
+    # it. The pane rendered each one identically to a real call minus the
+    # result line, so the failure was invisible from outside. The words
+    # "with your Bash tool" are therefore load-bearing, and so is saying
+    # what typing it achieves (nothing). Pinned by
+    # test_the_nudge_says_to_run_the_reply_not_type_it.
     return (
         f"NEW REQUEST {inbox_dir(session)}/{request_id}.json — read it, do the "
-        f"work, then reply with: {TOOL_BRAIN_REPLY} {request_id} '<json>'"
+        f"work, then RUN this with your Bash tool (typing it as text delivers "
+        f"nothing): {TOOL_BRAIN_REPLY} {request_id} '<json>'"
     )
 
 
