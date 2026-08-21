@@ -181,10 +181,20 @@ def _dispatch_announce(text: str, private: bool = False) -> None:
     env["PX_ANNOUNCE_TEXT"] = text.strip()[:spark_config.ANNOUNCE_MAX_CHARS]
     if private:
         env["PX_ANNOUNCE_PRIVATE"] = "1"
+    # Non-blocking, but NOT into /dev/null. The tool emits one JSON status line
+    # (ok / suppressed / error with a reason); discarding it is what let a tool
+    # that aborted before emitting any JSON, or returned {"status":"error"},
+    # read identically to success in px-mind.log for weeks. Tee both streams to
+    # a dedicated log so an announce that never reaches the speaker leaves a
+    # trace. Fire-and-forget still: we do not block the cognitive loop on it.
     try:
+        log_path = LOG_DIR / "tool-announce.log"
+        out = open(log_path, "a", buffering=1)
+        out.write(f"--- dispatch {dt.datetime.now(HOBART_TZ).isoformat()} "
+                  f"private={private}\n")
         subprocess.Popen([str(BIN_DIR / "tool-announce")], env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log("expression: announce dispatched (non-blocking)")
+                         stdout=out, stderr=subprocess.STDOUT)
+        log(f"expression: announce dispatched (non-blocking; → {log_path.name})")
     except Exception as e:
         log(f"expression: announce dispatch failed: {e}")
 

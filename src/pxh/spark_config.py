@@ -27,9 +27,11 @@ ANNOUNCE_ENABLED         = True   # G1+G2 passed 2026-08-01: relay live on M5, W
 ANNOUNCE_RELAY_URL       = os.environ.get("PX_ANNOUNCE_RELAY_URL", "http://192.168.0.249:7862")   # IP, not M5.local (Nests can't resolve mDNS). .249 is M5-wifi's DHCP reservation (M5's wired leg keeps .100 if ever replugged). Verified at cutover: .249/health HTTP 200 in 51ms, .100 times out
 ANNOUNCE_VOICE           = "data"
 # v1: single entity to avoid multi-target echo; IDs pinned by gate G2.
+# media_player.googlehome1094 was removed 2026-08-21 — it 404s in Home
+# Assistant (the entity no longer exists), so allowing it only offered a
+# target that can never accept a cast.
 ANNOUNCE_DEFAULT_TARGETS = ["media_player.nest_hub_max"]
-ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.nest_mini",
-                            "media_player.googlehome1094"]
+ANNOUNCE_ALLOWED_TARGETS = ["media_player.nest_hub_max", "media_player.nest_mini"]
 ANNOUNCE_MEDIA_CONTENT_TYPE = "music"   # pinned by gate G2 ("music" vs "audio/wav")
 ANNOUNCE_MAX_CHARS       = 200    # ~15-20s audio; bounds synth time + URL/log size
 ANNOUNCE_CONNECT_TIMEOUT = 5      # fast-fail if relay/M5 down
