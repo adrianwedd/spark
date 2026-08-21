@@ -484,6 +484,60 @@ def test_long_servo_motion_keeps_heartbeating(isolated_project, tmp_path):
     assert len(beats) >= 4, f"only {len(beats)} heartbeats across a 20s ease"
 
 
+def test_acquire_heartbeat_keeps_beating_during_a_slow_picarx_construction(isolated_project, tmp_path):
+    """Picarx() acquisition must not go silent, even right after a park.
+
+    Observed live 2026-08-21: a 7m53s "voice" GPIO lease cleared, idle_loop
+    resumed, and the very next acquisition went silent long enough for
+    systemd to kill the start (TimeoutStartSec) — twice in a row. Unlike the
+    pre-loop lease park (which beats every LEASE_RECHECK_S), nothing beat
+    again once idle_loop resumed and called into make_px(). This is
+    legitimate acquisition time, not a wedge, so the fix is a heartbeat
+    around the blocking call — not a longer timeout.
+    """
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+
+    beats = []
+    alive["write_alive_heartbeat"] = lambda mode, now=None: beats.append(mode)
+    alive["HEARTBEAT_EVERY_S"] = 0.05  # real-time but fast, to keep the test quick
+
+    def _slow_acquire():
+        time.sleep(0.35)
+        return "picarx-handle"
+
+    result = alive["_with_acquire_heartbeat"](_slow_acquire)
+
+    assert result == "picarx-handle"
+    assert beats, "a 0.35s blocking acquisition produced no heartbeat at all"
+    assert set(beats) == {"acquiring_picarx"}
+    assert len(beats) >= 3, f"only {len(beats)} heartbeats across a 0.35s acquisition"
+
+
+def test_acquire_heartbeat_stops_beating_once_acquisition_returns(isolated_project, tmp_path):
+    """The beat thread must not linger or fire after the call completes."""
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+
+    beats = []
+    alive["write_alive_heartbeat"] = lambda mode, now=None: beats.append(mode)
+    alive["HEARTBEAT_EVERY_S"] = 0.05
+
+    alive["_with_acquire_heartbeat"](lambda: "fast")
+    count_at_return = len(beats)
+    time.sleep(0.3)  # several beat intervals — nothing should fire post-return
+
+    assert len(beats) == count_at_return, (
+        "heartbeat thread kept beating after the acquisition already returned"
+    )
+
+
 # --- lease_wait: yielding GPIO is not a reason to die ---
 #
 # Observed on the Pi: 47 of 111 px-alive restarts in 6h were *clean* exits
