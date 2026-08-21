@@ -1301,6 +1301,7 @@ import threading
 
 class _StubHandler(http.server.BaseHTTPRequestHandler):
     captured = []  # class-level capture: list of (method, path, body)
+    cast_status = 200  # HA play_media response code; a test may set 4xx/5xx
 
     def log_message(self, *a):  # silence
         pass
@@ -1326,7 +1327,8 @@ class _StubHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"audio_url": "http://192.168.0.100:7862/audio/abc123.wav",
                              "voice": "data", "cached": False, "duration_s": 1.2})
         else:  # HA play_media
-            self._send(200, [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])
+            self._send(_StubHandler.cast_status,
+                       [{"entity_id": "media_player.nest_hub_max", "state": "playing"}])
 
 
 def _start_stub():
@@ -1365,12 +1367,19 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     assert not (isolated_project["state_dir"] / "gpio_lease.json").exists()
 
 
-def test_tool_announce_borrows_matching_parent_gpio_lease(isolated_project):
-    """A nested voice tool may use, but must not clear, its inherited authority."""
+def test_tool_announce_ignores_gpio_leases(isolated_project):
+    """tool-announce touches no hardware, so it must not consult the GPIO lease
+    at all. The old lease check was the second half of the Nest regression: the
+    voice loop holds the 'voice' lease without exporting PX_GPIO_LEASE_ID, so an
+    announce raised on a voice turn saw a foreign lease and returned "GPIO
+    already leased" every time. Announce must now proceed regardless of any
+    lease, and must neither claim nor clear the store."""
     _StubHandler.captured = []
     srv = _start_stub()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     state_dir = isolated_project["state_dir"]
+    # A FOREIGN lease is held, and this process does NOT know its id — exactly
+    # the voice-loop situation that used to block the announce.
     lease = GpioLeaseStore(state_dir).acquire("voice", ttl_s=60)
     assert lease is not None
     env = isolated_project["env"].copy()
@@ -1384,16 +1393,53 @@ def test_tool_announce_borrows_matching_parent_gpio_lease(isolated_project):
         "PX_HA_TOKEN": "t",
         "PX_NIGHT_SILENCE_START_H": "99",
         "PX_NIGHT_SILENCE_END_H": "0",
-        "PX_GPIO_LEASE_ID": lease.lease_id,
     })
+    env.pop("PX_GPIO_LEASE_ID", None)
     try:
         payload = parse_json(run_tool(["bin/tool-announce"], env))
     finally:
         srv.shutdown()
 
-    assert payload["status"] == "ok"
+    assert payload["status"] == "ok", \
+        f"announce must proceed despite a foreign GPIO lease: {payload}"
+    assert payload["targets"] == ["media_player.nest_hub_max"]
+    # The foreign lease is left exactly as it was — announce neither took it
+    # nor released it.
     assert GpioLeaseStore(state_dir).current()["lease_id"] == lease.lease_id
-    assert not (state_dir / "exploring.json").exists()
+
+
+def test_tool_announce_surfaces_ha_cast_failure_reason(isolated_project):
+    """An HA cast error used to vanish into `except: pass`, so a bad token or a
+    renamed entity read identically to success. The reason (secret-free) must
+    now reach the payload."""
+    _StubHandler.captured = []
+    _StubHandler.cast_status = 500
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({
+        "PX_DRY": "0",
+        "PX_ANNOUNCE_TEXT": "Dinner is ready",
+        "PX_BYPASS_SUDO": "1",
+        "PX_ANNOUNCE_RELAY_URL": base,
+        "PX_HA_HOST": base,
+        "ANNOUNCE_RELAY_TOKEN": "t",
+        "PX_HA_TOKEN": "t",
+        "PX_NIGHT_SILENCE_START_H": "99",
+        "PX_NIGHT_SILENCE_END_H": "0",
+    })
+    try:
+        payload = parse_json(run_tool(["bin/tool-announce"], env))
+    finally:
+        srv.shutdown()
+        _StubHandler.cast_status = 200  # restore for other tests
+
+    assert payload["status"] == "error"
+    assert payload["error"] == "no target accepted the cast"
+    reasons = payload.get("cast_errors", {})
+    assert "media_player.nest_hub_max" in reasons, \
+        f"the failing entity's reason must be preserved: {payload}"
+    assert "500" in reasons["media_player.nest_hub_max"]
 
 
 def _run_announce_against_stub(isolated_project, text, *, private):

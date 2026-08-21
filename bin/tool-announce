@@ -5,10 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
-# Slow synth: release px-alive so it doesn't kill us mid-call (skip in dry).
-if [[ "${PX_DRY:-0}" == "0" ]]; then
-    yield_alive
-fi
+# This tool touches NO hardware — it synthesises audio on the M5 relay over
+# HTTP and asks Home Assistant to cast a URL. It deliberately does NOT call
+# yield_alive and does NOT take a GPIO lease. Both were inherited ceremony
+# that only ever failed the tool:
+#
+#   * yield_alive: since #250 it returns non-zero when it cannot confirm
+#     px-alive exited, and `set -e` then aborts this script *before the Python
+#     heredoc emits any JSON* — the one thing every tool must always do. And a
+#     `pi`-invoked announce cannot even signal px-alive, which runs as root:
+#     the `kill -USR1` gets EPERM. There is no GPIO to protect here anyway.
+#   * the GPIO lease: the voice loop holds the "voice" lease without exporting
+#     PX_GPIO_LEASE_ID, so the lease check saw a foreign lease and returned
+#     "GPIO already leased" on every voice-initiated announce — i.e. always.
+#     A network call needs no lease.
+#
+# Pinned by test_tool_announce_needs_no_gpio_ceremony.
 
 python - "$@" <<'PY'
 """Tool wrapper: synth text on the M5 relay, then cast to a single Nest via HA."""
@@ -18,14 +30,12 @@ import datetime as dt
 import http.client
 import json
 import os
-import signal
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.state import update_session
 from pxh import policy
 from pxh import spark_config as cfg
@@ -131,6 +141,16 @@ def _ha_cast(entity_id: str, audio_url: str, ha_base: str, ha_token: str) -> boo
         return 200 <= resp.status < 300
 
 
+def _cast_error_reason(exc: Exception) -> str:
+    """A short, secret-free reason a cast failed. The HA response body can
+    echo the request, so we keep only status/reason, never the raw body."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code} {exc.reason}"
+    if isinstance(exc, urllib.error.URLError):
+        return f"unreachable: {exc.reason}"
+    return type(exc).__name__
+
+
 def main() -> int:
     text = (os.environ.get("PX_ANNOUNCE_TEXT") or "").strip()
     dry = os.environ.get("PX_DRY", "0") != "0"
@@ -155,83 +175,73 @@ def main() -> int:
     relay_token = os.environ.get("ANNOUNCE_RELAY_TOKEN", "")
     ha_token = os.environ.get("PX_HA_TOKEN", "")
 
-    store = GpioLeaseStore(STATE_DIR)
-    inherited_token = os.environ.get("PX_GPIO_LEASE_ID")
-    current = store.current()
-    borrowed = bool(
-        current
-        and inherited_token
-        and current.get("lease_id") == inherited_token
-    )
-    gpio_guard = None
-    if current and not borrowed:
-        return _emit({"status": "error", "error": "GPIO already leased"})
-    if not borrowed:
-        gpio_guard = GpioLeaseGuard(
-            store,
-            "announce",
-            on_lost=lambda: os.kill(os.getpid(), signal.SIGTERM),
-        )
-        if not gpio_guard.acquire():
-            return _emit({"status": "error", "error": "GPIO already leased"})
+    # 1) synth on the relay
     try:
-        # 1) synth on the relay
+        result = _post_json(
+            f"{cfg.ANNOUNCE_RELAY_URL}/announce",
+            {"text": text[:cfg.ANNOUNCE_MAX_CHARS], "voice": cfg.ANNOUNCE_VOICE,
+             "cache": not private},
+            {"Authorization": f"Bearer {relay_token}"},
+            cfg.ANNOUNCE_CONNECT_TIMEOUT, cfg.ANNOUNCE_READ_TIMEOUT,
+        )
+    except _RelayHTTPError as e:
+        return _emit({"status": "error", "error": f"relay {e.status}: {e.detail}"})
+    except (OSError, ValueError, http.client.HTTPException, urllib.error.URLError) as e:
+        # OSError covers connect timeout/refused; ValueError covers a non-JSON body.
+        return _emit({"status": "error", "error": f"relay unreachable: {e}"})
+
+    audio_url = result.get("audio_url")
+    if not audio_url:
+        return _emit({"status": "error", "error": f"relay returned no audio_url: {result}"})
+
+    # 2) cast to each resolved target (single in v1); skip unavailable
+    cast_ok = []
+    cast_errors: dict[str, str] = {}
+    for entity in targets:
+        state = _ha_state(entity, cfg.HA_BASE_URL, ha_token)
+        if state == "unavailable":
+            # Preserved rather than silently skipped — an entity that is
+            # unavailable at cast time is the single most likely reason a
+            # working relay produces silence, and swallowing it is what made
+            # the last regression invisible.
+            cast_errors[entity] = "entity unavailable"
+            continue
+        if state == "playing":
+            pass  # destructive to current playback (documented v1 behavior)
         try:
-            result = _post_json(
-                f"{cfg.ANNOUNCE_RELAY_URL}/announce",
-                {"text": text[:cfg.ANNOUNCE_MAX_CHARS], "voice": cfg.ANNOUNCE_VOICE,
-                 "cache": not private},
-                {"Authorization": f"Bearer {relay_token}"},
-                cfg.ANNOUNCE_CONNECT_TIMEOUT, cfg.ANNOUNCE_READ_TIMEOUT,
-            )
-        except _RelayHTTPError as e:
-            return _emit({"status": "error", "error": f"relay {e.status}: {e.detail}"})
-        except (OSError, ValueError, http.client.HTTPException, urllib.error.URLError) as e:
-            # OSError covers connect timeout/refused; ValueError covers a non-JSON body.
-            return _emit({"status": "error", "error": f"relay unreachable: {e}"})
+            if _ha_cast(entity, audio_url, cfg.HA_BASE_URL, ha_token):
+                cast_ok.append(entity)
+            else:
+                cast_errors[entity] = "cast returned non-2xx"
+        except Exception as e:  # noqa: BLE001 - best-effort per target, reason kept
+            # The reason is preserved (secret-free) instead of discarded — an
+            # HA 401/404/500/timeout used to vanish into `except: pass`, so a
+            # broken token or a renamed entity looked identical to success.
+            cast_errors[entity] = _cast_error_reason(e)
 
-        audio_url = result.get("audio_url")
-        if not audio_url:
-            return _emit({"status": "error", "error": f"relay returned no audio_url: {result}"})
-
-        # 2) cast to each resolved target (single in v1); skip unavailable
-        cast_ok = []
-        for entity in targets:
-            state = _ha_state(entity, cfg.HA_BASE_URL, ha_token)
-            if state == "unavailable":
-                continue  # skip + log via payload below
-            if state == "playing":
-                pass  # destructive to current playback (documented v1 behavior)
-            try:
-                if _ha_cast(entity, audio_url, cfg.HA_BASE_URL, ha_token):
-                    cast_ok.append(entity)
-            except Exception:
-                pass  # best-effort per target
-
-        payload = {
-            "status": "ok" if cast_ok else "error",
-            "audio_url": audio_url,
-            "targets": cast_ok,
-            "voice": result.get("voice", cfg.ANNOUNCE_VOICE),
-            "cached": result.get("cached"),
-            "duration_s": result.get("duration_s"),
-        }
-        if not cast_ok:
-            payload["error"] = "no target accepted the cast"
-        try:
-            # Private DMs (message_obi) must not leave their text in session
-            # bookkeeping — redact, mirroring the thoughts-log redaction in mind.py.
-            hist_text = "[private message to Obi]" if private else text[:80]
-            update_session(
-                fields={"last_action": "tool_announce"},
-                history_entry={"event": "announce", "targets": cast_ok, "text": hist_text},
-            )
-        except Exception:
-            pass   # session bookkeeping must never break the announce contract
-        return _emit(payload)
-    finally:
-        if gpio_guard is not None:
-            gpio_guard.release()
+    payload = {
+        "status": "ok" if cast_ok else "error",
+        "audio_url": audio_url,
+        "targets": cast_ok,
+        "voice": result.get("voice", cfg.ANNOUNCE_VOICE),
+        "cached": result.get("cached"),
+        "duration_s": result.get("duration_s"),
+    }
+    if cast_errors:
+        payload["cast_errors"] = cast_errors
+    if not cast_ok:
+        payload["error"] = "no target accepted the cast"
+    try:
+        # Private DMs (message_obi) must not leave their text in session
+        # bookkeeping — redact, mirroring the thoughts-log redaction in mind.py.
+        hist_text = "[private message to Obi]" if private else text[:80]
+        update_session(
+            fields={"last_action": "tool_announce"},
+            history_entry={"event": "announce", "targets": cast_ok, "text": hist_text},
+        )
+    except Exception:
+        pass   # session bookkeeping must never break the announce contract
+    return _emit(payload)
 
 
 if __name__ == "__main__":
