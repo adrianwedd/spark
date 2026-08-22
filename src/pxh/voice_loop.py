@@ -737,8 +737,14 @@ def acknowledge_unavailable(dry_run: bool = False) -> bool:
     acknowledgement is not an exemption from the dysregulation protocol — if
     policy says no audio, the correct outcome here is still silence.
 
-    Only reached under an active wake grant (checked by the caller), because
-    this answers a direct summons and nothing else.
+    Deliberately carries no wake-grant precondition of its own: the caller
+    only reaches this path after a voice turn was actually dispatched, so a
+    summons already happened. Re-checking wake_grant_active() here would ask
+    whether a *window* is still open after the very delay that can close it —
+    the brain is slowest exactly when it is saturated, which is also when the
+    grant is most likely to have aged out. This line is gated the same way any
+    other interactive reply is: quiet mode, night silence and on-call still
+    apply, and a live grant still overrides them when one is present.
     """
     action = {"tool": "tool_voice", "params": {"text": VOICE_UNAVAILABLE_ACK}}
     try:
@@ -1272,14 +1278,20 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         if rc == VOICE_BRAIN_UNAVAILABLE:
             # Acknowledge and stop. Not `continue`: another lap would re-ask a
             # brain we just established cannot answer, which is the escalation
-            # this whole change exists to remove. The wake grant is what makes
-            # this a direct summons rather than SPARK volunteering; without one
-            # there is nobody waiting and the right answer is silence.
+            # this whole change exists to remove.
+            #
+            # No wake-grant precondition here: this turn only exists because
+            # something already dispatched a prompt to the brain, so a live
+            # summons is not in question. Gating on a *fresh* wake_grant_active()
+            # read at this point would fail exactly when it matters most — a
+            # slow, saturated brain is the same delay that ages a grant out —
+            # turning the one timeout this line exists to answer into silence.
+            # acknowledge_unavailable() still goes through validate_action(), so
+            # quiet mode, night silence and on-call bind this line exactly as
+            # they bind any other interactive speech; a live grant there still
+            # overrides them, same as it would for a real answer.
             print(f"[voice-loop] {stderr.strip()}")
-            if policy_context.wake_grant_active():
-                acknowledge_unavailable(args.dry_run)
-            else:
-                print("[voice-loop] no active wake grant; staying silent")
+            acknowledge_unavailable(args.dry_run)
             break
 
         if rc != 0:
