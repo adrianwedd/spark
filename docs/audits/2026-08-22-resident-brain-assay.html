@@ -1,0 +1,496 @@
+<title>Resident Brain Assay</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg: #0f1214;
+  --surface: #171b1e;
+  --surface-2: #1d2226;
+  --border: #2a3136;
+  --text: #e8ecee;
+  --text-dim: #9aa5ab;
+  --text-faint: #6b757a;
+  --accent: #5fd3c4;
+  --accent-dim: #3a7d74;
+  --good: #7ecb7e;
+  --good-bg: rgba(126,203,126,0.1);
+  --bad: #e0685c;
+  --bad-bg: rgba(224,104,92,0.1);
+  --warn: #e0b84c;
+  --warn-bg: rgba(224,184,76,0.1);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f5f2;
+    --surface: #ffffff;
+    --surface-2: #eeece7;
+    --border: #d8d5cd;
+    --text: #1b1e1f;
+    --text-dim: #56605f;
+    --text-faint: #8a938f;
+    --accent: #1f8f80;
+    --accent-dim: #bfe8e1;
+    --good: #2d8a2d;
+    --good-bg: rgba(45,138,45,0.08);
+    --bad: #b8352a;
+    --bad-bg: rgba(184,53,42,0.08);
+    --warn: #966a10;
+    --warn-bg: rgba(150,106,16,0.1);
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f5f2;
+  --surface: #ffffff;
+  --surface-2: #eeece7;
+  --border: #d8d5cd;
+  --text: #1b1e1f;
+  --text-dim: #56605f;
+  --text-faint: #8a938f;
+  --accent: #1f8f80;
+  --accent-dim: #bfe8e1;
+  --good: #2d8a2d;
+  --good-bg: rgba(45,138,45,0.08);
+  --bad: #b8352a;
+  --bad-bg: rgba(184,53,42,0.08);
+  --warn: #966a10;
+  --warn-bg: rgba(150,106,16,0.1);
+}
+:root[data-theme="dark"] {
+  --bg: #0f1214;
+  --surface: #171b1e;
+  --surface-2: #1d2226;
+  --border: #2a3136;
+  --text: #e8ecee;
+  --text-dim: #9aa5ab;
+  --text-faint: #6b757a;
+  --accent: #5fd3c4;
+  --accent-dim: #3a7d74;
+  --good: #7ecb7e;
+  --good-bg: rgba(126,203,126,0.1);
+  --bad: #e0685c;
+  --bad-bg: rgba(224,104,92,0.1);
+  --warn: #e0b84c;
+  --warn-bg: rgba(224,184,76,0.1);
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  margin: 0;
+  padding: 0 1.5rem 6rem;
+  line-height: 1.55;
+}
+.wrap { max-width: 880px; margin: 0 auto; }
+.mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+
+/* ── Header ───────────────────────────────────────── */
+header {
+  padding: 3rem 0 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+.eyebrow {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  display: flex;
+  gap: 0.6em;
+  align-items: baseline;
+}
+.eyebrow .sep { color: var(--text-faint); }
+h1 {
+  font-size: clamp(1.6rem, 4vw, 2.3rem);
+  font-weight: 700;
+  margin: 0.5rem 0 0.6rem;
+  text-wrap: balance;
+  letter-spacing: -0.01em;
+}
+.subhead { color: var(--text-dim); font-size: 1rem; max-width: 62ch; }
+.subhead code { font-family: 'IBM Plex Mono', monospace; font-size: 0.9em; color: var(--accent); }
+
+/* ── Sections ─────────────────────────────────────── */
+section { padding: 2.4rem 0; border-bottom: 1px solid var(--border); }
+section:last-of-type { border-bottom: none; }
+.sec-label {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 0.9rem;
+}
+h2 {
+  font-size: 1.3rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+  letter-spacing: -0.005em;
+}
+p { color: var(--text-dim); margin: 0.7rem 0; max-width: 68ch; }
+p.lead { color: var(--text); font-size: 1.05rem; }
+strong { color: var(--text); font-weight: 600; }
+
+/* ── Verdict card ─────────────────────────────────── */
+.verdict {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 1.4rem 1.6rem;
+  margin: 1.2rem 0;
+}
+.verdict .tag {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+  display: block;
+}
+.verdict p { color: var(--text); font-size: 1.02rem; margin: 0.5rem 0; }
+
+/* ── Tables ───────────────────────────────────────── */
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 4px; }
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; min-width: 560px; }
+thead th {
+  text-align: left;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: var(--surface-2);
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+tbody td {
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  vertical-align: top;
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: var(--surface-2); }
+td.num, th.num { font-family: 'IBM Plex Mono', monospace; font-variant-numeric: tabular-nums; text-align: right; }
+td.name { color: var(--text); font-weight: 500; }
+.pill {
+  display: inline-block;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem;
+  padding: 0.15em 0.55em;
+  border-radius: 3px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.pill.good { background: var(--good-bg); color: var(--good); }
+.pill.bad  { background: var(--bad-bg); color: var(--bad); }
+.pill.warn { background: var(--warn-bg); color: var(--warn); }
+
+/* ── Latency strip chart ──────────────────────────── */
+.chart { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 1.3rem 1.4rem 1rem; margin: 1rem 0; }
+.chart-title { font-family: 'IBM Plex Mono', monospace; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 0.9rem; }
+.strip-row { display: flex; align-items: center; gap: 0.8rem; margin: 0.55rem 0; }
+.strip-label { width: 110px; flex-shrink: 0; font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; color: var(--text-dim); text-align: right; }
+.strip-track { position: relative; flex: 1; height: 22px; background: var(--surface-2); border-radius: 3px; }
+.strip-deadline { position: absolute; top: -4px; bottom: -4px; width: 1px; background: var(--warn); opacity: 0.6; }
+.strip-deadline::after {
+  content: attr(data-label);
+  position: absolute; top: -16px; left: 50%; transform: translateX(-50%);
+  font-family: 'IBM Plex Mono', monospace; font-size: 0.6rem; color: var(--warn); white-space: nowrap;
+}
+.dot {
+  position: absolute; top: 50%; width: 9px; height: 9px; border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid var(--bg);
+}
+.dot.ok { background: var(--accent); }
+.dot.fail { background: var(--bad); }
+.chart-axis { display: flex; justify-content: space-between; margin-top: 0.4rem; padding-left: 122px; }
+.chart-axis span { font-family: 'IBM Plex Mono', monospace; font-size: 0.65rem; color: var(--text-faint); }
+.chart-legend { display: flex; gap: 1.4rem; margin-top: 1rem; padding-left: 122px; }
+.chart-legend .item { display: flex; align-items: center; gap: 0.4rem; font-family: 'IBM Plex Mono', monospace; font-size: 0.68rem; color: var(--text-dim); }
+.chart-legend .sw { width: 8px; height: 8px; border-radius: 50%; }
+
+/* ── Two-col observation/inference ───────────────── */
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+@media (max-width: 640px) { .split { grid-template-columns: 1fr; } }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1.1rem 1.3rem;
+}
+.card h3 {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin: 0 0 0.8rem;
+}
+.card.obs h3 { color: var(--text-dim); }
+.card.inf h3 { color: var(--accent); }
+.card ul { margin: 0; padding-left: 1.1rem; }
+.card li { color: var(--text-dim); font-size: 0.88rem; margin: 0.55rem 0; }
+.card li::marker { color: var(--text-faint); }
+
+/* ── Defect list ─────────────────────────────────── */
+.defect { display: flex; gap: 0.9rem; padding: 0.85rem 0; border-bottom: 1px solid var(--border); }
+.defect:last-child { border-bottom: none; }
+.defect .sev { flex-shrink: 0; width: 78px; }
+.defect .body h4 { margin: 0 0 0.25rem; font-size: 0.92rem; color: var(--text); font-weight: 600; }
+.defect .body p { margin: 0; font-size: 0.85rem; }
+.defect .body .meta { font-family: 'IBM Plex Mono', monospace; font-size: 0.68rem; color: var(--text-faint); margin-top: 0.35rem; }
+
+/* ── Experiment box ──────────────────────────────── */
+.experiment {
+  background: linear-gradient(180deg, var(--surface) 0%, var(--surface-2) 100%);
+  border: 1px solid var(--accent-dim);
+  border-radius: 4px;
+  padding: 1.4rem 1.6rem;
+}
+.experiment .tag { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.experiment p { color: var(--text); }
+.experiment .falsify { margin-top: 0.9rem; padding-top: 0.9rem; border-top: 1px dashed var(--border); }
+.experiment .falsify .k { font-family: 'IBM Plex Mono', monospace; font-size: 0.68rem; color: var(--warn); text-transform: uppercase; letter-spacing: 0.08em; }
+
+footer { padding: 2rem 0 1rem; color: var(--text-faint); font-size: 0.78rem; font-family: 'IBM Plex Mono', monospace; }
+a { color: var(--accent); }
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="eyebrow"><span>SPARK · REGRESSION ASSAY</span><span class="sep">/</span><span>2026-08-22</span></div>
+  <h1>Did the resident brain make SPARK worse?</h1>
+  <p class="subhead">Master (<code>05629e79</code>) vs. the pre-resident cold-start bridge (<code>3084368b</code>), measured three ways: cognition in isolation, a from-scratch minimal resident harness, and live behaviour on the actual robot.</p>
+</header>
+
+<section>
+  <div class="sec-label">01 — Verdict</div>
+  <div class="verdict">
+    <span class="tag">Recommendation: Retain current architecture, fix one narrow regression</span>
+    <p>On identical prompts, the resident brain answered <strong>faster</strong> (18.8s vs 30.2s median) and <strong>more correctly</strong> (it recalled a fact it was told 90 seconds earlier; the cold-start bridge confidently denied ever being told). The resident architecture isn't the liability — a <em>naive</em> resident session is: a from-scratch minimal harness with zero SPARK-specific engineering never once delivered a reply through its own designated channel, in 14 for 14 turns. Production's hardening is what separates a working resident brain from a non-functional one.</p>
+    <p>The one clear, narrow regression: when the resident brain does time out, current master can now fail <strong>silently</strong> (a new wake-grant gate suppresses even the fallback acknowledgment without a live wake event), where the old build always spoke <em>something</em>. That's fixable without touching the architecture — see §06.</p>
+  </div>
+</section>
+
+<section>
+  <div class="sec-label">02 — Layer A · Cognition path, isolated</div>
+  <h2>Same prompt, same system prompt, two backends</h2>
+  <p class="lead"><code class="mono">build_model_prompt()</code> and <code class="mono">docs/prompts/claude-voice-system.md</code> are byte-identical between the two revisions (confirmed by diff) — so this is a genuine single-variable test: resident brain call vs. cold <code class="mono">claude -p</code> subprocess, nothing else different. No tool execution, no audio policy.</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr>
+        <th>Backend</th><th class="num">Success</th><th class="num">Malformed</th>
+        <th class="num">Median</th><th class="num">Mean</th><th class="num">p90</th><th class="num">Max</th>
+        <th>Declared budget</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td class="name">master · resident brain</td>
+          <td class="num"><span class="pill good">13 / 14</span></td>
+          <td class="num">0</td>
+          <td class="num">18.8s</td><td class="num">23.0s</td><td class="num">39.3s</td><td class="num">86.5s</td>
+          <td>45s (voice_turn) — <span style="color:var(--bad)">exceeded once, 1.9×</span></td>
+        </tr>
+        <tr>
+          <td class="name">3084368b · cold claude‑voice‑bridge</td>
+          <td class="num"><span class="pill good">13 / 14</span></td>
+          <td class="num">0</td>
+          <td class="num">30.2s</td><td class="num">34.9s</td><td class="num">61.0s</td><td class="num">120.1s</td>
+          <td><span style="color:var(--warn)">none declared</span> — harness capped at 120s</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="chart">
+    <div class="chart-title">Per-prompt latency (14 identical prompts, both backends) — dashed line is the resident brain's own declared 45s budget</div>
+
+    <div class="strip-row">
+      <div class="strip-label">master</div>
+      <div class="strip-track" id="track-master"></div>
+    </div>
+    <div class="strip-row">
+      <div class="strip-label">old bridge</div>
+      <div class="strip-track" id="track-old"></div>
+    </div>
+    <div class="chart-axis"><span>0s</span><span>30s</span><span>60s</span><span>90s</span><span>120s</span></div>
+    <div class="chart-legend">
+      <div class="item"><span class="sw" style="background:var(--accent)"></span>delivered a valid action</div>
+      <div class="item"><span class="sw" style="background:var(--bad)"></span>failed / no answer</div>
+    </div>
+  </div>
+
+  <p><strong>The one qualitative finding that matters more than any latency number:</strong> asked "what's my favourite colour?" twice, immediately after being told "my favourite colour is teal" — the resident brain issued <code class="mono">tool_recall</code> both times, the correct action regardless of conversation memory. The cold bridge issued <code class="mono">tool_perform</code> with a fabricated denial both times: <em>"I don't actually have that saved anywhere, Obi."</em> It had, three turns earlier, correctly called <code class="mono">tool_remember</code> on the same fact — the old build didn't lose the memory, it never tried to look it up, and answered confidently anyway.</p>
+</section>
+
+<section>
+  <div class="sec-label">03 — Layer C · Minimal resident, built from scratch</div>
+  <h2>Is "resident" the problem, or is it SPARK's specific implementation?</h2>
+  <p class="lead">A dedicated tmux session, empty cwd, no project CLAUDE.md, the same conversational system prompt as Layer A plus one instruction ("reply by running this script"), one tool in its allowlist, direct request→response — the smallest resident Claude Code harness that could answer the same 14 prompts.</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Metric</th><th class="num">Result</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Turns where the designated reply tool was called</td><td class="num"><span class="pill bad">0 / 14</span></td></tr>
+        <tr><td class="name">Turns answered directly in the chat pane instead</td><td class="num"><span class="pill warn">14 / 14</span></td></tr>
+        <tr><td class="name">Caller-facing success (what a real program watching for the reply would see)</td><td class="num"><span class="pill bad">0 / 14</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>This is the exact failure mode that caused the real 4h43m production outage (#226): the model narrates a well-formed answer instead of executing the tool that delivers it. It happened on <strong>every single turn</strong>, with zero SPARK complexity in the way — no reflection, no vision, no multi-kind routing, no large system prompt. The content was usually good (it correctly asked for wheels-on-blocks confirmation before a drive request it was never told was safe), but none of it ever reached a caller.</p>
+  <p>Read against Layer A, where the production <code class="mono">spark-brain</code> setup delivered 13/14 through its tool: <strong>the gap between 0% and 93% is entirely the hardening already sitting on top of the base architecture</strong> — the exact reply-tool wording, the absolute-path rule, the "reply exactly once" instruction, the mailbox protocol. That hardening is the product of fixing #226 the first time. Reverting the architecture would not remove this failure mode; it would remove the fix for it.</p>
+</section>
+
+<section>
+  <div class="sec-label">04 — Layer B · The actual robot, today</div>
+  <h2>When you say "Hey Spark," what happens before cognition even starts</h2>
+  <p>A genuine wake-word detection at <span class="mono">15:23:18</span> — vosk heard "hey spark" correctly. What followed was upstream of everything measured in §02–03:</p>
+
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th class="num">t+</th><th>Event</th></tr></thead>
+      <tbody>
+        <tr><td class="num">0.0s</td><td>Wake word detected, grant opened</td></tr>
+        <tr><td class="num">+3s</td><td><span class="pill bad">enable_speaker() timed out</span> after 3.0s</td></tr>
+        <tr><td class="num">+14s</td><td>Recording finally starts (unexplained gap)</td></tr>
+        <tr><td class="num">+17s</td><td>3.0s of audio captured — mostly silence (rms 134, peak 673)</td></tr>
+        <tr><td class="num">+24s</td><td>STT hallucinates a 1-word "i", falls through, returns empty</td></tr>
+        <tr><td class="num">+28s</td><td>Empty transcript — conversation aborted, brain never asked</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The resident-vs-cold-start question was never engaged: <code class="mono">run_conversation()</code> returns immediately on an empty transcript, before either backend would be called. This is a real, live defect in the wake/STT capture stage — but that stage is <strong>byte-identical</strong> between 3084368b and HEAD (confirmed in the 116-file diff), so it is not attributable to the resident-brain migration. It would very likely reproduce the same way on the old build.</p>
+
+  <p><strong>A second real attempt, minutes later, worked end to end.</strong> Wake detected at <span class="mono">15:34:15</span>, this time recording started immediately (no repeat of the 14s gap), captured a real utterance, and ran two full conversation turns through the actual production stack — wake → STT → <code class="mono">spark-brain</code> (kind <code class="mono">voice_turn</code>) → policy → spoken reply — both completing with <code class="mono">voice loop rc=0</code>. The three underlying brain replies logged during it took 10.5s, 14.3s and 9.3s: well inside budget, consistent with Layer A's median. So the empty-transcript failure in the first attempt was a real but intermittent fault, not a standing block — current master can and does complete a genuine "Hey Spark" round trip today.</p>
+</section>
+
+<section>
+  <div class="sec-label">05 — Observations vs. causal inference</div>
+  <div class="split">
+    <div class="card obs">
+      <h3>Observed (facts)</h3>
+      <ul>
+        <li>Resident brain: 13/14 success, median 18.8s, one 86.5s outlier that broke its own declared 45s budget.</li>
+        <li>Cold bridge: 13/14 success, median 30.2s, one 120.1s hang against no declared budget at all.</li>
+        <li>Cold bridge fabricated a false "I don't know that" twice on a fact it had correctly stored moments earlier.</li>
+        <li>A from-scratch minimal resident harness delivered 0/14 replies through its designated channel, always narrating in the pane instead.</li>
+        <li>A real wake event today produced an empty transcript before cognition was ever reached; wake/STT code is unchanged since 3084368b.</li>
+        <li>A second real wake event minutes later completed two full turns end to end (rc=0 both times), with brain replies at 10.5s / 14.3s / 9.3s — comfortably on budget.</li>
+        <li>11 <code class="mono">voice_turn</code> brain-timeout/unavailable events logged in production today before this test began; 517 since 2026-08-17.</li>
+        <li>20-minute idle soak on master: load falling, memory/swap flat, all services active, brain marker stayed validated throughout.</li>
+      </ul>
+    </div>
+    <div class="card inf">
+      <h3>Causal candidates (not proven)</h3>
+      <ul>
+        <li>The resident brain's tail latency (the 86.5s call) may be queueing/contention on the single-flight session lock shared with reflection and other kinds — not measured directly here.</li>
+        <li>The cold bridge's memory fabrication is plausibly a generic cold-model tendency to answer conversationally rather than invoke a lookup tool when no execution history is visible to it — the same broad tendency as Layer C's narration failure, in a different direction.</li>
+        <li>The wake/STT capture gap (enable_speaker timeout + ~14s delay) may be resource contention from the concurrent testing load this session was already generating — not isolated as the sole cause.</li>
+        <li>The new <code class="mono">wake_grant</code> gate turning a slow-brain failure into total silence is a design choice, not a bug — but it changes the old build's "always says something, eventually" property into "sometimes says nothing at all."</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-label">06 — Product defects on the record (kept out of the A/B verdict)</div>
+  <p>Real, currently live, and independent of which cognition backend runs — none of these were fixed during this assay.</p>
+
+  <div class="defect">
+    <div class="sev"><span class="pill warn">wake/stt</span></div>
+    <div class="body"><h4>enable_speaker() timeout + capture gap on real wake events</h4>
+      <p>3s subprocess timeout followed by a ~14s unexplained gap before recording starts — found live today, §04. Present in code unchanged since before the resident brain.</p>
+      <div class="meta">bin/px-wake-listen · new finding, 2026-08-22</div>
+    </div>
+  </div>
+  <div class="defect">
+    <div class="sev"><span class="pill bad">brain</span></div>
+    <div class="body"><h4>voice_turn tail latency exceeds its own declared budget</h4>
+      <p>45s budget, observed up to 86.5s in a controlled test; 517 timeout/unavailable events logged since 2026-08-17, 11 on the day of this test alone before testing began.</p>
+      <div class="meta">src/pxh/brain.py · pre-existing, ongoing</div>
+    </div>
+  </div>
+  <div class="defect">
+    <div class="sev"><span class="pill bad">announce</span></div>
+    <div class="body"><h4>Nest relay rejects every request — 401 bad token</h4>
+      <p>Relay itself is healthy (confirmed via its own health endpoint); the configured token no longer matches.</p>
+      <div class="meta">bin/tool-announce · confirmed live today</div>
+    </div>
+  </div>
+  <div class="defect">
+    <div class="sev"><span class="pill warn">tool-look</span></div>
+    <div class="body"><h4>Direct invocation hangs indefinitely</h4>
+      <p>No output, no error, no timeout at the tool level. Masked in real usage only by the voice loop's own caller-side timeout wrapper.</p>
+      <div class="meta">bin/tool-look · confirmed live today</div>
+    </div>
+  </div>
+  <div class="defect">
+    <div class="sev"><span class="pill warn">logging</span></div>
+    <div class="body"><h4>Root-owned log lock blocks pi-user tool logging</h4>
+      <p><code class="mono">logs/tool-drive.log.rotlock</code> owned by root from a prior root-context run; blocks the <code>pi</code> user, who owns every real invocation of this tool.</p>
+      <div class="meta">logs/tool-drive.log.rotlock · pre-existing</div>
+    </div>
+  </div>
+  <div class="defect">
+    <div class="sev"><span class="pill warn">quiet mode</span></div>
+    <div class="body"><h4>spark_quiet_mode stuck true, origin unrecoverable</h4>
+      <p>Known issue (#209) — history ring is only 7.5h, dashboard PATCH logs nothing. Correctly suppressing audio throughout this assay; not cleared or guessed at.</p>
+      <div class="meta">state/session.json · pre-existing</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sec-label">07 — Smallest experiment that could falsify this recommendation</div>
+  <div class="experiment">
+    <span class="tag">Next step</span>
+    <p>Instrument the real base rate and root cause of the <code class="mono">voice_turn</code> tail-latency failures (§06) across a week of actual family use — not synthetic back-to-back calls, which may themselves induce contention this assay can't distinguish from a structural issue. Specifically: does elapsed time correlate with concurrent reflection/other-kind traffic on the same single-flight lock, or with session context size approaching a recycle boundary?</p>
+    <div class="falsify">
+      <span class="k">This recommendation is wrong if</span>
+      <p style="margin-top:0.4rem">the real-world base rate turns out far higher than the ~1-in-14 sampled here — e.g. north of 10-20% under actual family conversational timing. At that rate, "resident is faster and more correct on average" is swamped by "resident goes silent on a meaningful fraction of real summons," and the recommendation flips toward narrowly reverting or bypassing the resident path specifically for the <code class="mono">voice_turn</code> kind — not the architecture as a whole.</p>
+    </div>
+  </div>
+  <p style="margin-top:1.2rem"><strong>Smallest safe fix for the one confirmed narrow regression</strong> (§01): let <code class="mono">acknowledge_unavailable()</code>'s single deterministic line bypass the wake-grant check specifically — it is not model output, carries no content risk, and its entire purpose is telling a person who just summoned SPARK that they were heard. Everything else about the wake-grant gate stays exactly as designed.</p>
+</section>
+
+<footer>
+  Methodology note: no git checkout or service swap to 3084368b was performed. The old build's cognition layer was measured by extracting <code>bin/claude-voice-bridge</code> and calling it directly with an identical prompt — its full historical wake/systemd/resource stack was not reconstructed and is out of scope for this assay. Production was never mutated; all comparisons ran against extracted or from-scratch harnesses alongside the live system.
+</footer>
+
+</div>
+
+<script>
+(function(){
+  const master = [[9.28,true],[86.52,false],[12.06,true],[8.25,true],[15.02,true],[16.46,true],[9.28,true],[18.84,true],[19.89,true],[39.3,true],[20.5,true],[30.21,true],[25.67,true],[10.28,true]];
+  const old = [[120.1,false],[29.94,true],[14.3,true],[14.27,true],[30.16,true],[17.16,true],[34.43,true],[16.26,true],[16.1,true],[61.03,true],[42.87,true],[30.76,true],[43.27,true],[18.08,true]];
+  const maxT = 120;
+  function render(id, data, deadline){
+    const track = document.getElementById(id);
+    if (deadline) {
+      const dl = document.createElement('div');
+      dl.className = 'strip-deadline';
+      dl.style.left = (deadline/maxT*100) + '%';
+      dl.setAttribute('data-label', deadline + 's budget');
+      track.appendChild(dl);
+    }
+    data.forEach(([t, ok]) => {
+      const d = document.createElement('div');
+      d.className = 'dot ' + (ok ? 'ok' : 'fail');
+      d.style.left = Math.min(t/maxT*100, 100) + '%';
+      d.title = t.toFixed(1) + 's';
+      track.appendChild(d);
+    });
+  }
+  render('track-master', master, 45);
+  render('track-old', old, null);
+})();
+</script>
