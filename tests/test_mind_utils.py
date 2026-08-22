@@ -813,8 +813,14 @@ def test_expression_look_around_calls_tool(_mock_awareness_and_battery):
     """look_around dispatches to tool-look with PX_PAN and PX_TILT env vars."""
     with patch("subprocess.run") as mock_run:
         expression(_thought("look_around"), dry=True)
+    # Match on the actual dispatched command (call.args[0][0]), not a substring
+    # of the whole call's repr: look_around's env dict is passed by reference to
+    # the tool-look call and then mutated in place (PX_TEXT added) before the
+    # follow-up tool-voice call copies it, so a "tool-look" in str(c) search can
+    # be comparing against a huge, order-sensitive dict repr rather than the
+    # command that was actually run.
     calls = [c for c in mock_run.call_args_list
-             if "tool-look" in str(c)]
+             if c.args and c.args[0] and c.args[0][0].endswith("/tool-look")]
     assert len(calls) == 1
     env = calls[0].kwargs.get("env") or calls[0][1].get("env", {})
     assert "PX_PAN" in env
