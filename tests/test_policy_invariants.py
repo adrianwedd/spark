@@ -917,6 +917,110 @@ def test_the_dispatcher_consults_the_grant_it_loads_rather_than_its_caller(monke
     assert tool == "tool_voice"
 
 
+# --- the fallback acknowledgement needs no wake-grant precondition of its own
+#
+# #262-class regression: a resident-brain timeout is exactly the delay that
+# can age a live wake grant out, so requiring a *fresh* wake_grant_active()
+# read before the deterministic ack would turn the one timeout it exists to
+# answer into silence. It must still be gated exactly like any other
+# interactive reply — quiet mode and night silence still apply — so the ack
+# is neither exempt from policy nor held to a stricter bar than normal speech.
+
+def test_acknowledgement_needs_no_wake_grant_when_policy_otherwise_allows(monkeypatch):
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: DAY_TS)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    monkeypatch.setattr(policy_context, "wake_grant_active", lambda: False)
+
+    spoken = []
+    monkeypatch.setattr(
+        voice_loop, "execute_tool",
+        lambda tool, env, dry: spoken.append((tool, env)) or (0, "", ""),
+    )
+
+    assert voice_loop.acknowledge_unavailable(dry_run=True) is True
+    assert len(spoken) == 1
+    tool, _ = spoken[0]
+    assert tool == "tool_voice"
+
+
+def test_acknowledgement_is_still_downgraded_by_quiet_mode_without_a_grant(monkeypatch):
+    """Not a blanket bypass: absent a live grant, the ack is downgraded to the
+    same presence-safe substitute any other blocked interactive speech gets —
+    it does not get the grant's exemption for free."""
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: DAY_TS)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {"spark_quiet_mode": True})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    monkeypatch.setattr(policy_context, "wake_grant_active", lambda: False)
+
+    spoken = []
+    monkeypatch.setattr(
+        voice_loop, "execute_tool",
+        lambda tool, env, dry: spoken.append((tool, env)) or (0, "", ""),
+    )
+
+    voice_loop.acknowledge_unavailable(dry_run=True)
+    assert len(spoken) == 1
+    tool, _ = spoken[0]
+    assert tool != "tool_voice", "quiet mode must still silence the ack"
+
+
+def test_acknowledgement_is_still_downgraded_by_night_silence_without_a_grant(monkeypatch):
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: NIGHT_TS)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    monkeypatch.setattr(policy_context, "wake_grant_active", lambda: False)
+
+    spoken = []
+    monkeypatch.setattr(
+        voice_loop, "execute_tool",
+        lambda tool, env, dry: spoken.append((tool, env)) or (0, "", ""),
+    )
+
+    voice_loop.acknowledge_unavailable(dry_run=True)
+    assert len(spoken) == 1
+    tool, _ = spoken[0]
+    assert tool != "tool_voice", "night silence must still silence the ack"
+
+
+def test_a_timed_out_voice_turn_acknowledges_exactly_once_without_a_grant(monkeypatch):
+    """End-to-end shape of the fix, at the real supervisor_loop call site: a
+    resident-brain timeout must produce exactly one deterministic
+    acknowledgement and stop — not loop back to re-ask a brain already
+    established unavailable — even though the wake grant that opened the turn
+    reads inactive by the time the timeout is handled."""
+    monkeypatch.setattr(voice_loop, "_policy_now", lambda: DAY_TS)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {})
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+    monkeypatch.setattr(policy_context, "wake_grant_active", lambda: False)
+
+    monkeypatch.setattr(voice_loop, "ensure_session", lambda: None)
+    texts = iter(["are you there?"])
+    monkeypatch.setattr(voice_loop, "capture_text_input", lambda: next(texts, None))
+
+    turn_calls = []
+    monkeypatch.setattr(
+        voice_loop, "run_voice_turn",
+        lambda prompt, **kw: turn_calls.append(prompt) or
+        (voice_loop.VOICE_BRAIN_UNAVAILABLE, "", "resident brain unavailable"),
+    )
+
+    acked = []
+    monkeypatch.setattr(
+        voice_loop, "acknowledge_unavailable",
+        lambda dry_run=False: acked.append(dry_run) or True,
+    )
+
+    args = voice_loop.parse_args([
+        "--backend", "brain", "--max-turns", "5",
+        "--input-mode", "text", "--dry-run",
+    ])
+    voice_loop.supervisor_loop(args)
+
+    assert len(turn_calls) == 1, "a saturated brain must not be re-asked"
+    assert acked == [True]
+
+
 # --- the sink, end to end, against a canary rather than a self-report -------
 
 def test_hey_spark_at_three_am_gets_an_audible_reply(sink, tmp_path):
