@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,15 @@ from pxh.state import update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 PX_LOOK = Path(os.environ.get("PX_LOOK_CMD", PROJECT_ROOT / "bin/px-look"))
+
+# Bounds every invocation, direct or via the voice loop — px-look's own
+# subprocess.run() had no timeout of its own, so a wedged I2C bus or a stuck
+# sudo child hung this tool forever with no output, since capture_output=True
+# buffers px-look's own log lines until it exits. Sized generously above
+# yield_alive's own ~30s ceiling (PX_YIELD_ALIVE_MAX_WAIT_S) plus a slow,
+# I2C-contended Picarx() acquisition (idle-alive documents up to 60s under
+# contention) plus easing/hold — not the ~1-2s common case.
+LOOK_TIMEOUT_S = float(os.environ.get("PX_LOOK_TOOL_TIMEOUT_S", "90"))
 
 
 def main() -> int:
@@ -47,25 +57,49 @@ def main() -> int:
     if dry_mode:
         command.append("--dry-run")
 
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    # A dedicated process group, not just a child process: `command` may be
+    # `sudo -n ... px-look`, and killing only the sudo PID on timeout can
+    # leave its python3 child running (and GPIO5 still claimed) with nothing
+    # left tracking it. Killing the whole group guarantees both die together,
+    # which is what actually frees the pin — Picarx.close() doesn't release
+    # it, only full process exit does, so a deterministic kill is exactly as
+    # clean as a graceful one from GPIO's point of view.
+    proc = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=LOOK_TIMEOUT_S)
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        returncode = 124  # conventional timeout exit code
 
     update_session(
         fields={"last_action": "tool_look"},
-        history_entry={"event": "look", "pan": pan, "tilt": tilt, "dry": dry_mode, "rc": result.returncode},
+        history_entry={"event": "look", "pan": pan, "tilt": tilt, "dry": dry_mode, "rc": returncode},
     )
 
     payload = {
-        "status": "ok" if result.returncode == 0 else "error",
-        "returncode": result.returncode,
+        "status": "ok" if returncode == 0 else "error",
+        "returncode": returncode,
         "dry": dry_mode,
         "pan": pan,
         "tilt": tilt,
-        "stdout": result.stdout[-1024:],
-        "stderr": result.stderr[-512:],
+        "stdout": stdout[-1024:],
+        "stderr": stderr[-512:],
     }
+    if timed_out:
+        payload["error"] = f"tool_look timed out after {LOOK_TIMEOUT_S:.0f}s; GPIO handle killed"
     log_event("look", payload)
     print(json.dumps(payload))
-    return 0 if result.returncode == 0 else result.returncode
+    return 0 if returncode == 0 else returncode
 
 
 if __name__ == "__main__":
