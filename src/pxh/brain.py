@@ -123,6 +123,15 @@ _BRAIN_KINDS = frozenset({
     "describe_scene",
 })
 
+# Kinds that will wait out a `validating` marker (#273) instead of failing
+# instantly. Deliberately narrow: the evidence (#270/#273) is specifically
+# about the interactive "Hey Spark" turn a person is standing in front of the
+# robot waiting on. A background kind that hits `validating` today just fails
+# and retries on its own cooldown — nothing measured shows it needs the same
+# wait, and giving it one for free would spend a daemon's time on a guess
+# rather than evidence.
+_VALIDATION_WAIT_KINDS = frozenset({"voice_turn"})
+
 # Per-kind wall-clock deadline. These bound one turn; the per-type cooldowns and
 # daily cap in claude_session.py still sit in front of ask_brain and bound how
 # many turns happen at all.
@@ -428,6 +437,26 @@ def session_state(session: str, model: str | None = None) -> str:
     # A stale `validating` marker means a supervisor died mid-handshake. The
     # repair is the same as any other "nobody is working on it".
     return NO_MARKER
+
+
+def _await_validation(session: str, model: str | None, deadline: float) -> str:
+    """Poll for a `validating` marker to resolve, bounded by `deadline`.
+
+    Only ever worth calling on `VALIDATING`: `session_state()` already treats
+    `session_absent` and `no_marker` as "nobody is working on it right now",
+    not "in progress" (see the docstring above and `session_state`'s own
+    fall-through) — polling either would just spend the caller's budget
+    waiting on nothing. Returns whatever `session_state()` next reports:
+    `validated` on success, `no_marker` if the handshake fails or its marker
+    ages out mid-wait, or `validating` again if `deadline` arrives first.
+    """
+    while True:
+        state = session_state(session, model=model)
+        if state != VALIDATING:
+            return state
+        if time.monotonic() >= deadline:
+            return state
+        time.sleep(POLL_INTERVAL_S)
 
 
 def _ensure_dir(path: Path) -> Path | None:
@@ -861,10 +890,27 @@ def ask_brain(
     # Fast path, before the lock. During startup this is the common case, and a
     # caller that queued behind the supervisor's lock would spend LOCK_WAIT_S
     # learning what the marker already said.
+    outer_started = time.monotonic()
     state = session_state(session, model=model)
+    if state == VALIDATING and kind in _VALIDATION_WAIT_KINDS:
+        # #273: every historical "session not validated" voice_turn failure
+        # landed within 16-107s of a recycle/handshake/self-heal event. A
+        # `validating` marker means a handshake is provably in flight right
+        # now — run_handshake holds this same single-flight lock for its
+        # whole duration — so this is not a guess about whether waiting will
+        # help, it's waiting for the same lock a queued caller already waits
+        # for, just before the lock.acquire() call instead of never reaching
+        # it. Bounded by LOCK_WAIT_S so it stays well inside timeout_s (45s
+        # for voice_turn). Scoped to _VALIDATION_WAIT_KINDS rather than every
+        # kind: the evidence is specifically about the interactive turn a
+        # child is waiting on, and a background kind that fails now simply
+        # retries on its own cooldown — no evidence it needs the same wait.
+        state = _await_validation(session, model,
+                                   deadline=outer_started + LOCK_WAIT_S)
     if state != VALIDATED:
         _log("brain_unavailable", kind=kind, session=session,
-             reason="session not validated", state=state)
+             reason="session not validated", state=state,
+             validating_wait_s=round(time.monotonic() - outer_started, 2))
         return None
 
     lock = _lock_for(session)
@@ -908,7 +954,16 @@ def ask_brain(
 
         # The deadline travels with the request so the session can see how long
         # it has, and so wedge detection has something to compare against.
-        deadline = time.time() + timeout_s
+        # Anchored to `timeout_s` from `outer_started`, not a fresh `timeout_s`
+        # from here: a validating-wait (or the lock wait just above) already
+        # spent part of the caller's budget, and #273 requires that spend be
+        # accounted for rather than layered on top — a voice_turn caller that
+        # waited close to LOCK_WAIT_S for validation must not then also get a
+        # full fresh 45s, or the total drifts back toward the >45s tails #270
+        # measured. `max(1.0, ...)` is a floor, not a real fallback: no
+        # currently-defined kind (smallest is voice_turn's 45s, wait is capped
+        # at LOCK_WAIT_S=10s) can drive this negative.
+        deadline = time.time() + max(1.0, timeout_s - (time.monotonic() - outer_started))
         request = {
             "id": request_id,
             "kind": kind,
@@ -945,6 +1000,11 @@ def ask_brain(
 
         turns_before, consecutive_slow_before = _turn_health_snapshot(session)
         lock_wait_s = round(lock_acquired - started, 2)
+        # A third bucket alongside lock_wait_s/exec_s (#267): time spent in
+        # _await_validation, split out so a future #270-style audit can tell
+        # "landed during a recycle window" apart from queue contention and
+        # raw execution time instead of them blurring into duration_s again.
+        validating_wait_s = round(started - outer_started, 2)
 
         while time.time() < deadline:
             reply = collect_reply(session, request_id)
@@ -952,6 +1012,7 @@ def ask_brain(
                 duration_s = time.monotonic() - started
                 _log("brain_reply", kind=kind, session=session,
                           duration_s=round(duration_s, 2),
+                          validating_wait_s=validating_wait_s,
                           lock_wait_s=lock_wait_s,
                           exec_s=round(time.monotonic() - lock_acquired, 2),
                           turns_since_reset=turns_before,
@@ -962,6 +1023,7 @@ def ask_brain(
 
         _log("brain_timeout", kind=kind, session=session,
                   timeout_s=timeout_s,
+                  validating_wait_s=validating_wait_s,
                   lock_wait_s=lock_wait_s,
                   exec_s=round(time.monotonic() - lock_acquired, 2),
                   turns_since_reset=turns_before,

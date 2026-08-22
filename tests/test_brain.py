@@ -1075,6 +1075,124 @@ def test_a_caller_never_injects_a_model_switch(_mailbox, _live_pane, monkeypatch
         "ask_brain must fall back on a model mismatch, never inject /model"
 
 
+# --------------------------------------------------------------------------
+# Bounded wait for a validating marker (#273)
+# --------------------------------------------------------------------------
+
+def test_voice_turn_waits_out_a_validating_marker_and_succeeds(_mailbox, _live_pane, monkeypatch):
+    """A handshake in flight (validating) can resolve to validated within
+    LOCK_WAIT_S — the case #270/#273 found causing ~16% of historical
+    voice_turn failures. A caller that arrives moments too early must not
+    fail just because it asked before the handshake landed."""
+    session = brain.BRAIN_SESSION
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: True)
+    brain.write_validation_marker(session, state="validating",
+                                  request_id=str(uuid.uuid4()),
+                                  model=brain.configured_model(session), attempt=1)
+
+    def _resolve_then_answer():
+        time.sleep(brain.LOCK_WAIT_S / 4)
+        _validate(session)
+        request_id = _pending_id(session)
+        _reply_via_tool(session, request_id, {"tool": "tool_voice", "params": {}})
+
+    worker = threading.Thread(target=_resolve_then_answer, daemon=True)
+    worker.start()
+    reply = brain.ask_brain("voice_turn", {"prompt": "hi"}, timeout_s=5)
+    worker.join(timeout=5)
+
+    assert reply is not None and reply["reply"] == {"tool": "tool_voice", "params": {}}
+    assert len(_live_pane) == 1, \
+        "exactly one turn must be injected — no duplicate request from the wait itself"
+
+
+def test_voice_turn_gives_up_on_a_validating_marker_that_never_clears(_mailbox, _session_present):
+    """The bounded half of 'bounded wait': a handshake that never resolves
+    must not turn a 45s voice_turn budget into an indefinite hang."""
+    session = brain.BRAIN_SESSION
+    brain.write_validation_marker(session, state="validating",
+                                  request_id=str(uuid.uuid4()),
+                                  model=brain.configured_model(session), attempt=1)
+
+    started = time.monotonic()
+    result = brain.ask_brain("voice_turn", {"prompt": "hi"}, timeout_s=5)
+    elapsed = time.monotonic() - started
+
+    assert result is None
+    assert elapsed >= brain.LOCK_WAIT_S, "must actually wait, not fail on the first read"
+    assert elapsed < 5, "the wait must stay bounded well inside the caller's timeout_s"
+
+
+def test_voice_turn_does_not_wait_on_an_absent_session(_mailbox, monkeypatch):
+    """session_absent is 'nobody is working on it' (session_state's own
+    docstring), not 'in progress' — waiting on it spends budget on nothing."""
+    monkeypatch.setattr(tmux_claude, "session_exists", lambda spec=None: False)
+
+    started = time.monotonic()
+    result = brain.ask_brain("voice_turn", {"prompt": "hi"}, timeout_s=5)
+    elapsed = time.monotonic() - started
+
+    assert result is None
+    assert elapsed < brain.LOCK_WAIT_S / 2, "session_absent must fail immediately"
+
+
+def test_voice_turn_does_not_wait_when_there_is_no_marker_at_all(_mailbox, _session_present):
+    """no_marker is the same 'nobody is working on it' case as session_absent —
+    a stale/never-started handshake, not a live one about to resolve."""
+    started = time.monotonic()
+    result = brain.ask_brain("voice_turn", {"prompt": "hi"}, timeout_s=5)
+    elapsed = time.monotonic() - started
+
+    assert result is None
+    assert elapsed < brain.LOCK_WAIT_S / 2, "no_marker must fail immediately"
+
+
+def test_a_background_kind_still_fails_instantly_on_a_validating_marker(
+        _mailbox, _session_present):
+    """The wait is scoped to voice_turn (#273's evidence), not every kind — a
+    background caller must see byte-identical behaviour to before this fix."""
+    session = brain.BRAIN_SESSION
+    brain.write_validation_marker(session, state="validating",
+                                  request_id=str(uuid.uuid4()),
+                                  model=brain.configured_model(session), attempt=1)
+
+    started = time.monotonic()
+    result = brain.ask_brain("research", {"q": "why"}, timeout_s=5)
+    elapsed = time.monotonic() - started
+
+    assert result is None
+    assert elapsed < brain.LOCK_WAIT_S / 2, \
+        "an unscoped kind must not wait out a validating marker"
+
+
+def test_await_validation_does_not_hold_the_single_flight_lock(_mailbox, _session_present):
+    """A handshake needs this same lock to finish — run_handshake holds it for
+    its whole duration (src/pxh/brain_daemon.py). If the wait held it too,
+    waiting for the handshake would deadlock the handshake it's waiting on."""
+    session = brain.BRAIN_SESSION
+    brain.write_validation_marker(session, state="validating",
+                                  request_id=str(uuid.uuid4()),
+                                  model=brain.configured_model(session), attempt=1)
+
+    lock = brain._lock_for(session)
+    acquired = threading.Event()
+
+    def _poll():
+        brain._await_validation(session, None,
+                                deadline=time.monotonic() + brain.LOCK_WAIT_S)
+
+    worker = threading.Thread(target=_poll, daemon=True)
+    worker.start()
+    time.sleep(max(brain.POLL_INTERVAL_S * 3, 0.05))  # let the poll loop actually start
+    got = lock.acquire(timeout=1)
+    if got:
+        acquired.set()
+        lock.release()
+    worker.join(timeout=brain.LOCK_WAIT_S + 1)
+
+    assert acquired.is_set(), "a concurrent lock.acquire() must not block behind the poll"
+
+
 def test_every_rolled_out_kind_matches_the_session_model():
     """A kind whose model differs from the session default would fall back on
     every single call, forever, silently. Failing here is how PX_BRAIN_KINDS
