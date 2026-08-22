@@ -461,6 +461,46 @@ def test_tool_look_dry_run(isolated_project):
     assert payload["tilt"] == 10
 
 
+def test_tool_look_cannot_hang_forever(isolated_project, tmp_path):
+    """A wedged px-look (stuck I2C, orphaned sudo child, whatever) must not
+    hang the caller indefinitely. Direct invocation with no output/error was
+    the reported symptom; this proves a bound exists and that the whole
+    process tree — not just the immediate child — is actually reaped."""
+    hang_script = tmp_path / "hang-look"
+    marker = tmp_path / "child.pid"
+    hang_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo hanging >&2\n"
+        f"sleep 300 & echo $! > {marker}\n"
+        "wait\n"
+    )
+    hang_script.chmod(0o755)
+
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "0"
+    env["PX_LOOK_CMD"] = str(hang_script)
+    env["PX_LOOK_TOOL_TIMEOUT_S"] = "1"
+
+    result = subprocess.run(
+        ["bin/tool-look"], cwd=PROJECT_ROOT, text=True, capture_output=True,
+        check=False, env=env, timeout=30,
+    )
+    payload = parse_json(result.stdout.strip())
+    assert payload["status"] == "error"
+    assert payload["returncode"] == 124
+    assert "timed out" in payload["error"]
+
+    child_pid = int(marker.read_text().strip())
+    import time as _time
+    for _ in range(20):
+        if not Path(f"/proc/{child_pid}").exists():
+            break
+        _time.sleep(0.1)
+    assert not Path(f"/proc/{child_pid}").exists(), (
+        "timing out must kill the whole process group, not just the direct child"
+    )
+
+
 def test_tool_sonar_dry_run(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
