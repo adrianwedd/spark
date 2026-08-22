@@ -581,6 +581,30 @@ def _turn_health_path(session: str) -> Path:
     return session_dir(session) / "turns.json"
 
 
+def _turn_health_snapshot(session: str) -> tuple[int, int]:
+    """Read-only peek at (count, consecutive_slow) for a log line.
+
+    Never mutates — record_turn_completion is still the only writer — and
+    never raises, matching every other read in this file that a log call must
+    survive. A cheap, always-available proxy for "how close to a context
+    recycle is this session" without reaching into brain_daemon's in-process
+    state, which lives in a different process and derives from this same
+    counter anyway (see refresh_turns_from_counter).
+    """
+    try:
+        data = json.loads(_turn_health_path(session).read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return 0, 0
+    if not isinstance(data, dict):
+        return 0, 0
+    count = data.get("count", 0)
+    consecutive_slow = data.get("consecutive_slow", 0)
+    return (
+        count if isinstance(count, int) else 0,
+        consecutive_slow if isinstance(consecutive_slow, int) else 0,
+    )
+
+
 # How much of a kind's own per-call deadline a delivered turn may consume
 # before it counts as "slow" for the validated-but-slow self-heal detector.
 # Expressed as a fraction of the caller's own deadline_for_kind rather than one
@@ -856,6 +880,12 @@ def ask_brain(
         _log("brain_busy", kind=kind, session=session,
                   waited_s=round(time.monotonic() - started, 2))
         return None
+    # Split from `started` so brain_reply/brain_timeout can tell queue
+    # contention (another kind holding this single-flight lock) apart from
+    # the resident session actually taking a long time to answer — the two
+    # have different causes and different fixes, and duration_s alone
+    # conflates them.
+    lock_acquired = time.monotonic()
     _relax_lock_mode(session)
 
     request_id = str(uuid.uuid4())
@@ -913,18 +943,29 @@ def ask_brain(
         # regardless of tick timing (#258).
         slow_threshold_s = SELF_HEAL_SLOW_FRACTION * timeout_s
 
+        turns_before, consecutive_slow_before = _turn_health_snapshot(session)
+        lock_wait_s = round(lock_acquired - started, 2)
+
         while time.time() < deadline:
             reply = collect_reply(session, request_id)
             if reply is not None:
                 duration_s = time.monotonic() - started
                 _log("brain_reply", kind=kind, session=session,
-                          duration_s=round(duration_s, 2))
+                          duration_s=round(duration_s, 2),
+                          lock_wait_s=lock_wait_s,
+                          exec_s=round(time.monotonic() - lock_acquired, 2),
+                          turns_since_reset=turns_before,
+                          consecutive_slow_before=consecutive_slow_before)
                 record_turn_completion(session, slow=duration_s >= slow_threshold_s)
                 return reply
             time.sleep(POLL_INTERVAL_S)
 
         _log("brain_timeout", kind=kind, session=session,
-                  timeout_s=timeout_s)
+                  timeout_s=timeout_s,
+                  lock_wait_s=lock_wait_s,
+                  exec_s=round(time.monotonic() - lock_acquired, 2),
+                  turns_since_reset=turns_before,
+                  consecutive_slow_before=consecutive_slow_before)
         record_turn_completion(session, slow=True)
         return None
     finally:

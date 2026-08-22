@@ -530,6 +530,76 @@ def test_ask_brain_marks_a_reply_past_the_slow_fraction_as_slow(_live_pane):
     assert brain.read_turn_health(session)["consecutive_slow"] == 1
 
 
+def test_ask_brain_reply_separates_lock_wait_from_execution_time(_live_pane, monkeypatch):
+    """duration_s alone conflates queue contention (another kind holding the
+    single-flight lock) with the resident session actually taking a long
+    time — Track B of the 2026-08-22 assay needs the two told apart to tell
+    whether tail latency is contention or slow model execution.
+
+    The queue wait is simulated deterministically by wrapping the real lock's
+    acquire() rather than by genuinely contending it from two threads: this
+    codebase's own test_second_caller_falls_back_rather_than_interleaving
+    already establishes that two same-process FileLock instances on this
+    filelock install do not block-and-retry against each other the way two
+    separate OS processes do — real cross-request contention (the case this
+    field exists to diagnose) only arises across processes in production."""
+    session = brain.session_for_kind("research")
+    captured = []
+    monkeypatch.setattr(brain, "_log", lambda event, **f: captured.append((event, f)))
+
+    real_lock_for = brain._lock_for
+
+    def _slow_to_acquire(sess):
+        lock = real_lock_for(sess)
+        real_acquire = lock.acquire
+
+        def _acquire(*a, **k):
+            time.sleep(0.2)
+            return real_acquire(*a, **k)
+
+        lock.acquire = _acquire
+        return lock
+
+    monkeypatch.setattr(brain, "_lock_for", _slow_to_acquire)
+
+    def _reply():
+        # Generous margins throughout: a real subprocess spawn (tool-brain-reply)
+        # has been observed taking up to ~6.8s under this Pi's real load
+        # (feedback_spark_subprocess_test_pitfalls), so a tight budget here is
+        # exactly what makes this class of test flaky under the full suite
+        # rather than in isolation.
+        request_id = _pending_id(session, timeout_s=15.0)
+        _reply_via_tool(session, request_id, {"ok": True})
+
+    threading.Thread(target=_reply, daemon=True).start()
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=30) is not None
+
+    replies = [fields for event, fields in captured if event == "brain_reply"]
+    assert len(replies) == 1
+    fields = replies[0]
+    assert fields["lock_wait_s"] >= 0.15, "queue wait should reflect the slow acquire"
+    assert fields["exec_s"] >= 0
+    # duration_s spans the same start/end as lock_wait_s + exec_s combined.
+    assert abs(fields["duration_s"] - (fields["lock_wait_s"] + fields["exec_s"])) < 0.1
+    assert fields["turns_since_reset"] == 0
+    assert fields["consecutive_slow_before"] == 0
+
+
+def test_ask_brain_timeout_also_reports_lock_wait_and_exec_time(_live_pane, monkeypatch):
+    session = brain.session_for_kind("research")
+    captured = []
+    monkeypatch.setattr(brain, "_log", lambda event, **f: captured.append((event, f)))
+
+    assert brain.ask_brain("research", {"q": 1}, timeout_s=0.2) is None
+
+    timeouts = [fields for event, fields in captured if event == "brain_timeout"]
+    assert len(timeouts) == 1
+    fields = timeouts[0]
+    assert fields["lock_wait_s"] >= 0
+    assert fields["exec_s"] >= 0.15, "exec time should span the full unanswered deadline"
+    assert fields["turns_since_reset"] == 0
+
+
 def test_consecutive_slow_streak_resets_on_a_fast_reply(_live_pane):
     """The streak measures a *run* of degraded turns; one real fast answer
     proves the session recovered on its own and starts it over — the same
