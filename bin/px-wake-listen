@@ -5,6 +5,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
+# Load .env secrets (ANNOUNCE_RELAY_TOKEN, PX_HA_TOKEN, etc.) — this process
+# spawns voice_loop.py per turn, which inherits this environment and dispatches
+# tool-announce/tool-chat from it. Without this, every announce triggered from
+# a real conversation runs with no relay token and 401s silently.
+ENV_FILE="$PROJECT_ROOT/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 exec "$PROJECT_ROOT/.venv/bin/python3" - "$@" <<'PY'
 """Wake-word listener: detects wake phrase via Vosk, captures utterance, pipes to voice loop.
 
@@ -170,26 +182,43 @@ def enable_speaker_amp(timeout_s: float = 3.0) -> None:
     import only succeeds under /usr/bin/python3 — ModuleNotFoundError is the
     expected path here, not a failure worth logging. Fall back to a system
     python subprocess; best-effort either way.
+
+    Always logs which path answered and how long it took (#Track-A, the
+    2026-08-22 assay's wake/STT gap): a live occurrence showed a 3s subprocess
+    timeout followed by a further ~14s of silence before recording began, with
+    nothing distinguishing "GPIO/I2C contention inside enable_speaker" from
+    "something after it" — this is a bounded, always-on timing seam rather
+    than a one-off probe, so the next occurrence is diagnosable from the log
+    alone.
     """
+    t0 = time.monotonic()
     try:
         from robot_hat import enable_speaker
         enable_speaker()
+        log(f"enable_speaker: direct import ok ({time.monotonic() - t0:.2f}s)")
         return
     except ModuleNotFoundError:
         pass
     except Exception as exc:
-        log(f"enable_speaker (direct) failed: {exc}")
+        log(f"enable_speaker (direct) failed after {time.monotonic() - t0:.2f}s: {exc}")
     try:
         proc = subprocess.run(
             ["/usr/bin/python3", "-c",
              "from robot_hat import enable_speaker; enable_speaker()"],
             capture_output=True, timeout=timeout_s,
         )
+        elapsed = time.monotonic() - t0
         if proc.returncode != 0:
             err = proc.stderr.decode(errors="replace").strip().splitlines()
-            log(f"enable_speaker (subprocess) failed: {err[-1] if err else 'unknown'}")
+            log(f"enable_speaker (subprocess) failed after {elapsed:.2f}s: "
+                f"{err[-1] if err else 'unknown'}")
+        else:
+            log(f"enable_speaker: subprocess ok ({elapsed:.2f}s)")
+    except subprocess.TimeoutExpired:
+        log(f"enable_speaker (subprocess) timed out after {time.monotonic() - t0:.2f}s "
+            f"(budget {timeout_s:.1f}s) — GPIO/I2C likely contended by another process")
     except Exception as exc:
-        log(f"enable_speaker (subprocess) failed: {exc}")
+        log(f"enable_speaker (subprocess) failed after {time.monotonic() - t0:.2f}s: {exc}")
 
 
 def rms(data: bytes) -> float:
@@ -1182,6 +1211,7 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                             _vosk_partial_last_log = _now_partial
 
                 if any(p in text for p in all_wake_phrases if p != "[unk]") and len(text.strip().split()) >= 2:
+                    _wake_t0 = time.monotonic()
                     log(f"wake word detected: {text!r}")
                     # A deliberate summons opens the audible-reply window. This
                     # is the only place a grant is ever originated: policy.py
@@ -1195,15 +1225,22 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                     if grant_id is None:
                         log("wake grant unavailable — reply stays subject to "
                             "night/quiet suppression")
-                    # Pre-enable speaker amp so it's warm before chime audio arrives
+                    # Pre-enable speaker amp so it's warm before chime audio arrives.
+                    # enable_speaker_amp() logs its own method/timing; the two
+                    # elapsed-since-wake lines below bracket it and the recording
+                    # start, so a gap between "wake word detected" and
+                    # "recording..." (#Track-A, 2026-08-22 assay) is attributable
+                    # to a specific stage rather than reconstructed after the fact
+                    # from bare timestamps.
                     enable_speaker_amp()
+                    log(f"wake->speaker-enable done: {time.monotonic() - _wake_t0:.2f}s elapsed")
                     # Chime in background while we start recording
                     threading.Thread(target=play_chime, args=(args.aplay_device,), daemon=True).start()
                     # Periodic heartbeat: soft tick every 5s so user knows we're listening/thinking
                     _beep_stop = start_periodic_beep(args.aplay_device, interval_s=5.0)
 
                     # --- Capture initial utterance ---
-                    log("recording...")
+                    log(f"recording... (wake->recording: {time.monotonic() - _wake_t0:.2f}s elapsed)")
                     audio_bytes = record_utterance(stream, MAX_RECORD_S, SILENCE_S)
                     chunks_n = len(audio_bytes) // (CHUNK * 2)
                     log(f"captured {chunks_n} chunks ({chunks_n * CHUNK / MIC_RATE:.1f}s)")
