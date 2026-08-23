@@ -688,6 +688,12 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
 
     deadline_s = float(brain.deadline_for_kind(VOICE_TURN_KIND))
     fast_failure_s = deadline_s / 2
+    # px-wake-listen exports its wake-grant id as the one correlation id for
+    # this turn; absent when driven by --input-mode text or a bare voice loop
+    # invocation, in which case brain.py logs trace_id=null rather than
+    # inventing one — a missing id is honest signal that this call didn't
+    # originate from a real wake, not something to paper over.
+    trace_id = os.environ.get("PX_TRACE_ID")
 
     for attempt in range(1, attempts + 1):
         started = time.monotonic()
@@ -705,6 +711,7 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
                     "remember anything for this request — return the object "
                     "and nothing else."
                 ),
+                "trace_id": trace_id,
             })
         except Exception as exc:  # noqa: BLE001 - the loop must survive the brain
             return VOICE_BRAIN_UNAVAILABLE, "", f"brain call raised: {exc}"
@@ -1352,6 +1359,7 @@ def supervisor_loop(args: argparse.Namespace) -> None:
                 "tool": tool,
                 "returncode": rc_tool,
                 "dry": args.dry_run,
+                "trace_id": os.environ.get("PX_TRACE_ID"),
             },
         )
 

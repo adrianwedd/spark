@@ -1006,11 +1006,20 @@ def ask_brain(
         # raw execution time instead of them blurring into duration_s again.
         validating_wait_s = round(started - outer_started, 2)
 
+        # Caller-supplied correlation id, if any (e.g. px-wake-listen's wake
+        # grant id) — threaded through payload rather than a new ask_brain
+        # parameter so callers unaware of tracing are unaffected. Surfacing it
+        # here is what lets `grep <trace_id> logs/tool-*.log` reconstruct one
+        # turn's timeline across the wake listener, the brain and tool-voice
+        # without correlating on wall-clock proximity alone.
+        trace_id = payload.get("trace_id") if isinstance(payload, dict) else None
+
         while time.time() < deadline:
             reply = collect_reply(session, request_id)
             if reply is not None:
                 duration_s = time.monotonic() - started
                 _log("brain_reply", kind=kind, session=session,
+                          request_id=request_id, trace_id=trace_id,
                           duration_s=round(duration_s, 2),
                           validating_wait_s=validating_wait_s,
                           lock_wait_s=lock_wait_s,
@@ -1022,6 +1031,7 @@ def ask_brain(
             time.sleep(POLL_INTERVAL_S)
 
         _log("brain_timeout", kind=kind, session=session,
+                  request_id=request_id, trace_id=trace_id,
                   timeout_s=timeout_s,
                   validating_wait_s=validating_wait_s,
                   lock_wait_s=lock_wait_s,

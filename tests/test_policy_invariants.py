@@ -549,6 +549,10 @@ AUDIO_PRODUCERS: dict[str, tuple[str, str]] = {
     "bin/tts-glados-server": ("server", "synthesises WAV bytes, plays nothing"),
     "bin/px-env": ("mention", "comment explaining the PULSE_SERVER fix"),
     "bin/run-wake": ("mention", "forwards --aplay-device to px-wake-listen"),
+    "src/pxh/speaker_amp.py": (
+        "helper", "enables GPIO20 only — no aplay/espeak call of its own; "
+                  "shared by tool-voice (gated) and px-wake-listen (ungated), "
+                  "each of which is evaluated under its own entry above"),
 }
 
 

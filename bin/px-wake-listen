@@ -41,6 +41,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from pathlib import Path
 
@@ -178,47 +179,18 @@ def log(msg: str) -> None:
 def enable_speaker_amp(timeout_s: float = 3.0) -> None:
     """Enable the MAX98357A amp (GPIO 20) so aplay output is audible.
 
-    robot_hat lives in system site-packages, not the venv, so the direct
-    import only succeeds under /usr/bin/python3 — ModuleNotFoundError is the
-    expected path here, not a failure worth logging. Fall back to a system
-    python subprocess; best-effort either way.
-
-    Always logs which path answered and how long it took (#Track-A, the
-    2026-08-22 assay's wake/STT gap): a live occurrence showed a 3s subprocess
-    timeout followed by a further ~14s of silence before recording began, with
-    nothing distinguishing "GPIO/I2C contention inside enable_speaker" from
-    "something after it" — this is a bounded, always-on timing seam rather
-    than a one-off probe, so the next occurrence is diagnosable from the log
-    alone.
+    Delegates to pxh.speaker_amp.ensure_speaker_enabled, which checks the live
+    GPIO20 state via `pinctrl` first (~4ms) and skips the expensive enable
+    path entirely once it's already high. GPIO20 is a one-way latch nothing in
+    this codebase ever lowers, so within one process uptime (this listener
+    runs continuously across a whole conversation, chime after chime) every
+    call after the first was previously paying full subprocess cost for
+    nothing (#Track-A, the 2026-08-22 assay's wake/STT gap: a live occurrence
+    showed a 3s subprocess timeout followed by a further ~14s of silence
+    before recording began).
     """
-    t0 = time.monotonic()
-    try:
-        from robot_hat import enable_speaker
-        enable_speaker()
-        log(f"enable_speaker: direct import ok ({time.monotonic() - t0:.2f}s)")
-        return
-    except ModuleNotFoundError:
-        pass
-    except Exception as exc:
-        log(f"enable_speaker (direct) failed after {time.monotonic() - t0:.2f}s: {exc}")
-    try:
-        proc = subprocess.run(
-            ["/usr/bin/python3", "-c",
-             "from robot_hat import enable_speaker; enable_speaker()"],
-            capture_output=True, timeout=timeout_s,
-        )
-        elapsed = time.monotonic() - t0
-        if proc.returncode != 0:
-            err = proc.stderr.decode(errors="replace").strip().splitlines()
-            log(f"enable_speaker (subprocess) failed after {elapsed:.2f}s: "
-                f"{err[-1] if err else 'unknown'}")
-        else:
-            log(f"enable_speaker: subprocess ok ({elapsed:.2f}s)")
-    except subprocess.TimeoutExpired:
-        log(f"enable_speaker (subprocess) timed out after {time.monotonic() - t0:.2f}s "
-            f"(budget {timeout_s:.1f}s) — GPIO/I2C likely contended by another process")
-    except Exception as exc:
-        log(f"enable_speaker (subprocess) failed after {time.monotonic() - t0:.2f}s: {exc}")
+    from pxh.speaker_amp import ensure_speaker_enabled
+    ensure_speaker_enabled(timeout_s=timeout_s, log=log)
 
 
 def rms(data: bytes) -> float:
@@ -1225,6 +1197,17 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                     if grant_id is None:
                         log("wake grant unavailable — reply stays subject to "
                             "night/quiet suppression")
+                    # One correlation id for this whole turn — the wake grant
+                    # id when we have one (it's already a per-turn identity),
+                    # else a local fallback so the trace still holds together
+                    # even without a live grant. Exported into the process
+                    # environment so it flows unmodified through every
+                    # subprocess this turn spawns (voice_loop.py, tool-voice)
+                    # via their own `os.environ.copy()`, without threading a
+                    # new parameter through each call site.
+                    trace_id = grant_id or f"nogrant-{uuid.uuid4().hex[:12]}"
+                    os.environ["PX_TRACE_ID"] = trace_id
+                    log(f"wake_detected trace_id={trace_id}")
                     # Pre-enable speaker amp so it's warm before chime audio arrives.
                     # enable_speaker_amp() logs its own method/timing; the two
                     # elapsed-since-wake lines below bracket it and the recording
@@ -1314,6 +1297,8 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                             grant_id=grant_id,
                         )
 
+                    log(f"turn_complete trace_id={trace_id} "
+                        f"total_elapsed_s={time.monotonic() - _wake_t0:.2f}")
                     # The conversation is over, so the window closes now
                     # rather than idling out — inactivity should mean silence
                     # immediately, not silence in three minutes. Reached on
