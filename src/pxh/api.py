@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .runtime_paths import resolve_heartbeat_read_path, resolve_sonar_live_read_path
-from .state import atomic_write, load_session, load_session_readonly, update_session, tail_lines
+from .state import atomic_write, clear_quiet_mode, load_session, load_session_readonly, set_quiet_mode, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
     ALLOWED_TOOLS,
@@ -575,7 +575,12 @@ class SessionPatch(BaseModel):
     confirm: Optional[bool] = None  # required when enabling safety-critical fields
 
 
-PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "spark_quiet_mode", "roaming_allowed"}
+# spark_quiet_mode is deliberately excluded here (#209) — it is patched
+# through state.set_quiet_mode()/clear_quiet_mode() in patch_session()
+# instead of the generic update_session(fields=...) loop below, so a
+# dashboard toggle gets the same provenance (source, reason, history entry)
+# as every other quiet-mode writer instead of a bare untracked bool flip.
+PATCHABLE_FIELDS = {"listening", "confirm_motion_allowed", "wheels_on_blocks", "mode", "persona", "roaming_allowed"}
 SAFETY_CRITICAL_FIELDS = {"confirm_motion_allowed", "roaming_allowed"}
 VALID_PERSONAS = {"vixen", "gremlin", "spark", "claude", ""}  # "claude" or "" clears persona
 
@@ -1803,7 +1808,7 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
         value = getattr(body, key, None)
         if value is not None:
             fields[key] = value
-    if not fields:
+    if not fields and body.spark_quiet_mode is None:
         raise HTTPException(status_code=400, detail="no patchable fields provided")
     # Safety-critical fields (e.g. motion, roaming) require confirm: true to enable
     critical_enables = {k for k in fields if k in SAFETY_CRITICAL_FIELDS and fields[k] is True}
@@ -1821,7 +1826,17 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
             raise HTTPException(status_code=400, detail=f"invalid persona: {p!r} (valid: vixen, gremlin, spark, claude)")
         else:
             fields["persona"] = p
-    return update_session(fields=fields)
+    result: Optional[Dict[str, Any]] = None
+    # spark_quiet_mode routes through the canonical transition API (#209)
+    # rather than the generic fields update, so a dashboard toggle carries
+    # provenance and a history entry like every other quiet-mode writer.
+    if body.spark_quiet_mode is True:
+        result = set_quiet_mode(enabled=True, source="dashboard", reason="dashboard_enable")
+    elif body.spark_quiet_mode is False:
+        result = clear_quiet_mode(source="dashboard", reason="dashboard_disable")
+    if fields:
+        result = update_session(fields=fields)
+    return result
 
 
 @app.post("/api/v1/session/history/clear", dependencies=[Depends(_verify_token)])

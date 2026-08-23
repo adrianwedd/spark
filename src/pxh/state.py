@@ -13,6 +13,7 @@ try:
 except ImportError:
     FileLock = None  # deferred — only needed by session lock functions
 
+from . import quiet_mode
 from .logging import log_event
 from .time import utc_timestamp
 
@@ -177,7 +178,11 @@ def default_state() -> Dict[str, Any]:
         "obi_mood": None,
         "obi_streak": 0,
         "obi_story_lines": [],
+        # spark_quiet_mode is derived at read time from quiet_state (#209) —
+        # kept so every pre-existing reader (policy.py, ~30 tests) still sees
+        # a plain bool without needing to know quiet_state exists.
         "spark_quiet_mode": False,
+        "quiet_state": None,
         "history": [],
     }
 
@@ -212,12 +217,25 @@ def ensure_session() -> Path:
     return path
 
 
+def _with_resolved_quiet_mode(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive the legacy `spark_quiet_mode` bool from `quiet_state` (#209).
+
+    Every existing reader — policy.py's `is True` check chief among them —
+    keeps working against a plain bool without knowing `quiet_state` exists.
+    Read-time only: this does not write anything back, so a lapsed temporary
+    window reads as inactive here without anyone having cleared the record
+    on disk (see `quiet_mode.resolve`).
+    """
+    data["spark_quiet_mode"] = quiet_mode.resolve(data, now=time.time())
+    return data
+
+
 def load_session() -> Dict[str, Any]:
     path = ensure_session()
     lock_path = str(path) + ".lock"
     with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             _log.warning("session.json corrupt — resetting to defaults: %s", path)
             corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
@@ -229,7 +247,7 @@ def load_session() -> Dict[str, Any]:
             _trim_corrupt_backups(path, keep=3)
             data = default_state()
             atomic_write(path, json.dumps(data, indent=2) + "\n")
-            return data
+        return _with_resolved_quiet_mode(data)
 
 
 def load_session_readonly() -> Dict[str, Any]:
@@ -241,9 +259,10 @@ def load_session_readonly() -> Dict[str, Any]:
     """
     path = session_path()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default_state()
+        data = default_state()
+    return _with_resolved_quiet_mode(data)
 
 
 def save_session(data: Dict[str, Any]) -> None:
@@ -285,3 +304,42 @@ def update_session(
 
         atomic_write(path, json.dumps(data, indent=2) + "\n")
         return data
+
+
+def set_quiet_mode(
+    *,
+    enabled: bool,
+    source: str,
+    reason: Optional[str] = None,
+    ttl_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """The one canonical quiet-mode writer (#209) — `bin/tool-quiet`,
+    `bin/tool-transition` and the dashboard PATCH all route through this
+    (or `clear_quiet_mode`) instead of writing `spark_quiet_mode` directly.
+
+    Always logs a history entry, closing the gap where the dashboard PATCH
+    previously toggled the flag with no record of who or why. `ttl_s=None`
+    is indefinite (the Three S's protocol); a caller that wants a bounded
+    buffer (`bin/tool-transition`) passes a TTL in seconds.
+    """
+    now = time.time()
+    expires_at = now + ttl_s if ttl_s is not None else None
+    record = quiet_mode.new_state(
+        enabled=enabled, source=source, reason=reason, set_at=now, expires_at=expires_at,
+    )
+    resolved = quiet_mode.resolve({"quiet_state": record}, now=now)
+    return update_session(
+        fields={"quiet_state": record, "spark_quiet_mode": resolved},
+        history_entry={
+            "event": "quiet_mode_set" if enabled else "quiet_mode_clear",
+            "source": source,
+            "reason": reason,
+            "enabled": enabled,
+            "expires_at": expires_at,
+        },
+    )
+
+
+def clear_quiet_mode(*, source: str, reason: Optional[str] = None) -> Dict[str, Any]:
+    """Convenience wrapper — `set_quiet_mode(enabled=False, ...)`."""
+    return set_quiet_mode(enabled=False, source=source, reason=reason, ttl_s=None)

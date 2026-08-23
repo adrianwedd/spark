@@ -27,8 +27,7 @@ import subprocess
 from pathlib import Path
 
 from pxh.logging import log_event
-from pxh.state import load_session, update_session
-from pxh.time import utc_timestamp
+from pxh.state import clear_quiet_mode, load_session, set_quiet_mode, update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
@@ -61,10 +60,8 @@ def main() -> int:
         emote("idle", dry)
         # One short, calm statement — then silence
         speak("It's okay. I'm here.", dry)
-        update_session(
-            fields={"spark_quiet_mode": True, "last_action": "tool_quiet"},
-            history_entry={"event": "quiet_start", "ts": utc_timestamp()},
-        )
+        set_quiet_mode(enabled=True, source="tool_quiet", reason="three_ss_start", ttl_s=None)
+        update_session(fields={"last_action": "tool_quiet"})
         payload = {"status": "ok", "action": "start", "quiet_mode": True, "dry": dry,
                    "note": "Three S's active — no demands, idle presence only"}
 
@@ -89,10 +86,8 @@ def main() -> int:
         # Clear the flag first, so nothing at all runs under a stale True. Any
         # gentle re-engagement is a separate turn, which now passes policy
         # normally because quiet mode is already false.
-        update_session(
-            fields={"spark_quiet_mode": False, "last_action": "tool_quiet"},
-            history_entry={"event": "quiet_end", "ts": utc_timestamp()},
-        )
+        clear_quiet_mode(source="tool_quiet", reason="three_ss_end")
+        update_session(fields={"last_action": "tool_quiet"})
         emote("curious", dry)
         payload = {"status": "ok", "action": "end", "quiet_mode": False,
                    "spoke": False, "dry": dry}
