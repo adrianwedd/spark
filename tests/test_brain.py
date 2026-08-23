@@ -410,6 +410,33 @@ def test_mailbox_dirs_are_world_writable(_mailbox):
         assert path.stat().st_mode & 0o7777 == 0o1777, f"{path} must be 1777"
 
 
+def test_recycle_landed_today_true_when_marker_matches(_mailbox):
+    root = brain.brain_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "recycle_state.json").write_text(
+        json.dumps({"last_recycle_day": "2026-08-23"}))
+    assert brain.recycle_landed_today("2026-08-23") is True
+
+
+def test_recycle_landed_today_false_when_marker_is_stale(_mailbox):
+    root = brain.brain_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "recycle_state.json").write_text(
+        json.dumps({"last_recycle_day": "2026-08-22"}))
+    assert brain.recycle_landed_today("2026-08-23") is False
+
+
+def test_recycle_landed_today_none_when_marker_is_missing(_mailbox):
+    assert brain.recycle_landed_today("2026-08-23") is None
+
+
+def test_recycle_landed_today_none_when_marker_is_corrupt(_mailbox):
+    root = brain.brain_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "recycle_state.json").write_text("{not json")
+    assert brain.recycle_landed_today("2026-08-23") is None
+
+
 def test_sweep_moves_pending_requests_to_dead(_mailbox):
     """A restarted session must never replay requests whose callers have
     already fallen back and moved on."""

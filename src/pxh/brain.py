@@ -333,6 +333,33 @@ def current_path(session: str) -> Path:
     return session_dir(session) / "current.json"
 
 
+def recycle_landed_today(today: str) -> bool | None:
+    """Has the resident session's context already been reset today?
+
+    True for either cause brain_daemon treats as a reset — a landed nightly
+    recycle, or the session having been (re)created today (recreate stamps
+    the same marker, since a fresh session has nothing left to recycle). A
+    caller wanting to avoid racing brain_daemon's own nightly recycle (#278 —
+    consolidation and the recycle both become eligible at the same Hobart
+    hour) can check this before spending a request, without depending on
+    brain_daemon or its in-memory SessionState.
+
+    `today` is the caller's own local-date string (e.g. Hobart "%Y-%m-%d") —
+    this module carries no timezone of its own. Returns None, not False, when
+    brain_daemon's recycle_state.json is missing or unreadable — "unknown",
+    so a caller that wants to fail open (nothing to race if the brain has
+    never run) can tell that apart from a proven "not yet".
+    """
+    try:
+        data = json.loads((brain_root() / "recycle_state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    day = data.get("last_recycle_day")
+    if not isinstance(day, str) or not day:
+        return None
+    return day == today
+
+
 def validation_path(session: str) -> Path:
     return session_dir(session) / "validation.json"
 

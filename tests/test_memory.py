@@ -431,6 +431,54 @@ def test_maybe_consolidate_dry_returns_none_and_writes_nothing():
     assert not memory.consolidation_meta_file().exists()
 
 
+def _set_recycle_landed(monkeypatch, day):
+    """day=None => no marker at all (brain_daemon has never run)."""
+    monkeypatch.setattr(
+        memory.brain, "recycle_landed_today",
+        lambda today: None if day is None else day == today)
+
+
+def test_maybe_consolidate_defers_during_the_recycle_hour_when_not_yet_landed(monkeypatch):
+    """#278: at 02:xx, before brain_daemon's own bookkeeping shows today's
+    nightly recycle has landed, consolidation must defer rather than race
+    it — and deferring must not cost one of the day's two attempts."""
+    at2 = dt.datetime(2026, 7, 11, 2, 30, tzinfo=HOBART)
+    _set_recycle_landed(monkeypatch, "2026-07-10")  # yesterday — not landed yet
+    with patch.object(memory, "consolidate") as mc:
+        assert memory.maybe_consolidate(now=at2) is None
+    mc.assert_not_called()
+    assert not memory.consolidation_meta_file().exists()
+
+
+def test_maybe_consolidate_proceeds_during_the_recycle_hour_once_landed(monkeypatch):
+    at2 = dt.datetime(2026, 7, 11, 2, 30, tzinfo=HOBART)
+    _set_recycle_landed(monkeypatch, "2026-07-11")  # today — already landed
+    with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 1}) as mc:
+        assert memory.maybe_consolidate(now=at2)["status"] == "ok"
+    mc.assert_called_once()
+
+
+def test_maybe_consolidate_fails_open_when_no_recycle_marker_exists(monkeypatch):
+    """A missing recycle_state.json (brain_daemon never ran — e.g. before its
+    first boot) must not block consolidation forever; unknown proceeds."""
+    at2 = dt.datetime(2026, 7, 11, 2, 30, tzinfo=HOBART)
+    _set_recycle_landed(monkeypatch, None)
+    with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 1}) as mc:
+        assert memory.maybe_consolidate(now=at2)["status"] == "ok"
+    mc.assert_called_once()
+
+
+def test_maybe_consolidate_ignores_recycle_state_past_the_grace_hour():
+    """Past the window's first hour, proceed regardless of recycle state —
+    a recycle still waiting on a busy brain must not cost the whole day's
+    consolidation. No monkeypatch: the real brain.recycle_landed_today runs
+    and finds no marker, which alone proves this path never even checks."""
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 1}) as mc:
+        assert memory.maybe_consolidate(now=at3)["status"] == "ok"
+    mc.assert_called_once()
+
+
 def test_maybe_consolidate_fails_closed_when_meta_stamp_write_fails():
     """Finding 3: if the pre-call attempt stamp can't be written, we must not
     spend the LLM session — consolidate() must not be called, and the
