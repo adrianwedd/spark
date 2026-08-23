@@ -125,6 +125,26 @@ def test_offline_opens_monotonic_circuit_and_suppresses_repeated_probes(monkeypa
     assert circuit["open_until_monotonic"] == 400.0
 
 
+def test_circuit_opened_before_a_reboot_does_not_survive_it(monkeypatch, _isolated_m5):
+    """A circuit deadline is a monotonic value; time.monotonic() resets to
+    ~0 on reboot, so without a boot_id check a deadline written late in a
+    long prior uptime reads as still-open for a very long time afterward —
+    this is the exact defect that left reflection and post_qa dead for
+    hours after a real reboot (2026-08-23)."""
+    now = [58 * 3600.0]  # late in a long prior uptime
+    monkeypatch.setattr(_isolated_m5.time, "monotonic", lambda: now[0])
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+        assert _isolated_m5.ask_m5("reflection", "prompt", "system").status == "offline"
+
+    # Reboot: monotonic resets near zero, boot_id changes.
+    now[0] = 5.0
+    monkeypatch.setattr(_isolated_m5, "_BOOT_ID", "post-reboot-id")
+    with patch("urllib.request.urlopen", return_value=_response("thought")) as probe:
+        result = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert result.status == "available"
+    assert probe.call_count == 1
+
+
 def test_circuit_retries_after_five_monotonic_minutes(monkeypatch, _isolated_m5):
     """The circuit must reopen only after its full five-minute monotonic interval."""
     now = [100.0]
