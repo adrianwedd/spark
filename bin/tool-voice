@@ -12,11 +12,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 from filelock import FileLock, Timeout as _FileLockTimeout
 
 from pxh import policy_context
 from pxh.logging import log_event
+from pxh.speaker_amp import ensure_speaker_enabled
 from pxh.state import update_session
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
@@ -54,17 +57,28 @@ else:
 
 
 def main() -> int:
+    # Correlation id for one wake->speech turn (set by px-wake-listen from its
+    # wake grant); elapsed_s is dispatch-to-log-line, not audio duration, so
+    # it marks where in the tool-voice call this outcome landed, not how long
+    # playback took.
+    _trace_id = os.environ.get("PX_TRACE_ID")
+    _dispatch_t0 = time.monotonic()
+
+    def _log_voice(payload: dict) -> None:
+        log_event("voice", {**payload, "trace_id": _trace_id,
+                             "elapsed_s": round(time.monotonic() - _dispatch_t0, 2)})
+
     text = os.environ.get("PX_TEXT")
     if not text:
         payload = {"status": "error", "error": "PX_TEXT environment variable is required"}
-        log_event("voice", payload)
+        _log_voice(payload)
         print(json.dumps(payload))
         return 1
 
     # Content safety filter — refuse to speak dangerous how-to content
     if _is_dangerous(text):
         payload = {"status": "blocked", "reason": "content_filter", "text": text[:100]}
-        log_event("voice", payload)
+        _log_voice(payload)
         print(json.dumps(payload))
         return 1
 
@@ -92,7 +106,7 @@ def main() -> int:
     if not _verdict.allowed:
         payload = {"status": "suppressed", "reason": _verdict.reason,
                    "text": text[:200]}
-        log_event("voice", payload)
+        _log_voice(payload)
         print(json.dumps(payload))
         return 0
 
@@ -113,7 +127,7 @@ def main() -> int:
                 fields={"last_action": "tool_voice"},
                 history_entry={"event": "voice", "text": text, "dry": _dry, "persona": persona},
             )
-            log_event("voice", {"status": "ok", "persona": persona, "text": text, "dry": _dry})
+            _log_voice({"status": "ok", "persona": persona, "text": text, "dry": _dry})
             print(result.stdout, end="")
             return result.returncode
     
@@ -198,11 +212,7 @@ def main() -> int:
             wav_data = _normalize_wav(wav_data)
             try:
                 with VOICE_LOCK:
-                    subprocess.run(
-                        ["sudo", "-n", "/usr/bin/python3", "-c",
-                         "from robot_hat import enable_speaker; enable_speaker()"],
-                        check=False, capture_output=True,
-                    )
+                    ensure_speaker_enabled(sudo=True, log=lambda m: print(f"[tool-voice] {m}", file=sys.stderr))
                     pulse_env = os.environ.copy()
                     pulse_env.setdefault("PULSE_SERVER", "unix:/run/user/1000/pulse/native")
                     play_res = subprocess.run(
@@ -218,7 +228,7 @@ def main() -> int:
                         # Don't set status=error — fall through to espeak fallback
             except _FileLockTimeout:
                 payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
-                log_event("voice", payload)
+                _log_voice(payload)
                 print(json.dumps(payload))
                 return 1
 
@@ -238,11 +248,7 @@ def main() -> int:
                     voice_variant = os.environ.get("PX_VOICE_VARIANT", "en-gb")
                     device = os.environ.get("PX_VOICE_DEVICE")
                     # Enable robot-hat speaker amplifier (GPIO 20) before audio
-                    subprocess.run(
-                        ["sudo", "-n", "/usr/bin/python3", "-c",
-                         "from robot_hat import enable_speaker; enable_speaker()"],
-                        check=False, capture_output=True,
-                    )
+                    ensure_speaker_enabled(sudo=True, log=lambda m: print(f"[tool-voice] {m}", file=sys.stderr))
                     import re as _re
                     spoken = _re.sub(r'\bObi\b', 'Obee', text, flags=_re.IGNORECASE)
                     es_res = subprocess.run(
@@ -289,12 +295,12 @@ def main() -> int:
                         payload["status"] = "error"
         except _FileLockTimeout:
             payload = {"status": "error", "error": "voice lock timeout", "dry": dry_mode, "text": text}
-            log_event("voice", payload)
+            _log_voice(payload)
             print(json.dumps(payload))
             return 1
         except Exception as exc:
             payload = {"status": "error", "error": f"playback error: {exc}", "dry": dry_mode, "text": text}
-            log_event("voice", payload)
+            _log_voice(payload)
             print(json.dumps(payload))
             return 1
 
@@ -302,7 +308,7 @@ def main() -> int:
         fields={"last_action": "tool_voice"},
         history_entry={"event": "voice", "text": text, "dry": dry_mode},
     )
-    log_event("voice", payload)
+    _log_voice(payload)
     print(json.dumps(payload))
     return 0 if payload["status"] == "ok" else 1
 
