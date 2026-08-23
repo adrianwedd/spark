@@ -4,7 +4,26 @@ After=network.target sound.target
 Wants=sound.target
 
 [Service]
-Type=simple
+# Type=notify, not simple (#219 item 3): under Type=simple the unit is
+# considered "started" the instant it execs, so TimeoutStartSec never
+# actually gates model loading — a live incident on 2026-08-23 sat wedged in
+# SenseVoice loading (mem_cgroup_handle_over_high, synchronous reclaim under
+# MemoryHigh) for 47+ minutes with systemd having no idea anything was wrong.
+# Under Type=notify, TimeoutStartSec governs the time until READY=1 arrives
+# (bin/px-wake-listen's notify_ready(), called only after STT backend
+# selection completes) — a start that never gets there past the deadline is
+# killed and handed to Restart=always/RestartSec=10 below, which is this
+# unit's existing "fail loudly and retry later" mechanism once the timeout is
+# real. 900s is deliberately generous rather than tight: a normal cold start
+# (Vosk + SenseVoice, no contention) completes in single-digit seconds, but a
+# start racing another process for I2C/memory right after a prior crash
+# should still get a real chance before being killed and restarted into the
+# same contention. This bounds the failure mode at "restart loop, visible in
+# the journal" instead of "silently wedged for hours," which is what #219
+# actually needed — it does not by itself make loading faster.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=900
 User=pi
 Group=pi
 WorkingDirectory=/home/pi/picar-x-hacking

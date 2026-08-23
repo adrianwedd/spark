@@ -83,7 +83,7 @@ cpu:    some avg10=6.15  avg60=5.19  avg300=4.16
 | Service | MemoryHigh | MemoryMax | CPUWeight | Rationale (full text in each drop-in) |
 |---|---:|---:|---:|---|
 | px-brain | 960M | 1536M | 150 | ~3x expected single-session steady state; raised priority — #217's strongest evidence implicates this process losing scheduler contention |
-| px-wake-listen | 640M | 1024M | default | High ~1.1x steady state; Max ~12% above documented 900M peak (#219) |
+| px-wake-listen | 896M | 1280M | default | **Recalibrated 2026-08-23 — see "Track B" below.** High clears the measured 707-730M one-time model-load peak; the original 640M/1024M pair (superseded) was set below that peak and guaranteed throttling on every start |
 | px-tts-glados | 576M | 768M | default | conservative multiple; no documented peak exists (new finding) |
 | px-frigate-stream | 224M | 384M | 50 | bursty; lowered priority — should yield under contention |
 | px-api-server | 128M | 256M | default | headroom for request spikes |
@@ -156,6 +156,98 @@ simultaneously hitting its own peak at once. `MemoryHigh` (throttle, not
 kill) is what actually protects against a slow multi-service squeeze, by
 design. `tests/test_systemd_containment.py::test_sum_of_memory_max_is_disclosed_not_assumed_safe`
 pins this fact so a future edit can't silently un-disclose it.
+
+## Track B: px-wake-listen allocator-retention fix and recalibration (2026-08-23)
+
+The original 640M/1024M pair above was sized against a single steady-state
+RSS number (522-571M, see baseline table) without distinguishing an
+intrinsic operating cost from a fixable defect. Two live incidents on
+2026-08-23 forced the distinction: `px-wake-listen` wedged in
+`mem_cgroup_handle_over_high` (synchronous reclaim under `MemoryHigh`) for
+**47.9 minutes**, and a subsequent restart wedged again for **~4m54s** before
+being SIGKILLed on `Restart=always`'s own timeout — both while
+`Type=simple` meant systemd had no way to know either wedge was happening.
+
+**1. Allocator retention was fixable, not intrinsic.** `bin/px-wake-memprofile`
+(repeated-cycle mode, `PX_MEMPROFILE_CYCLES=8`) isolated the two components of
+this service's memory: model load and one untrimmed inference legitimately
+cost 707-730M PSS/RSS (Vosk grammar + SenseVoice's onnxruntime session,
+inference itself adding only ~12M) — but that figure never fell back down on
+its own. `gc.collect()` alone (Python-level references only) recovers a small
+fraction of it; `malloc_trim(0)` via `ctypes.CDLL("libc.so.6")`, run **without
+unloading either model**, is what returns the freed-but-retained glibc arena
+memory to the OS. Run live twice on 2026-08-23 with the service stopped:
+
+| Stage | PSS | RSS |
+|---|---:|---:|
+| after both models load, before any inference | 707-718M | 718-730M |
+| after one **untrimmed** inference | 719M | 729M (+~12M — confirms inference itself is cheap) |
+| after the first `malloc_trim(0)` call | 449M | 460M |
+| after 7 further inference+trim cycles | 449M (±70K noise) | 460M exactly, **zero drift** |
+
+The flat result across 8 repeated cycles is the direct answer to "verify
+repeated cycles do not accumulate memory": they don't, once every cycle
+trims. `bin/px-wake-listen`'s `_release_transient_memory()` runs this same
+`gc.collect()` + `malloc_trim(0)` pair from the single chokepoint
+`_do_transcribe()` returns through — every STT fallback path, including a
+full fall-through to Vosk — pinned by
+`tests/test_wake_memory_containment.py`.
+
+**2. MemoryHigh/MemoryMax recalibrated from that evidence, not from a round
+number.** The critical distinction the recalibration turns on: `malloc_trim`
+cannot lower the *load-time* peak, because it only runs after a completed
+transcription — the 707-730M figure happens once per process lifetime,
+before any trim call exists to catch it. Sizing `MemoryHigh` to the
+post-trim steady state (449-460M) would have thrown the ceiling straight
+back below the unavoidable load peak — reproducing the exact failure the old
+640M value already had. `MemoryHigh=896M` clears the measured peak with
+~25-27% headroom instead; `MemoryMax=1280M` keeps ~43% margin above that and
+stays comfortably above the historical 900-924M VmHWM peak (the pre-fix
+worst case, when nothing ever trimmed the arena). Full reasoning lives in
+`systemd/px-wake-listen.service.d/10-containment.conf`'s comment block.
+
+**3. Bounded startup contract.** `Type=simple` is why the 47-minute wedge was
+invisible to systemd: the unit is considered "started" the instant it
+`exec()`s, so `TimeoutStartSec` never gated model-load time at all. Converted
+to `Type=notify` (`NotifyAccess=main` — systemd's default `NotifyAccess=none`
+silently discards `sd_notify()` traffic, which would have made this a
+regression rather than a fix) with `TimeoutStartSec=900`. `notify_ready()`
+(mirroring `bin/px-alive`'s helper) fires only after STT backend selection
+completes, or from the duplicate-instance guard's clean exit — never before
+the daemon can do its job. A start that never reaches `READY=1` within 900s
+is killed and handed to the existing `Restart=always`/`RestartSec=10`, which
+turns "silently wedged for hours" into "visible restart loop in the
+journal." 900s is deliberately generous, not tight — a start racing another
+process for I2C/memory right after a crash should get a real chance rather
+than being killed back into the same contention it is already losing to.
+
+**Live redeploy, 2026-08-23T19:45 AEST**, under real (not synthetic) host
+contention — `load1=6.2`, `psi_io_some_avg10=39.06`, `psi_io_full_avg10=32.9`,
+memory PSI at 0 (this was I/O, not memory, pressure):
+
+- Cold start completed in **44.7s** (`model load end: backend=sensevoice
+  elapsed=44.7s`) — bounded, and `systemctl start` blocked correctly on
+  `READY=1` rather than returning early.
+- `memory.events:high` rose from 0 to 96 *during the load window itself*
+  (some transient reclaim activity while usage approached the new ceiling
+  under this particular I/O-contended load) but froze there once loading
+  finished — no wedge, no OOM, no `max` events, `systemctl show` reported
+  `ActiveState=active`/`SubState=running` immediately after.
+- Resting floor immediately post-load, before any real transcription has
+  run: `VmRSS=683.9M` / `Pss=673.1M` (`MemoryCurrent=689.5M` against
+  `MemoryHigh=939.5M`/`MemoryMax=1342.2M`, i.e. 896M/1280M as configured) —
+  consistent with the profiler's measured pre-trim range.
+
+**What remains unverified by this session:** an actual spoken "Hey Spark"
+wake word was not exercised — that requires a human voice at the physical
+mic, which this session could not manufacture. The identical
+`gc.collect()`/`malloc_trim(0)` logic was verified 8 times over against the
+same live model objects via the profiler (flat 460M, no drift), and the
+redeployed service's cold-start/resting-state behavior was verified against
+real host contention, but the first production `memtrim(post_transcribe)`
+log line from a genuine spoken interaction should be checked (`journalctl -u
+px-wake-listen | grep memtrim`) once the robot is next used, to confirm the
+production wiring behaves as the profiler proxy predicts.
 
 ## Acceptance testing
 
