@@ -21,6 +21,22 @@ M5_HOST = os.environ.get("PX_M5_SPARK_HOST", "http://M5.local:11434")
 M5_TIMEOUT_S = float(os.environ.get("PX_M5_SPARK_TIMEOUT_S", "30"))
 CIRCUIT_OPEN_S = 300.0
 
+
+def _read_boot_id() -> str:
+    """The kernel's boot id — see brain_daemon._read_boot_id for why this host
+    needs it: no RTC, so a monotonic deadline written before a reboot reads as
+    still-open for a full CIRCUIT_OPEN_S (or worse, whatever uptime the prior
+    boot had reached) against the new boot's near-zero clock."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8"
+        ).strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+_BOOT_ID = _read_boot_id()
+
 M5Status = Literal["available", "busy", "timeout", "offline", "bad_response"]
 
 
@@ -130,7 +146,8 @@ def _result(status: M5Status, *, response: str = "", error: str = "",
 def _open_circuit(status: M5Status) -> None:
     try:
         atomic_write(_circuit_path(), json.dumps({"status": status,
-            "open_until_monotonic": time.monotonic() + CIRCUIT_OPEN_S}))
+            "open_until_monotonic": time.monotonic() + CIRCUIT_OPEN_S,
+            "boot_id": _BOOT_ID}))
     except OSError:
         pass
 
@@ -164,7 +181,12 @@ def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = Non
         return _result("busy", kind=kind, started=started, error="M5 SPARK model busy")
     try:
         circuit = circuit_summary()
-        if time.monotonic() < float(circuit.get("open_until_monotonic", 0)):
+        # A circuit opened before this boot is meaningless: time.monotonic()
+        # resets to ~0 on reboot, so a deadline computed against the prior
+        # boot's uptime can read as "still open" for days regardless of
+        # whether M5 is actually reachable now.
+        if circuit.get("boot_id") == _BOOT_ID and \
+                time.monotonic() < float(circuit.get("open_until_monotonic", 0)):
             status = circuit.get("status")
             if status in ("timeout", "offline", "bad_response"):
                 return _result(status, kind=kind, started=started, error="M5 circuit open")
