@@ -95,14 +95,58 @@ cpu:    some avg10=6.15  avg60=5.19  avg300=4.16
 | px-blog | 64M | 192M | 50 | idle baseline tiny; Max covers an active compose pass; lowered priority |
 | cloudflared | 96M | 192M | default | not implicated in #217 |
 
-**Deliberately not contained:** the interactive/operator Claude session
+**Deliberately not contained here:** the interactive/operator Claude session
 (`user.slice/user-1000.slice/session-3.scope`, ~1GB observed, including the
 session that produced this PR) — #217's own text flags this class of session
 as a contributor ("why a third Claude operator session pushes the host to
 ~1.7GB"), but the goal's explicit per-service target list names only system
 daemons, and applying a cgroup limit to a live interactive session risks
 capping the very session doing this work. Recommended as a separate,
-deliberately-scoped follow-up rather than guessed at here.
+deliberately-scoped follow-up rather than guessed at here. **That follow-up
+is `bin/px-claude-dev`, below** — a 2026-08-23 re-measurement confirmed this
+class of session was still the single largest live memory consumer on the
+host (~862 MiB PSS for `claude` alone, ~1.43 GiB current / 1.67 GiB peak for
+the whole scope, still uncontained).
+
+## Operator/development Claude containment (`bin/px-claude-dev`, 2026-08-23)
+
+`bin/px-claude-dev` wraps `claude` (an operator working the repo — not
+`spark-brain`, which is already contained above) in its own transient
+`systemd-run --user --scope --collect`, with `MemoryHigh=1024M` /
+`MemoryMax=2048M` by default (`PX_DEV_CLAUDE_MEMORY_HIGH` /
+`PX_DEV_CLAUDE_MEMORY_MAX` override either). Use it in place of a bare
+`claude` invocation for repo work on the robot.
+
+**Why a new scope wrapping only the `claude` process, not a cap on the
+existing SSH session-N.scope or on `user-1000.slice`:**
+
+- **Not `user-1000.slice`:** PulseAudio, PipeWire and `filter-chain` all live
+  under `user@1000.service/session.slice/`, a **sibling** of the raw SSH
+  `session-N.scope`, not a child of it — confirmed by reading each service's
+  `/proc/<pid>/cgroup` live. A `user-1000.slice`-wide cap would throttle audio
+  infrastructure the same way it throttles `claude`; this is exactly what the
+  #219-era goal warned against doing "blindly."
+- **Not the existing `session-N.scope`:** that scope is the operator's whole
+  SSH login shell, not just `claude` — capping it would also throttle
+  unrelated diagnostic work (`journalctl`, `tail`, an editor) done in the same
+  shell, which was never what was observed to balloon. It is also the scope
+  the *currently running* investigation/implementation session is itself
+  using; a script cannot safely cap the cgroup it is executing inside without
+  risking self-OOM mid-task.
+- A dedicated scope around just the `claude` child avoids both: it bounds the
+  ~862-912 MiB PSS process tree the 2026-08-23 measurement actually
+  implicated, while leaving the rest of the SSH session and all audio/session
+  infrastructure unaffected.
+
+This only affects **future** sessions launched through the wrapper — it does
+not retroactively cap any session already running, including the one that
+wrote it. `docs/operations/resource-containment.md`'s existing acceptance-
+testing pattern (A. baseline, B. bounded pressure test, C. recovery) applies
+here too: verify with `systemd-run --user --scope -p MemoryHigh=100M -p
+MemoryMax=150M -- /bin/true` (harmless, self-cleaning) before trusting the
+wrapper against a real session, and confirm via `systemctl --user status
+<scope>` that PulseAudio/PipeWire units are unaffected while a capped
+`px-claude-dev` session runs.
 
 **Honesty about the ceiling, not a guarantee:** the sum of every `MemoryMax`
 above (~4.2G) exceeds total host RAM (3796M). Per-cgroup hard caps are not a
@@ -133,6 +177,28 @@ it automatically.
 
 **C. Recovery** — health returns automatically; no stale "ok" from a dead
 component; no host reboot required; no session/runtime state corruption.
+
+## Observability extension (`src/pxh/hostload.py`, 2026-08-23)
+
+The 2026-08-23 memory-pressure episode also showed that `hostload.py`
+(added for #270/#283, wired into `brain.py` and `mic_stream.py`) only ever
+sampled CPU PSI — during that episode CPU PSI stayed at 0 the whole time
+while memory/IO PSI reached 46%/65% full avg10, so nothing #270/#283 already
+logs could have been correlated against the actual bottleneck. Extended,
+event-driven only (no new high-frequency logging), to add:
+
+- `psi_mem_some_avg10_<prefix>` / `psi_mem_full_avg10_<prefix>`
+- `psi_io_some_avg10_<prefix>` / `psi_io_full_avg10_<prefix>`
+- `swap_free_kb_<prefix>`
+- `cgroup_pressure_fields(unit, prefix)` — `mem_ratio_<unit>_<prefix>`
+  (`memory.current` / `memory.high`, omitted when uncapped),
+  `events_high_<unit>_<prefix>` (cumulative) and
+  `events_high_rate_<unit>_<prefix>` (delta since this process's last call)
+  for `px-brain` and `px-wake-listen`, the two units this episode found
+  chronically pressed against their own ceiling.
+
+Existing keys (`load1_<prefix>`, `psi_cpu_avg10_<prefix>`) are unchanged, for
+backward compatibility with existing log analysis over #270/#283 events.
 
 ## Is #217 mitigated or merely instrumented?
 

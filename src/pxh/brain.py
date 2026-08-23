@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from . import health, tmux_claude
-from .hostload import host_load_fields
+from .hostload import cgroup_pressure_fields, host_load_fields
 from .logging import log_event
 from .state import PROJECT_ROOT, atomic_write
 from .time import utc_timestamp
@@ -938,6 +938,7 @@ def ask_brain(
     # a full time-series belongs to a real host-load logger (#218), not to a
     # per-turn log line already carrying five other duration fields.
     load_at_start = host_load_fields("start")
+    cgroup_at_start = cgroup_pressure_fields("px-brain", "start")
 
     request_id = str(uuid.uuid4())
     try:
@@ -1031,7 +1032,8 @@ def ask_brain(
                           exec_s=round(time.monotonic() - lock_acquired, 2),
                           turns_since_reset=turns_before,
                           consecutive_slow_before=consecutive_slow_before,
-                          **load_at_start, **host_load_fields("end"))
+                          **load_at_start, **host_load_fields("end"),
+                  **cgroup_at_start, **cgroup_pressure_fields("px-brain", "end"))
                 record_turn_completion(session, slow=duration_s >= slow_threshold_s)
                 return reply
             time.sleep(POLL_INTERVAL_S)
@@ -1044,7 +1046,8 @@ def ask_brain(
                   exec_s=round(time.monotonic() - lock_acquired, 2),
                   turns_since_reset=turns_before,
                   consecutive_slow_before=consecutive_slow_before,
-                  **load_at_start, **host_load_fields("end"))
+                  **load_at_start, **host_load_fields("end"),
+                  **cgroup_at_start, **cgroup_pressure_fields("px-brain", "end"))
         record_turn_completion(session, slow=True)
         return None
     finally:

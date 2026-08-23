@@ -40,7 +40,7 @@ import threading
 import time
 from collections import deque
 
-from .hostload import host_load_fields
+from .hostload import cgroup_pressure_fields, host_load_fields
 
 DEFAULT_RATE = 44100
 DEFAULT_CHANNELS = 1
@@ -253,7 +253,10 @@ class ArecordStream:
                 line = raw.decode(errors="replace").strip()
                 if line:
                     if "overrun" in line:
-                        load = host_load_fields("at")
+                        load = {
+                            **host_load_fields("at"),
+                            **cgroup_pressure_fields("px-wake-listen", "at"),
+                        }
                         suffix = " ".join(f"{k}={v}" for k, v in load.items())
                         line = f"{line} [{suffix}]" if suffix else line
                     self._log(f"arecord: {line}")
