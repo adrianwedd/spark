@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from filelock import FileLock
 
-from pxh import provenance
+from pxh import brain, provenance
 from pxh.state import atomic_write
 from pxh.time import utc_timestamp
 
@@ -43,6 +43,14 @@ DEDUPE_SIMILARITY = 0.85
 DEDUPE_WINDOW_DAYS = 14
 CONSOLIDATION_WINDOW = (2, 6)     # Hobart hours [start, end)
 MAX_ATTEMPTS_PER_DAY = 2
+# CONSOLIDATION_WINDOW[0] and brain_daemon.NIGHTLY_RECYCLE_HOUR both default to
+# 2 — the same Hobart hour, not a coincidence to design around but the actual
+# collision (#278): a consolidation attempt that lands mid-recycle burns one
+# of MAX_ATTEMPTS_PER_DAY on lock contention instead of an answer, and two
+# such races exhausts the whole day's budget with nothing written. Confined
+# to the window's first hour, when the race is actually possible — see
+# maybe_consolidate.
+CONSOLIDATION_RECYCLE_GRACE_HOURS = 1
 MIN_THOUGHTS = 5
 MAX_MEMORIES_PER_DAY = 8
 
@@ -377,6 +385,18 @@ def maybe_consolidate(dry: bool = False, persona: str = "spark",
     if not (CONSOLIDATION_WINDOW[0] <= local.hour < CONSOLIDATION_WINDOW[1]):
         return None
     today = local.strftime("%Y-%m-%d")
+
+    # Only the window's first hour can race the nightly recycle (#278) — past
+    # it, proceed exactly as before regardless of recycle state, so a recycle
+    # that's still waiting on a busy brain doesn't cost the day's consolidation
+    # entirely. Within that hour, defer without spending an attempt only when
+    # brain_daemon's own bookkeeping proves the race hasn't resolved yet;
+    # `None` (no marker — e.g. brain_daemon has never run) fails open, same as
+    # today.
+    if local.hour < CONSOLIDATION_WINDOW[0] + CONSOLIDATION_RECYCLE_GRACE_HOURS:
+        if brain.recycle_landed_today(today) is False:
+            return None
+
     meta_f = consolidation_meta_file()
     meta = {}
     try:
