@@ -3,6 +3,7 @@ import os
 import pwd
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -926,17 +927,56 @@ def test_tool_quiet_end_clears_flag_without_speaking(isolated_project):
     It used to speak while spark_quiet_mode was still True, which is exactly
     the nested-audio bypass pxh.policy exists to prevent. Any re-engagement
     line is now a subsequent, ordinarily policy-evaluated audio turn.
+
+    Starts from an authoritative quiet_state=True (not the empty default) so
+    this actually exercises clearing it — since #209, spark_quiet_mode is
+    never persisted once quiet_state exists, so asserting on the raw legacy
+    bool alone would pass vacuously even if clearing were broken.
     """
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
+    env["PX_QUIET_ACTION"] = "start"
+    run_tool(["bin/tool-quiet"], env)
+
     env["PX_QUIET_ACTION"] = "end"
     stdout = run_tool(["bin/tool-quiet"], env)
     payload = parse_json(stdout)
     assert payload["status"] == "ok"
     assert payload["quiet_mode"] is False
     assert payload["spoke"] is False
+
+    from pxh import quiet_mode
     session = json.loads(isolated_project["session_path"].read_text())
-    assert session["spark_quiet_mode"] is False
+    assert session["quiet_state"]["enabled"] is False
+    assert quiet_mode.resolve(session, now=time.time()) is False
+
+
+def test_px_spark_clears_authoritative_quiet_state(isolated_project):
+    """bin/px-spark must clear quiet mode through the canonical API (#209),
+    not by writing the legacy spark_quiet_mode bool directly.
+
+    A direct bool write is silently masked by an authoritative quiet_state
+    record — quiet_mode.migrate_legacy() always prefers structured state
+    over the legacy bool — so activating the SPARK persona while a Three
+    S's session is active must actually clear quiet_state, not just report
+    success while leaving it in place.
+    """
+    env = isolated_project["env"].copy()
+    env["PX_DRY"] = "1"
+    env["PX_QUIET_ACTION"] = "start"
+    run_tool(["bin/tool-quiet"], env)
+
+    spark_env = isolated_project["env"].copy()
+    spark_env["PX_DRY"] = "1"
+    spark_env["PX_SPARK_ACTIVATE_ONLY"] = "1"
+    stdout = run_tool(["bin/px-spark"], spark_env)
+    assert "[spark] persona activated" in stdout
+
+    from pxh import quiet_mode
+    session = json.loads(isolated_project["session_path"].read_text())
+    assert session["quiet_state"]["enabled"] is False
+    assert quiet_mode.resolve(session, now=time.time()) is False
+    assert session["persona"] == "spark"
 
 
 def test_tool_repair_does_not_clear_quiet_mode(isolated_project):

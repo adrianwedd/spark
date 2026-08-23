@@ -410,6 +410,52 @@ class TestSession:
         )
         assert resp.status_code == 400
 
+    def test_patch_spark_quiet_mode_routes_through_canonical_api(self, api_client, auth_headers):
+        """A dashboard PATCH must carry provenance (#209) — it is not a raw
+        field write, so the response must reflect the derived value and the
+        session history must record who set it and why."""
+        resp = api_client.patch(
+            "/api/v1/session",
+            headers=auth_headers,
+            json={"spark_quiet_mode": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["spark_quiet_mode"] is True
+
+        resp = api_client.get("/api/v1/session", headers=auth_headers)
+        entry = resp.json()["history"][-1]
+        assert entry["source"] == "dashboard"
+        assert entry["reason"] == "dashboard_enable"
+        assert entry["enabled"] is True
+
+        resp = api_client.patch(
+            "/api/v1/session",
+            headers=auth_headers,
+            json={"spark_quiet_mode": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["spark_quiet_mode"] is False
+
+        resp = api_client.get("/api/v1/session", headers=auth_headers)
+        entry = resp.json()["history"][-1]
+        assert entry["source"] == "dashboard"
+        assert entry["reason"] == "dashboard_disable"
+        assert entry["enabled"] is False
+
+    def test_patch_spark_quiet_mode_combined_with_generic_field(self, api_client, auth_headers):
+        """A single PATCH setting both spark_quiet_mode and a generic field
+        must not let the generic field's raw update_session() return value
+        shadow quiet_state's already-durable derived value (#209)."""
+        resp = api_client.patch(
+            "/api/v1/session",
+            headers=auth_headers,
+            json={"spark_quiet_mode": True, "listening": True},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["spark_quiet_mode"] is True
+        assert data["listening"] is True
+
 
 # -- Tool execution --
 

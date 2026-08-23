@@ -154,6 +154,85 @@ def test_rotate_log_uses_filelock(tmp_path):
     assert not (tmp_path / "concurrent.log.rotlock.lock").exists()
 
 
+# -- set_quiet_mode / clear_quiet_mode (#209) --
+
+def test_set_quiet_mode_does_not_persist_spark_quiet_mode(tmp_path, monkeypatch):
+    """Once quiet_state exists, spark_quiet_mode must never be written to
+    disk as a competing field — only derived at read time. A stray on-disk
+    True/False here would be exactly the kind of value that could go stale
+    relative to quiet_state (e.g. after a TTL lapses with nothing rewriting
+    it) and mislead any future reader that doesn't go through resolve()."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    state.set_quiet_mode(enabled=True, source="test", reason="r")
+    raw = json.loads(session_file.read_text())
+    assert "quiet_state" in raw
+    assert raw["quiet_state"]["enabled"] is True
+    assert "spark_quiet_mode" not in raw
+
+
+def test_set_quiet_mode_return_value_has_derived_spark_quiet_mode(tmp_path, monkeypatch):
+    """Callers that inspect the return value (dashboard PATCH response, tool
+    payloads) must still see a correct spark_quiet_mode, even though it is
+    never written to the file."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    result = state.set_quiet_mode(enabled=True, source="test")
+    assert result["spark_quiet_mode"] is True
+    result = state.clear_quiet_mode(source="test")
+    assert result["spark_quiet_mode"] is False
+
+
+def test_set_quiet_mode_history_records_previous_state_and_transition(tmp_path, monkeypatch):
+    """A real False->True transition is distinguishable from a subsequent
+    idempotent True->True reaffirmation by previous_enabled/transition."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+
+    state.set_quiet_mode(enabled=True, source="test", reason="first")
+    entry = json.loads(session_file.read_text())["history"][-1]
+    assert entry["previous_enabled"] is False
+    assert entry["enabled"] is True
+    assert entry["transition"] is True
+
+    state.set_quiet_mode(enabled=True, source="test", reason="reaffirm")
+    entry = json.loads(session_file.read_text())["history"][-1]
+    assert entry["previous_enabled"] is True
+    assert entry["enabled"] is True
+    assert entry["transition"] is False
+
+    state.clear_quiet_mode(source="test", reason="end")
+    entry = json.loads(session_file.read_text())["history"][-1]
+    assert entry["previous_enabled"] is True
+    assert entry["enabled"] is False
+    assert entry["transition"] is True
+
+
+def test_set_quiet_mode_history_previous_state_reflects_expired_ttl(tmp_path, monkeypatch):
+    """previous_enabled must come from resolve(), not a raw bool — a lapsed
+    TTL buffer should read as previous_enabled=False even though the stale
+    record on disk still says enabled=True."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    state.set_quiet_mode(enabled=True, source="test", ttl_s=-1)  # already expired
+    state.set_quiet_mode(enabled=True, source="test", reason="new_buffer")
+    entry = json.loads(session_file.read_text())["history"][-1]
+    assert entry["previous_enabled"] is False
+
+
+def test_load_session_never_persists_derived_spark_quiet_mode(tmp_path, monkeypatch):
+    """load_session()'s derivation must stay read-only — a lapsed quiet_state
+    should read as inactive without load_session() rewriting the record."""
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    state.set_quiet_mode(enabled=True, source="test", ttl_s=-1)  # already expired
+    data = state.load_session()
+    assert data["spark_quiet_mode"] is False
+    raw = json.loads(session_file.read_text())
+    assert raw["quiet_state"]["enabled"] is True  # unchanged on disk
+    assert "spark_quiet_mode" not in raw
+
+
 def test_rotate_log_skips_when_locked(tmp_path):
     """rotate_log should silently skip if another rotator holds the lock."""
     from pxh.state import rotate_log

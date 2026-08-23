@@ -21,17 +21,28 @@ for arg in "$@"; do
     fi
 done
 
-# Activate SPARK persona in session state
+# Activate SPARK persona in session state.
+#
+# Quiet mode is cleared through the canonical API (#209), not by writing the
+# legacy spark_quiet_mode bool directly. A direct bool write is silently
+# masked by an authoritative quiet_state record — quiet_mode.migrate_legacy()
+# always prefers structured state over the legacy bool — so a raw write here
+# would report success while leaving an active Three S's session in place.
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, os.environ["PROJECT_ROOT"] + "/src")
-from pxh.state import update_session
-update_session(fields={
-    "persona": "spark",
-    "spark_quiet_mode": False,
-})
+from pxh.state import clear_quiet_mode, update_session
+clear_quiet_mode(source="px_spark", reason="persona_activated")
+update_session(fields={"persona": "spark"})
 print("[spark] persona activated")
 PY
+
+# Test hook (#209): exit right after persona activation, before the greet
+# and the exec into codex-voice-loop, so activation is unit-testable without
+# needing a real voice backend.
+if [[ "${PX_SPARK_ACTIVATE_ONLY:-0}" != "0" ]]; then
+    exit 0
+fi
 
 # Set SPARK voice environment
 export PX_PERSONA=spark

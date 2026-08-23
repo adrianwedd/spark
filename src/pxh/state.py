@@ -6,7 +6,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 try:
     from filelock import FileLock
@@ -275,8 +275,20 @@ def save_session(data: Dict[str, Any]) -> None:
 def update_session(
     fields: Optional[Dict[str, Any]] = None,
     history_entry: Optional[Dict[str, Any]] = None,
+    history_entry_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
     history_limit: int = 100,
+    remove_fields: Optional[list] = None,
 ) -> Dict[str, Any]:
+    """`history_entry_fn`, if given, is called with the pre-mutation `data`
+    while the lock is held, and its return value is used as `history_entry`.
+    This is the only race-safe way for a caller to log "previous state" —
+    reading current state before calling update_session() and computing a
+    diff outside the lock would TOCTOU against a concurrent writer.
+
+    `remove_fields`, if given, deletes those keys from `data` after `fields`
+    is merged in — the only way to retire a persisted key (e.g. a legacy
+    field superseded by a newer one) rather than just overwrite its value.
+    """
     # Call ensure_session BEFORE acquiring the lock — ensure_session acquires
     # the same lock internally and FileLock is not reentrant.
     path = ensure_session()
@@ -293,8 +305,13 @@ def update_session(
                 pass
             log_event("state-corruption", {"path": str(path), "message": "session.json was corrupt; reset to default state"})
 
+        if history_entry_fn is not None:
+            history_entry = history_entry_fn(data)
         if fields:
             data.update(fields)
+        if remove_fields:
+            for key in remove_fields:
+                data.pop(key, None)
         if history_entry:
             entry = {"ts": utc_timestamp(), **history_entry}
             history = data.setdefault("history", [])
@@ -314,30 +331,58 @@ def set_quiet_mode(
     ttl_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The one canonical quiet-mode writer (#209) — `bin/tool-quiet`,
-    `bin/tool-transition` and the dashboard PATCH all route through this
-    (or `clear_quiet_mode`) instead of writing `spark_quiet_mode` directly.
+    `bin/tool-transition`, `bin/px-spark` and the dashboard PATCH all route
+    through this (or `clear_quiet_mode`) instead of writing `spark_quiet_mode`
+    directly.
+
+    `quiet_state` is the only thing persisted to disk. `spark_quiet_mode` is
+    never written here — it stays a read-time compatibility field derived by
+    `load_session()`/`load_session_readonly()` (`_with_resolved_quiet_mode`),
+    so there is exactly one on-disk record of quiet mode and it cannot go
+    stale relative to itself. Any legacy `spark_quiet_mode` already on disk
+    (e.g. from `default_state()`'s bootstrap, written before `quiet_state`
+    ever existed) is actively removed on every call, not just left unwritten
+    — a stale bool sitting next to a disagreeing `quiet_state` is exactly the
+    kind of value that misled `bin/px-spark`'s old direct write. The dict
+    returned to the caller is enriched with the same derivation before it
+    goes back, so callers that inspect the return value (the dashboard PATCH
+    response, tool payloads) still see a correct `spark_quiet_mode` — it just
+    was never written to the file.
 
     Always logs a history entry, closing the gap where the dashboard PATCH
-    previously toggled the flag with no record of who or why. `ttl_s=None`
-    is indefinite (the Three S's protocol); a caller that wants a bounded
-    buffer (`bin/tool-transition`) passes a TTL in seconds.
+    previously toggled the flag with no record of who or why. The entry
+    records `previous_enabled` alongside the new `enabled`, computed from the
+    pre-mutation record under the same lock (no TOCTOU against a concurrent
+    writer), so a reader can distinguish a real transition from an idempotent
+    reaffirmation (`transition: previous_enabled != enabled`) instead of only
+    ever seeing the new state. `ttl_s=None` is indefinite (the Three S's
+    protocol); a caller that wants a bounded buffer (`bin/tool-transition`)
+    passes a TTL in seconds.
     """
     now = time.time()
     expires_at = now + ttl_s if ttl_s is not None else None
     record = quiet_mode.new_state(
         enabled=enabled, source=source, reason=reason, set_at=now, expires_at=expires_at,
     )
-    resolved = quiet_mode.resolve({"quiet_state": record}, now=now)
-    return update_session(
-        fields={"quiet_state": record, "spark_quiet_mode": resolved},
-        history_entry={
+
+    def _history_entry(pre_mutation_data: Dict[str, Any]) -> Dict[str, Any]:
+        previous_enabled = quiet_mode.resolve(pre_mutation_data, now=now)
+        return {
             "event": "quiet_mode_set" if enabled else "quiet_mode_clear",
             "source": source,
             "reason": reason,
+            "previous_enabled": previous_enabled,
             "enabled": enabled,
+            "transition": previous_enabled != enabled,
             "expires_at": expires_at,
-        },
+        }
+
+    data = update_session(
+        fields={"quiet_state": record},
+        remove_fields=["spark_quiet_mode"],
+        history_entry_fn=_history_entry,
     )
+    return _with_resolved_quiet_mode(data)
 
 
 def clear_quiet_mode(*, source: str, reason: Optional[str] = None) -> Dict[str, Any]:

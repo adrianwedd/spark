@@ -1826,17 +1826,22 @@ async def patch_session(body: SessionPatch) -> Dict[str, Any]:
             raise HTTPException(status_code=400, detail=f"invalid persona: {p!r} (valid: vixen, gremlin, spark, claude)")
         else:
             fields["persona"] = p
-    result: Optional[Dict[str, Any]] = None
     # spark_quiet_mode routes through the canonical transition API (#209)
     # rather than the generic fields update, so a dashboard toggle carries
     # provenance and a history entry like every other quiet-mode writer.
+    # quiet_state — not spark_quiet_mode — is the only thing persisted, so
+    # the response is always re-read via load_session() rather than trusting
+    # whichever branch's raw return happened to fire last: a PATCH that sets
+    # both spark_quiet_mode and a generic field (e.g. persona) in one call
+    # must not let the second write's stale on-disk spark_quiet_mode shadow
+    # the first write's already-durable quiet_state.
     if body.spark_quiet_mode is True:
-        result = set_quiet_mode(enabled=True, source="dashboard", reason="dashboard_enable")
+        set_quiet_mode(enabled=True, source="dashboard", reason="dashboard_enable")
     elif body.spark_quiet_mode is False:
-        result = clear_quiet_mode(source="dashboard", reason="dashboard_disable")
+        clear_quiet_mode(source="dashboard", reason="dashboard_disable")
     if fields:
-        result = update_session(fields=fields)
-    return result
+        update_session(fields=fields)
+    return load_session()
 
 
 @app.post("/api/v1/session/history/clear", dependencies=[Depends(_verify_token)])
