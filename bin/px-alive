@@ -294,6 +294,13 @@ _heartbeat_err_logged = False
 # yield_alive killed the very process the park was protecting. Parked we hold no
 # Picarx handle, so there is nothing to yield and the correct answer is a no-op.
 _yield_requested = False
+# Mirrors idle_loop's local face_active so the SIGTERM/SIGINT handler (which
+# runs outside idle_loop's scope) can skip stop_face_detection() the same way
+# the SIGUSR1 yield path does — calling Vilib.camera_close() on a camera that
+# was never successfully started takes ~20s to fail ("Camera __init__
+# sequence did not complete"), long enough to blow yield_alive's heartbeat
+# staleness threshold on the caller side.
+_face_active = False
 
 
 def _on_yield(_sig, _frame) -> None:
@@ -760,6 +767,8 @@ def idle_loop(args) -> None:
     # Start face detection if enabled
     if face_tracking:
         face_active = start_face_detection()
+    global _face_active
+    _face_active = face_active
 
     # Keep a persistent Picarx instance to avoid GPIO pin leak on repeated
     # Picarx() construction (reset_mcu claims GPIO5 and close() doesn't
@@ -833,7 +842,7 @@ def idle_loop(args) -> None:
             # Check yield flag — clean exit between iterations (not mid-I2C)
             if _yield_requested:
                 log("SIGUSR1: tool needs GPIO — stopping so it can run")
-                _with_heartbeat(lambda: (drop_px(), stop_face_detection()))
+                _with_heartbeat(lambda: (drop_px(), stop_face_detection() if face_active else None))
                 sys.exit(0)
 
             now = time.monotonic()
@@ -1080,7 +1089,8 @@ def main(argv) -> int:
     def _shutdown(sig, _frame):
         log(f"received signal {sig} — shutting down")
         _safe_unlink_pid()
-        _with_heartbeat(stop_face_detection)  # release camera before process exit
+        # release camera before process exit — only if it was ever opened
+        _with_heartbeat(lambda: stop_face_detection() if _face_active else None)
         sys.exit(0)  # finally block in idle_loop handles drop_px
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -1161,7 +1171,11 @@ def main(argv) -> int:
         log(f"fatal: {exc}")
         return 1
     finally:
-        if not args.no_face:
+        # _face_active (not args.no_face): a camera that was never
+        # successfully opened has nothing to release, and closing an
+        # unopened Vilib session is the slow, always-failing path this
+        # gate exists to avoid — see the SIGUSR1 yield path above.
+        if _face_active:
             _with_heartbeat(stop_face_detection)
         _safe_unlink_pid()
         log("stopped")
