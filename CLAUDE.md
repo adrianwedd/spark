@@ -508,7 +508,13 @@ Claude pair. `pi`'s sudoers grant was also tightened from blanket
 `NOPASSWD: ALL` to exact absolute commands/units only. This is defence in
 depth, not a full security boundary — the agent still runs as the same
 Unix user under the same harness — see `docs/operations/agent-authority.md`.
-Issue #281 stays open for the deferred OS-level separate-identity work.
+Issue #281 stays open for the deferred OS-level separate-identity work — see
+`docs/operations/agent-os-isolation-design.md` for the phase-2 design
+(a `DynamicUser=` `spark-research` principal, invoked via a root-owned
+`px-signal-alive`-style launcher, read-only checkout, `state/`/`.env`
+inaccessible) and a working unprivileged-`bwrap` prototype
+(`tools/prototypes/agent-os-isolation/`) proving the sandboxing mechanism —
+not yet implemented; no live user/group/sudoers change has been made for it.
 
 ## Security
 

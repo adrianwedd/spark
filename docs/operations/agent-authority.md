@@ -86,7 +86,9 @@ sudo) or give a delegated agent a separate OS identity. **Issue #281 stays
 open** for that stronger work — a genuinely separate identity or sandbox
 (container, dedicated low-privilege user, or read-only worktree checkout)
 that removes GPIO/I²C/audio/sudo/production-write authority at the OS
-level, not just at the tool-dispatch level.
+level, not just at the tool-dispatch level. See
+[agent-os-isolation-design.md](agent-os-isolation-design.md) for that
+phase's design and a working (not-yet-implemented) prototype.
 
 ## Acceptance
 
