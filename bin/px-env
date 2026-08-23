@@ -53,6 +53,24 @@ except Exception:
 ' "$heartbeat_file" 2>/dev/null
 }
 
+# "age_s mode" on one line, or nothing if the file is missing/unreadable.
+# Used only for the lease_wait fast-path below — the existing staleness
+# checks further down keep using the age-only helper unchanged.
+_yield_alive_heartbeat_age_and_mode() {
+    local heartbeat_file="$1"
+    [[ -f "$heartbeat_file" ]] || return 0
+    python3 -c '
+import json, sys, time
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    ts = float(data["ts"])
+    print(int(time.time() - ts), data.get("mode", ""))
+except Exception:
+    pass
+' "$heartbeat_file" 2>/dev/null
+}
+
 # Signal px-alive to release its Picarx/GPIO handle so a tool can use servos.
 # Usage: yield_alive  (call before opening Picarx in any tool script)
 yield_alive() {
@@ -61,6 +79,43 @@ yield_alive() {
         local pid
         pid=$(<"$pid_file")
         if [[ -d "/proc/$pid" ]]; then
+            # Fast path: px-alive can be legitimately PARKED — holding no
+            # GPIO at all — because another process (e.g. a live voice
+            # conversation) already holds the GPIO lease. A parked px-alive
+            # never exits (it has nothing to tear down), so the process-death
+            # check below can never succeed for it; every caller used to wait
+            # out the full budget (up to 30s) and report "wedged" even though
+            # px-alive's own log said "no GPIO held, nothing to yield" the
+            # whole time (#279 — reproduced live: every GPIO tool the brain
+            # picked mid-conversation failed this way, in a system prompt
+            # that explicitly prefers such tools for expressiveness). px-alive
+            # writes mode="lease_wait" into its heartbeat every
+            # LEASE_RECHECK_S=2s while parked, so a fresh reading of it is
+            # positive, current evidence of "nothing held" — not a guess —
+            # and short-circuits before the signal is even sent, mirroring
+            # what px-alive's own signal handler independently concludes for
+            # a SIGUSR1 that arrives while parked. Any other mode (or a stale
+            # / unreadable heartbeat) falls through to the unchanged wait
+            # logic below.
+            # Resolved once, used by both this fast-path check and phase 2
+            # below — same resolution order (explicit override, then the
+            # tmpfs copy, then the state-dir fallback), same stale threshold.
+            local heartbeat_file="${PX_YIELD_ALIVE_HEARTBEAT_FILE:-}"
+            if [[ -z "$heartbeat_file" ]]; then
+                heartbeat_file="${PX_ALIVE_HEARTBEAT_DIR:-/run/spark}/alive_heartbeat.json"
+                [[ -f "$heartbeat_file" ]] || heartbeat_file="${PX_STATE_DIR:-$PROJECT_ROOT/state}/alive_heartbeat.json"
+            fi
+            local stale_after_s="${PX_YIELD_ALIVE_HEARTBEAT_STALE_S:-6}"
+            local _hb_age_mode
+            _hb_age_mode=$(_yield_alive_heartbeat_age_and_mode "$heartbeat_file")
+            if [[ -n "$_hb_age_mode" ]]; then
+                local _hb_age="${_hb_age_mode%% *}"
+                local _hb_mode="${_hb_age_mode#* }"
+                if [[ "$_hb_mode" == "lease_wait" && "$_hb_age" =~ ^[0-9]+$ && "$_hb_age" -le "$stale_after_s" ]]; then
+                    return 0
+                fi
+            fi
+
             # px-alive runs as root; a bare `kill` from a non-root caller
             # (most bin/tool-*, bin/px-* scripts) fails EPERM and is
             # swallowed by `|| true`, so px-alive never sees the signal and
@@ -99,18 +154,12 @@ yield_alive() {
             # PX_YIELD_ALIVE_MAX_WAIT_S so a caller can never hang
             # indefinitely, even against a heartbeat that never stops.
             if [[ -d "/proc/$pid" ]]; then
-                local heartbeat_file="${PX_YIELD_ALIVE_HEARTBEAT_FILE:-}"
-                if [[ -z "$heartbeat_file" ]]; then
-                    heartbeat_file="${PX_ALIVE_HEARTBEAT_DIR:-/run/spark}/alive_heartbeat.json"
-                    [[ -f "$heartbeat_file" ]] || heartbeat_file="${PX_STATE_DIR:-$PROJECT_ROOT/state}/alive_heartbeat.json"
-                fi
+                # heartbeat_file and stale_after_s already resolved above,
+                # for the lease_wait fast-path check.
                 # Evidence-based ceiling: ~2x the worst live teardown observed
                 # (14s), not the 2-3s gaze-animation figure the original 5s
                 # budget was sized against.
                 local max_wait_s="${PX_YIELD_ALIVE_MAX_WAIT_S:-30}"
-                # 3x HEARTBEAT_EVERY_S (2s) — margin for a missed beat or two
-                # without mistaking a slow one for a wedged one.
-                local stale_after_s="${PX_YIELD_ALIVE_HEARTBEAT_STALE_S:-6}"
                 local fast_window_ds=$(( poll_iters * 2 ))
                 local phase2_budget_ds=$(( (max_wait_s * 10) - fast_window_ds ))
                 local phase2_iters=$(( phase2_budget_ds > 0 ? phase2_budget_ds / 5 : 0 ))

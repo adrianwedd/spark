@@ -128,6 +128,7 @@ def _make_heartbeating_zombie_proxy(
     heartbeat_file: Path,
     beat_every_s: float,
     exit_after_s: float | None = None,
+    mode: str = "acquiring_picarx",
 ) -> int:
     """Like _make_zombie_proxy, but also refreshes a heartbeat JSON file —
     simulating px-alive's own _with_heartbeat() (#261) during a slow-but-
@@ -153,7 +154,7 @@ def _make_heartbeating_zombie_proxy(
     heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(heartbeat_file.parent), suffix=".tmp")
     with os.fdopen(fd, "w") as f:
-        f.write(json.dumps({"ts": time.time(), "mode": "acquiring_picarx"}))
+        f.write(json.dumps({"ts": time.time(), "mode": mode}))
     os.replace(tmp, heartbeat_file)
     code = (
         "import json, os, signal, tempfile, time\n"
@@ -161,11 +162,12 @@ def _make_heartbeating_zombie_proxy(
         f"heartbeat_file = {str(heartbeat_file)!r}\n"
         f"beat_every_s = {beat_every_s!r}\n"
         f"exit_after_s = {exit_after_s!r}\n"
+        f"mode = {mode!r}\n"
         "start = time.time()\n"
         "while True:\n"
         "    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(heartbeat_file), suffix='.tmp')\n"
         "    with os.fdopen(fd, 'w') as f:\n"
-        "        f.write(json.dumps({'ts': time.time(), 'mode': 'acquiring_picarx'}))\n"
+        "        f.write(json.dumps({'ts': time.time(), 'mode': mode}))\n"
         "    os.replace(tmp, heartbeat_file)\n"
         "    if exit_after_s is not None and time.time() - start >= exit_after_s:\n"
         "        break\n"
@@ -427,3 +429,118 @@ def test_yield_alive_signals_via_sudo():
         "yield_alive must signal px-alive via sudo — a bare kill silently "
         "fails for every non-root caller"
     )
+
+
+@_LINUX_ONLY
+def test_yield_alive_returns_immediately_when_px_alive_is_parked_lease_wait(
+    long_poll_env, tmp_path
+):
+    """#279: a parked px-alive (GPIO lease held by someone else, e.g. a live
+    voice conversation) holds no handle and will never exit — the
+    process-death check alone can never succeed for it, so every caller used
+    to wait out the full budget and report "wedged" even though px-alive's
+    own log said "no GPIO held, nothing to yield" the whole time. A fresh
+    mode="lease_wait" heartbeat is current, positive evidence there is
+    nothing to yield, and must short-circuit before the slow poll loops
+    (poll_iters left at the real default — this proves the short-circuit
+    fires before phase 1, not just before phase 2).
+    """
+    log_dir = long_poll_env
+    heartbeat_file = tmp_path / "heartbeat" / "alive_heartbeat.json"
+    pid = _make_heartbeating_zombie_proxy(
+        log_dir, heartbeat_file, beat_every_s=0.3, mode="lease_wait"
+    )
+    try:
+        start = time.monotonic()
+        result = _source_and_call(
+            log_dir,
+            heartbeat_file=heartbeat_file,
+            subprocess_timeout=30,
+        )
+        elapsed = time.monotonic() - start
+        assert result.returncode == 0, (
+            f"yield_alive must succeed immediately against a parked "
+            f"px-alive, got {result.returncode}. stderr: {result.stderr[:500]}"
+        )
+        assert elapsed < 1.0, (
+            "yield_alive took long enough to have gone through the poll "
+            f"loops instead of short-circuiting on lease_wait: {elapsed:.2f}s"
+        )
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@_LINUX_ONLY
+def test_yield_alive_ignores_stale_lease_wait_heartbeat(long_poll_env, tmp_path):
+    """A lease_wait heartbeat is only evidence while it's current. A stale
+    one (px-alive stopped updating it — genuinely wedged, or the file is a
+    leftover from a previous park) must not short-circuit; the caller falls
+    through to the existing wait/failure logic unchanged.
+    """
+    log_dir = long_poll_env
+    heartbeat_file = tmp_path / "heartbeat" / "alive_heartbeat.json"
+    heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
+    heartbeat_file.write_text(json.dumps({"ts": time.time() - 3600, "mode": "lease_wait"}))
+    pid = _make_zombie_proxy(log_dir)
+    try:
+        start = time.monotonic()
+        result = _source_and_call(
+            log_dir,
+            poll_iters="3",
+            heartbeat_file=heartbeat_file,
+            max_wait_s="2",
+            stale_after_s="6",
+            subprocess_timeout=30,
+        )
+        elapsed = time.monotonic() - start
+        assert result.returncode != 0, (
+            "a stale lease_wait heartbeat must not short-circuit success"
+        )
+        assert elapsed > 0.5, (
+            "returned too fast to have gone through the poll loops — the "
+            f"stale check may not be gating the short-circuit. elapsed={elapsed:.2f}s"
+        )
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+@_LINUX_ONLY
+def test_yield_alive_does_not_short_circuit_on_running_mode(long_poll_env, tmp_path):
+    """A fresh heartbeat in "running" mode means px-alive holds the handle —
+    the exact case this whole function exists to wait for. Only
+    mode="lease_wait" may short-circuit; any other mode, however fresh,
+    must fall through to the unchanged wait/failure logic.
+    """
+    log_dir = long_poll_env
+    heartbeat_file = tmp_path / "heartbeat" / "alive_heartbeat.json"
+    pid = _make_heartbeating_zombie_proxy(
+        log_dir, heartbeat_file, beat_every_s=0.3, mode="running"
+    )
+    try:
+        start = time.monotonic()
+        result = _source_and_call(
+            log_dir,
+            poll_iters="3",
+            heartbeat_file=heartbeat_file,
+            max_wait_s="2",
+            stale_after_s="6",
+            subprocess_timeout=30,
+        )
+        elapsed = time.monotonic() - start
+        assert result.returncode != 0, (
+            "mode=running must never short-circuit — px-alive holds the handle"
+        )
+        assert elapsed > 0.5, (
+            f"returned too fast to have gone through the poll loops: {elapsed:.2f}s"
+        )
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
