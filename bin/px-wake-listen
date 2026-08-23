@@ -31,10 +31,13 @@ Flow:
 """
 import argparse
 import contextlib
+import ctypes
 import datetime as dt
+import gc
 import json
 import os
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -66,6 +69,7 @@ from pxh.mic_stream import (                          # noqa: E402
 )
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore  # noqa: E402
 from pxh import wake_grant                                  # noqa: E402
+from pxh.hostload import cgroup_pressure_fields, host_load_fields  # noqa: E402
 
 # How long a wake conversation stays audible without a turn. Refreshed by each
 # turn of the conversation the wake word opened, capped by
@@ -174,6 +178,93 @@ def log(msg: str) -> None:
             os.replace(tmp, str(LOG_FILE))
     except Exception:
         pass
+
+
+def _sd_notify(message: str) -> bool:
+    """Send a systemd notification without requiring python-systemd.
+
+    Mirrors bin/px-alive's helper of the same name — duplicated rather than
+    shared, matching this codebase's convention of small per-daemon helpers
+    over a new cross-daemon module for a ~10-line primitive.
+    """
+    address = os.environ.get("NOTIFY_SOCKET", "")
+    if not address:
+        return False
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify_socket:
+            notify_socket.connect(address)
+            notify_socket.sendall(message.encode("utf-8"))
+        return True
+    except OSError as exc:
+        log(f"systemd notify failed: {exc}")
+        return False
+
+
+# Under Type=notify, TimeoutStartSec gates the time until READY=1 arrives —
+# unlike Type=simple, where the unit is "started" the instant it execs and a
+# multi-minute model load under memory pressure (#219) has no timeout at all.
+# notify_ready() fires once, after STT backend selection and before
+# listen_loop() — the first point this daemon is actually doing its job.
+_ready = False
+
+
+def notify_ready(status: str) -> None:
+    """Declare the daemon operational. Idempotent — the first call wins."""
+    global _ready
+    if _ready:
+        return
+    _ready = True
+    _sd_notify(f"READY=1\nSTATUS={status}")
+    log(f"systemd: ready ({status})")
+
+
+def _rss_kb() -> int | None:
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _release_transient_memory(label: str) -> None:
+    """Return freed-but-retained glibc heap to the OS after a transcription cycle.
+
+    Evidence (#219 Track B, bin/px-wake-memprofile, 2026-08-23): loading
+    SenseVoice establishes ~494MB of real working set; `del` + `gc.collect()`
+    on the *models themselves* released only ~82MB of ~582MB retained;
+    `malloc_trim(0)` released the rest. That measurement deleted the model
+    objects — this call site must not: SenseVoice/Vosk stay resident for the
+    process lifetime. What this targets instead is the transient arena
+    growth onnxruntime's allocator leaves behind after each inference (the
+    profiler's "inference itself added only ~12MB" finding means the model
+    isn't the leak — the allocator's one-way-ratchet retention of that small
+    per-call growth, compounded over hours of real cycles, is). gc.collect()
+    clears any short-lived Python-side references (numpy arrays, sherpa-onnx
+    stream objects) before the trim so malloc_trim(0) has as little live
+    allocation pinning the heap as possible.
+
+    Never raises: this runs on the hot path after every real STT cycle, and
+    a broken host libc must not turn a successful transcription into a
+    crashed conversation turn.
+    """
+    before = _rss_kb()
+    gc.collect()
+    after_gc = _rss_kb()
+    trimmed = False
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        trimmed = bool(libc.malloc_trim(0))
+    except OSError as exc:
+        log(f"memtrim({label}): libc.so.6 unavailable ({exc}) — skipping malloc_trim")
+    except Exception as exc:
+        log(f"memtrim({label}): unexpected error ({exc}) — skipping malloc_trim")
+    after_trim = _rss_kb()
+    log(f"memtrim({label}): rss before={before} after_gc={after_gc} "
+        f"after_trim={after_trim} kB trimmed={trimmed}")
 
 
 def enable_speaker_amp(timeout_s: float = 3.0) -> None:
@@ -866,24 +957,30 @@ def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice
 
     If the primary backend returns empty (hallucination filtered), falls through
     to the next backend instead of returning empty.
+
+    Releases transient allocator memory (#219 Track B) after every completed
+    cycle, on every path (including a full fall-through to Vosk) — this is the
+    single chokepoint both listen_loop()'s initial utterance and
+    record_followup()'s follow-up turns call through.
     """
     _debug_dump_wav(audio_bytes)
+    text = ""
     if sensevoice is not None:
-        result = transcribe_sensevoice(sensevoice, audio_bytes)
-        if result.strip():
-            return result
-        log("stt: sensevoice returned empty — falling through to next backend")
-    if whisper is not None:
-        result = transcribe_whisper(whisper, audio_bytes)
-        if result.strip():
-            return result
-        log("stt: whisper returned empty — falling through to next backend")
-    if stt is not None:
-        result = transcribe_sherpa(stt, audio_bytes)
-        if result.strip():
-            return result
-        log("stt: sherpa returned empty — falling through to vosk")
-    return transcribe(model, audio_bytes)
+        text = transcribe_sensevoice(sensevoice, audio_bytes)
+        if not text.strip():
+            log("stt: sensevoice returned empty — falling through to next backend")
+    if not text.strip() and whisper is not None:
+        text = transcribe_whisper(whisper, audio_bytes)
+        if not text.strip():
+            log("stt: whisper returned empty — falling through to next backend")
+    if not text.strip() and stt is not None:
+        text = transcribe_sherpa(stt, audio_bytes)
+        if not text.strip():
+            log("stt: sherpa returned empty — falling through to vosk")
+    if not text.strip():
+        text = transcribe(model, audio_bytes)
+    _release_transient_memory("post_transcribe")
+    return text
 
 
 def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
@@ -1357,6 +1454,10 @@ def main(argv) -> int:
         pass
     if _existing_pid and _existing_pid != os.getpid() and os.path.isdir(f"/proc/{_existing_pid}"):
         log(f"another px-wake-listen (pid={_existing_pid}) already running — exiting")
+        # Under Type=notify, exiting before READY=1 reads as a failed start,
+        # not the clean no-op this guard intends — declare done-and-idle
+        # instead so systemd doesn't loop this instance on a start timeout.
+        notify_ready(f"duplicate of pid={_existing_pid} — exiting")
         return 0
     PID_FILE.write_text(str(os.getpid()))
     persona_names = list(PERSONAS.keys())
@@ -1391,6 +1492,21 @@ def main(argv) -> int:
     except ImportError as exc:
         log(f"missing dependency: {exc}")
         return 1
+
+    # Bounded-startup-contract instrumentation (#219 item 3): the 18+ minute
+    # cold starts observed under memory pressure were invisible to systemd
+    # under Type=simple, which considers the unit "started" at exec() rather
+    # than at actual readiness. These fields make the load itself measurable
+    # against the same PSI/cgroup signal #270/#283 already use for timeouts
+    # elsewhere, and notify_ready() below is what makes TimeoutStartSec (once
+    # the unit moves to Type=notify) actually govern this phase.
+    _load_t0 = time.monotonic()
+    _load_start_fields = {
+        **host_load_fields("load_start"),
+        **cgroup_pressure_fields("px-wake-listen", "load_start"),
+        "rss_kb_load_start": _rss_kb(),
+    }
+    log(f"model load start: {_load_start_fields}")
 
     vosk.SetLogLevel(-1)  # suppress Kaldi verbosity
     log(f"loading Vosk model {model_path} ...")
@@ -1433,6 +1549,19 @@ def main(argv) -> int:
 
     backend = "sensevoice" if sensevoice else ("faster-whisper" if whisper else ("sherpa-onnx" if stt else "vosk"))
     log(f"STT backend: {backend}")
+
+    _load_elapsed_s = time.monotonic() - _load_t0
+    _load_end_fields = {
+        **host_load_fields("load_end"),
+        **cgroup_pressure_fields("px-wake-listen", "load_end"),
+        "rss_kb_load_end": _rss_kb(),
+        "load_elapsed_s": round(_load_elapsed_s, 2),
+    }
+    log(f"model load end: backend={backend} elapsed={_load_elapsed_s:.1f}s {_load_end_fields}")
+
+    # First point this daemon is actually doing its job — see the notify_ready
+    # docstring for why this fires here rather than at process start.
+    notify_ready(f"listening (backend={backend})")
 
     try:
         listen_loop(model, args, stt, whisper, sensevoice)

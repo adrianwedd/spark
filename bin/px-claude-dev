@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# px-claude-dev — launch the interactive/development Claude Code session
+# (an operator working the repo over SSH, not SPARK's resident spark-brain)
+# under a dedicated memory-bounded systemd scope.
+#
+# Why this exists (2026-08-23 memory-pressure investigation): an uncontained
+# operator session was the single largest live memory consumer on this
+# 3.71 GiB robot — ~862 MiB PSS for the claude process alone, ~1.43 GiB
+# current / 1.67 GiB peak for its whole session-N.scope — with no
+# MemoryHigh/MemoryMax at all. Nothing stopped it from starving px-brain,
+# px-wake-listen or any other production daemon competing for the same RAM.
+# docs/operations/resource-containment.md already flagged this session as
+# the deliberately-deferred follow-up to the #217/#218/#219 containment work;
+# this is that follow-up.
+#
+# Design: wrap only the `claude` process itself, not the whole SSH login
+# shell — a scope around the login shell would also throttle any other
+# diagnostic work (tail, journalctl, an editor) done in the same session,
+# which was never the thing observed to balloon. `systemd-run --user --scope`
+# creates a transient, foreground, TTY-attached cgroup scope under
+# user@1000.service/session.slice — a *sibling* of PulseAudio/PipeWire, not a
+# parent of them (confirmed by inspecting their cgroup paths live), so this
+# cannot throttle audio or session infrastructure. It is also a sibling of,
+# not a substitute for, the raw session-N.scope the shell itself runs in —
+# capping that scope instead was rejected because it would need capping
+# *this* very session mid-task, which is not something a running script can
+# safely do to itself.
+#
+# MemoryHigh is a soft throttle (synchronous reclaim, degrades rather than
+# kills) around 1 GiB; MemoryMax is a hard backstop at 2 GiB — even at that
+# absolute worst case, ~1.7 GiB remains for the rest of the system. Exceeding
+# the cap degrades this session, never the robot.
+set -euo pipefail
+
+CLAUDE_BIN="${PX_CLAUDE_BIN:-}"
+if [[ -z "$CLAUDE_BIN" ]]; then
+    CLAUDE_BIN="$(command -v claude || true)"
+fi
+if [[ -z "$CLAUDE_BIN" && -x "$HOME/.local/bin/claude" ]]; then
+    CLAUDE_BIN="$HOME/.local/bin/claude"
+fi
+if [[ -z "$CLAUDE_BIN" ]]; then
+    echo "px-claude-dev: claude binary not found (set PX_CLAUDE_BIN)" >&2
+    exit 1
+fi
+
+MEMORY_HIGH="${PX_DEV_CLAUDE_MEMORY_HIGH:-1024M}"
+MEMORY_MAX="${PX_DEV_CLAUDE_MEMORY_MAX:-2048M}"
+
+if ! command -v systemd-run >/dev/null 2>&1; then
+    # A dev tool failing open (uncontained) rather than refusing to launch at
+    # all: this is operator ergonomics, not a safety invariant like the
+    # policy sink in src/pxh/policy.py — there is no robot behaviour behind
+    # this gate for a missing systemd-run to silently unlock.
+    echo "px-claude-dev: systemd-run not found — running uncontained" >&2
+    exec "$CLAUDE_BIN" "$@"
+fi
+
+exec systemd-run --user --scope --collect \
+    -p "MemoryHigh=$MEMORY_HIGH" \
+    -p "MemoryMax=$MEMORY_MAX" \
+    --description="px-claude-dev (operator session, MemoryHigh=$MEMORY_HIGH MemoryMax=$MEMORY_MAX)" \
+    -- "$CLAUDE_BIN" "$@"

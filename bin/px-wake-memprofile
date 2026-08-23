@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# px-wake-memprofile — characterize px-wake-listen's resident working set,
+# stage by stage, instead of guessing from the single steady-state RSS number
+# in docs/operations/resource-containment.md.
+#
+# 2026-08-23 directive (#219 follow-up): "characterize exactly which model
+# objects account for the heap" — MemoryHigh=640M is chronically exceeded
+# (~709M current + 211M swap observed, ~795k memory.events:high and
+# climbing). The live/healthy backend is Vosk (wake-word grammar, always
+# loaded) + SenseVoice (~228MB int8 per its own loader's comment) — nothing
+# else in the fallback ladder loads once SenseVoice succeeds. That documented
+# model size is a large gap short of ~709M, so this measures rather than
+# assumes what fills it: onnxruntime session/arena overhead, the Vosk graph,
+# audio buffering, and whatever the Python/numpy runtime itself costs before
+# any model is touched.
+#
+# Mirrors (does not import — bin/px-wake-listen embeds its Python via a
+# heredoc executed with `python3 -`, so there is no module to import from) the
+# loader calls in bin/px-wake-listen's load_stt_model/load_sensevoice. Keep
+# these in sync if those loaders change; this is a diagnostic, not the
+# production loading path itself.
+#
+# IMPORTANT: loads a second, independent copy of both models. Running this
+# while the live px-wake-listen.service is also loaded roughly doubles
+# wake-listener-class memory for the duration — stop the service first:
+#   sudo systemctl stop px-wake-listen
+#   bin/px-wake-memprofile
+#   sudo systemctl start px-wake-listen
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+exec "$PROJECT_ROOT/.venv/bin/python3" - "$@" <<'PY'
+import ctypes
+import gc
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+# __file__ is not set for a script executed via `python3 -` from stdin;
+# PROJECT_ROOT is exported by px-env instead.
+PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
+
+VOSK_MODEL = str(PROJECT_ROOT / "models" / "vosk-model-small-en-us-0.15")
+SENSEVOICE_MODEL = str(
+    PROJECT_ROOT / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+)
+VOSK_RATE = 16000
+
+stages = []
+
+
+def _pss_kb():
+    try:
+        for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _rss_kb():
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def snapshot(label):
+    entry = {
+        "stage": label,
+        "t": round(time.monotonic(), 2),
+        "rss_kb": _rss_kb(),
+        "pss_kb": _pss_kb(),
+    }
+    stages.append(entry)
+    print(
+        f"{label:32s} rss={entry['rss_kb']} kB  pss={entry['pss_kb']} kB",
+        file=sys.stderr,
+    )
+    return entry
+
+
+snapshot("0_interpreter_baseline")
+
+import vosk  # noqa: E402
+
+snapshot("1_after_vosk_import")
+
+import sherpa_onnx  # noqa: E402
+
+snapshot("2_after_sherpa_onnx_import")
+
+vosk.SetLogLevel(-1)
+model = vosk.Model(VOSK_MODEL)
+snapshot("3_after_vosk_model_loaded")
+
+sv_path = Path(SENSEVOICE_MODEL)
+sensevoice = None
+if (sv_path / "model.int8.onnx").exists() and (sv_path / "tokens.txt").exists():
+    sensevoice = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=str(sv_path / "model.int8.onnx"),
+        tokens=str(sv_path / "tokens.txt"),
+        num_threads=4,
+        sample_rate=VOSK_RATE,
+        language="en",
+        use_itn=False,
+        provider="cpu",
+    )
+snapshot("4_after_sensevoice_loaded")
+
+if sensevoice is not None:
+    # One warm-up recognition against 1s of silence — exercises onnxruntime's
+    # arena allocator, which is known to grow (and not necessarily shrink)
+    # against its first real inference rather than at model-load time.
+    import numpy as np
+
+    stream = sensevoice.create_stream()
+    silence = np.zeros(VOSK_RATE, dtype=np.float32)
+    stream.accept_waveform(VOSK_RATE, silence)
+    sensevoice.decode_stream(stream)
+    _ = stream.result.text
+    del stream
+snapshot("5_after_one_transcription")
+
+sensevoice_loaded = sensevoice is not None
+
+
+def _trim(label):
+    """Mirrors bin/px-wake-listen's _release_transient_memory: gc.collect()
+    then malloc_trim(0), WITHOUT deleting the model objects — this is the
+    production fix path, not the one-shot model teardown below."""
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except OSError:
+        pass
+    snapshot(label)
+
+
+# #219 item 1's explicit ask: "verify repeated cycles do not accumulate
+# memory". Runs REPEAT_CYCLES more inference+trim passes against the SAME
+# live sensevoice object (never deleted) — if onnxruntime's arena allocator
+# retains growth the trim can't reach, RSS climbs cycle over cycle; if the
+# fix holds, it should flatten after the first cycle or two.
+REPEAT_CYCLES = int(os.environ.get("PX_MEMPROFILE_CYCLES", "8"))
+if sensevoice is not None:
+    import numpy as np
+
+    for cycle in range(1, REPEAT_CYCLES + 1):
+        stream = sensevoice.create_stream()
+        silence = np.zeros(VOSK_RATE, dtype=np.float32)
+        stream.accept_waveform(VOSK_RATE, silence)
+        sensevoice.decode_stream(stream)
+        _ = stream.result.text
+        del stream
+        _trim(f"8_repeat_cycle_{cycle}_of_{REPEAT_CYCLES}")
+
+del model
+if sensevoice is not None:
+    del sensevoice
+gc.collect()
+snapshot("9_after_del_and_gc_collect")
+
+try:
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+except OSError:
+    pass
+snapshot("10_after_malloc_trim")
+
+print(json.dumps({"vosk_model": VOSK_MODEL,
+                   "sensevoice_model": SENSEVOICE_MODEL,
+                   "sensevoice_loaded": sensevoice_loaded,
+                   "repeat_cycles": REPEAT_CYCLES,
+                   "stages": stages}, indent=2))
+PY
