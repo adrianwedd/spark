@@ -451,6 +451,14 @@ BLACKLIST_FILES = {
     # hand SPARK the ability to write himself a permanent 3am grant.
     "src/pxh/wake_grant.py",
     "src/pxh/policy_context.py",
+    # quiet_mode.py derives the enabled/expiry decision policy.py's Rule 1
+    # reads as a plain bool (#209); state.py holds the one write path
+    # (set_quiet_mode/clear_quiet_mode) and the read-time derivation. Neither
+    # matches WHITELIST_PATTERNS today, but named here on the same footing as
+    # the policy/wake_grant pair — a future broader pattern must not silently
+    # hand self-evolution a way to make quiet mode fail open.
+    "src/pxh/quiet_mode.py",
+    "src/pxh/state.py",
     # Resident-only Claude. The scanner and the suite that calls it are
     # protected together and for the same reason the policy pair is: an
     # evolution PR that may edit either one can satisfy the invariant by

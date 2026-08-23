@@ -24,8 +24,13 @@ import subprocess
 from pathlib import Path
 
 from pxh.logging import log_event
-from pxh.state import update_session
+from pxh.state import set_quiet_mode, update_session
 from pxh.time import utc_timestamp
+
+# 20-minute low-demand buffer (#209) — deliberately time-bounded, unlike
+# tool-quiet's indefinite Three S's: a transition buffer should lift itself
+# without needing a matching "end" call.
+TRANSITION_BUFFER_TTL_S = 1200
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
@@ -97,14 +102,16 @@ def main() -> int:
                    "minutes": minutes, "dry": dry}
 
     elif action == "buffer":
-        # 20-minute low-demand buffer after a transition — no instructions, just presence
-        # spark_quiet_mode=True: Claude will only use tool_emote idle until tool_quiet end is called
+        # 20-minute low-demand buffer after a transition — no instructions, just presence.
+        # Bounded by TRANSITION_BUFFER_TTL_S: unlike tool-quiet's indefinite quiet mode,
+        # this lifts itself on the next read past expiry — no matching "end" call needed.
         emote("idle", dry)
         speak("We're here. Take your time. No rush.", dry)
-        update_session(
-            fields={"spark_quiet_mode": True, "last_action": "tool_transition"},
-            history_entry={"event": "transition_buffer", "ts": utc_timestamp()},
+        set_quiet_mode(
+            enabled=True, source="tool_transition", reason="transition_buffer",
+            ttl_s=TRANSITION_BUFFER_TTL_S,
         )
+        update_session(fields={"last_action": "tool_transition"})
         payload = {"status": "ok", "action": "buffer", "dry": dry,
                    "note": "20-min low-demand buffer — avoid instructions, quiet_mode=True"}
 
