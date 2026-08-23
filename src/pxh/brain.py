@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from . import health, tmux_claude
+from .hostload import host_load_fields
 from .logging import log_event
 from .state import PROJECT_ROOT, atomic_write
 from .time import utc_timestamp
@@ -226,35 +227,6 @@ def _log(event: str, **fields: Any) -> None:
         log_event("brain", {"event": event, **fields})
     except Exception:  # noqa: BLE001 - logging is never load-bearing
         pass
-
-
-def _host_load_fields(prefix: str) -> dict[str, float]:
-    """Best-effort (loadavg, CPU-PSI) snapshot, never raising.
-
-    #270 found exec_s blowouts (voice_turn hitting its full 45s with
-    lock_wait_s/validating_wait_s both ~0, so not ask_brain's own queueing)
-    clustering inside windows of heavy concurrent host activity — PR merges
-    landing on this same checkout, another sustained CPU consumer starting
-    mid-window — on a 4-core Pi that also hosts the resident session. This is
-    a fourth diagnostic bucket alongside lock_wait_s/validating_wait_s/exec_s
-    (#267, #270): whether the *host*, not ask_brain, was the bottleneck.
-    `load1` lags (60s rolling window); PSI `avg10` is the more responsive
-    signal and is what should actually be compared against exec_s.
-    """
-    fields: dict[str, float] = {}
-    try:
-        fields[f"load1_{prefix}"] = float(Path("/proc/loadavg").read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        line = Path("/proc/pressure/cpu").read_text().splitlines()[0]
-        for token in line.split():
-            if token.startswith("avg10="):
-                fields[f"psi_cpu_avg10_{prefix}"] = float(token.split("=", 1)[1])
-                break
-    except (OSError, ValueError, IndexError):
-        pass
-    return fields
 
 
 def is_classified_kind(kind: str) -> bool:
@@ -965,7 +937,7 @@ def ask_brain(
     # Captured once here, not per poll iteration: cheap enough to be free, but
     # a full time-series belongs to a real host-load logger (#218), not to a
     # per-turn log line already carrying five other duration fields.
-    load_at_start = _host_load_fields("start")
+    load_at_start = host_load_fields("start")
 
     request_id = str(uuid.uuid4())
     try:
@@ -1059,7 +1031,7 @@ def ask_brain(
                           exec_s=round(time.monotonic() - lock_acquired, 2),
                           turns_since_reset=turns_before,
                           consecutive_slow_before=consecutive_slow_before,
-                          **load_at_start, **_host_load_fields("end"))
+                          **load_at_start, **host_load_fields("end"))
                 record_turn_completion(session, slow=duration_s >= slow_threshold_s)
                 return reply
             time.sleep(POLL_INTERVAL_S)
@@ -1072,7 +1044,7 @@ def ask_brain(
                   exec_s=round(time.monotonic() - lock_acquired, 2),
                   turns_since_reset=turns_before,
                   consecutive_slow_before=consecutive_slow_before,
-                  **load_at_start, **_host_load_fields("end"))
+                  **load_at_start, **host_load_fields("end"))
         record_turn_completion(session, slow=True)
         return None
     finally:

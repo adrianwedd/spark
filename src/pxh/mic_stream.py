@@ -40,6 +40,8 @@ import threading
 import time
 from collections import deque
 
+from .hostload import host_load_fields
+
 DEFAULT_RATE = 44100
 DEFAULT_CHANNELS = 1
 DEFAULT_CHUNK_FRAMES = 2048
@@ -229,7 +231,18 @@ class ArecordStream:
 
     def _stderr_loop(self, proc: subprocess.Popen) -> None:
         """Surface arecord's own overrun warnings — this daemon exists because
-        dropped audio used to be invisible."""
+        dropped audio used to be invisible.
+
+        An `overrun` line means arecord's own ALSA buffer overflowed — audio
+        lost before the reader thread ever got a chance to drain it, a
+        different and more serious event than the ring-buffer drops
+        `_maybe_log_drop` counts. #283 found these both frequent (hundreds
+        logged, several a day) and severe (up to 56.8s in one event) in
+        production, clustering on the same kind of day #270 found voice_turn
+        blowing its own deadline on — so a load/PSI snapshot rides along here
+        too, to check the same shared-host-contention hypothesis rather than
+        guessing at it a second time.
+        """
         stderr = proc.stderr
         if stderr is None:
             return
@@ -239,6 +252,10 @@ class ArecordStream:
                     return
                 line = raw.decode(errors="replace").strip()
                 if line:
+                    if "overrun" in line:
+                        load = host_load_fields("at")
+                        suffix = " ".join(f"{k}={v}" for k, v in load.items())
+                        line = f"{line} [{suffix}]" if suffix else line
                     self._log(f"arecord: {line}")
         except (OSError, ValueError):
             pass
