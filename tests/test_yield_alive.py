@@ -423,11 +423,18 @@ def test_yield_alive_signals_via_sudo():
     dozens of "did not exit within 5s; aborting to protect GPIO exclusivity"
     failures. `pi` already holds passwordless sudo on this host, so routing
     through it fixes both root and non-root callers uniformly.
+
+    #281: the raw `kill -USR1 $pid` was replaced with the root-owned
+    `px-signal-alive` helper, which resolves px-alive's real MainPID from
+    systemd itself instead of trusting a caller-supplied PID — a sudoers
+    rule permissive enough to match `kill -USR1 <any-pid>` would have let
+    any caller point the signal at an arbitrary process.
     """
     body = (PROJECT_ROOT / "bin" / "px-env").read_text()
-    assert "sudo -n kill -USR1 \"$pid\"" in body, (
-        "yield_alive must signal px-alive via sudo — a bare kill silently "
-        "fails for every non-root caller"
+    assert "sudo -n /usr/local/sbin/px-signal-alive USR1" in body, (
+        "yield_alive must signal px-alive via the px-signal-alive helper "
+        "(issue #281) — a raw kill either fails for non-root callers or "
+        "requires an unsafe wildcard sudoers grant"
     )
 
 

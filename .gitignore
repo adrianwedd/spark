@@ -81,7 +81,9 @@ bin/go2rtc
 logs/*.pid
 diag_summary.json
 .claude.json
-.claude/
+.claude/*
+!.claude/agents/
+!.claude/agents/**
 .npm/
 .worktrees/
 .venv

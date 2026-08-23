@@ -122,11 +122,12 @@ yield_alive() {
             # every yield silently degrades into the 5s poll timeout below
             # (#250-class regression — confirmed live via tool-perform.log/
             # tool-emote.log: "did not exit within 5s; aborting to protect
-            # GPIO exclusivity", dozens of occurrences). `pi` already has
-            # passwordless sudo for this host's automation; route through it
-            # unconditionally so both root and non-root callers work the
-            # same way (sudo to root-signal-root is a harmless no-op).
-            sudo -n kill -USR1 "$pid" 2>/dev/null || true
+            # GPIO exclusivity", dozens of occurrences). Route through the
+            # root-owned px-signal-alive helper rather than a raw `kill`
+            # (#281): the helper resolves px-alive's real MainPID from
+            # systemd itself, so the sudoers grant backing this call never
+            # has to accept an arbitrary caller-supplied PID argument.
+            sudo -n /usr/local/sbin/px-signal-alive USR1 2>/dev/null || true
 
             # Phase 1: fast poll for the common case — px-alive exits
             # cleanly inside the original ~5s budget (gaze animations take

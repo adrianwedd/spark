@@ -467,6 +467,16 @@ BLACKLIST_FILES = {
     # not a preference to be re-argued by a future PR.
     "tools/check_resident_claude.py",
     "tests/test_resident_only_invariant.py",
+    # Delegated-agent authority boundary (#281). Same reasoning as the
+    # resident-only pair above: an evolution PR that can edit the checker
+    # can satisfy it by weakening what it checks. The restricted agent
+    # definition itself is also named here — .claude/agents/ doesn't match
+    # any WHITELIST_PATTERNS today, but a future broader pattern must not
+    # silently hand self-evolution a way to widen spark-investigator's
+    # tools list back toward Bash/Write/Edit/Agent.
+    "tools/check_investigator_agent.py",
+    "tests/test_agent_authority_invariant.py",
+    ".claude/agents/spark-investigator.md",
 }
 
 BLACKLIST_PATTERNS = [

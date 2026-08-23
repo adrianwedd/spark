@@ -833,10 +833,18 @@ def _stop_alive() -> int | None:
     if pid:
         log(f"pausing px-alive (pid={pid}) for voice turn")
         try:
-            # px-alive runs as root; use sudo kill so pi user can signal it
-            r = subprocess.run(["sudo", "-n", "kill", str(pid)], check=False, capture_output=True)
+            # px-alive runs as root; route through the root-owned
+            # px-signal-alive helper rather than a raw `kill` (#281). It
+            # resolves px-alive's real MainPID from systemd itself, so the
+            # sudoers grant backing this call never has to accept an
+            # arbitrary caller-supplied PID argument.
+            r = subprocess.run(
+                ["sudo", "-n", "/usr/local/sbin/px-signal-alive", "TERM"],
+                check=False,
+                capture_output=True,
+            )
             if r.returncode != 0:
-                log(f"_stop_alive: sudo kill failed (rc={r.returncode}): {r.stderr.decode(errors='replace').strip()}")
+                log(f"_stop_alive: px-signal-alive failed (rc={r.returncode}): {r.stderr.decode(errors='replace').strip()}")
             time.sleep(2.0)  # wait for Picarx.close() to release GPIO
         except Exception as exc:
             log(f"_stop_alive: exception: {exc}")

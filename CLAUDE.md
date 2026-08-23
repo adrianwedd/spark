@@ -493,6 +493,23 @@ trusted.
 px-evolve (see `claude_session.BLACKLIST_FILES`). Evolvable policy coverage
 lives in `tests/test_policy.py` — keep that split.
 
+### Delegated-Agent Authority Boundary (#281)
+
+A delegated/research Claude Code agent must be *mechanically* unable to
+touch production systemd, GPIO, live audio/wake hardware, or state — a
+prose instruction not to is not a boundary, and one delegated fork already
+took live physical action outside the scope it was given. `spark-investigator`
+(`.claude/agents/spark-investigator.md`) is a restricted subagent type
+whose `tools:` field is a hard, harness-enforced allowlist (`Read, Grep,
+Glob, WebSearch, WebFetch` — no `Bash`/`Write`/`Edit`/`Agent`), pinned by
+`tools/check_investigator_agent.py` + `tests/test_agent_authority_invariant.py`
+and blacklisted from px-evolve on the same footing as the resident-only
+Claude pair. `pi`'s sudoers grant was also tightened from blanket
+`NOPASSWD: ALL` to exact absolute commands/units only. This is defence in
+depth, not a full security boundary — the agent still runs as the same
+Unix user under the same harness — see `docs/operations/agent-authority.md`.
+Issue #281 stays open for the deferred OS-level separate-identity work.
+
 ## Security
 
 - PIN verify returns session tokens (4h TTL) — raw Bearer token never exposed to browser

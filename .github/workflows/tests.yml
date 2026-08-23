@@ -43,6 +43,14 @@ jobs:
       - name: resident-only Claude invariant
         run: python tools/check_resident_claude.py
 
+      # Delegated-agent authority boundary (#281): the restricted
+      # spark-investigator subagent type must never regain Bash/Write/
+      # Edit/NotebookEdit/Agent. Own step for the same reason as above —
+      # a red build here says "the boundary was reopened", not "one test
+      # among 1200 failed".
+      - name: delegated-agent authority invariant
+        run: python tools/check_investigator_agent.py
+
       # -m "not live" deselects the hardware tests; see the marker definition in
       # pyproject.toml. Nothing else is passed on purpose: this job exists to be
       # an honest gate, and pre-setting LOG_DIR or PX_BYPASS_SUDO here would
