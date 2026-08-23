@@ -759,7 +759,8 @@ def test_ease_call_sites_publish_distinguishable_modes():
 
 
 def test_camera_teardown_is_heartbeat_protected_at_every_call_site():
-    """stop_face_detection()/drop_px() must never run un-beaten.
+    """stop_face_detection()/drop_px() must never run un-beaten, and must
+    never run at all when face detection was never actually opened.
 
     Observed live 2026-08-21, minutes after the make_px()-acquisition fix
     shipped: a routine yield_alive from px-cron-say delivered SIGUSR1
@@ -767,26 +768,36 @@ def test_camera_teardown_is_heartbeat_protected_at_every_call_site():
     can run" and began teardown, and 14s later systemd's watchdog killed it
     anyway (SIGABRT) — the same restart-storm shape, relocated from
     acquisition to teardown, because stop_face_detection()'s
-    Vilib.camera_close() is itself a blocking call with no heartbeat and it
-    runs on every yield, every SIGTERM, every idle_loop exit, and again in
-    main()'s own outer finally. This pins all four call sites to the
-    heartbeat-wrapped form so a future edit can't quietly reintroduce a bare
-    call.
+    Vilib.camera_close() is itself a blocking call with no heartbeat.
+
+    A second, independent defect in the same family was found live
+    2026-08-23: with Frigate holding the camera exclusively,
+    start_face_detection() always fails and face_active is always False —
+    but three of the four teardown call sites called stop_face_detection()
+    (or gated on args.no_face, the *intent* to track faces, not whether it
+    ever succeeded) regardless, and Vilib.camera_close() on a camera that
+    was never opened takes ~20s to fail ("Camera __init__ sequence did not
+    complete"), long enough to blow yield_alive's heartbeat-staleness
+    threshold on the calling tool. Every call site must now also gate on
+    face_active (mirrored at module scope as _face_active for the two sites
+    outside idle_loop's own scope).
     """
     body = (PROJECT_ROOT / "bin" / "px-alive").read_text()
 
-    yield_path = '_with_heartbeat(lambda: (drop_px(), stop_face_detection()))'
-    finally_path = (
+    gated_local = (
         '_with_heartbeat(lambda: (drop_px(), stop_face_detection() if face_active else None))'
     )
-    shutdown_path = '_with_heartbeat(stop_face_detection)'
-
-    assert yield_path in body, "SIGUSR1 mid-loop teardown lost its heartbeat wrapper"
-    assert finally_path in body, "idle_loop's finally-block teardown lost its heartbeat wrapper"
-    assert body.count(shutdown_path) == 2, (
-        "_shutdown()'s and main()'s own camera-release calls must both stay "
-        "heartbeat-wrapped"
+    gated_shutdown = (
+        '_with_heartbeat(lambda: stop_face_detection() if _face_active else None)'
     )
+    gated_main_finally = 'if _face_active:\n            _with_heartbeat(stop_face_detection)'
+
+    assert body.count(gated_local) == 2, (
+        "the SIGUSR1 yield path and idle_loop's finally-block teardown must "
+        "both stay heartbeat-wrapped and gated on face_active"
+    )
+    assert gated_shutdown in body, "_shutdown()'s camera-release lost its heartbeat/face_active gate"
+    assert gated_main_finally in body, "main()'s outer finally must gate on _face_active, not args.no_face"
 
     # Every remaining direct Call node to stop_face_detection() must sit on a
     # line that also mentions _with_heartbeat — this fails loudly if a new
