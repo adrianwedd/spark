@@ -745,6 +745,15 @@ async def health():
         effective_statuses = dict(component_statuses)
         if heartbeat_available:
             effective_statuses.pop("px-alive", None)
+        # Reported below as its own check, but deliberately kept out of the
+        # liveness rollup. This endpoint answers "is the device serving", and a
+        # 503 here takes the tunnel health check with it; a nightly cognitive
+        # pass that has not run yet is not a serving failure. It still has to
+        # be *visible* — being reported nowhere at all is the bug this
+        # component exists to fix — so it moves to checks["memory"] rather than
+        # being dropped. Newly deployed, it reads "missing" until the first
+        # 02:00 pass, which would otherwise 503 the API for a whole day.
+        effective_statuses.pop(_health.CONSOLIDATION_COMPONENT, None)
         status_rank = {
             "ok": 0,
             "degraded": 1,
@@ -760,6 +769,15 @@ async def health():
         checks["daemons"] = {
             "status": daemon_status,
             "components": component_statuses,
+        }
+        # When SPARK last actually formed a long-term memory. No error text:
+        # this endpoint is unauthenticated and last_error can carry paths.
+        _mem = daemons.get("memory_formation") or {}
+        checks["memory"] = {
+            "status": _mem.get("status", "unknown"),
+            "last_formed_ts": _mem.get("last_formed_ts"),
+            "age_s": _mem.get("age_s"),
+            "overdue": _mem.get("overdue"),
         }
         if daemon_status != "ok" and overall == "ok":
             overall = "degraded"

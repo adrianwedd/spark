@@ -3577,16 +3577,46 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
 
 def _consolidation_tick(session: dict, dry: bool) -> None:
     """Nightly memory consolidation (02:00-06:00 Hobart, once per date, SPARK only).
-    Never raises — the mind loop must survive any consolidation failure."""
+    Never raises — the mind loop must survive any consolidation failure.
+
+    Health reporting distinguishes three outcomes, and the distinction is the
+    whole point of reporting at all:
+
+    * ``None`` — not attempted, because it is not the window, it is already
+      done for this Hobart date, or this is a dry run. **Records nothing.** A
+      night that was never due is not a failure, and staleness already covers
+      true silence; writing a success here would mean the component reported
+      "healthy" every 60s forever regardless of whether memory ever formed.
+    * ``ok``/``skipped`` — the pass ran and did its job. "Skipped" is a real
+      success: too few thoughts in 24h means there was nothing worth keeping,
+      which is a correct outcome, and `maybe_consolidate` marks the date done
+      for it. Recording it keeps a quiet-but-working night fresh.
+    * anything else — attempted and failed. This is the case that was silent
+      before: the store simply stopped growing while every other dial read ok.
+    """
     if (session.get("persona") or "").lower().strip() != "spark":
         return
+    component = health_mod.CONSOLIDATION_COMPONENT
     try:
         _cons = spark_memory.maybe_consolidate(dry=dry)
-        if _cons is not None:
-            _detail = _cons.get("error") or _cons.get("reason") or f"wrote {_cons.get('written', 0)}"
-            log(f"consolidation: {_cons.get('status')} — {_detail}")
+        if _cons is None:
+            return
+        _status = _cons.get("status")
+        _detail = _cons.get("error") or _cons.get("reason") or f"wrote {_cons.get('written', 0)}"
+        log(f"consolidation: {_status} — {_detail}")
+        if _status == "dry":
+            return  # a dry run forms no memory; it must not refresh the record
+        if _status in ("ok", "skipped"):
+            health_mod.record_success(
+                component,
+                detail={"status": _status, "written": _cons.get("written", 0),
+                        "note": _detail})
+        else:
+            health_mod.record_failure(
+                component, _detail, detail={"status": _status})
     except Exception as exc:
         log(f"consolidation error: {exc}")
+        health_mod.record_failure(component, f"{type(exc).__name__}: {exc}")
 
 
 def _should_express(action: str, transitions: list, now: float,

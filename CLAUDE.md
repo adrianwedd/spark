@@ -132,6 +132,27 @@ Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every
 - px-mind publishes the aggregate to `state/health.json` and into `awareness["health"]`; `summarize()` feeds reflection context. Readers that must be correct **when px-mind is down** call `read_health()` directly, not the snapshot.
 - `tests/conftest.py` has an **autouse** fixture redirecting `health_dir()` to tmp. Without it, in-process tests write mock health records into the live robot's `state/health/` — `isolated_project` is opt-in and only isolates subprocesses.
 
+**Long-term memory formation is a health component, `px-mind-consolidation`.**
+Until it existed, the nightly consolidation pass could fail every night while
+`read_health()` reported `overall: ok` — it was simply absent from
+`KNOWN_COMPONENTS`, and absence is the one state this module cannot report. Its
+window is **30h**, not px-blog's 86400: consolidation fires anywhere inside
+02:00–06:00 Hobart, so two healthy runs can sit ~28h apart and a daily window
+would call a working job stale most afternoons. `_consolidation_tick`
+distinguishes three outcomes and the distinction is load-bearing — `ok`/`skipped`
+record a success (too few thoughts is a correct night, not a failure), a failed
+attempt records a failure, and **`None` records nothing**, because "not due
+tonight" must not refresh the record on every 60s tick.
+
+`health.memory_formation()` answers "when did SPARK last form a long-term
+memory", promoted to a top-level `memory_formation` key in `read_health()` and
+rendered by `bin/px-motd`. It keys on **`last_success_ts`, never `updated_ts`** —
+a failing attempt refreshes the record without distilling anything, so a pass
+that fails nightly stays inside its staleness window and under the failure
+threshold while the store has not grown for days. That is why `overdue`
+(>48h) is a separate axis from `status`, and why `summarize()` returns a
+non-empty string for overdue memory on an otherwise clean bill.
+
 **Claude spend visibility:** `token_log.log_usage()` takes a `backend` argument and splits totals under `by_backend` in `state/token_usage.json`. The top-level totals mix free Ollama with paid Claude and cannot answer "what am I spending". `call_llm()` also sets `result["backend"]` to the tier that actually served — the `backend=` reflection log line shows the *configured* primary, not the one that answered.
 
 ### Idle-Alive Daemon
