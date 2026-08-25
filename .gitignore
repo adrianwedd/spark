@@ -22,6 +22,8 @@ state/notes.jsonl
 state/notes-*.jsonl
 state/intention-*.json
 state/memories-*.jsonl
+state/people-*.jsonl
+state/people-*.jsonl.lock
 state/consolidation_meta.json
 # Brain mailbox: live request/reply traffic for the resident Claude
 # sessions. Runtime state, and it contains prompt payloads.

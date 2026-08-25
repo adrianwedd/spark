@@ -461,3 +461,78 @@ def build_seed_record(*, polarity: str, obj: str, actor: str,
     provenance.stamp(record, "report", SEED_SOURCE,
                      evidence=[f"operator:{actor_slug}", text])
     return record
+
+
+# --- retrieval -------------------------------------------------------------
+# Exactly two prompts may include this context: the SPARK voice prompt and the
+# obi-chat prompt. Never GREMLIN/VIXEN, never reflection/public chat/blog/
+# social — pinned by `tests/test_people_invariants.py`, which allowlists the
+# call sites the way it already allowlists the writers.
+
+RETRIEVAL_LIMIT = 3
+
+
+def _age_phrase(ts: str, now: dt.datetime) -> str:
+    try:
+        when = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return ""
+    days = (now.astimezone(HOBART_TZ).date() - when.astimezone(HOBART_TZ).date()).days
+    if days <= 0:
+        return "today"
+    if days == 1:
+        return "yesterday"
+    return f"{days} days ago"
+
+
+def render_person_fact(record: dict, now: dt.datetime | None = None) -> str:
+    """One compact line, attribution first. An operator seed renders as the
+    operator's claim ("adrian told you that obi likes dinosaurs"), never as
+    something the subject said — the record's `source` decides, so no caller
+    can misattribute a seed by accident."""
+    when = now or dt.datetime.now(dt.timezone.utc)
+    subject = str(record.get("subject") or DEFAULT_SUBJECT).capitalize()
+    text = str(record.get("text") or "").strip()
+    age = _age_phrase(str(record.get("ts") or ""), when)
+    if record.get("source") == SEED_SOURCE:
+        actor = str(record.get("source_actor") or "someone").capitalize()
+        return f"{actor} told you that {subject} {text}."
+    aged = f" ({age})" if age else ""
+    return f'{subject} told you{aged}: "{text}"'
+
+
+def person_context(query: str, persona: str = "spark",
+                   subject: str = DEFAULT_SUBJECT,
+                   limit: int = RETRIEVAL_LIMIT,
+                   now: dt.datetime | None = None) -> str:
+    """Relevant live person facts for a prompt, or "" — never padding.
+
+    Relevance is tag overlap with the query, the same tokenizer the records
+    were tagged with at write time. No overlap means no injection: an empty
+    string is the correct answer to an unrelated question, because padded
+    "context" is how a fact store turns into a script. Superseded and expired
+    records never surface. Only SPARK gets this context; any other persona
+    gets "" regardless of what the caller intended. Never raises — this sits
+    inside the voice loop and an API request handler.
+    """
+    try:
+        if normalize_persona(persona) not in WRITER_PERSONAS:
+            return ""
+        q = memory._tokenize(query)
+        if not q:
+            return ""
+        when = now or dt.datetime.now(dt.timezone.utc)
+        scored = []
+        for rec in read_people("spark", subject=subject, now=when):
+            if provenance.is_superseded(rec):
+                continue
+            score = len(q & set(rec.get("tags") or ()))
+            if score > 0:
+                scored.append((score, str(rec.get("ts") or ""), rec))
+        scored.sort(key=lambda item: item[1], reverse=True)  # newest first…
+        scored.sort(key=lambda item: item[0], reverse=True)  # …then best match
+        top = [rec for _, _, rec in scored[:max(1, limit)]]
+        return "\n".join(render_person_fact(rec, when) for rec in top)
+    except Exception as exc:  # broad for the writer's reason: never kill a caller
+        print(f"[people] retrieval failed: {exc}", file=sys.stderr)
+        return ""

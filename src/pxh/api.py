@@ -1647,6 +1647,14 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
     if proj_summary:
         prompt = proj_summary + "\n" + prompt
 
+    # Person memory — relevant facts only, "" when nothing matches. This and
+    # the SPARK voice prompt are the only two prompts that may include it.
+    person_facts = people.person_context(obi_text)
+    if person_facts:
+        prompt = ("What you know about Obi (attribution matters — an "
+                  "operator-told fact is not something Obi said):\n"
+                  + person_facts + "\n" + prompt)
+
     try:
         reply = await asyncio.wait_for(
             _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT,

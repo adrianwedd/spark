@@ -95,14 +95,19 @@ it. Optional expiry and supersession work exactly as above. Only benign,
 stable facts are seeded; nothing sensitive (health, family conflict,
 school support, private messages, location).
 
-## Retrieval (stage 5 — not in the writer PR)
+## Retrieval
 
-Injection into exactly two prompts: the SPARK voice prompt (persona ==
-spark) and the obi-chat prompt. Never GREMLIN/VIXEN; never reflection,
-public chat, blog, or social. Retrieval returns zero when nothing is
-relevant — no recent-padding, ever. Injected lines are compact, preserve
-attribution ("Adrian told you that…" vs "Obi told you 2 days ago that…"),
-and every injected statement is mechanically traceable to a stored record.
+`people.person_context()` injects into exactly two prompts:
+`voice_loop.build_model_prompt` (SPARK persona only) and `api.post_obi_chat`.
+Never GREMLIN/VIXEN; never reflection, public chat, blog, or social — the
+reader allowlist and the two exact call sites are pinned by
+`test_people_invariants.py`. Relevance is tag overlap with the query (same
+tokenizer the records were tagged with); no overlap returns "" — no
+recent-padding, ever. Rendered lines are compact, carry attribution decided
+by the record's `source` ("Adrian told you that Obi likes dinosaurs." for a
+seed vs 'Obi told you (2 days ago): "…"' for a direct report), and quote the
+stored fact text verbatim so every injected line is mechanically traceable
+to its record.
 
 ## Enforcement
 

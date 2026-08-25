@@ -417,3 +417,97 @@ def test_seed_cli_refuses_an_empty_seed_set(tmp_path):
     assert out.returncode == 1
     assert json.loads(out.stdout)["status"] == "error"
     assert not (tmp_path / "people-spark.jsonl").exists()
+
+
+# ── Retrieval (person_context) — stage-5/6 acceptance ──────────────────────
+
+def _seeded_store():
+    people.append_person_facts([people.build_seed_record(
+        polarity="like", obj="dinosaurs", actor="adrian",
+        ts="2026-08-25T00:00:00Z")], now=NOW)
+    people.append_person_facts(_facts("I love cuttlefish"), now=NOW)
+
+
+def test_related_prompt_retrieves_and_lines_trace_to_stored_records():
+    _seeded_store()
+    ctx = people.person_context("tell me about dinosaurs", now=NOW)
+    assert ctx == "Adrian told you that Obi likes dinosaurs."
+    stored = people.read_people(now=NOW)
+    assert any(r["text"] in ctx for r in stored)
+
+
+def test_unrelated_prompt_retrieves_nothing_never_padding():
+    _seeded_store()
+    assert people.person_context("what's the weather like", now=NOW) == ""
+    assert people.person_context("", now=NOW) == ""
+
+
+def test_direct_obi_report_renders_with_age_and_verbatim_clause():
+    _seeded_store()
+    ctx = people.person_context("do you remember what I love, cuttlefish?",
+                                now=NOW)
+    assert ctx == 'Obi told you (today): "I love cuttlefish"'
+
+
+def test_correction_supersedes_in_retrieval():
+    people.append_person_facts(_facts("my best friend is Sam"), now=NOW)
+    people.append_person_facts(
+        people.extract_person_facts(role="obi", text="my best friend is Mia",
+                                    msg_id="m2", ts="2026-08-25T10:00:00Z",
+                                    now=NOW), now=NOW)
+    ctx = people.person_context("who is my best friend", now=NOW)
+    assert "Mia" in ctx or "mia" in ctx
+    assert "sam" not in ctx.lower()
+
+
+def test_expired_commitment_disappears_from_retrieval():
+    people.append_person_facts(
+        _facts("I'm going to the school fair on Saturday"), now=NOW)
+    during = people.person_context("are you coming to the school fair",
+                                   now=NOW)
+    after = people.person_context("are you coming to the school fair",
+                                  now=NOW + dt.timedelta(days=14))
+    assert "school fair" in during
+    assert after == ""
+
+
+def test_retrieval_is_refused_for_the_performance_personas():
+    _seeded_store()
+    for persona in ("gremlin", "vixen"):
+        assert people.person_context("dinosaurs", persona=persona,
+                                     now=NOW) == ""
+
+
+def test_retrieval_never_raises_on_a_corrupt_store():
+    people.people_file("spark").parent.mkdir(parents=True, exist_ok=True)
+    people.people_file("spark").write_text("{not json\n", encoding="utf-8")
+    assert people.person_context("dinosaurs", now=NOW) == ""
+
+
+def test_retrieval_caps_at_the_limit_best_matches_first():
+    for obj in ("red dinosaurs", "green dinosaurs", "blue dinosaurs",
+                "old dinosaurs"):
+        people.append_person_facts(
+            [people.build_seed_record(polarity="like", obj=obj,
+                                      actor="adrian")], now=NOW)
+    ctx = people.person_context("dinosaurs", now=NOW)
+    assert len(ctx.splitlines()) == people.RETRIEVAL_LIMIT
+
+
+def test_voice_prompt_carries_person_facts_for_spark_only():
+    from pxh import voice_loop
+    _seeded_store()
+    spark = voice_loop.build_model_prompt("SYS", {"persona": ""},
+                                          "tell me about dinosaurs")
+    assert "Adrian told you that Obi likes dinosaurs." in spark
+    gremlin = voice_loop.build_model_prompt("SYS", {"persona": "gremlin"},
+                                            "tell me about dinosaurs")
+    assert "dinosaurs" not in gremlin.split("User transcript")[0]
+
+
+def test_voice_prompt_has_no_person_section_when_nothing_is_relevant():
+    from pxh import voice_loop
+    _seeded_store()
+    prompt = voice_loop.build_model_prompt("SYS", {"persona": ""},
+                                           "what's the weather")
+    assert "What you know about Obi" not in prompt
