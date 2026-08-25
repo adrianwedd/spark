@@ -163,7 +163,7 @@ def _memory_formation_line(rec: dict, job: dict | None = None) -> str:
     """
     formed = (rec or {}).get("last_success_ts")
     age = _age_secs(formed)
-    label = f"  \ud83e\udde0 {DIM}long-term memory{RESET} "
+    label = f"  \U0001f9e0 {DIM}long-term memory{RESET} "
     beat = _age_secs((job or {}).get("heartbeat_ts"))
     if beat is not None and beat <= JOB_HEARTBEAT_STALE_S:
         started = _age_secs((job or {}).get("started_ts"))
