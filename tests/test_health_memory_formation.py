@@ -282,3 +282,15 @@ def test_motd_line_renders_without_a_job_argument(motd):
 def test_motd_job_heartbeat_threshold_matches_memory_module(motd):
     from pxh import memory
     assert motd.JOB_HEARTBEAT_STALE_S == memory.JOB_HEARTBEAT_STALE_S
+
+
+def test_motd_line_is_printable_utf8(motd):
+    # The line's emoji was once written as a "\\ud83e\\udde0" surrogate-pair
+    # escape, which composes fine in memory and then raises UnicodeEncodeError
+    # the moment print() encodes it — killing the whole motd at the exact line
+    # this feature added. Content assertions can't catch that; only encoding
+    # the rendered string does.
+    for rec, job in (({}, None),
+                     ({"last_success_ts": "2026-08-25T00:00:00Z"}, None),
+                     ({}, _job(started_ago_s=120, beat_ago_s=30))):
+        motd._memory_formation_line(rec, job).encode("utf-8")
