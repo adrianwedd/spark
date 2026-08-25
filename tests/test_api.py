@@ -294,6 +294,50 @@ class TestHealth:
         assert response.status_code == 503
         assert response.json()["checks"]["daemons"]["status"] == "unknown"
 
+    def test_memory_formation_is_reported_without_503ing_liveness(
+            self, api_client, isolated_project):
+        """A nightly cognitive pass that has not run is not a serving failure.
+
+        This endpoint gates the tunnel health check. A newly added component
+        reads "missing" until its first 02:00 pass, so folding it into the
+        daemon rollup would 503 the API for a day over something that has
+        nothing to do with whether the device is serving. It still has to be
+        visible — being reported nowhere is the bug — so it gets its own check.
+        """
+        from pxh import health
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir)
+        health._component_path(health.CONSOLIDATION_COMPONENT).unlink()
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        checks = response.json()["checks"]
+        assert checks["daemons"]["status"] == "ok"
+        assert checks["memory"]["status"] == "missing"
+        assert checks["memory"]["overdue"] is True
+        assert checks["memory"]["last_formed_ts"] is None
+        # Still listed among the components — excluded from the rollup, not hidden.
+        assert health.CONSOLIDATION_COMPONENT in checks["daemons"]["components"]
+
+    def test_memory_check_reports_a_recent_consolidation(
+            self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir, mode="running")
+        self._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+
+        assert response.status_code == 200
+        memory = response.json()["checks"]["memory"]
+        assert memory["overdue"] is False
+        assert memory["last_formed_ts"]
+        # Unauthenticated endpoint: no error text, which can carry paths.
+        assert "last_error" not in memory
+
     def test_health_degrades_on_stale_loop_even_when_sonar_is_fresh(
             self, api_client, isolated_project):
         state_dir = isolated_project["state_dir"]

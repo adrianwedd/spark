@@ -136,6 +136,48 @@ def _trunc(s: str, maxlen: int = 72) -> str:
     return s[:maxlen - 1] + "\u2026" if len(s) > maxlen else s
 
 
+# Two nights without a consolidated memory. Mirrors
+# pxh.health.MEMORY_FORMATION_OVERDUE_S \u2014 duplicated rather than imported
+# because px-motd runs as root from PAM and deliberately imports no pxh module.
+MEMORY_OVERDUE_S = 48 * 3600
+
+
+def _memory_formation_line(rec: dict) -> str:
+    """Render "long-term memory" from the px-mind-consolidation health record.
+
+    Keyed on ``last_success_ts``, never ``updated_ts``: a failed nightly pass
+    refreshes the record without distilling anything, so the age of the last
+    *success* is the only number that answers "when did SPARK last form a
+    long-term memory". `rec` is the raw record so this stays pure and testable;
+    px-motd's own path clamping decides which file it comes from.
+    """
+    formed = (rec or {}).get("last_success_ts")
+    age = _age_secs(formed)
+    label = f"  \ud83e\udde0 {DIM}long-term memory{RESET} "
+    if age is None:
+        err = _trunc(str((rec or {}).get("last_error") or ""), 44)
+        tail = f" {DIM}{err}{RESET}" if err else ""
+        return label + f"{RED}never formed{RESET}{tail}"
+    txt = _age_str(formed)
+    if age > MEMORY_OVERDUE_S:
+        err = _trunc(str((rec or {}).get("last_error") or ""), 44)
+        tail = f" {DIM}{err}{RESET}" if err else ""
+        return label + f"{RED}last formed {txt}{RESET}{tail}"
+    return label + f"{GREEN}last formed {txt}{RESET}"
+
+
+def _age_secs(ts_str: str | None) -> int | None:
+    if not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - ts).total_seconds())
+    except Exception:
+        return None
+
+
 def _bar(pct: float, width: int = 12) -> str:
     pct = max(0.0, min(100.0, pct))
     filled = int(pct / 100 * width)
@@ -588,6 +630,13 @@ def section_spark() -> list[str]:
             spark = _sparkline(buckets, 24)
             total_24h = sum(buckets)
             out.append(f"  {DIM}24h thoughts{RESET} {GREY}{spark}{RESET} {DIM}{total_24h} total{RESET}")
+
+    # Long-term memory formation. Thoughts above are the last 24h; this is what
+    # survived them. The nightly consolidation pass had no health component at
+    # all until now, so it could fail every night while this banner showed a
+    # busy, healthy-looking robot.
+    out.append(_memory_formation_line(
+        _json(STATE / "health" / "px-mind-consolidation.json")))
 
     # Weather
     weather = aw.get("weather", {}) if aw else {}

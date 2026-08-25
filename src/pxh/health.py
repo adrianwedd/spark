@@ -51,6 +51,14 @@ STALE_AFTER_S: dict[str, int] = {
     "px-wake-listen": 900,    # only reports on wake events + periodic heartbeat
     "px-post": 3600,          # only runs when a postable thought appears
     "px-blog": 86400,         # daily cadence at its most frequent
+    # Memory consolidation is nightly like px-blog, but it fires inside a
+    # four-hour window (02:00-06:00 Hobart) rather than at a fixed hour, so two
+    # perfectly healthy runs can sit ~28h apart (02:00 one night, 05:59 the
+    # next). px-blog's 86400 would therefore report a working job as stale most
+    # afternoons — the classic way an alarm teaches its reader to ignore it.
+    # 30h clears that worst case with ~2h to spare, and a night that produced
+    # no attempt at all still surfaces by the following morning.
+    "px-mind-consolidation": 108000,
     "px-api-server": 300,
     "px-frigate-stream": 300,
     # The brain supervisor ticks every 10s but throttles its success writes to
@@ -62,6 +70,17 @@ DEFAULT_STALE_AFTER_S = 900
 # Components expected to exist. Absent files report "missing" rather than being
 # silently omitted — a daemon that never started is exactly what we want to see.
 KNOWN_COMPONENTS = tuple(STALE_AFTER_S)
+
+# The nightly consolidation pass that turns a day of thoughts into durable
+# memory. Named here because more than one surface asks the same question of it
+# ("when did SPARK last form a long-term memory?") and a typo'd component name
+# reads as "missing" rather than failing loudly.
+CONSOLIDATION_COMPONENT = "px-mind-consolidation"
+
+# Long-term memory that has not formed in this long is worth saying out loud
+# even while the component itself still reads within its staleness window. Two
+# nights is the threshold: one missed night is a bad night, two is amnesia.
+MEMORY_FORMATION_OVERDUE_S = 48 * 3600
 
 _STATUS_RANK = {"ok": 0, "degraded": 1, "stale": 2, "failing": 3, "missing": 3}
 
@@ -263,6 +282,52 @@ def read_watchdog_margin(state_dir: Path | str | None = None) -> dict[str, Any]:
     return out
 
 
+def humanize_age(seconds: float | None) -> str:
+    """Coarse "3d ago" phrasing, matching bin/px-motd's `_age_str`."""
+    if seconds is None:
+        return "never"
+    secs = int(seconds)
+    if secs < 0:
+        return "just now"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def memory_formation(now: dt.datetime | None = None) -> dict[str, Any]:
+    """When SPARK last actually formed a long-term memory.
+
+    Deliberately keyed on ``last_success_ts``, not ``updated_ts``: a failed
+    consolidation attempt refreshes the record without distilling anything, so
+    a component that reports every night and succeeds on none of them would
+    otherwise look eternally fresh. That is the exact shape of the failure this
+    exists to catch — the store stops growing while every dial reads green.
+
+    ``overdue`` is a separate axis from ``status`` on purpose. A component can
+    sit inside its staleness window and below the failure threshold while still
+    not having produced a memory for days, because failing attempts keep both
+    of those dials quiet.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    rec = _read_record(CONSOLIDATION_COMPONENT)
+    status, _ = _derive_status(rec, CONSOLIDATION_COMPONENT, now)
+    formed_ts = rec.get("last_success_ts") if rec else None
+    age = _age_s(formed_ts, now)
+    return {
+        "component": CONSOLIDATION_COMPONENT,
+        "status": status,
+        "last_formed_ts": formed_ts,
+        "age_s": round(age) if age is not None else None,
+        "age_human": humanize_age(age),
+        "overdue": age is None or age > MEMORY_FORMATION_OVERDUE_S,
+        "last_error": rec.get("last_error") if rec else None,
+    }
+
+
 def read_health(components: tuple[str, ...] | None = None) -> dict[str, Any]:
     """Aggregate every component record into a single live view.
 
@@ -313,6 +378,11 @@ def read_health(components: tuple[str, ...] | None = None) -> dict[str, Any]:
         "overall": overall,
         "unhealthy": unhealthy,
         "components": out,
+        # Promoted out of `components` as well as staying in it: "when did I
+        # last form a long-term memory" is a question about SPARK, not about a
+        # daemon, and a reader scanning for it should not have to know which
+        # component name implements it.
+        "memory_formation": memory_formation(now),
     }
 
 
@@ -324,8 +394,17 @@ def summarize(health: dict[str, Any] | None = None) -> str:
     """
     health = health if health is not None else read_health()
     unhealthy = health.get("unhealthy") or []
+    # Overdue memory formation is its own signal, reported even when every
+    # component reads ok. Repeated failed attempts keep the staleness window
+    # fed and the failure streak short-lived, so the component can look healthy
+    # for days while the memory store has not grown at all.
+    mem = health.get("memory_formation") or {}
+    mem_note = ""
+    if mem.get("overdue"):
+        mem_note = ("long-term memory: never formed" if not mem.get("last_formed_ts")
+                    else f"long-term memory: last formed {mem.get('age_human')}")
     if not unhealthy:
-        return ""
+        return mem_note
     bits = []
     for name in unhealthy:
         entry = health["components"][name]
@@ -340,4 +419,6 @@ def summarize(health: dict[str, Any] | None = None) -> str:
             fails = entry.get("consecutive_failures", 0)
             detail = f" ({err[:80]})" if err else ""
             bits.append(f"{name}: {status} after {fails} failures{detail}")
+    if mem_note:
+        bits.append(mem_note)
     return "; ".join(bits)
