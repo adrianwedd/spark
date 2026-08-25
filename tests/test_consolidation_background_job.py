@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import threading
 import time
 
@@ -68,6 +69,26 @@ def _backdate_marker(started_ago_s: float, beat_ago_s: float = 0.0) -> None:
     job["started_ts"] = (now - dt.timedelta(seconds=started_ago_s)).isoformat()
     job["heartbeat_ts"] = (now - dt.timedelta(seconds=beat_ago_s)).isoformat()
     memory._write_consolidation_job(job)
+
+
+def _live_marker(**overrides) -> dict:
+    """A marker naming *this* process, by the full identity tuple.
+
+    Built rather than hand-written so the identity fields cannot drift out of a
+    test and quietly turn it into an assertion about a malformed marker.
+    """
+    now = dt.datetime.now(UTC).isoformat()
+    job = {
+        "status": "running",
+        "pid": os.getpid(),
+        "boot_id": memory._read_boot_id(),
+        "pid_starttime": memory._pid_starttime(os.getpid()),
+        "attempt": 1,
+        "started_ts": now,
+        "heartbeat_ts": now,
+    }
+    job.update(overrides)
+    return job
 
 
 # ---------------------------------------------------------------------------
@@ -227,15 +248,20 @@ def test_a_marker_from_a_dead_owner_is_not_a_running_claim(due, monkeypatch):
 
 
 def test_a_marker_with_a_silent_heartbeat_is_stale():
-    """A live pid is not enough: the process may exist and no longer be ticking."""
-    import os
+    """A live, correctly-identified pid is not enough on its own.
+
+    The process may exist, be the right process, and simply have stopped
+    ticking. The heartbeat is the only check that catches that, which is why
+    the identity checks below are additions to it rather than replacements.
+    """
     fresh = dt.datetime.now(UTC)
     old = fresh - dt.timedelta(seconds=memory.JOB_HEARTBEAT_STALE_S + 60)
-    live_and_beating = {"pid": os.getpid(), "started_ts": old.isoformat(),
-                        "heartbeat_ts": fresh.isoformat()}
-    live_but_quiet = {"pid": os.getpid(), "started_ts": old.isoformat(),
-                      "heartbeat_ts": old.isoformat()}
-    no_beat_at_all = {"pid": os.getpid(), "started_ts": fresh.isoformat()}
+    live_and_beating = _live_marker(started_ts=old.isoformat(),
+                                    heartbeat_ts=fresh.isoformat())
+    live_but_quiet = _live_marker(started_ts=old.isoformat(),
+                                  heartbeat_ts=old.isoformat())
+    no_beat_at_all = _live_marker()
+    no_beat_at_all.pop("heartbeat_ts")
     assert not memory.consolidation_job_is_stale(live_and_beating)
     assert memory.consolidation_job_is_stale(live_but_quiet)
     assert memory.consolidation_job_is_stale(no_beat_at_all)
@@ -249,7 +275,62 @@ def test_a_stale_marker_does_not_block_a_fresh_claim():
         "heartbeat_ts": dt.datetime.now(UTC).isoformat(),
     })
     assert memory.claim_consolidation_job(attempt=1) is True
-    assert memory.read_consolidation_job()["pid"] == __import__("os").getpid()
+    assert memory.read_consolidation_job()["pid"] == os.getpid()
+
+
+# ---------------------------------------------------------------------------
+# 1c. A pid is a slot the kernel reuses, not a name for a process
+# ---------------------------------------------------------------------------
+
+def test_a_freshly_claimed_marker_carries_its_full_identity():
+    """Claiming stamps boot_id and start time, and that marker is not stale."""
+    assert memory.claim_consolidation_job(attempt=1) is True
+    job = memory.read_consolidation_job()
+    assert job["boot_id"] == memory._read_boot_id()
+    assert job["pid_starttime"] == memory._pid_starttime(os.getpid())
+    assert isinstance(job["pid_starttime"], int)
+    assert not memory.consolidation_job_is_stale(job)
+
+
+def test_a_marker_from_a_previous_boot_is_stale():
+    """A reboot means the owning thread is certainly gone.
+
+    Nothing survives a reboot, so this marker is reclaimable *immediately* —
+    it must not have to wait out a heartbeat that can never arrive again. The
+    pid here is this live process's, so only the boot id can make it stale.
+    """
+    job = _live_marker(boot_id="00000000-0000-4000-8000-000000000000")
+    assert memory.consolidation_job_is_stale(job)
+    memory._write_consolidation_job(job)
+    assert memory.claim_consolidation_job(attempt=1) is True
+
+
+def test_pid_reuse_does_not_read_as_a_running_consolidation():
+    """The pid is live and passes the cmdline check; the start tick is not ours.
+
+    This is the case the marker could not previously tell apart: an unrelated
+    process that inherited the number would have read as a consolidation in
+    flight for as long as it ran, blocking every attempt that night.
+    """
+    real = memory._pid_starttime(os.getpid())
+    assert isinstance(real, int)
+    assert memory.consolidation_job_is_stale(_live_marker(pid_starttime=real + 1))
+    assert not memory.consolidation_job_is_stale(_live_marker(pid_starttime=real))
+
+
+@pytest.mark.parametrize("field", ["boot_id", "pid_starttime"])
+def test_a_marker_missing_an_identity_field_is_stale(field):
+    """Lenient read, same posture as the rest of the module.
+
+    A marker we cannot identify is not evidence of work in progress, and must
+    never be able to block tonight's attempt — including the markers written by
+    the pre-hardening version of this code, which carry neither field.
+    """
+    missing = _live_marker()
+    missing.pop(field)
+    assert memory.consolidation_job_is_stale(missing)
+    assert memory.consolidation_job_is_stale(_live_marker(**{field: None}))
+    assert memory.consolidation_job_is_stale(_live_marker(**{field: "junk"}))
 
 
 # ---------------------------------------------------------------------------

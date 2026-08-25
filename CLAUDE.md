@@ -165,14 +165,29 @@ time, so it was given an ad-hoc `timeout=180` that silently overrode the
 declared deadline, so every failure timed out at exactly 180.1s.
 
 **`state/consolidation_job.json` is the in-flight marker**, and it is keyed on
-**pid plus a heartbeat** — `{"status","pid","attempt","started_ts","heartbeat_ts"}`.
-A health record says what the last *finished* attempt did; nothing else answers
-"is one running right now". The worker thread dies with its process, so a marker
-outliving its owner is always a lie: `consolidation_job_is_stale()` calls it
-stale when `/proc/<pid>` is gone (or is not px-mind) **or** the heartbeat has
-been quiet past `JOB_HEARTBEAT_STALE_S`. A restart therefore cannot leave a
-false in-progress claim behind, and the tick records that cleanup as a
-*failure* — no memory formed that night — rather than silently resetting. The
+a real **instance identity** — `(boot_id, pid, pid_starttime)` — plus a
+heartbeat, not on a bare pid: *a pid is a slot the kernel reuses, not a name for
+a process*. A health record says what the last *finished* attempt did; nothing
+else answers "is one running right now". The worker thread dies with its
+process, so a marker outliving its owner is always a lie, and
+`consolidation_job_is_stale()` has four ways to catch it: a **different
+`boot_id`** (a reboot means the owner is certainly gone, so the marker is
+reclaimable at once instead of waiting out a heartbeat that will never arrive),
+a **`pid_starttime` mismatch** (`/proc/<pid>/stat` field 22 — the canonical
+within-boot PID-reuse discriminator; parse it by splitting on the **last** `)`,
+since the comm field can contain spaces and parens), `/proc/<pid>` gone or not
+px-mind, **or** the heartbeat quiet past `JOB_HEARTBEAT_STALE_S`. The heartbeat
+stays the load-bearing backstop — it is the only one that catches an owner that
+is genuinely alive and has simply stopped ticking; the identity checks are
+exactness and speed, not a replacement. Missing or unparseable identity reads as
+**stale**, the module's lenient-read posture: an unreadable marker must never
+block tonight's attempt. `boot_id` is the same idiom as
+`brain_daemon._read_boot_id` / `m5` / `wake_grant`, and earns its place for the
+same host-specific reason — this Pi has no RTC and timesyncd steps the clock, so
+boot_id is the one member of the tuple a clock step cannot move. A restart
+therefore cannot leave a false in-progress claim behind, and the tick records
+that cleanup as a *failure* — no memory formed that night — rather than
+silently resetting. The
 heartbeat is written by the **tick**, not the worker: the worker spends its
 whole life blocked in `ask_brain` and could not beat if it wanted to. Past
 `JOB_OVERRUN_AFTER_S` an unfinished run is reported **once**, not every 60s.
@@ -226,7 +241,7 @@ Three-layer architecture:
   Ollama. Writes to `state/thoughts.jsonl` only after a valid M5 response.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. **Redaction is a property of the record, not of a call site.** `mind.redact_private_dm()` moves the private text off `thought["thought"]` (replacing it with `mind.PRIVATE_DM_PLACEHOLDER`) the moment the thought exists, onto `PRIVATE_DM_TEXT_KEY` — an in-process delivery field that `without_private_dm_text()` strips from every persistence path and that exactly one consumer reads (`_emit_message_obi`). It is applied twice, idempotently: at record creation in `reflection()` and again at the dispatch boundary in `expression()`, so a record built by anything else is still safe. This shape exists because the previous one — a `display_text` local used only for the thoughts-file write — leaked the raw DM into session history, and from there into the voice-loop prompt (GREMLIN/VIXEN included), the awareness conversation digest, the reflection prompt and `GET /api/v1/session`. **Do not reintroduce a sink that reads `thought["thought"]` expecting raw text.** Pinned by `tests/test_message_obi_redaction.py`.
-- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day ≥40min apart, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. **Runs on a background daemon thread with a pid-keyed job marker (`state/consolidation_job.json`), never inline on the tick** — see the health section. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
+- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day ≥40min apart, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. **Runs on a background daemon thread with an identity-keyed job marker (`state/consolidation_job.json`), never inline on the tick** — see the health section. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
 
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets

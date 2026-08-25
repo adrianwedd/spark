@@ -516,12 +516,16 @@ def maybe_consolidate(dry: bool = False, persona: str = "spark",
 # is that missing state, and it is deliberately a file rather than a process
 # variable — px-motd, the operator and a later px-mind all need to read it.
 #
-# It is keyed on pid, and liveness is `/proc/{pid}` plus a cmdline check, the
-# same idiom as px-mind's own single-instance guard and its px-alive pid check.
-# The worker thread dies with its process, so a marker outliving its owner is
-# always a lie; making the lie detectable is the whole job of `pid` and
-# `heartbeat_ts`. Nothing here ever treats a marker as authoritative evidence
-# that work is in progress without first checking that its owner still exists.
+# It is keyed on a real instance identity — `(boot_id, pid, pid_starttime)` —
+# not on a bare pid, because a pid is a slot the kernel reuses rather than a
+# name for a process. Liveness on top of that is `/proc/{pid}` plus a cmdline
+# check, the same idiom as px-mind's own single-instance guard and its px-alive
+# pid check, with `heartbeat_ts` as the backstop for an owner that is alive but
+# no longer ticking. The worker thread dies with its process, so a marker
+# outliving its owner is always a lie; making the lie detectable is the whole
+# job of those fields. Nothing here ever treats a marker as authoritative
+# evidence that work is in progress without first checking that the process
+# that wrote it — not merely something wearing its pid — still exists.
 
 def consolidation_job_file() -> Path:
     return _state_dir() / "consolidation_job.json"
@@ -570,6 +574,45 @@ def _pid_is_px_mind(pid: object) -> bool:
     return "px-mind" in cmdline
 
 
+def _read_boot_id() -> str | None:
+    """The kernel's boot id, or None when it cannot be read.
+
+    Same idiom as `brain_daemon._read_boot_id` (and `m5`, `wake_grant`), for the
+    same host-specific reason: this Pi has no RTC and timesyncd steps the clock,
+    so boot_id is the one member of an identity tuple a clock step cannot move.
+    """
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _pid_starttime(pid: object) -> int | None:
+    """Field 22 of `/proc/{pid}/stat` — clock ticks since boot at process start.
+
+    The canonical within-boot discriminator for PID reuse: the kernel may hand
+    the same pid to an unrelated process, but it cannot hand it the same start
+    tick. Parsed by splitting on the LAST `)` because field 2 is the comm,
+    which is unparenthesised-unsafe — a process named `px-mind (old)` would
+    otherwise shift every field index after it.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    _, sep, after_comm = stat.rpartition(")")
+    if not sep:
+        return None
+    fields = after_comm.split()
+    try:                       # field 22 is index 19 once fields 1-2 are gone
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
 def consolidation_job_age_s(job: dict,
                             now: dt.datetime | None = None) -> float | None:
     started = _parse_ts((job or {}).get("started_ts"))
@@ -583,16 +626,45 @@ def consolidation_job_is_stale(job: dict,
                                now: dt.datetime | None = None) -> bool:
     """True when nothing is plausibly still working on this marker.
 
-    Two independent ways to be stale, and both are needed. The owning process
-    may be gone outright (a restart — the thread died with it), or it may still
-    exist while no longer ticking, in which case only the heartbeat says so.
-    A missing heartbeat reads as stale rather than fresh: an unreadable marker
-    must never be able to block tonight's attempt forever.
+    Four independent ways to be stale, and all are needed. In order of how
+    exactly they answer "is the thread that wrote this still alive":
+
+    1. **A different boot.** The owning process is certainly gone, so a marker
+       from before a reboot is reclaimable immediately rather than after
+       waiting out a heartbeat that will never arrive again.
+    2. **PID reuse.** `pid` alone names a slot the kernel reuses, not a
+       process; `pid_starttime` is what makes it name *this* process. Without
+       it a marker could point at an unrelated program that inherited the
+       number and read as a live consolidation for as long as that program ran.
+    3. The pid is dead, or alive but not a px-mind.
+    4. **The heartbeat** — still the load-bearing backstop, and the only check
+       that catches an owner that is genuinely alive and has simply stopped
+       ticking. 1–3 are accelerators and exactness; none of them replaces it.
+
+    Missing or unparseable identity reads as stale rather than fresh, the same
+    lenient-read posture as the rest of this module: an unreadable marker must
+    never be able to block tonight's attempt forever.
     """
     if not job:
         return False
+
+    recorded_boot = job.get("boot_id")
+    if not isinstance(recorded_boot, str) or not recorded_boot:
+        return True
+    current_boot = _read_boot_id()
+    # A boot id we cannot read is not evidence of a *different* boot, so it
+    # falls through to the checks below rather than voiding a live marker.
+    if current_boot is not None and recorded_boot != current_boot:
+        return True
+
     if not _pid_is_px_mind(job.get("pid")):
         return True
+    recorded_start = job.get("pid_starttime")
+    if not isinstance(recorded_start, int) or isinstance(recorded_start, bool):
+        return True
+    if _pid_starttime(job.get("pid")) != recorded_start:
+        return True
+
     beat = _parse_ts(job.get("heartbeat_ts"))
     if beat is None:
         return True
@@ -621,6 +693,9 @@ def claim_consolidation_job(attempt: int = 0,
             return _write_consolidation_job({
                 "status": "running",
                 "pid": os.getpid(),
+                # pid names a slot; these two name the process in it.
+                "boot_id": _read_boot_id(),
+                "pid_starttime": _pid_starttime(os.getpid()),
                 "attempt": attempt,
                 "started_ts": stamp,
                 "heartbeat_ts": stamp,
