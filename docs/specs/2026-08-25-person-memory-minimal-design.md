@@ -84,8 +84,8 @@ stay on disk. Corrections use `provenance.supersedes` on the same
 
 ## Operator seeding (stage 2)
 
-A small CLI writes operator-known facts through the same canonical
-`append_person_facts` writer — never by editing the JSONL directly, never
+`bin/px-person-seed` (dry-run by default; `--write` to append) writes
+operator-known facts through the same canonical `append_person_facts` writer — never by editing the JSONL directly, never
 via an LLM. Seed records are structurally distinguishable from
 conversational extraction: `source`/`source_channel` is `operator_seed`,
 the evidence names the operator as the asserting actor, and kind remains

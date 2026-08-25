@@ -405,3 +405,59 @@ def record_person_facts(*, role: str, text: str, persona: str = "spark",
     except Exception as exc:  # broad: a memory writer must not kill its caller
         print(f"[people] extraction failed: {exc}", file=sys.stderr)
         return 0
+
+
+# --- operator seeding ------------------------------------------------------
+SEED_SOURCE = "operator_seed"
+
+
+def build_seed_record(*, polarity: str, obj: str, actor: str,
+                      subject: str = DEFAULT_SUBJECT,
+                      expires_ts: str | None = None,
+                      ts: str | None = None) -> dict:
+    """One operator-asserted preference record, for `bin/px-person-seed`.
+
+    Same shape the extractor produces, so retrieval and supersession treat
+    both uniformly — with one deliberate difference: **the record says the
+    operator asserted it, never that Obi did.** ``source`` and the provenance
+    source are ``operator_seed`` and ``source_actor`` names who typed it, so
+    a renderer that says "Obi told me" about a seed has to ignore the record,
+    not misread it. Evidence is the operator's assertion, which forges no
+    conversation history: there is no message id because there was no message.
+
+    Preferences only. The seed path exists so known stable interests can be
+    present before the first conversation; relationships and commitments are
+    exactly the kinds that should only enter through Obi's own words.
+
+    Unlike the conversational writer this *does* raise on bad input — an
+    operator at a terminal is the one caller who should see the error.
+    """
+    if polarity not in ("like", "dislike"):
+        raise ValueError(f"polarity must be like|dislike, got {polarity!r}")
+    topic_obj = _norm(obj).lower()
+    if not (3 <= len(topic_obj) <= MAX_FACT_CHARS):
+        raise ValueError(f"seed object must be 3-{MAX_FACT_CHARS} chars: {obj!r}")
+    if _DEICTIC_HEAD.match(topic_obj):
+        raise ValueError(f"seed object has no stable referent: {obj!r}")
+    actor_slug = re.sub(r"[^a-z0-9_-]", "", str(actor or "").lower().strip())
+    if not actor_slug:
+        raise ValueError("a seed must name its operator (--by)")
+    if expires_ts:
+        dt.datetime.fromisoformat(str(expires_ts).replace("Z", "+00:00"))
+    text = f"{'likes' if polarity == 'like' else 'dislikes'} {topic_obj}"
+    record = {
+        "ts": ts or utc_timestamp(),
+        "subject": str(subject or DEFAULT_SUBJECT).lower().strip(),
+        "fact_kind": "preference",
+        "topic": f"preference:{topic_obj}",
+        "polarity": polarity,
+        "text": text,
+        "tags": sorted(memory._tokenize(text)),
+        "importance": IMPORTANCE,
+        "source": SEED_SOURCE,
+        "source_actor": actor_slug,
+        "expires_ts": expires_ts or None,
+    }
+    provenance.stamp(record, "report", SEED_SOURCE,
+                     evidence=[f"operator:{actor_slug}", text])
+    return record
