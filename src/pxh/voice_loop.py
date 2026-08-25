@@ -545,6 +545,16 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
         context_sections.append("Recent conversation (oldest first):")
         context_sections.append(json.dumps(recent_turns, indent=2))
 
+    # Person memory — SPARK only, and only when something is actually relevant
+    # to what was just said. GREMLIN/VIXEN never receive Obi's facts; the
+    # retrieval helper re-checks the persona itself, so this outer gate is
+    # defence in depth, not the boundary.
+    if _active_persona in ("", "spark"):
+        person_facts = people.person_context(user_text)
+        if person_facts:
+            context_sections.append("What you know about Obi (told to you directly — attribution matters):")
+            context_sections.append(person_facts)
+
     # Inject inner thoughts from px-mind — use persona-scoped file to prevent cross-persona leakage
     _thoughts_name = f"thoughts-{_active_persona}.jsonl" if _active_persona else "thoughts.jsonl"
     thoughts_file = Path(os.environ.get("PX_STATE_DIR", str(PROJECT_ROOT / "state"))) / _thoughts_name

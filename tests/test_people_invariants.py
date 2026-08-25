@@ -32,7 +32,7 @@ SRC = Path(mind.__file__).resolve().parent
 # prose is a scan someone eventually deletes.
 FORBIDDEN = ("pxh.people", "import people", "people_file", "read_people",
              "load_people", "record_person_facts", "extract_person_facts",
-             "people-")
+             "person_context", "people-")
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -83,17 +83,44 @@ def test_person_store_is_physically_separate_from_consolidated_memory():
     assert "memories-" in memory.memories_file("spark").name
 
 
-def test_no_other_module_reads_the_person_store():
-    """Step 3 is write-only. Retrieval (step 4) will add readers deliberately;
-    until then anything reading this store is an accident."""
+def test_only_the_two_specified_prompts_read_the_person_store():
+    """Retrieval reaches exactly two prompts: the SPARK voice prompt and the
+    obi-chat prompt. Any other reader — reflection, public chat, blog,
+    social — is an accident, and raw-read helpers stay inside people.py."""
     readers = set()
     for path in sorted(SRC.glob("*.py")):
         if path.name == "people.py":
             continue
         text = path.read_text(encoding="utf-8")
-        if "read_people" in text or "load_people" in text:
+        if any(tok in text for tok in ("read_people", "load_people",
+                                       "person_context")):
             readers.add(path.name)
-    assert readers == set(), f"unexpected readers of the person store: {readers}"
+    assert readers == {"api.py", "voice_loop.py"}, readers
+
+
+def test_retrieval_is_called_from_exactly_the_two_named_functions():
+    """Within the two permitted files, the call site is pinned to the one
+    function each that builds the permitted prompt — `person_context` in a
+    new helper is how the public-chat prompt quietly acquires it."""
+    from pxh import api
+    assert Path(voice_loop.__file__).read_text(encoding="utf-8") \
+        .count("person_context") == 1
+    assert "person_context" in inspect.getsource(voice_loop.build_model_prompt)
+    assert Path(api.__file__).read_text(encoding="utf-8") \
+        .count("person_context") == 1
+    assert "person_context" in inspect.getsource(api.post_obi_chat)
+
+
+def test_public_chat_prompt_never_carries_person_facts(tmp_path, monkeypatch):
+    """Behavioural backstop for the scan above: even with a populated store
+    and a directly-relevant question, the public chat prompt builder must
+    not surface Obi's facts to strangers."""
+    from pxh import api
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    people.append_person_facts(people.extract_person_facts(
+        role="obi", text="I like dinosaurs", msg_id="m1"))
+    src = inspect.getsource(api.public_chat)
+    assert "person_context" not in src and "read_people" not in src
 
 
 def test_only_the_two_specified_call_sites_write_facts():
@@ -140,3 +167,11 @@ def test_writer_and_its_invariants_are_blacklisted_from_self_evolution():
     for path in ("src/pxh/people.py", "tests/test_people_invariants.py"):
         assert path in claude_session.BLACKLIST_FILES
         assert not claude_session.file_in_whitelist(path)
+
+
+def test_the_person_store_is_gitignored():
+    """The store was committed once by a reflexive `git add -A` — the facts in
+    a person store belong to the person, not to the repository history."""
+    ignore = (Path(people.__file__).resolve().parent.parent.parent
+              / ".gitignore").read_text(encoding="utf-8")
+    assert "state/people-*.jsonl" in ignore
