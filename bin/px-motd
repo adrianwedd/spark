@@ -141,8 +141,12 @@ def _trunc(s: str, maxlen: int = 72) -> str:
 # because px-motd runs as root from PAM and deliberately imports no pxh module.
 MEMORY_OVERDUE_S = 48 * 3600
 
+# Mirrors pxh.memory.JOB_HEARTBEAT_STALE_S, duplicated for the same reason and
+# pinned by test_motd_job_heartbeat_threshold_matches_memory_module.
+JOB_HEARTBEAT_STALE_S = 300
 
-def _memory_formation_line(rec: dict) -> str:
+
+def _memory_formation_line(rec: dict, job: dict | None = None) -> str:
     """Render "long-term memory" from the px-mind-consolidation health record.
 
     Keyed on ``last_success_ts``, never ``updated_ts``: a failed nightly pass
@@ -150,10 +154,21 @@ def _memory_formation_line(rec: dict) -> str:
     *success* is the only number that answers "when did SPARK last form a
     long-term memory". `rec` is the raw record so this stays pure and testable;
     px-motd's own path clamping decides which file it comes from.
+
+    `job` is `state/consolidation_job.json`, the background worker's in-flight
+    marker (#291). A run in progress is appended as a hint rather than
+    replacing the line: "last formed 26h ago" is still the honest answer while
+    tonight's pass is mid-flight, and a marker whose heartbeat has gone quiet
+    is not evidence of anything, so it is ignored.
     """
     formed = (rec or {}).get("last_success_ts")
     age = _age_secs(formed)
     label = f"  \ud83e\udde0 {DIM}long-term memory{RESET} "
+    beat = _age_secs((job or {}).get("heartbeat_ts"))
+    if beat is not None and beat <= JOB_HEARTBEAT_STALE_S:
+        started = _age_secs((job or {}).get("started_ts"))
+        for_s = f" for {started // 60}m" if started and started >= 60 else ""
+        label += f"{DIM}(consolidating now{for_s}){RESET} "
     if age is None:
         err = _trunc(str((rec or {}).get("last_error") or ""), 44)
         tail = f" {DIM}{err}{RESET}" if err else ""
@@ -636,7 +651,8 @@ def section_spark() -> list[str]:
     # all until now, so it could fail every night while this banner showed a
     # busy, healthy-looking robot.
     out.append(_memory_formation_line(
-        _json(STATE / "health" / "px-mind-consolidation.json")))
+        _json(STATE / "health" / "px-mind-consolidation.json"),
+        _json(STATE / "consolidation_job.json")))
 
     # Weather
     weather = aw.get("weather", {}) if aw else {}

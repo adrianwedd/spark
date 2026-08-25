@@ -1607,39 +1607,81 @@ def test_reflection_injects_active_intention(tmp_path, monkeypatch):
     assert "current intention" in ctx.lower()
 
 
-def test_consolidation_tick_spark_logs_result(monkeypatch):
+_SPARK_SESSION = {"persona": "spark"}
+
+
+def _run_consolidation_tick(session=_SPARK_SESSION, dry=False):
+    """Tick, then wait for the worker it launched (#291 made the pass async).
+
+    Default is a sentinel, not `None`-or-truthy: `{}` is a real session under
+    test here (no persona at all) and must not be swapped for SPARK's.
+    """
+    pxh.mind._consolidation_tick(session, dry=dry)
+    worker = pxh.mind._consolidation_worker
+    if worker is not None:
+        worker.join(timeout=60)
+        pxh.mind._consolidation_worker = None
+
+
+@pytest.fixture
+def consolidation_due(monkeypatch, tmp_path):
+    """Report the pass as due, with the job marker isolated into tmp."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(pxh.mind.spark_memory, "consolidation_due",
+                        lambda *a, **kw: None)
+    pxh.mind._consolidation_worker = None
+    yield
+    pxh.mind._consolidation_worker = None
+
+
+def test_consolidation_tick_spark_logs_result(monkeypatch, consolidation_due):
     calls = []
     monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate",
                         lambda dry: {"status": "ok", "written": 2})
     monkeypatch.setattr(pxh.mind, "log", lambda msg: calls.append(msg))
-    pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)
+    _run_consolidation_tick()
     assert any("consolidation: ok" in c and "wrote 2" in c for c in calls)
 
 
-def test_consolidation_tick_none_is_silent(monkeypatch):
+def test_consolidation_tick_none_is_silent(monkeypatch, consolidation_due):
     calls = []
     monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate", lambda dry: None)
     monkeypatch.setattr(pxh.mind, "log", lambda msg: calls.append(msg))
+    _run_consolidation_tick()
+    # The launch line is the tick's own; the *outcome* is what must stay silent.
+    assert not any("consolidation:" in c and "started" not in c for c in calls)
+
+
+def test_consolidation_tick_not_due_launches_nothing(monkeypatch, tmp_path):
+    """The cheap read-only gate runs before any thread is spent."""
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
+    pxh.mind._consolidation_worker = None
+    called = []
+    monkeypatch.setattr(pxh.mind.spark_memory, "consolidation_due",
+                        lambda *a, **kw: "outside the 02:00-06:00 window")
+    monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate",
+                        lambda dry: called.append(1))
     pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)
-    assert calls == []
+    assert pxh.mind._consolidation_worker is None
+    assert called == []
 
 
-def test_consolidation_tick_never_raises(monkeypatch):
+def test_consolidation_tick_never_raises(monkeypatch, consolidation_due):
     def boom(dry):
         raise RuntimeError("disk exploded")
     calls = []
     monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate", boom)
     monkeypatch.setattr(pxh.mind, "log", lambda msg: calls.append(msg))
-    pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)  # must not raise
+    _run_consolidation_tick()  # must not raise, on this thread or the worker's
     assert any("consolidation error" in c for c in calls)
 
 
-def test_consolidation_tick_skips_other_personas(monkeypatch):
+def test_consolidation_tick_skips_other_personas(monkeypatch, consolidation_due):
     called = []
     monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate",
                         lambda dry: called.append(1))
-    pxh.mind._consolidation_tick({"persona": "gremlin"}, dry=False)
-    pxh.mind._consolidation_tick({}, dry=False)
+    _run_consolidation_tick({"persona": "gremlin"})
+    _run_consolidation_tick({})
     assert called == []
 
 

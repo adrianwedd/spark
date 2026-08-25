@@ -75,7 +75,13 @@ _TYPE_COOLDOWNS: dict[str, int] = {
     "compose": 14400,      # 4 hours
     "conversation": 900,   # 15 min
     "blog": 1800,          # 30 min
-    "consolidate": 72000,  # 20 hours
+    # 40 min, matching memory.RETRY_SPACING_S (#291). It was 20 hours, which
+    # meant the *first* attempt of a night consumed the only slot the second
+    # one could ever have used: `memory.MAX_ATTEMPTS_PER_DAY` promised two
+    # tries between 02:00 and 06:00 and this made the second structurally
+    # unreachable. 40 min also clears the 30-min global cooldown, so attempt 2
+    # is spaced past it rather than exempted from it.
+    "consolidate": 2400,
 }
 
 _TYPE_QUOTAS: dict[str, int] = {
@@ -85,7 +91,9 @@ _TYPE_QUOTAS: dict[str, int] = {
     "compose": 2,
     "conversation": 4,
     "blog": 5,
-    "consolidate": 1,
+    # Two, to match memory.MAX_ATTEMPTS_PER_DAY (#291). A quota of 1 made the
+    # retry that module offers impossible to spend.
+    "consolidate": 2,
 }
 
 # Higher number = higher priority.  Used for budget-tight gating.
@@ -325,7 +333,7 @@ _brain_kinds = brain_kinds
 def _run_via_brain(
     session_type: str,
     prompt: str,
-    timeout: int,
+    timeout: int | None,
     model: str,
 ) -> RunResult:
     """Serve a session from the resident Claude session instead of a subprocess.
@@ -339,6 +347,14 @@ def _run_via_brain(
     resident session's envelope is fixed when it launches and cannot be
     widened for one request. That is a security property, not a limitation to
     work around.
+
+    `timeout=None` means "use the deadline this kind declares" —
+    `brain._DEADLINE_S`, which is the single source of truth for how long a
+    classified kind may take. A caller that passes a number overrides it, and
+    #291 is what that costs when the number is wrong: `consolidate` declares
+    600s, memory.py passed an ad-hoc 180, and because the tighter value always
+    wins the declared budget was unreachable — every live failure timed out at
+    exactly 180.1s.
     """
     from . import brain  # local import keeps the tmux dependency off the hot path
 
@@ -376,7 +392,7 @@ def _run_via_brain(
 def run_claude_session(
     session_type: str,
     prompt: str,
-    timeout: int = 300,
+    timeout: int | None = None,
     allowed_tools: str = "",
     skip_permissions: bool = False,
     cwd: str | Path | None = None,
@@ -385,6 +401,10 @@ def run_claude_session(
 ) -> RunResult:
     """Run a Claude session with budget checking, model routing, and logging.
 
+    timeout: seconds, or None (the default) to use the deadline the kind
+    declares in `brain._DEADLINE_S`. Prefer None — the declared per-kind
+    deadline is the one source of truth, and an ad-hoc override that is
+    tighter silently replaces it (see #291).
     model_override: use this model instead of the session-type default.
     skip_budget_check: skip rate-limit check (use for sub-phases of an already-checked session).
     Raises SessionBudgetExhausted if rate-limited (unless skip_budget_check=True).
