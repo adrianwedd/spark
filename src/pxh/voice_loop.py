@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from filelock import Timeout as FileLockTimeout
 
-from pxh import policy, policy_context
+from pxh import people, policy, policy_context
 from pxh.utils import clamp
 from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
@@ -346,6 +346,12 @@ def record_conversation_turn(
 ) -> None:
     """Append a turn and trim the buffer to the last max_turns, atomically.
     max_turns <= 0 disables the buffer (writes an empty file)."""
+    # Person-memory writer: the user's own words only, and only under the SPARK
+    # persona (refused inside record_person_facts, so GREMLIN/VIXEN cannot
+    # acquire a store by any route). Ahead of the early return, because turning
+    # the conversation buffer off is not a decision about long-term memory.
+    people.record_person_facts(role="user", text=user_text, persona=persona,
+                               channel="voice")
     if max_turns <= 0:
         atomic_write(conversation_path(persona), "")
         return

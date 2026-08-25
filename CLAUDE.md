@@ -259,6 +259,18 @@ The six kinds have confidence ceilings clamped on write and read: `observation` 
 
 Writes are strict; reads are lenient. Invalid or legacy data remains readable as `unknown`, without promoting a coarse `source` string into a claim type. Corrections mark supersession without deleting history. Relevance retrieval returns only topical matches (never recent padding); explicit `mode="recent"` remains available. A populated store with no relevant hit does not fall back to raw notes.
 
+### Person Memory (`src/pxh/people.py`)
+
+Facts a person literally stated about themselves, extracted **deterministically**
+(regex, no model in the write path) into `state/people-{persona}.jsonl` as
+provenance kind `report`. **Reflection must never read this store** — its output
+reaches `/api/v1/public/thoughts`, the feed, the blog and Bluesky, so the
+separate file *is* the privacy firewall, enforced by the filesystem rather than a
+prompt. Pinned by `tests/test_people_invariants.py`; `people.py` and that test
+are blacklisted from px-evolve because `mind.py` is a whitelisted target. Design
+rationale, TTL policy and the bias-to-rejection matcher are in the module
+docstring; the false-positive corpus in `tests/test_people.py` is the spec.
+
 ### Autonomous Racing (px-race)
 
 ```bash

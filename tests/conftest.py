@@ -54,6 +54,28 @@ def _isolate_brain_mailbox(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_person_store(tmp_path, monkeypatch):
+    """Keep test utterances out of the live state/people-*.jsonl.
+
+    The person writer hangs off two call sites that plenty of existing tests
+    already exercise incidentally — voice_loop.record_conversation_turn and
+    api._append_obi_chat_api. Without this, a fixture sentence that happens to
+    match a pattern lands a fabricated fact in the real store, and step 4's
+    retrieval would later read it back to a child as something they said. Same
+    #221 hazard as the health and mailbox fixtures.
+
+    Repoints PROJECT_ROOT rather than PX_STATE_DIR, so a test that deliberately
+    sets PX_STATE_DIR still wins (people._state_dir prefers the env var) while
+    one that sets nothing can no longer reach the real directory.
+    """
+    try:
+        from pxh import people
+    except ImportError:
+        return
+    monkeypatch.setattr(people, "PROJECT_ROOT", tmp_path / "people-root")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_alive_heartbeat(tmp_path, monkeypatch):
     """Keep heartbeat reads off the live robot's /run/spark.
 

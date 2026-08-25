@@ -32,6 +32,7 @@ from filelock import FileLock as _FileLock, Timeout as _FileLockTimeout
 from pydantic import BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from . import people
 from .runtime_paths import resolve_heartbeat_read_path, resolve_sonar_live_read_path
 from .state import atomic_write, clear_quiet_mode, load_session, load_session_readonly, set_quiet_mode, update_session, tail_lines
 from .time import utc_timestamp
@@ -1350,7 +1351,16 @@ def _append_obi_chat_api(entry: dict) -> None:
                 lines = lines[-100:]
             atomic_write(path, "\n".join(lines) + "\n")
     except _FileLockTimeout:
-        pass  # best-effort; the message will still be returned in the response
+        return  # best-effort; the message will still be returned in the response
+    # Person-memory writer. Runs only after the message is durably stored, so a
+    # fact's evidence msg id always names a line that exists; the `obi` role
+    # gate is inside record_person_facts (SPARK's own replies are not facts
+    # about Obi), as is the guarantee that this never raises into the request.
+    people.record_person_facts(role=str(entry.get("role") or ""),
+                               text=str(entry.get("text") or ""),
+                               msg_id=str(entry.get("id") or "") or None,
+                               ts=str(entry.get("ts") or "") or None,
+                               channel="obi_chat")
 
 
 _PUBLIC_CHAT_EXECUTOR = ThreadPoolExecutor(max_workers=2)
