@@ -270,6 +270,9 @@ prompt. Pinned by `tests/test_people_invariants.py`; `people.py` and that test
 are blacklisted from px-evolve because `mind.py` is a whitelisted target. Design
 rationale, TTL policy and the bias-to-rejection matcher are in the module
 docstring; the false-positive corpus in `tests/test_people.py` is the spec.
+Operator seeding: `bin/px-person-seed` (dry-run by default, `--write` to append)
+lands records with `source: operator_seed` + `source_actor` — a seeded fact must
+never render as "Obi told me", and the attribution lives in the record itself.
 
 ### Autonomous Racing (px-race)
 

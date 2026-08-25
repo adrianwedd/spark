@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# px-person-seed — operator-seed a known person fact into the person store.
+#
+# Deterministic and honest about who is speaking: records land with
+# source=operator_seed and source_actor=<--by>, so they can never render as
+# "Obi told me". No LLM, no forged conversation history — the canonical
+# writer (`people.append_person_facts`) does the append, including
+# supersession of an earlier fact on the same topic.
+#
+# Usage:
+#   bin/px-person-seed --by adrian --like dinosaurs --like cuttlefish
+#   bin/px-person-seed --by adrian --dislike broccoli --write
+#
+# Default is a dry run that prints the exact candidate records; nothing is
+# written without --write.
+set -euo pipefail
+source "$(dirname "$0")/px-env"
+
+exec /usr/bin/python3 - "$@" <<'PY'
+import argparse
+import json
+import sys
+
+from pxh import people
+
+parser = argparse.ArgumentParser(prog="px-person-seed")
+parser.add_argument("--by", required=True,
+                    help="who is asserting these facts (e.g. adrian)")
+parser.add_argument("--subject", default=people.DEFAULT_SUBJECT)
+parser.add_argument("--like", action="append", default=[], metavar="THING")
+parser.add_argument("--dislike", action="append", default=[], metavar="THING")
+parser.add_argument("--expires", default=None,
+                    help="optional ISO-8601 expiry applied to every record")
+parser.add_argument("--write", action="store_true",
+                    help="append to the store (default: dry run, print only)")
+args = parser.parse_args()
+
+try:
+    records = [
+        people.build_seed_record(polarity=pol, obj=obj, actor=args.by,
+                                 subject=args.subject, expires_ts=args.expires)
+        for pol, objs in (("like", args.like), ("dislike", args.dislike))
+        for obj in objs
+    ]
+    if not records:
+        raise ValueError("nothing to seed: pass --like/--dislike")
+    if args.write:
+        people.append_person_facts(records, persona="spark")
+    print(json.dumps({"status": "ok", "dry": not args.write,
+                      "written": len(records) if args.write else 0,
+                      "store": str(people.people_file("spark")),
+                      "records": records}, indent=2, ensure_ascii=False))
+except ValueError as exc:
+    print(json.dumps({"status": "error", "error": str(exc)}))
+    sys.exit(1)
+PY

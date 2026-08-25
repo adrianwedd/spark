@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from pathlib import Path
 
 import pytest
 
@@ -316,3 +317,103 @@ def test_obi_chat_append_records_obi_messages_only(tmp_path, monkeypatch):
     live = people.read_people(now=NOW)
     assert [r["text"] for r in live] == ["I like dinosaurs"]
     assert "obi_chat:abc123" in provenance.read_provenance(live[0])["evidence"]
+
+
+# ── Operator seeding (px-person-seed) ──────────────────────────────────────
+
+def test_seed_record_names_the_operator_never_obi():
+    """The core stage-2 requirement: a seed must be structurally incapable of
+    rendering as "Obi told me". Attribution lives in the record itself."""
+    rec = people.build_seed_record(polarity="like", obj="Dinosaurs",
+                                   actor="Adrian")
+    assert rec["source"] == people.SEED_SOURCE == "operator_seed"
+    assert rec["source_actor"] == "adrian"
+    assert rec["topic"] == "preference:dinosaurs"
+    assert rec["text"] == "likes dinosaurs"
+    prov = provenance.read_provenance(rec)
+    assert prov["kind"] == "report"
+    assert prov["source"] == "operator_seed"
+    assert "operator:adrian" in prov["evidence"]
+    assert prov["confidence"] <= provenance.CONFIDENCE_CEILING["report"]
+    # No forged conversation history: no message reference of any channel.
+    raw = json.dumps(rec)
+    assert "conversation" not in raw and "obi_chat" not in raw \
+        and "turn:" not in raw
+
+
+@pytest.mark.parametrize("kwargs,why", [
+    (dict(polarity="favourite", obj="dinosaurs", actor="adrian"),
+     "unknown polarity"),
+    (dict(polarity="like", obj="dinosaurs", actor=""),
+     "a seed without a named operator is an anonymous claim"),
+    (dict(polarity="like", obj="it", actor="adrian"),
+     "deictic/short object has no stable referent"),
+    (dict(polarity="like", obj="this song", actor="adrian"),
+     "deictic head"),
+    (dict(polarity="like", obj="x" * 200, actor="adrian"),
+     "over-long object"),
+    (dict(polarity="like", obj="dinosaurs", actor="adrian",
+          expires_ts="not-a-date"), "unparseable expiry"),
+])
+def test_seed_rejects_bad_input_loudly(kwargs, why):
+    """Opposite failure posture to the conversational writer: the operator is
+    at a terminal, so raising is the honest behaviour."""
+    with pytest.raises(ValueError):
+        people.build_seed_record(**kwargs)
+
+
+def test_obis_own_words_supersede_an_operator_seed():
+    seed = people.build_seed_record(polarity="like", obj="broccoli",
+                                    actor="adrian", ts="2026-08-20T00:00:00Z")
+    people.append_person_facts([seed], now=NOW)
+    later = _facts("I hate broccoli")
+    people.append_person_facts(later, now=NOW)
+    live = [r for r in people.read_people(now=NOW)
+            if not provenance.is_superseded(r)]
+    assert [r["polarity"] for r in live] == ["dislike"]
+    assert live[0]["source"] == "conversation"
+
+
+def test_seed_expiry_is_honoured_at_read_time():
+    rec = people.build_seed_record(polarity="like", obj="training wheels",
+                                   actor="adrian",
+                                   expires_ts="2026-08-24T00:00:00Z")
+    people.append_person_facts([rec], now=NOW)
+    assert people.read_people(now=NOW) == []
+    assert people.load_people("spark") != []  # on disk, never deleted
+
+
+def test_seed_cli_is_dry_by_default_and_writes_only_with_write_flag(tmp_path):
+    import os
+    import subprocess
+    root = Path(people.__file__).resolve().parent.parent.parent
+    env = dict(os.environ, PX_STATE_DIR=str(tmp_path),
+               PYTHONPATH=str(root / "src"))
+    cli = [str(root / "bin" / "px-person-seed"), "--by", "adrian",
+           "--like", "dinosaurs", "--like", "cuttlefish"]
+    dry = json.loads(subprocess.run(cli, env=env, capture_output=True,
+                                    text=True, timeout=60).stdout)
+    assert dry["status"] == "ok" and dry["dry"] is True and dry["written"] == 0
+    assert [r["topic"] for r in dry["records"]] == [
+        "preference:dinosaurs", "preference:cuttlefish"]
+    assert not (tmp_path / "people-spark.jsonl").exists()
+    wet = json.loads(subprocess.run(cli + ["--write"], env=env,
+                                    capture_output=True, text=True,
+                                    timeout=60).stdout)
+    assert wet["written"] == 2
+    stored = people.load_people("spark")
+    assert {r["source"] for r in stored} == {"operator_seed"}
+
+
+def test_seed_cli_refuses_an_empty_seed_set(tmp_path):
+    import os
+    import subprocess
+    root = Path(people.__file__).resolve().parent.parent.parent
+    env = dict(os.environ, PX_STATE_DIR=str(tmp_path),
+               PYTHONPATH=str(root / "src"))
+    out = subprocess.run([str(root / "bin" / "px-person-seed"),
+                          "--by", "adrian", "--write"],
+                         env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 1
+    assert json.loads(out.stdout)["status"] == "error"
+    assert not (tmp_path / "people-spark.jsonl").exists()
