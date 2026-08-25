@@ -497,6 +497,14 @@ BLACKLIST_FILES = {
     "tools/check_investigator_agent.py",
     "tests/test_agent_authority_invariant.py",
     ".claude/agents/spark-investigator.md",
+    # Person memory. The firewall keeping what a child said in private out of
+    # reflection — and therefore out of public thoughts, the blog and Bluesky —
+    # is that `mind.py` never opens `people-*.jsonl`. `mind.py` is a whitelisted
+    # evolution target, so the module that decides whether that bridge exists
+    # must not be one SPARK can propose editing, and neither must the test that
+    # checks it. Same reasoning as the policy and resident-only pairs above.
+    "src/pxh/people.py",
+    "tests/test_people_invariants.py",
 }
 
 BLACKLIST_PATTERNS = [
