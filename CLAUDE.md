@@ -153,6 +153,39 @@ threshold while the store has not grown for days. That is why `overdue`
 (>48h) is a separate axis from `status`, and why `summarize()` returns a
 non-empty string for overdue memory on an otherwise clean bill.
 
+**Consolidation runs on a background daemon thread, never on the tick (#291).**
+`_consolidation_tick` only *supervises*: it heartbeats the in-flight marker,
+reaps what a previous process left behind, and decides whether to start a
+worker. It must always return promptly, because awareness, reflection and the
+battery check run behind it. The reason is arithmetic, not taste — the kind's
+declared deadline is **600s** and px-mind's own staleness window is **300s**, so
+an inline call that honoured its budget guaranteed px-mind read `stale`. That
+made the three defects mutually reinforcing: the pass could not be given enough
+time, so it was given an ad-hoc `timeout=180` that silently overrode the
+declared deadline, so every failure timed out at exactly 180.1s.
+
+**`state/consolidation_job.json` is the in-flight marker**, and it is keyed on
+**pid plus a heartbeat** — `{"status","pid","attempt","started_ts","heartbeat_ts"}`.
+A health record says what the last *finished* attempt did; nothing else answers
+"is one running right now". The worker thread dies with its process, so a marker
+outliving its owner is always a lie: `consolidation_job_is_stale()` calls it
+stale when `/proc/<pid>` is gone (or is not px-mind) **or** the heartbeat has
+been quiet past `JOB_HEARTBEAT_STALE_S`. A restart therefore cannot leave a
+false in-progress claim behind, and the tick records that cleanup as a
+*failure* — no memory formed that night — rather than silently resetting. The
+heartbeat is written by the **tick**, not the worker: the worker spends its
+whole life blocked in `ask_brain` and could not beat if it wanted to. Past
+`JOB_OVERRUN_AFTER_S` an unfinished run is reported **once**, not every 60s.
+
+**Two attempts a night, spaced 40 min apart** (`memory.RETRY_SPACING_S`). All
+three numbers used to disagree: `MAX_ATTEMPTS_PER_DAY` promised 2 while the
+`consolidate` quota was 1 and its type cooldown 20h, so attempt 2 was
+structurally unreachable. The spacing deliberately **clears** the 30-min global
+cooldown rather than adding `consolidate` to `_GLOBAL_COOLDOWN_EXEMPT` — nobody
+is waiting on a 3am retry, and each exemption is one more way for a background
+job to crowd a session someone *is* waiting on. Success **or a correct skip**
+marks the date done; only a failure leaves the later retry open.
+
 **Claude spend visibility:** `token_log.log_usage()` takes a `backend` argument and splits totals under `by_backend` in `state/token_usage.json`. The top-level totals mix free Ollama with paid Claude and cannot answer "what am I spending". `call_llm()` also sets `result["backend"]` to the tier that actually served — the `backend=` reflection log line shows the *configured* primary, not the one that answered.
 
 ### Idle-Alive Daemon
@@ -193,7 +226,7 @@ Three-layer architecture:
   Ollama. Writes to `state/thoughts.jsonl` only after a valid M5 response.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. Thoughts with `action=message_obi` are **redacted** in `thoughts-spark.jsonl` (written as `[private message to Obi]`) so the private DM content never reaches the public `/api/v1/public/thoughts` endpoint.
-- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
+- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day ≥40min apart, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. **Runs on a background daemon thread with a pid-keyed job marker (`state/consolidation_job.json`), never inline on the tick** — see the health section. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
 
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
@@ -244,7 +277,23 @@ Watches `state/thoughts-spark.jsonl` (salience ≥0.7 or spoken action), runs Cl
 | `compose` | Haiku | 4h | 2/day |
 | `conversation` | Sonnet | 15min | 4/day |
 | `blog` | Haiku | 30min | 5/day |
-| `consolidate` | Haiku | 20h | 1/day |
+| `consolidate` | Haiku | 40min | 2/day |
+
+`consolidate` is 40min/2 rather than 20h/1 so `memory.MAX_ATTEMPTS_PER_DAY`'s
+second nightly attempt can actually be spent (#291). 40min also clears the
+30-min global cooldown, so the retry is *spaced past* it rather than exempted
+from it.
+
+**Deadlines are declared once, in `brain._DEADLINE_S`, and `timeout=` on
+`run_claude_session` defaults to `None` so that table is what reaches
+`ask_brain`.** Pass a number only when you mean to override the kind's declared
+budget — an override that is *tighter* silently wins and makes the declared
+value unreachable, which is exactly what an ad-hoc `timeout=180` did to
+`consolidate`'s 600s: every live failure timed out at 180.1s while every
+success took 30–65s. Callers still passing ad-hoc values for classified kinds
+(`mind.py` self_debug 600 vs. declared 900; `bin/px-blog`, `bin/tool-research`,
+`bin/tool-compose`, `bin/tool-blog` passing 300, which matches) are redundant at
+best and drift at worst.
 
 Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
 

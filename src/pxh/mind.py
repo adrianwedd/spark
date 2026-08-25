@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1143,7 +1144,6 @@ def _fetch_ha_context(dry: bool = False) -> dict | None:
             log("ha_context: skipped — no PX_HA_TOKEN")
         return None
 
-    import threading
     result_box: dict = {}
 
     def _do_fetch():
@@ -3575,12 +3575,19 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     return True
 
 
-def _consolidation_tick(session: dict, dry: bool) -> None:
-    """Nightly memory consolidation (02:00-06:00 Hobart, once per date, SPARK only).
-    Never raises — the mind loop must survive any consolidation failure.
+CONSOLIDATION_THREAD_NAME = "px-mind-consolidation"
 
-    Health reporting distinguishes three outcomes, and the distinction is the
-    whole point of reporting at all:
+# The one in-flight consolidation worker, or None. Process-local by design: a
+# daemon thread dies with its process, so this variable and the on-disk marker
+# answer two different questions — "is this process running one right now" and
+# "did some process claim one and not finish it".
+_consolidation_worker: threading.Thread | None = None
+
+
+def _record_consolidation_outcome(result: dict | None) -> None:
+    """Report one finished consolidation attempt to health (#289).
+
+    Three outcomes, and the distinction is the whole point of reporting at all:
 
     * ``None`` — not attempted, because it is not the window, it is already
       done for this Hobart date, or this is a dry run. **Records nothing.** A
@@ -3594,26 +3601,107 @@ def _consolidation_tick(session: dict, dry: bool) -> None:
     * anything else — attempted and failed. This is the case that was silent
       before: the store simply stopped growing while every other dial read ok.
     """
+    if result is None:
+        return
+    component = health_mod.CONSOLIDATION_COMPONENT
+    status = result.get("status")
+    detail = (result.get("error") or result.get("reason")
+              or f"wrote {result.get('written', 0)}")
+    log(f"consolidation: {status} — {detail}")
+    if status == "dry":
+        return  # a dry run forms no memory; it must not refresh the record
+    if status in ("ok", "skipped"):
+        health_mod.record_success(
+            component,
+            detail={"status": status, "written": result.get("written", 0),
+                    "note": detail})
+    else:
+        health_mod.record_failure(component, detail, detail={"status": status})
+
+
+def _consolidation_worker_main(dry: bool) -> None:
+    """The background consolidation run. Never raises, always clears the marker.
+
+    This is the body that used to run inline on the awareness tick. A single
+    attempt is allowed `brain._DEADLINE_S["consolidate"]` = 600s, which is twice
+    px-mind's own 300s staleness window — inline, honouring that budget would
+    mean ten minutes with no awareness snapshot, no reflection and no battery
+    check, which is why #291's one-line deadline fix was not safe on its own.
+    """
+    try:
+        _record_consolidation_outcome(spark_memory.maybe_consolidate(dry=dry))
+    except Exception as exc:  # noqa: BLE001 — a daemon thread's death is silent
+        log(f"consolidation error: {exc}")
+        health_mod.record_failure(health_mod.CONSOLIDATION_COMPONENT,
+                                  f"{type(exc).__name__}: {exc}")
+    finally:
+        spark_memory.clear_consolidation_job()
+
+
+def _consolidation_tick(session: dict, dry: bool) -> None:
+    """Supervise the nightly consolidation worker. Returns promptly, always.
+
+    Everything expensive happens on `_consolidation_worker_main`'s thread; this
+    function only decides whether to start one, refreshes the in-flight
+    marker's heartbeat, and reaps what the last process left behind. It must
+    never block, because the mind loop's awareness/reflection/battery cadence
+    runs behind it.
+    """
+    global _consolidation_worker
     if (session.get("persona") or "").lower().strip() != "spark":
         return
     component = health_mod.CONSOLIDATION_COMPONENT
     try:
-        _cons = spark_memory.maybe_consolidate(dry=dry)
-        if _cons is None:
+        worker = _consolidation_worker
+        if worker is not None and not worker.is_alive():
+            worker.join(timeout=0)
+            _consolidation_worker = worker = None
+
+        if worker is not None:
+            # In flight in this process. Heartbeat the marker so a live-slow
+            # run stays distinguishable from an abandoned one, then get out of
+            # the way — this early return is what keeps awareness ticking
+            # through a ten-minute consolidation.
+            job = spark_memory.touch_consolidation_job()
+            if job.get("newly_overran"):
+                age = int(job.get("age_s") or 0)
+                log(f"consolidation: worker still running after {age}s "
+                    f"(budget {spark_memory.JOB_OVERRUN_AFTER_S}s) — overran")
+                health_mod.record_failure(
+                    component, f"worker overran ({age}s)",
+                    detail={"status": "overran", "pid": job.get("pid")})
             return
-        _status = _cons.get("status")
-        _detail = _cons.get("error") or _cons.get("reason") or f"wrote {_cons.get('written', 0)}"
-        log(f"consolidation: {_status} — {_detail}")
-        if _status == "dry":
-            return  # a dry run forms no memory; it must not refresh the record
-        if _status in ("ok", "skipped"):
-            health_mod.record_success(
-                component,
-                detail={"status": _status, "written": _cons.get("written", 0),
-                        "note": _detail})
-        else:
-            health_mod.record_failure(
-                component, _detail, detail={"status": _status})
+
+        job = spark_memory.read_consolidation_job()
+        if job:
+            # A marker with no worker of ours behind it. Either px-mind
+            # restarted mid-run (the thread went with the process) or another
+            # px-mind owns it. Only the first is ours to clean up, and it is a
+            # night on which no memory formed — so it is a failure, recorded
+            # once, not a silent reset.
+            if spark_memory.consolidation_job_is_stale(job):
+                spark_memory.clear_consolidation_job()
+                log(f"consolidation: cleared abandoned job "
+                    f"(pid={job.get('pid')}, started {job.get('started_ts')})")
+                health_mod.record_failure(
+                    component, "abandoned mid-run (px-mind restarted?)",
+                    detail={"status": "abandoned", "pid": job.get("pid")})
+            return
+
+        if dry:
+            return
+        reason = spark_memory.consolidation_due()
+        if reason is not None:
+            return
+        attempt = spark_memory.next_consolidation_attempt()
+        if not spark_memory.claim_consolidation_job(attempt=attempt):
+            return
+        _consolidation_worker = threading.Thread(
+            target=_consolidation_worker_main, args=(dry,),
+            name=CONSOLIDATION_THREAD_NAME, daemon=True)
+        _consolidation_worker.start()
+        log(f"consolidation: started in background (attempt {attempt}"
+            f"/{spark_memory.MAX_ATTEMPTS_PER_DAY})")
     except Exception as exc:
         log(f"consolidation error: {exc}")
         health_mod.record_failure(component, f"{type(exc).__name__}: {exc}")

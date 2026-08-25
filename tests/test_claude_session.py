@@ -502,24 +502,49 @@ class TestBudgetSummary:
 
 def test_consolidate_session_type_registered():
     from pxh import claude_session as cs
+    from pxh import memory
     assert cs._model_for_type("consolidate").startswith("claude-haiku")
-    assert cs._TYPE_QUOTAS["consolidate"] == 1
-    assert cs._TYPE_COOLDOWNS["consolidate"] == 72000
+    # Two per night, 40 min apart (#291). Was 1/72000, which made the second of
+    # memory.MAX_ATTEMPTS_PER_DAY's two attempts structurally unspendable —
+    # attempt 1 consumed the only slot attempt 2 could ever have used.
+    assert cs._TYPE_QUOTAS["consolidate"] == memory.MAX_ATTEMPTS_PER_DAY == 2
+    assert cs._TYPE_COOLDOWNS["consolidate"] == memory.RETRY_SPACING_S == 2400
     assert cs._PRIORITY["consolidate"] == 2
     assert cs._ENV_OVERRIDES["consolidate"] == "PX_CLAUDE_MODEL_CONSOLIDATE"
 
 
-def test_consolidate_quota_one_per_day(tmp_path, monkeypatch):
+def test_consolidate_quota_is_two_per_day(tmp_path, monkeypatch):
     import datetime as dt
     import json
     from pxh import claude_session as cs
     log = tmp_path / "claude_sessions.jsonl"
-    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    log.write_text(json.dumps({"ts": now, "type": "consolidate"}) + "\n", encoding="utf-8")
+    # Two attempts already spent tonight, spaced far enough apart that neither
+    # cooldown is what refuses the third — the quota must be.
+    now = dt.datetime.now(dt.timezone.utc)
+    log.write_text("".join(
+        json.dumps({"ts": (now - dt.timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "type": "consolidate"}) + "\n" for h in (3, 2)), encoding="utf-8")
     monkeypatch.setattr(cs, "SESSION_LOG", log)
     monkeypatch.setattr(cs, "BUDGET_DISABLED", False)
     reason = cs.check_budget("consolidate")
     assert reason is not None and "quota" in reason
+
+
+def test_consolidate_second_attempt_is_admitted(tmp_path, monkeypatch):
+    """The retry memory.py schedules must actually get past the budget gate."""
+    import datetime as dt
+    import json
+    from pxh import claude_session as cs
+    from pxh import memory
+    log = tmp_path / "claude_sessions.jsonl"
+    then = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=memory.RETRY_SPACING_S)
+    log.write_text(json.dumps(
+        {"ts": then.strftime("%Y-%m-%dT%H:%M:%SZ"), "type": "consolidate"}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setattr(cs, "SESSION_LOG", log)
+    monkeypatch.setattr(cs, "BUDGET_DISABLED", False)
+    assert cs.check_budget("consolidate") is None
 
 
 # ---------------------------------------------------------------------------

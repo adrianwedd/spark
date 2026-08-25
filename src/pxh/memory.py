@@ -46,6 +46,36 @@ MAX_ATTEMPTS_PER_DAY = 2
 MIN_THOUGHTS = 5
 MAX_MEMORIES_PER_DAY = 8
 
+# Minimum gap between the two nightly attempts (#291).
+#
+# Both attempts used to land ~60s apart, which made the retry decorative twice
+# over: `claude_session.COOLDOWN_S` (the 30-minute global session cooldown)
+# rejected it outright, and even without that a second Haiku turn started one
+# minute after the first failed is a retry of the same load conditions. 40
+# minutes clears the global cooldown with ten minutes of margin and still fits
+# twice inside the four-hour 02:00-06:00 window.
+#
+# Spacing past the cooldown is deliberate, rather than adding `consolidate` to
+# `_GLOBAL_COOLDOWN_EXEMPT`. The cooldown exists because two Claude sessions
+# close together contend on a 4-core Pi, and that reason applies to
+# consolidation exactly as written — the attempt is 600s of resident-session
+# time. An exemption would buy the retry by denying the premise.
+RETRY_SPACING_S = 2400
+
+# A consolidation worker that has held the job marker this long has overrun its
+# own budget (brain._DEADLINE_S["consolidate"] is 600s, plus prompt assembly and
+# the single-flight lock wait). Reported once, then left alone: the worker is a
+# daemon thread blocked inside ask_brain, which has its own deadline, so the
+# honest thing is to make the overrun visible rather than to pretend it can be
+# cancelled.
+JOB_OVERRUN_AFTER_S = 900
+
+# How long the marker's heartbeat may lag before its owner is presumed gone.
+# The owning px-mind refreshes it on every ~60s awareness tick, so five minutes
+# of silence means the process that claimed it is no longer ticking — which is
+# what a restart mid-consolidation looks like from the next process's side.
+JOB_HEARTBEAT_STALE_S = 300
+
 _STOPWORDS = frozenset(
     """a about after again all am an and any are as at be because been before but by can
     did do does for from had has have he her his how i if in into is it its just me more
@@ -325,8 +355,15 @@ def consolidate(dry: bool = False, persona: str = "spark",
 
         import pxh.claude_session as claude_session
         try:
+            # No `timeout=` on purpose (#291). The deadline for a classified
+            # brain kind is declared once, in brain._DEADLINE_S — 600s for
+            # `consolidate` — and `ask_brain` only reaches for it when the
+            # caller passes nothing. The ad-hoc 180 that used to sit here was
+            # tighter, so it won every time and the declared budget was never
+            # once reachable: every live failure measured exactly 180.1s while
+            # the successes measured 30-65s.
             result = claude_session.run_claude_session(
-                "consolidate", prompt, timeout=180, allowed_tools="")
+                "consolidate", prompt, allowed_tools="")
         except claude_session.SessionBudgetExhausted as exc:
             return {"status": "failed", "error": str(exc)}
         except Exception as exc:
@@ -368,26 +405,89 @@ def consolidation_meta_file() -> Path:
     return _state_dir() / "consolidation_meta.json"
 
 
+def _read_consolidation_meta() -> dict:
+    try:
+        meta = json.loads(consolidation_meta_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _parse_ts(value: object) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def consolidation_due(now: dt.datetime | None = None) -> str | None:
+    """The read-only half of `maybe_consolidate`'s gate.
+
+    Returns ``None`` when an attempt is due right now, otherwise a short reason
+    it is not. Writes nothing and costs one small file read, because px-mind
+    calls it on every ~60s awareness tick to decide whether to spend a worker
+    thread — the authoritative, state-mutating gate is still inside
+    `maybe_consolidate`, which calls this first.
+
+    Splitting it out is what lets the tick stay cheap without duplicating the
+    window/date/attempt logic in two places that could then disagree.
+    """
+    local = (now or dt.datetime.now(HOBART_TZ)).astimezone(HOBART_TZ)
+    if not (CONSOLIDATION_WINDOW[0] <= local.hour < CONSOLIDATION_WINDOW[1]):
+        return "outside the 02:00-06:00 window"
+    meta = _read_consolidation_meta()
+    if meta.get("last_date") != local.strftime("%Y-%m-%d"):
+        return None                      # a fresh Hobart date: first attempt
+    if meta.get("done"):
+        return "already done for this date"
+    attempts = meta.get("attempts", 0)
+    if attempts >= MAX_ATTEMPTS_PER_DAY:
+        return f"attempt cap reached ({attempts}/{MAX_ATTEMPTS_PER_DAY})"
+    last_attempt = _parse_ts(meta.get("last_attempt_ts"))
+    if last_attempt is not None:
+        elapsed = (local - last_attempt).total_seconds()
+        if 0 <= elapsed < RETRY_SPACING_S:
+            return (f"retry spacing ({int(elapsed)}s / {RETRY_SPACING_S}s "
+                    f"since attempt {attempts})")
+    return None
+
+
+def next_consolidation_attempt() -> int:
+    """1 or 2 — which attempt `maybe_consolidate` would spend next.
+
+    Recorded on the job marker so an operator looking at a stuck run can tell
+    "tonight's first try" from "the last chance before morning".
+    """
+    return _read_consolidation_meta().get("attempts", 0) + 1
+
+
 def maybe_consolidate(dry: bool = False, persona: str = "spark",
                       now: dt.datetime | None = None) -> dict | None:
-    """Once-per-Hobart-date gate for consolidate(). None = not now, or dry mode."""
+    """Once-per-Hobart-date gate for consolidate(). None = not now, or dry mode.
+
+    Runs on px-mind's consolidation worker thread, never on the awareness tick
+    itself (#291): a single attempt is allowed up to `brain._DEADLINE_S`'s 600s,
+    which is twice px-mind's own 300s health-staleness window.
+    """
     if dry:
         return None
     local = (now or dt.datetime.now(HOBART_TZ)).astimezone(HOBART_TZ)
-    if not (CONSOLIDATION_WINDOW[0] <= local.hour < CONSOLIDATION_WINDOW[1]):
+    if consolidation_due(now=local) is not None:
         return None
     today = local.strftime("%Y-%m-%d")
     meta_f = consolidation_meta_file()
-    meta = {}
-    try:
-        meta = json.loads(meta_f.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        pass
+    meta = _read_consolidation_meta()
     if meta.get("last_date") != today:
         meta = {"last_date": today, "attempts": 0, "done": False}
-    if meta.get("done") or meta.get("attempts", 0) >= MAX_ATTEMPTS_PER_DAY:
-        return None
     meta["attempts"] = meta.get("attempts", 0) + 1
+    # Stamped from `local`, not the wall clock, so the spacing gate reads the
+    # same clock the caller passed in — otherwise a test (or a replayed window)
+    # measures the gap against `now()` and every retry looks either overdue or
+    # impossible.
+    meta["last_attempt_ts"] = local.isoformat()
     meta_f.parent.mkdir(parents=True, exist_ok=True)
     try:
         atomic_write(meta_f, json.dumps(meta) + "\n")
@@ -404,3 +504,154 @@ def maybe_consolidate(dry: bool = False, persona: str = "spark",
         except OSError:
             pass
     return result
+
+
+# ---------------------------------------------------------------------------
+# Job marker — the in-flight record for the background consolidation worker
+# ---------------------------------------------------------------------------
+#
+# Consolidation runs on a daemon thread inside px-mind (#291), so "is it
+# running right now?" is not answerable from any file health.py writes: a
+# component record says what the *last finished* attempt did. The marker below
+# is that missing state, and it is deliberately a file rather than a process
+# variable — px-motd, the operator and a later px-mind all need to read it.
+#
+# It is keyed on pid, and liveness is `/proc/{pid}` plus a cmdline check, the
+# same idiom as px-mind's own single-instance guard and its px-alive pid check.
+# The worker thread dies with its process, so a marker outliving its owner is
+# always a lie; making the lie detectable is the whole job of `pid` and
+# `heartbeat_ts`. Nothing here ever treats a marker as authoritative evidence
+# that work is in progress without first checking that its owner still exists.
+
+def consolidation_job_file() -> Path:
+    return _state_dir() / "consolidation_job.json"
+
+
+def read_consolidation_job() -> dict:
+    """The in-flight marker, or {} when no worker holds one."""
+    try:
+        job = json.loads(consolidation_job_file().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return job if isinstance(job, dict) else {}
+
+
+def _write_consolidation_job(job: dict) -> bool:
+    f = consolidation_job_file()
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(f, json.dumps(job) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def clear_consolidation_job() -> None:
+    """Drop the marker. Called from the worker's `finally`, so it must not
+    raise — a lost marker is recoverable (staleness), a raise in a daemon
+    thread's teardown is not."""
+    try:
+        consolidation_job_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_is_px_mind(pid: object) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if not Path(f"/proc/{pid}").is_dir():
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return False
+    return "px-mind" in cmdline
+
+
+def consolidation_job_age_s(job: dict,
+                            now: dt.datetime | None = None) -> float | None:
+    started = _parse_ts((job or {}).get("started_ts"))
+    if started is None:
+        return None
+    return ((now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+            - started).total_seconds()
+
+
+def consolidation_job_is_stale(job: dict,
+                               now: dt.datetime | None = None) -> bool:
+    """True when nothing is plausibly still working on this marker.
+
+    Two independent ways to be stale, and both are needed. The owning process
+    may be gone outright (a restart — the thread died with it), or it may still
+    exist while no longer ticking, in which case only the heartbeat says so.
+    A missing heartbeat reads as stale rather than fresh: an unreadable marker
+    must never be able to block tonight's attempt forever.
+    """
+    if not job:
+        return False
+    if not _pid_is_px_mind(job.get("pid")):
+        return True
+    beat = _parse_ts(job.get("heartbeat_ts"))
+    if beat is None:
+        return True
+    now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    return (now - beat).total_seconds() > JOB_HEARTBEAT_STALE_S
+
+
+def claim_consolidation_job(attempt: int = 0,
+                            now: dt.datetime | None = None) -> bool:
+    """Take the marker for this process. False means somebody else holds it.
+
+    Under `FileLock` because the check and the write must not interleave, even
+    though px-mind's single-instance PID guard should already make a second
+    claimant impossible — a guard that is only correct because another guard
+    exists is one refactor away from being wrong.
+    """
+    f = consolidation_job_file()
+    stamp = ((now or dt.datetime.now(dt.timezone.utc))
+             .astimezone(dt.timezone.utc).isoformat())
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(f) + ".lock", timeout=LOCK_TIMEOUT_S):
+            existing = read_consolidation_job()
+            if existing and not consolidation_job_is_stale(existing, now=now):
+                return False
+            return _write_consolidation_job({
+                "status": "running",
+                "pid": os.getpid(),
+                "attempt": attempt,
+                "started_ts": stamp,
+                "heartbeat_ts": stamp,
+            })
+    except Exception:  # noqa: BLE001 — a failed claim is "don't start", never a raise
+        return False
+
+
+def touch_consolidation_job(now: dt.datetime | None = None) -> dict:
+    """Refresh the heartbeat from the owning process and report an overrun once.
+
+    The heartbeat is written by px-mind's tick, not by the worker: the worker
+    spends its whole life blocked inside `ask_brain` and could not beat if it
+    wanted to. "px-mind still observes this thread alive" is exactly the fact a
+    later reader needs, so that is what gets recorded.
+
+    The returned dict carries a transient ``newly_overran`` flag — not
+    persisted — the first tick on which the run crosses JOB_OVERRUN_AFTER_S, so
+    the caller can report a stuck worker exactly once instead of every 60s.
+    """
+    job = read_consolidation_job()
+    if not job:
+        return {}
+    now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    job["heartbeat_ts"] = now.isoformat()
+    age = consolidation_job_age_s(job, now=now)
+    newly_overran = (age is not None and age > JOB_OVERRUN_AFTER_S
+                     and not job.get("overrun_reported"))
+    if newly_overran:
+        job["overrun_reported"] = True
+    _write_consolidation_job(job)
+    if newly_overran:
+        job = dict(job, newly_overran=True, age_s=age)
+    return job

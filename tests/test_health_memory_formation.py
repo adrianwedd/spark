@@ -240,3 +240,45 @@ def test_motd_overdue_threshold_matches_health_module(motd):
     # Duplicated constant (px-motd imports no pxh module by design) — pin the
     # two together so they cannot silently drift.
     assert motd.MEMORY_OVERDUE_S == health.MEMORY_FORMATION_OVERDUE_S
+
+
+# --- the in-flight job marker (#291) ----------------------------------------
+
+
+def _job(started_ago_s: int, beat_ago_s: int) -> dict:
+    now = dt.datetime.now(dt.timezone.utc)
+    return {
+        "status": "running", "pid": 1234, "attempt": 1,
+        "started_ts": (now - dt.timedelta(seconds=started_ago_s)).isoformat(),
+        "heartbeat_ts": (now - dt.timedelta(seconds=beat_ago_s)).isoformat(),
+    }
+
+
+def test_motd_shows_a_consolidation_in_flight(motd):
+    ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=20)
+    line = _plain(motd._memory_formation_line(
+        {"last_success_ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")},
+        _job(started_ago_s=180, beat_ago_s=5)))
+    assert "consolidating now for 3m" in line
+    # The hint is additive: the honest age of the last real memory stays.
+    assert "last formed 20h ago" in line
+
+
+def test_motd_ignores_a_marker_whose_heartbeat_went_quiet(motd):
+    # A marker outliving its owner is a lie; px-motd must not repeat it.
+    ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=20)
+    line = _plain(motd._memory_formation_line(
+        {"last_success_ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ")},
+        _job(started_ago_s=9000, beat_ago_s=8000)))
+    assert "consolidating" not in line
+
+
+def test_motd_line_renders_without_a_job_argument(motd):
+    # The marker is absent almost all the time; the default must stay valid.
+    assert "never formed" in _plain(motd._memory_formation_line({}))
+    assert "never formed" in _plain(motd._memory_formation_line({}, {}))
+
+
+def test_motd_job_heartbeat_threshold_matches_memory_module(motd):
+    from pxh import memory
+    assert motd.JOB_HEARTBEAT_STALE_S == memory.JOB_HEARTBEAT_STALE_S

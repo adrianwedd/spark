@@ -387,10 +387,16 @@ def test_maybe_consolidate_runs_once_then_stamps():
 
 def test_maybe_consolidate_two_failures_stop_for_the_day():
     at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=HOBART)
+    # Attempt 2 is deliberately spaced past attempt 1 (#291), so the retry has
+    # to be asked for at a later clock — an immediate re-ask is refused.
+    at3b = at3 + dt.timedelta(seconds=memory.RETRY_SPACING_S)
     with patch.object(memory, "consolidate", return_value={"status": "failed", "error": "x"}) as mc:
         assert memory.maybe_consolidate(now=at3)["status"] == "failed"
-        assert memory.maybe_consolidate(now=at3)["status"] == "failed"
-        assert memory.maybe_consolidate(now=at3) is None  # attempt cap
+        assert memory.maybe_consolidate(now=at3) is None      # too soon
+        assert memory.maybe_consolidate(now=at3b)["status"] == "failed"
+        assert memory.maybe_consolidate(
+            now=at3b + dt.timedelta(seconds=memory.RETRY_SPACING_S)
+        ) is None  # attempt cap
     assert mc.call_count == 2
 
 
@@ -399,7 +405,8 @@ def test_maybe_consolidate_fresh_date_resets_attempts():
     day2 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=HOBART)
     with patch.object(memory, "consolidate", return_value={"status": "failed", "error": "x"}):
         memory.maybe_consolidate(now=day1)
-        memory.maybe_consolidate(now=day1)
+        memory.maybe_consolidate(
+            now=day1 + dt.timedelta(seconds=memory.RETRY_SPACING_S))
     with patch.object(memory, "consolidate", return_value={"status": "ok", "written": 1}) as mc:
         assert memory.maybe_consolidate(now=day2)["status"] == "ok"
     assert mc.call_count == 1
