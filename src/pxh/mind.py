@@ -410,6 +410,69 @@ MIND_EFFECT_TABLE: dict[str, str] = {
     "complete_goal":  "other",
 }
 
+# ── Private DM redaction (message_obi) ────────────────────────────
+# Redaction is a property of the RECORD, not of one call site. A message_obi
+# thought carries private text meant for one child; the placeholder below is
+# what every downstream reader sees, because the raw text is *moved off* the
+# display field the moment the record exists. It survives only on
+# PRIVATE_DM_TEXT_KEY, which exactly one consumer reads (_emit_message_obi) and
+# which no persistence path serialises.
+#
+# The previous shape redacted into a local variable used by a single write, so
+# every other sink — session history, the awareness conversation digest, the
+# reflection prompt, GET /api/v1/session, the voice-loop prompt (GREMLIN/VIXEN
+# included) — re-read the raw field and leaked. Sinks cannot be trusted to
+# remember an opt-in; the record has to arrive already safe.
+PRIVATE_DM_PLACEHOLDER = "[private message to Obi]"
+PRIVATE_DM_TEXT_KEY = "private_dm_text"
+
+
+def is_private_dm(thought: dict) -> bool:
+    """True when this thought carries private DM content for Obi."""
+    return isinstance(thought, dict) and thought.get("action") == "message_obi"
+
+
+def redact_private_dm(thought: dict) -> dict:
+    """Move a message_obi thought's private text onto the delivery-only field.
+
+    Mutates and returns ``thought`` so a caller cannot keep an un-redacted
+    alias by accident. Idempotent: a record already redacted keeps the raw text
+    it stashed on the first pass rather than overwriting it with the
+    placeholder. Non-DM thoughts are returned untouched.
+    """
+    if not is_private_dm(thought):
+        return thought
+    if PRIVATE_DM_TEXT_KEY not in thought:
+        thought[PRIVATE_DM_TEXT_KEY] = thought.get("thought", "")
+    thought["thought"] = PRIVATE_DM_PLACEHOLDER
+    thought["text"] = ""
+    return thought
+
+
+def private_dm_text(thought: dict) -> str:
+    """The raw DM text — readable only on the delivery path to Obi.
+
+    Returns "" rather than the placeholder when the field is absent, so a
+    record that somehow reached dispatch un-redacted sends nothing instead of
+    sending Obi the string "[private message to Obi]".
+    """
+    if not isinstance(thought, dict):
+        return ""
+    return str(thought.get(PRIVATE_DM_TEXT_KEY) or "")
+
+
+def without_private_dm_text(thought: dict) -> dict:
+    """A copy of ``thought`` with the delivery-only field removed.
+
+    Every persistence path goes through this: the delivery field is for the one
+    in-process hop from reflection() to _emit_message_obi() and must never be
+    written to disk.
+    """
+    if not isinstance(thought, dict):
+        return thought
+    return {k: v for k, v in thought.items() if k != PRIVATE_DM_TEXT_KEY}
+
+
 CHARGING_GATED_ACTIONS = {"scan", "look_at", "explore", "emote", "look_around", "calendar_check"}
 # Deliberately NOT absence-gated: "greet_arrival". Arrivals are the one moment
 # the absence heuristic is guaranteed stale — the person just walked in — so
@@ -2889,22 +2952,30 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         "px-mind-reflection",
         detail={"backend": thought["backend"], "elapsed_s": round(elapsed, 1)})
 
-    # message_obi thoughts carry private DM content. Capture this BEFORE the
-    # similarity suppressor can flip `action` to "wait" — otherwise a near-duplicate
-    # DM would slip past the redaction branch below and leak raw text to the public
-    # thoughts log. The placeholder is also used for every local log/persist path.
-    is_private_dm = thought.get("action") == "message_obi"
-    display_text = "[private message to Obi]" if is_private_dm else thought["thought"]
+    # message_obi thoughts carry private DM content. Redact the RECORD here,
+    # before anything downstream can read it — and before the similarity
+    # suppressor can flip `action` to "wait", which would otherwise make the
+    # record no longer look like a DM to any later redaction attempt. From this
+    # line on, `thought["thought"]` is the placeholder for every reader; the raw
+    # text lives only on PRIVATE_DM_TEXT_KEY, which _emit_message_obi reads and
+    # no persistence path writes.
+    private_dm = is_private_dm(thought)
+    # Kept only for the anti-repetition maths below: comparing placeholders
+    # against each other would score 1.0 and suppress every DM after the first.
+    similarity_text = thought["thought"]
+    if private_dm:
+        redact_private_dm(thought)
+    display_text = thought["thought"]
 
     # Anti-repetition: check against ALL recent thoughts, not just the last
     max_sim = 0.0
     for prev in recent_thoughts:
-        sim = text_similarity(thought["thought"], prev.get("thought", ""))
+        sim = text_similarity(similarity_text, prev.get("thought", ""))
         if sim > max_sim:
             max_sim = sim
     # Also check against last spoken text
     if _last_spoken_text:
-        sim = text_similarity(thought["thought"], _last_spoken_text)
+        sim = text_similarity(similarity_text, _last_spoken_text)
         if sim > max_sim:
             max_sim = sim
     if max_sim > SIMILARITY_THRESHOLD:
@@ -2921,9 +2992,9 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     if len(_mood_history) > 20:
         _mood_history[:] = _mood_history[-20:]
 
-    # Redact private DM content before any persistence — the thoughts log feeds the
-    # public /api/v1/public/thoughts endpoint, and notes/logs are defense-in-depth.
-    persist_thought = {**thought, "thought": display_text, "text": ""} if is_private_dm else thought
+    # The record is already redacted (see above); persistence only has to drop
+    # the in-process delivery field, which must never reach disk.
+    persist_thought = without_private_dm_text(thought)
     append_thought(persist_thought, persona=persona)
 
     # Write mood state for px-alive servo coordination
@@ -3084,6 +3155,14 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
     should be charged), False when gated/suppressed or action == "wait".
     """
     global _last_spoken_text, _last_morning_fact_date
+
+    # Second enforcement point for private-DM redaction. reflection() already
+    # redacts at record-creation time; this makes the *dispatch* boundary
+    # independent of who built the thought (a replayed record, a test, a future
+    # producer). It is idempotent, so the normal path pays nothing. Without it,
+    # `text` below — which becomes the session-history entry read by the voice
+    # prompt, the awareness digest and GET /api/v1/session — would be raw.
+    redact_private_dm(thought)
 
     action = thought.get("action", "wait")
     if action == "wait":
@@ -3525,7 +3604,10 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
                 log(f"expression: self_debug error: {exc}")
 
         elif action == "message_obi":
-            _emit_message_obi(text)
+            # `text` is the redacted placeholder here — deliberately. The DM's
+            # real content is only ever read from the delivery field, and only
+            # by this one call.
+            _emit_message_obi(private_dm_text(thought))
 
         elif action == "announce":
             if not text:
