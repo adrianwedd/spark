@@ -868,7 +868,7 @@ class TestDeviceControl:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["action"] == "reboot"
-        mock_popen.assert_called_once_with(["sudo", "/usr/bin/systemctl", "reboot"])
+        mock_popen.assert_called_once_with(["sudo", "-n", "/bin/systemctl", "reboot"])
 
     def test_device_shutdown_mocked(self, api_client, auth_headers):
         """Two-step: get nonce then confirm executes shutdown."""
@@ -887,7 +887,7 @@ class TestDeviceControl:
         data = resp.json()
         assert data["status"] == "ok"
         assert data["action"] == "shutdown"
-        mock_popen.assert_called_once_with(["sudo", "/sbin/shutdown", "-h", "now"])
+        mock_popen.assert_called_once_with(["sudo", "-n", "/sbin/shutdown", "-h", "now"])
 
     def test_device_confirm_invalid_nonce(self, api_client, auth_headers):
         """Confirm with bad nonce is rejected."""
