@@ -616,6 +616,17 @@ inaccessible) and a working unprivileged-`bwrap` prototype
 (`tools/prototypes/agent-os-isolation/`) proving the sandboxing mechanism —
 not yet implemented; no live user/group/sudoers change has been made for it.
 
+**Elevation rides root-owned launchers, never variable sudo lines (#300).**
+An exact sudoers rule matches the literal command line, so
+`sudo -n env PYTHONPATH=... px-*` can never match one — the #281 tightening
+silently broke all 12 GPIO tools *and* the battery emergency shutdown (bare
+`shutdown` resolves to `/usr/sbin/shutdown`, the rule said `/sbin/`). All
+GPIO/audio elevation now goes through `/usr/local/sbin/px-gpio-run` (source:
+`systemd/sbin/px-gpio-run`; sudoers source: `systemd/sudoers.d/`), which
+validates its target allowlist and chooses its own environment; `systemctl`/
+`shutdown` are always spelled absolutely. Pinned by
+`tests/test_sudo_invariants.py` — a new `sudo env`/bare-name call fails it.
+
 ## Security
 
 - PIN verify returns session tokens (4h TTL) — raw Bearer token never exposed to browser

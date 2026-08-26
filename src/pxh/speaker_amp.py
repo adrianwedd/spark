@@ -18,6 +18,7 @@ an invisible unbounded stall candidate.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from typing import Callable, Optional
@@ -67,9 +68,14 @@ def ensure_speaker_enabled(timeout_s: float = 3.0, log: Optional[LogFn] = None,
     except Exception as exc:
         _log(f"enable_speaker (direct) failed after {time.monotonic() - t0:.2f}s: {exc}")
 
-    cmd = ["/usr/bin/python3", "-c", "from robot_hat import enable_speaker; enable_speaker()"]
+    # Elevated path goes through the root-owned px-gpio-run launcher (#300):
+    # an exact sudoers rule cannot match `sudo python3 -c "..."`.
     if sudo:
-        cmd = ["sudo", "-n"] + cmd
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        cmd = ["sudo", "-n", gpio_run, "enable-speaker"]
+    else:
+        cmd = ["/usr/bin/python3", "-c",
+               "from robot_hat import enable_speaker; enable_speaker()"]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
         elapsed = time.monotonic() - t0

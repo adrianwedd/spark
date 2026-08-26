@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import pwd
 import subprocess
 from pathlib import Path
 
@@ -57,32 +56,23 @@ def main() -> int:
         print(json.dumps(payload))
         return 2
 
+    # Elevation goes through the root-owned px-gpio-run launcher (#300):
+    # exact sudoers rules cannot match a `sudo env VAR=...` line. The
+    # launcher's `wander` branch owns the two env facts that used to ride
+    # sudo's command line — it exports HOME=/home/pi (root needs pi's
+    # ~/.local `filelock`, READS only; writers must drop privileges, see
+    # `pxh.vision`) and turns a validated `--lease-id` back into
+    # PX_GPIO_LEASE_ID for the elevated subtree.
     command = []
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
-        python_path = os.environ.get("PYTHONPATH", "")
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        command.extend(["sudo", "-n", gpio_run, "wander"])
         lease_id = os.environ.get("PX_GPIO_LEASE_ID", "")
-        # sudo is env_reset, so root would land on HOME=/root — which has no
-        # ~/.local/lib/python3.11/site-packages, and `filelock` lives ONLY
-        # there. Without this every root-side update_session() in the subtree
-        # raises ImportError after the work is done, so the tool dies before
-        # printing its JSON and a successful run reads as a failure. Taken from
-        # the invoking uid rather than $HOME so a clobbered environment cannot
-        # silently reintroduce it. px-alive.service:17 does the same thing.
-        #
-        # This override buys ROOT-SIDE *READS* of pi's home, nothing more, and
-        # it applies to the whole elevated subtree — not just wander. Any code
-        # under here that WRITES beneath $HOME will drop root-owned files into
-        # the pi user's home, and the first root-owned file in a directory pi
-        # later needs to write is a permanent lockout for the pi user. Code
-        # that writes must drop privileges instead; see `pxh.vision`, which
-        # runs the Claude CLI under `runuser` for exactly this reason rather
-        # than riding this HOME.
-        home = pwd.getpwuid(os.getuid()).pw_dir
-        command.extend([
-            "sudo", "-n", "env", f"PYTHONPATH={python_path}",
-            f"PX_GPIO_LEASE_ID={lease_id}", f"HOME={home}",
-        ])
-    command.extend([str(PX_WANDER), "--steps", str(steps)])
+        if lease_id:
+            command.extend(["--lease-id", lease_id])
+    else:
+        command.append(str(PX_WANDER))
+    command.extend(["--steps", str(steps)])
     if mode == "explore":
         duration = int(clamp(float(os.environ.get("PX_WANDER_DURATION_S", "180")), 30, 300))
         command.extend(["--mode", "explore", "--duration", str(duration)])

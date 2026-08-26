@@ -16,14 +16,12 @@ done
 
 # Cliff calibration opens the same root-owned GPIO/I2C devices as a wander.
 # Make the command printed by the fail-closed gate directly runnable by pi.
+# Elevation goes through the root-owned px-gpio-run launcher (#300): an exact
+# sudoers rule cannot match a `sudo env VAR=...` line, and the launcher owns
+# the env the elevated run needs (this script re-sources px-env as root).
 if [[ "$calibrate_cliff" == "1" && "$dry_run" == "0" &&
       "${PX_BYPASS_SUDO:-0}" != "1" && "$EUID" -ne 0 ]]; then
-    exec sudo -n env \
-        "PYTHONPATH=$PYTHONPATH" \
-        "PROJECT_ROOT=$PROJECT_ROOT" \
-        "LOG_DIR=$LOG_DIR" \
-        "PX_STATE_DIR=${PX_STATE_DIR:-$PROJECT_ROOT/state}" \
-        "$SCRIPT_DIR/px-wander" "$@"
+    exec sudo -n "${PX_GPIO_RUN_CMD:-/usr/local/sbin/px-gpio-run}" wander "$@"
 fi
 
 calibration_guard=0

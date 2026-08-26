@@ -1,6 +1,5 @@
 import json
 import os
-import pwd
 import subprocess
 import sys
 import time
@@ -1706,15 +1705,14 @@ def test_tool_compose_note_is_stamped_as_sparks_own_narrative(tmp_path, monkeypa
     assert provenance.read_provenance(rec)["kind"] == "narrative"
 
 
-def test_tool_wander_sudo_env_carries_home(isolated_project, tmp_path):
-    """The elevated wander must inherit HOME=/home/pi.
+def test_tool_wander_elevates_only_through_the_launcher(isolated_project, tmp_path):
+    """The elevated wander rides the fixed px-gpio-run launcher (#300).
 
-    `sudo` is env_reset, so root lands on HOME=/root — where there is no
-    ~/.local/lib/python3.11/site-packages. `filelock` lives only there, so
-    every root-side `update_session()` in the subtree (wander itself, and
-    tool-describe-scene) dies on ImportError *after* doing its work, and the
-    tool exits without emitting its JSON. px-alive.service:17 already sets
-    this for the same reason.
+    An exact sudoers rule matches the literal command line, so nothing
+    variable — no `env VAR=...`, no HOME= — may appear on it. The properties
+    the old sudo-env shape carried (HOME=/home/pi so root can find pi's
+    ~/.local `filelock`; PX_GPIO_LEASE_ID for lease borrowing) are now the
+    launcher's `wander` branch's job, pinned separately below.
 
     Verified against the real constructed argv via a stub `sudo` on PATH,
     rather than by grepping the script's source.
@@ -1737,9 +1735,18 @@ def test_tool_wander_sudo_env_carries_home(isolated_project, tmp_path):
     run_tool(["bin/tool-wander"], env)
 
     argv = recorded.read_text().splitlines()
-    # The invoking uid's home, not the literal /home/pi. bin/tool-wander:81
-    # reads it from pwd.getpwuid(os.getuid()) precisely so a clobbered $HOME
-    # cannot reintroduce the bug; asserting the literal pinned this robot's
-    # value instead of the code's property, and could only ever pass here.
-    expected = f"HOME={pwd.getpwuid(os.getuid()).pw_dir}"
-    assert expected in argv, f"{expected} not threaded into sudo env: {argv}"
+    assert argv[:3] == ["-n", "/usr/local/sbin/px-gpio-run", "wander"], argv
+    # Nothing variable on the sudo line — that is what made #300 unmatchable.
+    assert not any("=" in a or a == "env" for a in argv), argv
+
+
+def test_launcher_wander_branch_owns_home_and_lease():
+    """The launcher's wander branch must export HOME=/home/pi (root needs
+    pi's ~/.local `filelock` — the property the old sudo-env line carried,
+    PR #202) and translate a validated --lease-id into PX_GPIO_LEASE_ID."""
+    launcher = (PROJECT_ROOT / "systemd" / "sbin" / "px-gpio-run").read_text()
+    wander_branch = launcher.split("wander)", 1)[1].split(";;", 1)[0]
+    assert "export HOME=/home/pi" in wander_branch
+    assert "PX_GPIO_LEASE_ID" in wander_branch
+    # The lease id is used as an env value by root: charset-validate it.
+    assert "[A-Za-z0-9_-]" in wander_branch

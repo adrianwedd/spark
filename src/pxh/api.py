@@ -2271,7 +2271,7 @@ def _run_systemctl(action: str, service: str) -> Dict[str, Any]:
     """Run systemctl {action} {service}. Returns status dict."""
     try:
         result = subprocess.run(
-            ["sudo", "systemctl", action, service],
+            ["sudo", "-n", "/usr/bin/systemctl", action, service],
             capture_output=True, text=True, timeout=15,
         )
         return {
@@ -2346,8 +2346,8 @@ async def control_service(service: str, action: str, body: ServiceActionRequest 
 # ---------------------------------------------------------------------------
 
 _DEVICE_ACTIONS: dict[str, list[str]] = {
-    "reboot": ["sudo", "/usr/bin/systemctl", "reboot"],
-    "shutdown": ["sudo", "/sbin/shutdown", "-h", "now"],
+    "reboot": ["sudo", "-n", "/usr/bin/systemctl", "reboot"],
+    "shutdown": ["sudo", "-n", "/usr/sbin/shutdown", "-h", "now"],
 }
 
 # Two-step device action confirmation (Issue #93)

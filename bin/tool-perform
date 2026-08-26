@@ -48,17 +48,23 @@ def main() -> int:
     env = os.environ.copy()
     env["PX_PERFORM_STEPS"] = json.dumps(steps)
 
+    # Elevation goes through the root-owned px-gpio-run launcher (#300):
+    # exact sudoers rules cannot match a `sudo env VAR=...` line. The steps
+    # JSON travels on stdin — env vars cannot cross sudo's env_reset, and
+    # argv would put user-authored text back into the sudo command line.
     command = []
+    steps_input = None
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
-        python_path = os.environ.get("PYTHONPATH", "")
-        command.extend(["sudo", "-n", "env",
-                        f"PYTHONPATH={python_path}",
-                        f"PX_PERFORM_STEPS={json.dumps(steps)}"])
-    command.append(str(PX_PERFORM))
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        command.extend(["sudo", "-n", gpio_run, "perform"])
+        steps_input = json.dumps(steps)
+    else:
+        command.append(str(PX_PERFORM))
     if dry_mode:
         command.append("--dry-run")
 
-    result = subprocess.run(command, capture_output=True, text=True, check=False, env=env)
+    result = subprocess.run(command, capture_output=True, text=True, check=False,
+                            env=env, input=steps_input)
 
     update_session(
         fields={"last_action": "tool_perform"},

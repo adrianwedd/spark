@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# px-gpio-run — run one allowlisted PiCar GPIO helper as root with a fixed,
+# root-chosen environment (issue #300).
+#
+# The #281 sudoers tightening replaced pi's `NOPASSWD: ALL` with exact-command
+# rules, which the tool family's `sudo -n env PYTHONPATH=... bin/px-*` shape
+# can never match: variable env/argv makes every call line unique, and a
+# caller-supplied PYTHONPATH honoured by root would be arbitrary-code-as-root
+# anyway. Same answer as px-signal-alive: variable parameters move behind a
+# root-owned launcher that validates the target name and chooses its own
+# environment. The px-* targets are bash wrappers that source bin/px-env and
+# derive PYTHONPATH themselves; the export here is belt-and-braces for any
+# future target that doesn't.
+#
+# Data still crosses the boundary as data: validated argv (each px-* script
+# hard-validates its own parameters), and for `perform` the steps JSON on
+# stdin — env vars cannot cross sudo's env_reset, and JSON in argv would put
+# user-authored text back into the sudo command line.
+#
+# Installed root:root 0755 at /usr/local/sbin/px-gpio-run (source of truth:
+# systemd/sbin/px-gpio-run in the repo — reinstall after editing).
+# Sudoers: /etc/sudoers.d/picar-x-services (source: systemd/sudoers.d/).
+set -euo pipefail
+
+REPO=/home/pi/picar-x-hacking
+export PYTHONPATH="/home/pi/picar-x:$REPO/src"
+
+name="${1:-}"
+[[ $# -ge 1 ]] && shift
+
+case "$name" in
+    circle|drive|emote|figure8|look|sonar|status|stop)
+        exec "$REPO/bin/px-$name" "$@"
+        ;;
+    perform)
+        # Steps JSON on stdin (see header). px-perform validates the JSON
+        # and treats it strictly as data.
+        PX_PERFORM_STEPS="$(cat)"
+        export PX_PERFORM_STEPS
+        exec "$REPO/bin/px-perform" "$@"
+        ;;
+    wander)
+        # px-wander runs as root but the claude CLI and filelock state need
+        # pi's HOME (PR #202). The GPIO lease token is an opaque id used only
+        # for equality comparison against state/gpio_lease.json.
+        if [[ "${1:-}" == "--lease-id" ]]; then
+            lease="${2:-}"
+            if [[ ! "$lease" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+                echo "px-gpio-run: bad lease id" >&2
+                exit 2
+            fi
+            export PX_GPIO_LEASE_ID="$lease"
+            shift 2
+        fi
+        export HOME=/home/pi
+        exec "$REPO/bin/px-wander" "$@"
+        ;;
+    line-follow)
+        # Manual demo launcher (bin/run-line-follow). The script sources
+        # px-env itself; PX_DRY travels as the --dry-run flag, not env.
+        exec bash "$REPO/bin/px-line-follow" "$@"
+        ;;
+    enable-speaker)
+        # GPIO 20 amp toggle (MAX98357A) — fixed one-liner, no arguments.
+        exec /usr/bin/python3 -c "from robot_hat import enable_speaker; enable_speaker()"
+        ;;
+    *)
+        echo "px-gpio-run: unknown target '$name'" >&2
+        exit 2
+        ;;
+esac

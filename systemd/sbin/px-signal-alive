@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# px-signal-alive — send a fixed signal to px-alive.service's *current*
+# MainPID, resolved from systemd itself. Never accepts a PID from the
+# caller, so there is no argument here that can be pointed at an arbitrary
+# process (issue #281: sudoers must never grant `kill <signal> *`).
+#
+# Installed root:root 0755 at /usr/local/sbin/px-signal-alive. Invoked only
+# via `sudo -n` with an exact sudoers match on the signal argument — see
+# /etc/sudoers.d/picar-x-services.
+set -euo pipefail
+
+sig="${1:-}"
+case "$sig" in
+    USR1|TERM) ;;
+    *)
+        echo "px-signal-alive: signal must be USR1 or TERM" >&2
+        exit 2
+        ;;
+esac
+
+pid=$(systemctl show -p MainPID --value px-alive.service)
+if [[ -z "$pid" || "$pid" == "0" ]]; then
+    echo "px-signal-alive: px-alive.service has no MainPID (not running?)" >&2
+    exit 1
+fi
+
+exec kill -s "$sig" "$pid"

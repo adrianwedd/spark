@@ -86,7 +86,7 @@ def _resume_stream() -> None:
     """Restart px-frigate-stream via systemd (non-blocking)."""
     bypass = os.environ.get("PX_BYPASS_SUDO", "0") == "1"
     cmd = (["bin/px-frigate-stream"] if bypass
-           else ["sudo", "-n", "/bin/systemctl", "start", "px-frigate-stream"])
+           else ["sudo", "-n", "/usr/bin/systemctl", "start", "px-frigate-stream"])
     subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,

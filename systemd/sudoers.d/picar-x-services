@@ -1,0 +1,32 @@
+# picar-x-services — pi's exact-command sudo grants (issues #281, #300).
+#
+# Source of truth: systemd/sudoers.d/picar-x-services in the repo.
+# Install:  sudo visudo -c -f systemd/sudoers.d/picar-x-services \
+#           && sudo install -m 0440 -o root -g root \
+#              systemd/sudoers.d/picar-x-services /etc/sudoers.d/picar-x-services
+#
+# Design rule (#281): no rule may take a variable parameter that changes the
+# meaning of the command — variable data goes behind a root-owned launcher
+# in /usr/local/sbin (px-signal-alive, px-gpio-run) that validates it.
+#
+# Both path spellings are listed for systemctl and shutdown deliberately
+# (#300): /bin and /sbin are symlinks into /usr on Bookworm, but sudo matches
+# the resolved command path as a string, and a bare `systemctl` resolves via
+# secure_path to /usr/bin/systemctl — the /bin/... spelling alone silently
+# broke every bare-spelling caller, including the battery emergency shutdown.
+
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-alive, /usr/bin/systemctl stop px-alive, /usr/bin/systemctl restart px-alive, /bin/systemctl start px-alive, /bin/systemctl stop px-alive, /bin/systemctl restart px-alive
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-mind, /usr/bin/systemctl stop px-mind, /usr/bin/systemctl restart px-mind, /bin/systemctl start px-mind, /bin/systemctl stop px-mind, /bin/systemctl restart px-mind
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-wake-listen, /usr/bin/systemctl stop px-wake-listen, /usr/bin/systemctl restart px-wake-listen, /bin/systemctl start px-wake-listen, /bin/systemctl stop px-wake-listen, /bin/systemctl restart px-wake-listen
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-api-server, /usr/bin/systemctl stop px-api-server, /usr/bin/systemctl restart px-api-server, /bin/systemctl start px-api-server, /bin/systemctl stop px-api-server, /bin/systemctl restart px-api-server
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-frigate-stream, /usr/bin/systemctl stop px-frigate-stream, /usr/bin/systemctl restart px-frigate-stream, /bin/systemctl start px-frigate-stream, /bin/systemctl stop px-frigate-stream, /bin/systemctl restart px-frigate-stream
+
+# Root-owned launchers: the arguments each accepts are validated inside the
+# launcher itself (px-signal-alive: fixed signal names; px-gpio-run: fixed
+# target allowlist + charset-checked lease id).
+pi ALL=(root) NOPASSWD: /usr/local/sbin/px-signal-alive USR1, /usr/local/sbin/px-signal-alive TERM
+pi ALL=(root) NOPASSWD: /usr/local/sbin/px-gpio-run *
+
+# Battery emergency shutdown (mind.py) and the API's confirmed device actions.
+pi ALL=(root) NOPASSWD: /usr/sbin/shutdown -h now, /sbin/shutdown -h now
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl reboot, /bin/systemctl reboot

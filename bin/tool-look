@@ -48,11 +48,15 @@ def main() -> int:
     pan  = max(-90, min(90, pan))
     tilt = max(-35, min(65, tilt))
 
+    # Elevation goes through the root-owned px-gpio-run launcher (#300):
+    # exact sudoers rules cannot match a `sudo env PYTHONPATH=...` line.
     command = []
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
-        python_path = os.environ.get("PYTHONPATH", "")
-        command.extend(["sudo", "-n", "env", f"PYTHONPATH={python_path}"])
-    command.extend([str(PX_LOOK), "--pan", str(pan), "--tilt", str(tilt),
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        command.extend(["sudo", "-n", gpio_run, "look"])
+    else:
+        command.append(str(PX_LOOK))
+    command.extend(["--pan", str(pan), "--tilt", str(tilt),
                     "--ease", f"{ease:.2f}", "--hold", f"{hold:.2f}"])
     if dry_mode:
         command.append("--dry-run")

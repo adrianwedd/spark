@@ -26,11 +26,14 @@ def main() -> int:
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
     threshold = int(os.environ.get("PX_BATTERY_THRESHOLD", "30"))
 
+    # Elevation goes through the root-owned px-gpio-run launcher (#300):
+    # exact sudoers rules cannot match a `sudo env PYTHONPATH=...` line.
     command = []
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
-        python_path = os.environ.get("PYTHONPATH", "")
-        command.extend(["sudo", "-n", "env", f"PYTHONPATH={python_path}"])
-    command.append(str(PX_STATUS))
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        command.extend(["sudo", "-n", gpio_run, "status"])
+    else:
+        command.append(str(PX_STATUS))
     if dry_mode:
         command.append("--dry-run")
 

@@ -60,12 +60,15 @@ def main() -> int:
     duration = clamp(duration, MIN_DURATION, MAX_DURATION)
     rest = clamp(rest, MIN_REST, MAX_REST)
 
+    # Elevation goes through the root-owned px-gpio-run launcher (#300):
+    # exact sudoers rules cannot match a `sudo env PYTHONPATH=...` line.
     command = []
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
-        python_path = os.environ.get("PYTHONPATH", "")
-        command.extend(["sudo", "-n", "env", f"PYTHONPATH={python_path}"])
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        command.extend(["sudo", "-n", gpio_run, "figure8"])
+    else:
+        command.append(str(PX_FIGURE8))
     command.extend([
-        str(PX_FIGURE8),
         "--speed",
         str(speed),
         "--duration",

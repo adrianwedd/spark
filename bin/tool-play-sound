@@ -60,11 +60,13 @@ def main() -> int:
         print(json.dumps(payload))
         return 1
 
-    # Enable speaker amp before playback
+    # Enable speaker amp before playback. Elevation goes through the
+    # root-owned px-gpio-run launcher (#300): exact sudoers rules cannot
+    # match a `sudo python3 -c "..."` line.
     try:
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
         subprocess.run(
-            ["sudo", "-n", "/usr/bin/python3", "-c",
-             "from robot_hat import enable_speaker; enable_speaker()"],
+            ["sudo", "-n", gpio_run, "enable-speaker"],
             check=False,
             capture_output=True,
         )

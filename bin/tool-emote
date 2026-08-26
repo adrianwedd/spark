@@ -34,11 +34,16 @@ def main() -> int:
         print(json.dumps(payload))
         return 1
 
+    # Elevation goes through the root-owned px-gpio-run launcher (#300):
+    # exact sudoers rules cannot match a `sudo env PYTHONPATH=...` line, and
+    # the launcher chooses its own environment rather than trusting ours.
     command = []
     if os.environ.get("PX_BYPASS_SUDO", "0") != "1":
-        python_path = os.environ.get("PYTHONPATH", "")
-        command.extend(["sudo", "-n", "env", f"PYTHONPATH={python_path}"])
-    command.extend([str(PX_EMOTE), name])
+        gpio_run = os.environ.get("PX_GPIO_RUN_CMD", "/usr/local/sbin/px-gpio-run")
+        command.extend(["sudo", "-n", gpio_run, "emote"])
+    else:
+        command.append(str(PX_EMOTE))
+    command.append(name)
     if dry_mode:
         command.append("--dry-run")
 

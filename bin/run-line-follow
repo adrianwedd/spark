@@ -7,9 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
 
-exec sudo -n \
-    PYTHONPATH="$PYTHONPATH" \
-    PROJECT_ROOT="$PROJECT_ROOT" \
-    LOG_DIR="$LOG_DIR" \
-    PX_DRY="${PX_DRY:-0}" \
-    bash "$SCRIPT_DIR/px-line-follow" "$@"
+# Elevation goes through the root-owned px-gpio-run launcher (#300): exact
+# sudoers rules cannot match a `sudo env VAR=...` line. PX_DRY cannot cross
+# sudo's env_reset, so it becomes the --dry-run flag.
+args=("$@")
+if [[ "${PX_DRY:-0}" != "0" ]]; then
+    args+=(--dry-run)
+fi
+exec sudo -n "${PX_GPIO_RUN_CMD:-/usr/local/sbin/px-gpio-run}" line-follow "${args[@]}"

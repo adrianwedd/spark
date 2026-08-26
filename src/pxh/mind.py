@@ -1562,7 +1562,11 @@ def battery_emergency_shutdown(pct: int, dry: bool) -> None:
         log("dry: would shutdown now")
     else:
         log("running: sudo shutdown -h now")
-        subprocess.run(["sudo", "shutdown", "-h", "now"], check=False)
+        # Absolute path: sudoers matches the literal command string, and a
+        # bare name resolves via secure_path to a spelling the rule may not
+        # carry — this exact mismatch silently broke the emergency shutdown
+        # after the #281 sudoers tightening (#300).
+        subprocess.run(["sudo", "-n", "/usr/sbin/shutdown", "-h", "now"], check=False)
 
 
 def battery_warn_comment(pct: int, dry: bool) -> None:
@@ -3457,7 +3461,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
                 if result.stdout.strip() != "active":
                     log("expression: px-alive not running — restarting")
                     subprocess.run(
-                        ["sudo", "-n", "systemctl", "start", "px-alive"],
+                        ["sudo", "-n", "/usr/bin/systemctl", "start", "px-alive"],
                         capture_output=True, check=False, timeout=10,
                     )
             except Exception as exc:
