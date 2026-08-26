@@ -876,7 +876,7 @@ def _restart_alive(had_alive: int | None = 1) -> None:
     log("restarting px-alive")
     try:
         r = subprocess.run(
-            ["sudo", "-n", "/usr/bin/systemctl", "start", "px-alive"],
+            ["sudo", "-n", "/bin/systemctl", "start", "px-alive"],
             capture_output=True, check=False, timeout=15,
         )
         if r.returncode != 0:

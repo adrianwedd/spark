@@ -37,8 +37,12 @@ INTERACTIVE_SCRIPTS = {"bin/px-update-reboot"}
 ALLOWED_SUDO_TARGETS = (
     "/usr/local/sbin/px-gpio-run",
     "/usr/local/sbin/px-signal-alive",
-    "/usr/bin/systemctl",
-    "/usr/sbin/shutdown",
+    # The /bin and /sbin spellings, not /usr/...: they are what the deployed
+    # sudoers rules carry (and /bin, /sbin are usrmerge symlinks anyway).
+    # Keeping one canonical spelling in code means a rule/code mismatch can
+    # only come from editing the sudoers, not from a new call site.
+    "/bin/systemctl",
+    "/sbin/shutdown",
     # The launcher path is overridable for tests via PX_GPIO_RUN_CMD; call
     # sites hold it in a variable named gpio_run.
     "gpio_run",
