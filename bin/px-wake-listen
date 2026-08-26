@@ -68,6 +68,7 @@ from pxh.mic_stream import (                          # noqa: E402
     resolve_arecord_device as _resolve_arecord_device,
 )
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore  # noqa: E402
+from pxh import policy as _policy                           # noqa: E402
 from pxh import wake_grant                                  # noqa: E402
 from pxh.hostload import cgroup_pressure_fields, host_load_fields  # noqa: E402
 
@@ -960,11 +961,20 @@ def _debug_dump_wav(audio_bytes: bytes) -> None:
         log(f"debug wav dump failed: {exc}")
 
 
-def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice=None) -> str:
+def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice=None,
+                   ) -> "tuple[str, bool]":
     """Transcribe audio using the best available backend: sensevoice > whisper > sherpa > vosk.
 
     If the primary backend returns empty (hallucination filtered), falls through
     to the next backend instead of returning empty.
+
+    Returns (text, fell_through). fell_through is True when a backend was tried
+    and returned empty (its rejection filters fired, or it heard nothing)
+    before a weaker backend produced the final text — the #304 signal: the
+    best-informed judge rejected this audio, and whatever a lower tier then
+    salvaged ('oh', a wake-word shred) is not corroboration that a person
+    actually spoke. Day paths may still use the salvaged text; the night wake
+    gate must not.
 
     Releases transient allocator memory (#219 Track B) after every completed
     cycle, on every path (including a full fall-through to Vosk) — this is the
@@ -973,22 +983,26 @@ def _do_transcribe(audio_bytes: bytes, model, stt=None, whisper=None, sensevoice
     """
     _debug_dump_wav(audio_bytes)
     text = ""
+    fell_through = False
     if sensevoice is not None:
         text = transcribe_sensevoice(sensevoice, audio_bytes)
         if not text.strip():
+            fell_through = True
             log("stt: sensevoice returned empty — falling through to next backend")
     if not text.strip() and whisper is not None:
         text = transcribe_whisper(whisper, audio_bytes)
         if not text.strip():
+            fell_through = True
             log("stt: whisper returned empty — falling through to next backend")
     if not text.strip() and stt is not None:
         text = transcribe_sherpa(stt, audio_bytes)
         if not text.strip():
+            fell_through = True
             log("stt: sherpa returned empty — falling through to vosk")
     if not text.strip():
         text = transcribe(model, audio_bytes)
     _release_transient_memory("post_transcribe")
-    return text
+    return text, fell_through
 
 
 def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
@@ -1016,7 +1030,7 @@ def record_followup(stream, model, stt=None, whisper=None, sensevoice=None,
                 rest = record_utterance(stream, FOLLOWUP_MAX_S, FOLLOWUP_SILENCE_S)
                 audio = b"".join(onset) + rest
                 play_chime_processing(aplay_device)
-                text = _do_transcribe(audio, model, stt, whisper, sensevoice)
+                text, _ = _do_transcribe(audio, model, stt, whisper, sensevoice)
                 if text and len(text.strip()) >= 2:
                     return text
                 # Phantom or echo (single char like 'i') — play a soft "try again" tick and keep waiting
@@ -1334,8 +1348,36 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                     log(f"captured {chunks_n} chunks ({chunks_n * CHUNK / MIC_RATE:.1f}s)")
                     # Processing beep: "got it, I'm thinking" — fires before STT + LLM
                     play_chime_processing(args.aplay_device)
-                    text_out = _do_transcribe(audio_bytes, model, stt, whisper, sensevoice)
+                    text_out, stt_fell_through = _do_transcribe(
+                        audio_bytes, model, stt, whisper, sensevoice)
                     log(f"utterance: {text_out!r}")
+
+                    # #304 — the night bypass is conditioned on a corroborated
+                    # utterance, not on the detection that preceded it. A wake
+                    # grant standing in for "a human is addressing SPARK" whose
+                    # only evidence is "a noise resembled the wake word" must
+                    # not unlock speech at night: an empty transcript, or one
+                    # the primary STT rejected before a weaker backend salvaged
+                    # a shred, ends the turn silently — no greeting, no
+                    # fallback line, no "I didn't catch that". The policy sink
+                    # enforces the same condition independently (an unconfirmed
+                    # grant no longer bypasses night silence), so this gate is
+                    # the UX half: skip the LLM round trip entirely rather
+                    # than run it into a suppressed tool-voice. By day,
+                    # behaviour is unchanged on the same transcript.
+                    utterance_credible = bool(text_out.strip()) and not stt_fell_through
+                    if utterance_credible and grant_id:
+                        wake_grant.confirm_grant(grant_id)
+                    night_now = _policy.is_night_hour(
+                        dt.datetime.now(_policy.HOBART_TZ).hour)
+                    if not utterance_credible and night_now:
+                        log(f"night wake gate: utterance not credible "
+                            f"(text={text_out!r} fell_through={stt_fell_through}) "
+                            f"— ending turn silently (#304)")
+                        if grant_id:
+                            wake_grant.close_grant(grant_id)
+                            grant_id = None
+                        text_out = ""
 
                     # Log transcript to session history for px-mind conversation digestion
                     if text_out:

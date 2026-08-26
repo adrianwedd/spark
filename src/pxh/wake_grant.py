@@ -47,6 +47,21 @@ that conversation extend the window; inactivity closes it; MAX_CONVERSATION_S
 caps the total so a room with a television in it cannot hold the gate open all
 night one legitimate-looking turn at a time.
 
+Opened is not the same as corroborated (#304)
+---------------------------------------------
+A grant opens on wake-word detection alone, because the window has to cover
+recording and the LLM round trip. But detection is only "a noise resembled the
+wake word" — at 00:53 one night, sustained room noise probed the matcher until
+a false accept crossed, the captured utterance was a hallucination-flagged
+'oh', and SPARK spoke three times on a bedroom-adjacent speaker. So a grant
+carries a second, initially-false fact: ``utterance_confirmed``, set by
+confirm_grant() once the summons produced a real transcript. policy.evaluate()
+lets a grant bypass *night silence* only when it is confirmed; the quiet-mode
+and on-call bypasses do not require confirmation, so daytime behaviour is
+unchanged. A grant document without the field reads as unconfirmed — the
+module's fail-closed posture, and what makes a legacy or hand-built document
+safe by default.
+
 One residual, on the record
 ---------------------------
 Everything on this box runs as ``pi``, so file permissions are not a trust
@@ -213,9 +228,36 @@ def open_grant(*, ttl_s: float = DEFAULT_TTL_S) -> str | None:
         "opened_boottime": now,
         "expires_boottime": now + min(float(ttl_s), MAX_CONVERSATION_S),
         "turns": 1,
+        "utterance_confirmed": False,
         "opened_utc": _utc_hint(),
     }
     return conversation_id if _write(doc) else None
+
+
+def confirm_grant(conversation_id: str) -> bool:
+    """Record that the summons produced a real utterance, not just a noise.
+
+    Only the conversation that owns a currently-valid grant may confirm it.
+    Called by bin/px-wake-listen once the captured utterance survived the STT
+    rejection filters; nothing else has grounds to make the claim.
+    """
+    doc = read_grant()
+    if doc is None or doc.get("conversation_id") != conversation_id:
+        return False
+    doc["utterance_confirmed"] = True
+    doc["confirmed_utc"] = _utc_hint()
+    return _write(doc)
+
+
+def is_grant_confirmed() -> bool:
+    """Whether the open wake conversation has a corroborated utterance.
+
+    False when there is no valid grant at all, and False for a valid grant
+    whose document lacks the field or carries anything but literal True — a
+    missing or mangled claim is not a corroborated one.
+    """
+    doc = read_grant()
+    return doc is not None and doc.get("utterance_confirmed") is True
 
 
 def refresh_grant(conversation_id: str, *, ttl_s: float = DEFAULT_TTL_S) -> bool:

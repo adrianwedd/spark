@@ -67,6 +67,7 @@ def evaluate(
     now: float,
     session_available: bool = True,
     wake_grant: bool = False,
+    wake_grant_confirmed: bool = False,
     _depth: int = 0,
 ) -> PolicyVerdict:
     """Decide whether an action may proceed. Returns a verdict; never executes.
@@ -145,8 +146,20 @@ def evaluate(
     # conversation happening in the room. And nothing here writes: quiet mode
     # stays set, this turn speaks through it, and quiet behaviour resumes by
     # itself the moment the window closes. bin/tool-quiet is still the one exit.
+    #
+    # At night the grant must also be *confirmed* (#304): detection alone means
+    # only "a noise resembled the wake word", and one 00:53 false accept whose
+    # utterance was a hallucination-flagged 'oh' put three unprompted
+    # utterances on a bedroom-adjacent speaker. wake_grant.confirm_grant()
+    # records that the summons produced a real transcript; until it has, an
+    # open grant falls through to the rules below, and rule 2 blocks the night
+    # window exactly as if nobody had spoken. By day an unconfirmed grant
+    # still carries the quiet-mode and on-call bypasses — the cost of a false
+    # positive there is a mild annoyance, not a woken child.
     if wake_grant and origin == "interactive":
-        return PolicyVerdict(allowed=True, reason="wake_grant")
+        hour = dt.datetime.fromtimestamp(now, tz=HOBART_TZ).hour
+        if wake_grant_confirmed or not is_night_hour(hour):
+            return PolicyVerdict(allowed=True, reason="wake_grant")
 
     # Rule 1 — quiet mode / dysregulation protocol. Both origins: an active
     # meltdown does not care who initiated the turn.

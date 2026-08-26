@@ -860,10 +860,11 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     # environment it was launched with. Same loader the sink uses, so the two
     # gates cannot disagree about whether a conversation is open.
     wake = policy_context.wake_grant_active()
+    wake_confirmed = policy_context.wake_grant_confirmed()
     verdict = policy.evaluate(
         requested_tool, params, effect=classify_effect(requested_tool, params),
         origin="interactive", session=session, awareness=awareness, now=now,
-        wake_grant=wake,
+        wake_grant=wake, wake_grant_confirmed=wake_confirmed,
     )
     if not verdict.allowed:
         substitute_tool = "tool_emote"
@@ -874,7 +875,8 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             substitute_tool, substitute_params,
             effect=classify_effect(substitute_tool, substitute_params),
             origin="interactive", session=session, awareness=awareness,
-            now=now, wake_grant=wake, _depth=1,
+            now=now, wake_grant=wake, wake_grant_confirmed=wake_confirmed,
+            _depth=1,
         )
         print(f"[voice-loop] requested={requested_tool} verdict=blocked "
               f"reason={verdict.reason} substituted={substitute_tool}",

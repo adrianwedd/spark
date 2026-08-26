@@ -327,6 +327,50 @@ def test_direct_tool_voice_still_speaks_when_policy_allows(sink):
     assert spoke is True
 
 
+# --- #304 at the sink: night speech needs a *confirmed* grant ---------------
+#
+# The acceptance artefact for the 00:53 incident: a wake grant opened by a
+# false accept whose utterance turned out empty or hallucination-flagged must
+# produce no audio at all at night. The grant documents here are written by
+# the real opener into a tmp runtime dir the sink subprocess is pointed at,
+# and silence is proven against the canary player, never against tool-voice's
+# self-report.
+
+@pytest.fixture
+def night_sink_with_grant(sink, tmp_path, monkeypatch):
+    from pxh import wake_grant as _wg
+
+    d = tmp_path / "wakegrant"
+    d.mkdir()
+    monkeypatch.setenv(_wg.GRANT_DIR_ENV, str(d))
+
+    def run(*, confirmed):
+        cid = _wg.open_grant()
+        assert cid is not None
+        if confirmed:
+            assert _wg.confirm_grant(cid) is True
+        env = dict(ALWAYS_NIGHT)
+        env[_wg.GRANT_DIR_ENV] = str(d)
+        return sink("three facts about wombats", **env)
+
+    return run
+
+
+def test_an_unconfirmed_wake_grant_is_silent_at_the_sink_at_night(night_sink_with_grant):
+    payload, spoke = night_sink_with_grant(confirmed=False)
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "night_silence"
+    assert spoke is False
+
+
+def test_a_confirmed_wake_grant_still_speaks_at_the_sink_at_night(night_sink_with_grant):
+    """The fix must not swallow the legitimate case: a real person, really
+    summoning, really speaking, still gets an audible answer at 1am."""
+    payload, spoke = night_sink_with_grant(confirmed=True)
+    assert payload["status"] == "ok"
+    assert spoke is True
+
+
 def test_persona_routing_cannot_bypass_the_sink_gate(sink):
     """A persona reaches the speaker via bin/tool-voice-persona, which re-enters
     tool-voice. The gate therefore has to sit *before* the reroute, or a persona
@@ -828,21 +872,136 @@ def test_closing_someone_elses_grant_is_refused(grant_dir):
 
 # --- what the grant permits, and what it must not -------------------------
 
-def _verdict(*, wake, origin="interactive", effect="audio", session=None,
-             awareness=None, now=NIGHT_TS, session_available=True):
+def _verdict(*, wake, confirmed=False, origin="interactive", effect="audio",
+             session=None, awareness=None, now=NIGHT_TS, session_available=True):
     return policy.evaluate(
         "tool_voice", {"text": "hello"}, effect=effect, origin=origin,
         session={} if session is None else session,
         awareness={} if awareness is None else awareness,
         now=now, session_available=session_available, wake_grant=wake,
+        wake_grant_confirmed=confirmed,
     )
 
 
 def test_wake_grant_permits_an_audible_reply_during_night_silence():
+    """Night bypass requires a *confirmed* grant (#304): the summons must have
+    produced a real transcript, not just a noise that resembled the wake word."""
     assert _verdict(wake=False).reason == "night_silence"
-    v = _verdict(wake=True)
+    v = _verdict(wake=True, confirmed=True)
     assert v.allowed is True
     assert v.reason == "wake_grant"
+
+
+# --- #304: detection alone must not defeat night silence --------------------
+#
+# The 00:53 incident: sustained room noise probed the wake matcher until a
+# false accept crossed, the utterance transcribed as a hallucination-flagged
+# 'oh', and SPARK spoke three times on a bedroom-adjacent speaker. The grant
+# was standing in for "a human is addressing SPARK" on the strength of "a
+# noise resembled the wake word". At night that inference no longer unlocks
+# anything: only a grant whose utterance was corroborated does.
+
+def test_an_unconfirmed_wake_grant_does_not_defeat_night_silence():
+    v = _verdict(wake=True, confirmed=False)
+    assert v.allowed is False
+    assert v.reason == "night_silence"
+
+
+def test_an_unconfirmed_wake_grant_still_bypasses_quiet_mode_by_day():
+    """Daytime behaviour is unchanged: the cost of a false positive there is a
+    mild annoyance, not a woken child."""
+    session = {"spark_quiet_mode": True}
+    v = _verdict(wake=True, confirmed=False, session=session, now=DAY_TS)
+    assert v.allowed is True
+    assert v.reason == "wake_grant"
+
+
+def test_a_confirmed_wake_grant_at_night_still_speaks_through_quiet_mode():
+    v = _verdict(wake=True, confirmed=True, session={"spark_quiet_mode": True})
+    assert v.allowed is True
+    assert v.reason == "wake_grant"
+
+
+def test_confirmation_without_a_grant_grants_nothing():
+    """The confirmed flag rides the grant; alone it is inert."""
+    v = _verdict(wake=False, confirmed=True)
+    assert v.allowed is False
+    assert v.reason == "night_silence"
+
+
+def test_confirmation_does_not_help_autonomous_speech():
+    v = _verdict(wake=True, confirmed=True, origin="autonomous")
+    assert v.reason != "wake_grant"
+
+
+def test_confirmation_cannot_override_an_unreadable_session():
+    v = _verdict(wake=True, confirmed=True, session_available=False)
+    assert v.allowed is False
+    assert v.reason == "session_unavailable"
+
+
+# --- #304: the confirmation lifecycle on the grant document -----------------
+
+def test_a_fresh_grant_is_unconfirmed(grant_dir):
+    assert wake_grant.open_grant() is not None
+    assert wake_grant.is_grant_active() is True
+    assert wake_grant.is_grant_confirmed() is False
+
+
+def test_confirming_the_owning_conversation_confirms_the_grant(grant_dir):
+    cid = wake_grant.open_grant()
+    assert wake_grant.confirm_grant(cid) is True
+    assert wake_grant.is_grant_confirmed() is True
+
+
+def test_confirming_someone_elses_conversation_is_refused(grant_dir):
+    wake_grant.open_grant()
+    assert wake_grant.confirm_grant("not-this-conversation") is False
+    assert wake_grant.is_grant_confirmed() is False
+
+
+def test_confirmation_does_not_survive_a_new_summons(grant_dir):
+    """Each detection re-earns corroboration; a new grant starts unconfirmed."""
+    first = wake_grant.open_grant()
+    wake_grant.confirm_grant(first)
+    wake_grant.open_grant()
+    assert wake_grant.is_grant_confirmed() is False
+
+
+def test_confirmation_survives_a_refresh(grant_dir):
+    """Later turns of the same conversation must not strip corroboration."""
+    cid = wake_grant.open_grant()
+    wake_grant.confirm_grant(cid)
+    assert wake_grant.refresh_grant(cid) is True
+    assert wake_grant.is_grant_confirmed() is True
+
+
+def test_a_grant_document_without_the_field_reads_unconfirmed(grant_dir):
+    """A legacy or hand-built document is unconfirmed by default — the field
+    must be present and literally True, the module's fail-closed posture."""
+    wake_grant.open_grant()
+    doc = _json.loads(wake_grant.grant_path().read_text())
+    del doc["utterance_confirmed"]
+    wake_grant.grant_path().write_text(_json.dumps(doc))
+    assert wake_grant.is_grant_active() is True
+    assert wake_grant.is_grant_confirmed() is False
+
+
+@pytest.mark.parametrize("value", [1, "true", "True", [], {}])
+def test_a_mangled_confirmation_claim_reads_unconfirmed(grant_dir, value):
+    wake_grant.open_grant()
+    doc = _json.loads(wake_grant.grant_path().read_text())
+    doc["utterance_confirmed"] = value
+    wake_grant.grant_path().write_text(_json.dumps(doc))
+    assert wake_grant.is_grant_confirmed() is False
+
+
+def test_an_expired_grant_is_not_confirmed_either(grant_dir, monkeypatch):
+    cid = wake_grant.open_grant(ttl_s=180.0)
+    wake_grant.confirm_grant(cid)
+    later = wake_grant.boottime() + 181.0
+    monkeypatch.setattr(wake_grant, "boottime", lambda: later)
+    assert wake_grant.is_grant_confirmed() is False
 
 
 def test_wake_grant_permits_an_audible_reply_during_quiet_mode():
@@ -914,12 +1073,20 @@ def test_the_dispatcher_consults_the_grant_it_loads_rather_than_its_caller(monke
     """
     monkeypatch.setattr(voice_loop, "_policy_now", lambda: NIGHT_TS)
     monkeypatch.setattr(policy_context, "wake_grant_active", lambda: False)
+    monkeypatch.setattr(policy_context, "wake_grant_confirmed", lambda: False)
     tool, _ = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
     assert tool != "tool_voice"
 
     monkeypatch.setattr(policy_context, "wake_grant_active", lambda: True)
+    monkeypatch.setattr(policy_context, "wake_grant_confirmed", lambda: True)
     tool, _ = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
     assert tool == "tool_voice"
+
+    # #304: at night an *unconfirmed* grant is not enough — the dispatcher
+    # loads both facts, and detection alone no longer unlocks night speech.
+    monkeypatch.setattr(policy_context, "wake_grant_confirmed", lambda: False)
+    tool, _ = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+    assert tool != "tool_voice"
 
 
 # --- the fallback acknowledgement needs no wake-grant precondition of its own
@@ -1029,11 +1196,16 @@ def test_a_timed_out_voice_turn_acknowledges_exactly_once_without_a_grant(monkey
 # --- the sink, end to end, against a canary rather than a self-report -------
 
 def test_hey_spark_at_three_am_gets_an_audible_reply(sink, tmp_path):
+    """A real summons: detection AND a corroborated utterance (#304). The
+    confirm is what px-wake-listen records once the transcript survives the
+    STT rejection filters; without it, night silence holds — see the
+    night_sink_with_grant tests above."""
     d = tmp_path / "wake-3am"
     d.mkdir()
     _os.environ[wake_grant.GRANT_DIR_ENV] = str(d)
     try:
-        wake_grant.open_grant()
+        cid = wake_grant.open_grant()
+        assert wake_grant.confirm_grant(cid) is True
     finally:
         del _os.environ[wake_grant.GRANT_DIR_ENV]
     payload, spoke = sink(session={}, **{wake_grant.GRANT_DIR_ENV: str(d)}, **ALWAYS_NIGHT)

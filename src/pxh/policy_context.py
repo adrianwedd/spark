@@ -135,6 +135,18 @@ def wake_grant_active() -> bool:
     return wake_grant.is_grant_active()
 
 
+def wake_grant_confirmed() -> bool:
+    """Whether the open wake conversation's utterance was corroborated (#304).
+
+    The companion fact to wake_grant_active(), loaded the same way for the
+    same reason: policy lets a grant bypass night silence only when the
+    summons produced a real transcript, and that claim is read off the grant
+    document itself — never accepted from a caller or an environment variable.
+    Fails closed: no grant, or a grant that was never confirmed, reads False.
+    """
+    return wake_grant.is_grant_confirmed()
+
+
 def evaluate_audio_sink(
     action: str,
     params: Dict[str, Any] | None = None,
@@ -178,4 +190,5 @@ def evaluate_audio_sink(
         awareness=load_awareness(warn_prefix=warn_prefix),
         now=time.time(),
         wake_grant=wake_grant_active(),
+        wake_grant_confirmed=wake_grant_confirmed(),
     )
