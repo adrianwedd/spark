@@ -20,7 +20,7 @@ from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
 from .logging import log_event
 from .state import load_session, update_session, ensure_session, tail_lines, atomic_write
-from .time import utc_timestamp
+from .time import local_time_line, utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 BIN_DIR = PROJECT_ROOT / "bin"
@@ -529,7 +529,13 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
     recent_history = state.get("history") or []
     recent_events = recent_history[-3:]
 
+    # Local-time anchor (#301): every timestamp below is UTC ('Z'), and with
+    # no local reference the model read 02:08Z as 2 AM wall-clock and told
+    # Obi to go to bed at midday. This line must come before any timestamps.
     context_sections = [
+        f"Current local time: {local_time_line()}",
+        "All 'Z'-suffixed timestamps below are UTC, roughly 10 hours behind "
+        "the local clock — never read them as local time.",
         "Current highlights:",
         json.dumps(highlights, indent=2),
     ]

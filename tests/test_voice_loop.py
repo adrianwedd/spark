@@ -52,6 +52,39 @@ def test_build_model_prompt_includes_highlights():
     assert 'User transcript: Weather now' in prompt
 
 
+# --- Local-time anchor (#301) -----------------------------------------------
+# The prompt is full of UTC 'Z' timestamps and previously carried no local
+# reference at all, so the model read 02:08Z as 2 AM wall-clock and told Obi
+# to go to bed at midday (three live occurrences on 2026-08-25/26).
+
+def test_build_model_prompt_anchors_local_time():
+    prompt = build_model_prompt("SYSTEM", {}, "hello")
+    assert "Current local time:" in prompt
+    assert "Australia/Hobart" in prompt
+    assert "UTC" in prompt  # the explicit are-not-local caveat
+    # The anchor must precede every timestamp section.
+    assert prompt.index("Current local time:") < prompt.index("Current highlights:")
+
+
+def test_local_time_line_converts_utc_to_hobart():
+    from pxh.time import local_time_line
+    # 02:08Z on 2026-08-25 is 12:08 PM in Hobart (AEST, UTC+10).
+    now = dt.datetime(2026, 8, 25, 2, 8, tzinfo=dt.timezone.utc)
+    line = local_time_line(now=now)
+    assert "12:08 PM" in line
+    assert "Tuesday 25 August 2026" in line
+    assert "UTC+10:00" in line
+
+
+def test_local_time_line_honours_dst():
+    from pxh.time import local_time_line
+    # 02:08Z on 2026-12-25 is 1:08 PM in Hobart (AEDT, UTC+11).
+    now = dt.datetime(2026, 12, 25, 2, 8, tzinfo=dt.timezone.utc)
+    line = local_time_line(now=now)
+    assert "1:08 PM" in line
+    assert "UTC+11:00" in line
+
+
 def test_validate_action_rejects_non_numeric_params():
     """Malformed numeric params should raise VoiceLoopError, not ValueError."""
     with pytest.raises(VoiceLoopError, match="invalid numeric"):
