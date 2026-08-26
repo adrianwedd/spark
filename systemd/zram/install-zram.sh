@@ -18,9 +18,15 @@ install -m 0644 "$REPO/systemd/zram/zram-generator.conf" /etc/systemd/zram-gener
 install -m 0644 "$REPO/systemd/zram/99-spark-zram.conf" /etc/sysctl.d/99-spark-zram.conf
 
 echo "== 4. activate (no reboot needed)"
+# daemon-reload runs the zram generator, which *materializes*
+# systemd-zram-setup@zram0.service from the config; starting it before the
+# reload finishes races the generator and the unit isn't there yet. Reload,
+# then start explicitly, then give udev/swapon a moment to attach.
 systemctl daemon-reload
 systemctl start systemd-zram-setup@zram0.service
+systemctl start dev-zram0.swap 2>/dev/null || true
 sysctl -p /etc/sysctl.d/99-spark-zram.conf
+for _ in 1 2 3 4 5; do grep -qw zram0 /proc/swaps && break; sleep 1; done
 
 echo "== 5. verify"
 swapon --show

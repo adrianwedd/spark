@@ -1,9 +1,24 @@
 # zram swap: breaking the SD-card IO-pressure → audio-loss loop (#283, #247)
 
-Status: **staged 2026-08-26, root install pending** (run
-`sudo bash systemd/zram/install-zram.sh` from the repo root — needs `pi`'s
-password because the #281 sudoers tightening removed the blanket NOPASSWD
-grant). No reboot required; activation is live.
+Status: **INSTALLED and live 2026-08-26** — zram0 active at priority 100
+(1024 MB, zstd), `/var/swap` retained at −2 as fallback. Installed via
+`sudo bash systemd/zram/install-zram.sh` after caching a sudo credential
+(`sudo -v` in a real TTY; this session's `!` shell has no PTY for a password
+prompt, and #281 removed the blanket NOPASSWD). No reboot was required.
+Observation period (steps 5-6) is now running against natural load.
+
+## Post-install verification (2026-08-26T19:35 AEST)
+
+zram0 live at prio 100 above /var/swap (−2); comp_algorithm `zstd`; swap total
+1.5 GiB. All services active (px-brain `validated`, px-wake-listen, px-mind,
+px-api-server, px-alive, px-frigate-stream); `/api/v1/health` = ok; cgroup
+MemoryCurrent and `/proc/pressure` both still read. No swap storm — zram used
+0 B immediately post-activation (kernel migrates only on new pressure; the
+existing 98 MB in /var/swap stays until touched). vmstat si/so fell to 0 and
+IO PSI some avg10 dropped from ~85% (mid-install, apt draining) toward ~41%
+within a minute. The installer's own priority check originally fired one step
+early — before the generator materialized the unit on daemon-reload — and was
+fixed to reload-then-start-then-wait; a re-run or reboot now verifies cleanly.
 
 ## The loop being broken
 
