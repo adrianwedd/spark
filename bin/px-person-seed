@@ -16,7 +16,12 @@
 set -euo pipefail
 source "$(dirname "$0")/px-env"
 
-exec /usr/bin/python3 - "$@" <<'PY'
+# `python`, not a hardcoded /usr/bin/python3: px-env has already activated the
+# project venv when one exists (Pi and dev machines), and in CI the suite's own
+# interpreter is the only one that has this module's deps (filelock) installed —
+# the system python3 on GitHub's runner images sometimes does and sometimes
+# doesn't, which made the seed-CLI tests fail per-runner-image.
+exec python - "$@" <<'PY'
 import argparse
 import json
 import sys
