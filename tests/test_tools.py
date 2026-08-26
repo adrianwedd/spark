@@ -990,7 +990,13 @@ def test_tool_repair_does_not_clear_quiet_mode(isolated_project):
     stdout = run_tool(["bin/tool-repair"], env)
     payload = parse_json(stdout)
     assert payload["status"] == "ok"
-    assert json.loads(session_path.read_text())["spark_quiet_mode"] is True
+    # Quiet mode must remain EFFECTIVE. The on-disk shape may change: since
+    # #303 the tool's session write one-shot-migrates the seeded legacy bool
+    # into canonical quiet_state, so assert via resolve(), not the raw key.
+    from pxh import quiet_mode
+    session = json.loads(session_path.read_text())
+    assert quiet_mode.resolve(session, now=time.time()) is True
+    assert session["quiet_state"]["enabled"] is True
 
 
 def test_tool_breathe_simple_dry(isolated_project):

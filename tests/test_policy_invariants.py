@@ -634,6 +634,7 @@ import json as _json
 import os as _os
 import time as _time
 
+from pxh import quiet_mode as _quiet_mode
 from pxh import wake_grant
 
 
@@ -1052,8 +1053,14 @@ def test_hey_spark_during_quiet_mode_speaks_and_quiet_mode_remains_set(sink, tmp
                           **{wake_grant.GRANT_DIR_ENV: str(d)})
     assert payload["status"] == "ok"
     assert spoke is True
+    # The invariant is that quiet mode remains EFFECTIVE — speaking through a
+    # grant must not clear it. The on-disk shape is allowed to change: since
+    # #303, tool-voice's own session write one-shot-migrates a legacy-only
+    # bool into canonical quiet_state, so assert via resolve(), the single
+    # derivation, rather than the retired raw key.
     session_after = _json.loads((tmp_path / "state" / "session.json").read_text())
-    assert session_after["spark_quiet_mode"] is True
+    assert _quiet_mode.resolve(session_after, now=_time.time()) is True
+    assert session_after["quiet_state"]["enabled"] is True
 
 
 def test_an_expired_grant_is_silent_again(sink, tmp_path):

@@ -178,10 +178,12 @@ def default_state() -> Dict[str, Any]:
         "obi_mood": None,
         "obi_streak": 0,
         "obi_story_lines": [],
-        # spark_quiet_mode is derived at read time from quiet_state (#209) —
-        # kept so every pre-existing reader (policy.py, ~30 tests) still sees
-        # a plain bool without needing to know quiet_state exists.
-        "spark_quiet_mode": False,
+        # spark_quiet_mode is deliberately NOT here (#303). It is a read-time
+        # compatibility field — _with_resolved_quiet_mode() injects it into
+        # every loaded dict, so readers (policy.py, ~30 tests) still see a
+        # plain bool — but it must never exist as a durable default: a
+        # persisted copy is exactly the legacy-only shape whose one-shot
+        # migration _persist_canonical_quiet() exists to retire.
         "quiet_state": None,
         "history": [],
     }
@@ -230,6 +232,62 @@ def _with_resolved_quiet_mode(data: Dict[str, Any]) -> Dict[str, Any]:
     return data
 
 
+def _persist_canonical_quiet(data: Dict[str, Any]) -> None:
+    """One-shot durable retirement of legacy quiet-mode authority (#303).
+
+    Called under the session lock immediately before every persist
+    (`update_session`, `save_session`), so whichever write happens first
+    after this code deploys converts a legacy-only file to the canonical
+    shape — after that, `quiet_state` is the sole durable source of truth
+    and the naked `spark_quiet_mode` bool can never independently latch
+    quiet mode again.
+
+    Three mutually exclusive cases, mirroring `quiet_mode.migrate_legacy`'s
+    read-time precedence exactly so a file resolves identically before and
+    after its migration write:
+
+    1. Legacy-only shape (`spark_quiet_mode` present, `quiet_state`
+       absent/null): import the bool once, conservatively —
+       `quiet_mode.migration_record()` (`source="unknown"`,
+       `reason="legacy_migration"`, nothing fabricated) — drop the legacy
+       key, and append a `quiet_mode_migrated` history entry so the ring
+       records that the conversion happened and when.
+    2. Canonical state already exists (well-formed `quiet_state`): drop any
+       stray `spark_quiet_mode` sitting next to it. Precedence already
+       ignores it; removing it keeps disk single-source. No history noise —
+       nothing observable changed.
+    3. `quiet_state` present but malformed: touch *nothing*. The garbage
+       keeps failing closed at read time and stays on disk as evidence of
+       what wrote it. (The legacy key, if any, is also left alone here so
+       the file is byte-identical to what the forensics would want to see.)
+
+    Mutates `data` in place except `history`, which is re-bound to a copy
+    before appending — `save_session` hands this a shallow copy of a
+    caller's dict, and appending into a shared list would mutate state the
+    caller still holds.
+    """
+    if quiet_mode.needs_migration(data):
+        record = quiet_mode.migration_record(data)
+        data[quiet_mode.QUIET_STATE_KEY] = record
+        data.pop(quiet_mode.LEGACY_KEY, None)
+        history = list(data.get("history") or [])
+        history.append({
+            "ts": utc_timestamp(),
+            "event": "quiet_mode_migrated",
+            "source": record["source"],
+            "reason": record["reason"],
+            "enabled": record["enabled"],
+        })
+        data["history"] = history
+        log_event("state-quiet-migration", {
+            "enabled": record["enabled"],
+            "source": record["source"],
+            "reason": record["reason"],
+        })
+    elif quiet_mode.has_canonical_state(data):
+        data.pop(quiet_mode.LEGACY_KEY, None)
+
+
 def load_session() -> Dict[str, Any]:
     path = ensure_session()
     lock_path = str(path) + ".lock"
@@ -266,9 +324,19 @@ def load_session_readonly() -> Dict[str, Any]:
 
 
 def save_session(data: Dict[str, Any]) -> None:
+    """Persist a whole session dict.
+
+    Goes through `_persist_canonical_quiet` like every other write (#303):
+    a caller that round-trips `load_session()` -> `save_session()` would
+    otherwise persist the read-time-injected `spark_quiet_mode` back to
+    disk, quietly recreating the legacy shape this module retires. Works on
+    a shallow copy so the caller's dict is not mutated.
+    """
     path = ensure_session()
     lock_path = str(path) + ".lock"
     with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+        data = dict(data)
+        _persist_canonical_quiet(data)
         atomic_write(path, json.dumps(data, indent=2) + "\n")
 
 
@@ -288,7 +356,21 @@ def update_session(
     `remove_fields`, if given, deletes those keys from `data` after `fields`
     is merged in — the only way to retire a persisted key (e.g. a legacy
     field superseded by a newer one) rather than just overwrite its value.
+
+    `spark_quiet_mode` is refused as a field (#303): it is derived
+    compatibility output, and a caller that could persist it directly would
+    be a quiet-mode writer with no provenance — the exact writer class #285
+    retired. Route through `set_quiet_mode()`/`clear_quiet_mode()`. The
+    stray key is dropped with a warning rather than raising because this
+    sits under daemons, and a refused write must not become a crash loop.
     """
+    if fields and quiet_mode.LEGACY_KEY in fields:
+        _log.warning(
+            "update_session: ignoring direct %s write — quiet mode is only "
+            "writable via set_quiet_mode()/clear_quiet_mode() (#303)",
+            quiet_mode.LEGACY_KEY,
+        )
+        fields = {k: v for k, v in fields.items() if k != quiet_mode.LEGACY_KEY}
     # Call ensure_session BEFORE acquiring the lock — ensure_session acquires
     # the same lock internally and FileLock is not reentrant.
     path = ensure_session()
@@ -312,12 +394,17 @@ def update_session(
         if remove_fields:
             for key in remove_fields:
                 data.pop(key, None)
+        # After the caller's merge, so set_quiet_mode's own write (which
+        # brings quiet_state in via `fields`) never reads as a legacy-only
+        # shape and never logs a spurious migration entry.
+        _persist_canonical_quiet(data)
         if history_entry:
             entry = {"ts": utc_timestamp(), **history_entry}
             history = data.setdefault("history", [])
             history.append(entry)
-            if len(history) > history_limit:
-                data["history"] = history[-history_limit:]
+        history = data.get("history")
+        if isinstance(history, list) and len(history) > history_limit:
+            data["history"] = history[-history_limit:]
 
         atomic_write(path, json.dumps(data, indent=2) + "\n")
         return data

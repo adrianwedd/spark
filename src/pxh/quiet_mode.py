@@ -24,6 +24,15 @@ time (see `resolve()`) — nothing here ever writes back when a window has
 lapsed, so there is no sweeper to keep alive and no write path hidden inside
 what callers expect to be a read.
 
+The legacy-bool fallback in `migrate_legacy()` (case 3) is migration-era
+compatibility, not a standing contract (#303): `pxh.state` runs a one-shot
+*durable* migration (`state._persist_canonical_quiet`, via
+`needs_migration()`/`migration_record()` here) under the session lock on
+every persist, so the first write after deploy converts a legacy-only file
+to canonical `quiet_state` and the naked bool disappears from disk. The
+read-time fallback remains only for files no write has touched yet — e.g. a
+`load_session_readonly()` of a not-yet-migrated file, which cannot write.
+
 Byte-level session.json corruption (a JSON-decode failure) is `pxh.state`'s
 concern and #208's, not this module's: by the time data reaches
 `migrate_legacy()`/`resolve()`, `json.loads()` has already succeeded, so
@@ -45,6 +54,7 @@ LEGACY_KEY = "spark_quiet_mode"
 
 SOURCE_UNKNOWN = "unknown"
 SOURCE_MALFORMED = "malformed_fallback"
+REASON_LEGACY_MIGRATION = "legacy_migration"
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -137,6 +147,57 @@ def migrate_legacy(data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     return new_state(enabled=data.get(LEGACY_KEY) is True, source=SOURCE_UNKNOWN)
+
+
+def needs_migration(data: Dict[str, Any]) -> bool:
+    """True iff `data` still carries legacy-only quiet authority (#303).
+
+    That shape is a `spark_quiet_mode` key with no structured `quiet_state`
+    at all (missing key, or explicit JSON `null` — both are the "never
+    written" claim). It is precisely the shape `migrate_legacy()`'s case 3
+    resolves at read time, and read-time-only migration is the trap #303
+    closes: a file that only ever gets *read* keeps the naked bool as
+    perpetual authority forever. `state.py` calls this under the session
+    lock on every persist and, when true, writes `migration_record()` once.
+
+    Deliberately False when `quiet_state` is present-but-malformed: garbage
+    keeps failing closed at read time (`migrate_legacy` case 2) and stays on
+    disk as evidence of what wrote it — a durable migration must not launder
+    it into a tidy record. Also False when neither key exists: there is no
+    legacy authority to import, and inventing a record for a session that
+    never had one would be fabricated provenance.
+    """
+    return data.get(QUIET_STATE_KEY) is None and LEGACY_KEY in data
+
+
+def migration_record(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The one-shot conservative import of a legacy bool (#303). Pure.
+
+    `spark_quiet_mode is True` -> `enabled=True`; anything else ->
+    `enabled=False` — the same strict-identity reading as `migrate_legacy`.
+    Provenance is never fabricated beyond `source="unknown"`: no `set_at`
+    (nobody recorded when the bool was written) and no `expires_at` (the
+    legacy shape had no TTL, and inventing one would auto-clear a latch
+    whose origin — possibly a real Three S's meltdown protocol — is exactly
+    what we don't know). `reason="legacy_migration"` is what makes the
+    record operator-legible: a `px-brain-status`-style reader can say "still
+    quiet, origin unknown, imported from the pre-#285 bool" instead of
+    showing a naked True.
+    """
+    return new_state(
+        enabled=data.get(LEGACY_KEY) is True,
+        source=SOURCE_UNKNOWN,
+        reason=REASON_LEGACY_MIGRATION,
+    )
+
+
+def has_canonical_state(data: Dict[str, Any]) -> bool:
+    """True iff a well-formed structured `quiet_state` record exists —
+    the condition under which the legacy key is dead weight: precedence
+    rule 1 in `migrate_legacy` already ignores it, so a persist path may
+    drop it from disk without changing anything a reader can observe.
+    """
+    return _well_formed(data.get(QUIET_STATE_KEY))
 
 
 def resolve(data: Dict[str, Any], *, now: float) -> bool:

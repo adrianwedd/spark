@@ -252,3 +252,92 @@ def test_new_state_does_not_read_or_touch_any_session_dict():
     assert state["reason"] is None
     assert state["set_at"] is None
     assert state["expires_at"] is None
+
+
+# --- one-shot durable migration helpers (#303) ---------------------------
+#
+# These are the pure halves of state._persist_canonical_quiet(); the
+# write-path pins (file actually converted, exactly once, under the lock)
+# live in tests/test_state.py.
+
+
+def test_needs_migration_true_for_legacy_only_shape():
+    assert quiet_mode.needs_migration({"spark_quiet_mode": True}) is True
+    assert quiet_mode.needs_migration({"spark_quiet_mode": False}) is True
+
+
+def test_needs_migration_true_when_quiet_state_is_explicit_null():
+    # JSON null and a missing key are the same "never written" claim —
+    # default_state() historically wrote quiet_state: null next to the bool.
+    assert quiet_mode.needs_migration(
+        {"spark_quiet_mode": True, "quiet_state": None}
+    ) is True
+
+
+def test_needs_migration_false_without_a_legacy_key():
+    # Nothing to import — inventing a record here would be fabricated
+    # provenance for a session that never had legacy authority.
+    assert quiet_mode.needs_migration({}) is False
+    assert quiet_mode.needs_migration({"quiet_state": None}) is False
+
+
+def test_needs_migration_false_once_canonical_state_exists():
+    data = {
+        "spark_quiet_mode": True,
+        "quiet_state": {"enabled": False, "source": "tool_quiet"},
+    }
+    assert quiet_mode.needs_migration(data) is False
+
+
+def test_needs_migration_false_for_malformed_quiet_state():
+    # Garbage must stay on disk as evidence and keep failing closed at read
+    # time — a durable migration must not launder it into a tidy record.
+    data = {"spark_quiet_mode": False, "quiet_state": {"enabled": "yes"}}
+    assert quiet_mode.needs_migration(data) is False
+    assert quiet_mode.resolve(data, now=0.0) is True  # still fails closed
+
+
+def test_migration_record_imports_legacy_true_conservatively():
+    record = quiet_mode.migration_record({"spark_quiet_mode": True})
+    assert record["enabled"] is True
+    assert record["source"] == quiet_mode.SOURCE_UNKNOWN
+    assert record["reason"] == quiet_mode.REASON_LEGACY_MIGRATION
+    # Nothing fabricated: no set_at (nobody recorded when), no expires_at
+    # (the legacy shape had no TTL — inventing one would auto-clear a latch
+    # whose origin is exactly what we don't know).
+    assert record["set_at"] is None
+    assert record["expires_at"] is None
+
+
+def test_migration_record_imports_legacy_false_as_disabled():
+    record = quiet_mode.migration_record({"spark_quiet_mode": False})
+    assert record["enabled"] is False
+    assert record["source"] == quiet_mode.SOURCE_UNKNOWN
+    assert record["reason"] == quiet_mode.REASON_LEGACY_MIGRATION
+
+
+def test_migration_record_strict_identity_on_the_legacy_bool():
+    # Same `is True` discipline as migrate_legacy — a stray "true"/1 does
+    # not count as a real toggle, so it imports as disabled.
+    assert quiet_mode.migration_record({"spark_quiet_mode": "true"})["enabled"] is False
+    assert quiet_mode.migration_record({"spark_quiet_mode": 1})["enabled"] is False
+
+
+def test_migration_preserves_read_time_resolution():
+    # A file must resolve identically before and after its migration write —
+    # the migration changes the shape, never the effective answer.
+    for legacy in (True, False, "true", None):
+        data = {"spark_quiet_mode": legacy} if legacy is not None else {}
+        before = quiet_mode.resolve(data, now=12345.0)
+        migrated = {"quiet_state": quiet_mode.migration_record(data)}
+        assert quiet_mode.resolve(migrated, now=12345.0) is before
+
+
+def test_has_canonical_state_only_for_well_formed_records():
+    assert quiet_mode.has_canonical_state(
+        {"quiet_state": {"enabled": True, "source": "x"}}
+    ) is True
+    assert quiet_mode.has_canonical_state({"quiet_state": None}) is False
+    assert quiet_mode.has_canonical_state({}) is False
+    assert quiet_mode.has_canonical_state({"quiet_state": {"enabled": "yes"}}) is False
+    assert quiet_mode.has_canonical_state({"quiet_state": True}) is False
