@@ -288,6 +288,44 @@ def _persist_canonical_quiet(data: Dict[str, Any]) -> None:
         data.pop(quiet_mode.LEGACY_KEY, None)
 
 
+# A session manufactured from defaults after byte-level corruption is not
+# authoritative (#208): the healed file is *well-formed*, so downstream code
+# cannot tell it from a session someone actually wrote — and a clean default
+# carries quiet_state absent, i.e. "quiet mode off", a permissive claim with
+# no evidence behind it. Every heal therefore stamps this key into both the
+# returned dict and the healed file on disk, and policy reads treat its
+# presence as "the session could not be established" (fail closed — see
+# policy_context.load_session_for_policy). The next ordinary session write
+# clears it: the system asserting state again is what ends the recovery
+# window, so a one-off corruption cannot become a permanent mute. The
+# .corrupt.<ts> backup remains the forensic evidence either way.
+RECOVERED_KEY = "recovered_from_corruption"
+
+
+def _heal_corrupt_session(path: Path) -> Dict[str, Any]:
+    """Back up a corrupt session, write defaults stamped with RECOVERED_KEY.
+
+    Caller holds the session lock and has already failed to parse `path`.
+    """
+    _log.warning("session.json corrupt — resetting to defaults: %s", path)
+    corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
+    try:
+        path.rename(corrupt_backup)
+        _log.warning("corrupt session backed up to %s", corrupt_backup)
+    except OSError:
+        pass
+    _trim_corrupt_backups(path, keep=3)
+    data = default_state()
+    data[RECOVERED_KEY] = {"ts": utc_timestamp(), "backup": corrupt_backup.name}
+    log_event("state-corruption", {
+        "path": str(path),
+        "backup": corrupt_backup.name,
+        "message": "session.json was corrupt; reset to default state",
+    })
+    atomic_write(path, json.dumps(data, indent=2) + "\n")
+    return data
+
+
 def load_session() -> Dict[str, Any]:
     path = ensure_session()
     lock_path = str(path) + ".lock"
@@ -295,16 +333,7 @@ def load_session() -> Dict[str, Any]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            _log.warning("session.json corrupt — resetting to defaults: %s", path)
-            corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
-            try:
-                path.rename(corrupt_backup)
-                _log.warning("corrupt session backed up to %s", corrupt_backup)
-            except OSError:
-                pass
-            _trim_corrupt_backups(path, keep=3)
-            data = default_state()
-            atomic_write(path, json.dumps(data, indent=2) + "\n")
+            data = _heal_corrupt_session(path)
         return _with_resolved_quiet_mode(data)
 
 
@@ -336,6 +365,9 @@ def save_session(data: Dict[str, Any]) -> None:
     lock_path = str(path) + ".lock"
     with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
         data = dict(data)
+        # A caller round-tripping a recovered session writes deliberate state;
+        # the recovery taint must not be re-persisted with it (#208).
+        data.pop(RECOVERED_KEY, None)
         _persist_canonical_quiet(data)
         atomic_write(path, json.dumps(data, indent=2) + "\n")
 
@@ -376,16 +408,18 @@ def update_session(
     path = ensure_session()
     lock_path = str(path) + ".lock"
     with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+        just_recovered = False
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            data = default_state()
-            corrupt_backup = path.parent / (path.name + f".corrupt.{int(time.time())}")
-            try:
-                path.rename(corrupt_backup)
-            except OSError:
-                pass
-            log_event("state-corruption", {"path": str(path), "message": "session.json was corrupt; reset to default state"})
+            data = _heal_corrupt_session(path)
+            just_recovered = True
+        # An ordinary write ends the recovery window (#208): the system is
+        # asserting session state again, so the manufactured-defaults taint
+        # stops describing the file. The write that *performs* the heal keeps
+        # the stamp — it is part of the recovery, not evidence of health.
+        if not just_recovered:
+            data.pop(RECOVERED_KEY, None)
 
         if history_entry_fn is not None:
             history_entry = history_entry_fn(data)

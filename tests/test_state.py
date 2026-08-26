@@ -471,3 +471,65 @@ def test_default_state_has_no_legacy_quiet_key(tmp_path, monkeypatch):
     assert "spark_quiet_mode" not in raw
     events = [e for e in raw.get("history", []) if e.get("event") == "quiet_mode_migrated"]
     assert events == []  # fresh sessions have nothing to migrate
+
+
+# --- #208: a session recovered from corruption is not authoritative ---------
+
+def test_load_session_stamps_recovery_and_persists_it(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    session_file.write_text('{"quiet_state": {"enabled": true, ')  # truncated
+
+    data = state.load_session()
+    assert data[state.RECOVERED_KEY]
+
+    # Durable: a second read still reports the recovery, so a different
+    # process asking later cannot mistake the healed default for the truth.
+    again = state.load_session()
+    assert again[state.RECOVERED_KEY]
+
+    # Evidence preserved.
+    backups = list(tmp_path.glob("session.json.corrupt.*"))
+    assert backups and '"quiet_state"' in backups[0].read_text()
+
+
+def test_update_session_recovery_keeps_the_stamp_on_the_healing_write(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    session_file.write_text("not json at all")
+
+    data = state.update_session(fields={"last_action": "x"})
+    assert data[state.RECOVERED_KEY]
+    raw = json.loads(session_file.read_text())
+    assert raw[state.RECOVERED_KEY]
+
+
+def test_an_ordinary_write_ends_the_recovery_window(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    session_file.write_text("{{{")
+    assert state.load_session()[state.RECOVERED_KEY]
+
+    state.update_session(fields={"last_action": "x"})
+    raw = json.loads(session_file.read_text())
+    assert state.RECOVERED_KEY not in raw
+    assert state.RECOVERED_KEY not in state.load_session()
+
+
+def test_save_session_does_not_repersist_the_recovery_stamp(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    session_file.write_text("][")
+    data = state.load_session()
+    assert data[state.RECOVERED_KEY]
+
+    state.save_session(data)
+    raw = json.loads(session_file.read_text())
+    assert state.RECOVERED_KEY not in raw
+
+
+def test_a_clean_session_never_carries_the_stamp(tmp_path, monkeypatch):
+    session_file = tmp_path / "session.json"
+    monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
+    state.save_session({"history": []})
+    assert state.RECOVERED_KEY not in state.load_session()

@@ -529,6 +529,54 @@ def test_direct_tool_voice_speaks_when_the_session_reads_empty(sink):
     assert spoke is True
 
 
+def test_direct_tool_voice_is_silent_after_session_recovery_from_corruption(sink, tmp_path):
+    """#208 acceptance: quiet mode was on, then the session file was corrupted
+    (truncated mid-write). load_session() self-heals to a *well-formed*
+    default — no quiet flag, no decode error — which used to arrive at the
+    policy loader as a clean 'not quiet'. The heal now stamps the session as
+    recovered, the loader maps that to available=False, and rule 0 suppresses:
+    a session manufactured from defaults is not evidence the dysregulation
+    protocol is off. The canary proves the silence.
+    """
+    session = tmp_path / "state" / "session.json"
+    session.write_text('{"quiet_state": {"enabled": true, "source": "obi", ')
+    payload, spoke = sink()
+    assert spoke is False, "audio reached the player on a recovered session"
+    assert payload is not None, "the sink died instead of suppressing"
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "session_unavailable"
+
+    # The recovery stamp is durable until something writes the session, so a
+    # second turn straight after the heal is still silent — the healed default
+    # on disk does not read as permission either.
+    payload, spoke = sink()
+    assert payload["status"] == "suppressed"
+    assert payload["reason"] == "session_unavailable"
+    assert spoke is False
+
+    # Recovery evidence preserved: the corrupt bytes are backed up, never
+    # destroyed, and the healed file says what happened to it.
+    backups = list((tmp_path / "state").glob("session.json.corrupt.*"))
+    assert backups, "the corrupt session must be backed up, not discarded"
+    assert '"quiet_state"' in backups[0].read_text()
+
+    # An ordinary session write ends the recovery window: this is one
+    # suppressed stretch, not a permanent mute.
+    from pxh import state as _state
+    prev = _os.environ.get("PX_SESSION_PATH")
+    _os.environ["PX_SESSION_PATH"] = str(session)
+    try:
+        _state.update_session(fields={"last_action": "test"})
+    finally:
+        if prev is None:
+            _os.environ.pop("PX_SESSION_PATH", None)
+        else:
+            _os.environ["PX_SESSION_PATH"] = prev
+    payload, spoke = sink()
+    assert payload["status"] == "ok"
+    assert spoke is True
+
+
 # ---------------------------------------------------------------------------
 # The audio-producer inventory.
 #

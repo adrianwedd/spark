@@ -50,7 +50,7 @@ from typing import Any, Dict
 from filelock import Timeout as FileLockTimeout
 
 from pxh import policy, wake_grant
-from pxh.state import load_session
+from pxh.state import RECOVERED_KEY, load_session
 
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
 
@@ -88,14 +88,25 @@ def load_session_for_policy(*, warn_prefix: str = "[policy]") -> SessionRead:
     stdout as JSON. Every failure is announced on stderr rather than swallowed
     silently, so "SPARK went quiet" is never a mystery.
 
-    One residual, on the record: pxh.state.load_session() self-heals a corrupt
-    session by backing it up and returning defaults, so corruption arrives here
-    as a successful read of a session with no quiet flag. That is state.py's
-    behaviour and predates this module; closing it means changing what
-    load_session() promises, not what this function catches.
+    pxh.state.load_session() self-heals a corrupt session by backing it up and
+    returning defaults — a *well-formed* dict, which used to arrive here as a
+    successful read of a session with no quiet flag: the permissive answer
+    manufactured one layer further in (#208). The heal now stamps
+    state.RECOVERED_KEY into the healed session, and this loader maps its
+    presence to `available=False`: a session manufactured from defaults is not
+    evidence that quiet mode is off, so rule 0 suppresses exactly as it does
+    for a read that failed outright. The next ordinary session write clears
+    the stamp, so a one-off corruption is one suppressed window, not a
+    permanent mute.
     """
     try:
-        return SessionRead(dict(load_session() or {}), available=True)
+        data = dict(load_session() or {})
+        if data.get(RECOVERED_KEY):
+            print(f"{warn_prefix} policy: session was recovered from "
+                  f"corruption — quiet mode indeterminate, audio suppressed "
+                  f"until the next session write", file=sys.stderr)
+            return SessionRead({}, available=False)
+        return SessionRead(data, available=True)
     except FileLockTimeout as exc:
         reason = f"session lock contended ({exc})"
     except Exception as exc:  # noqa: BLE001 — see docstring; cannot permit
