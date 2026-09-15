@@ -1387,7 +1387,7 @@ _PUBLIC_CHAT_ENV_ALLOWLIST = {
 
 async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
                               kind: str = "public_chat") -> str:
-    """Answer a chat turn on the pinned M5 model, with no tool envelope.
+    """Answer a chat turn on the pinned cognition model, with no tool envelope.
 
     `public_chat` and `obi_chat` have been classified as io kinds in brain.py
     since the brain was built — deadlines, session routing, the lot. This
@@ -1415,7 +1415,7 @@ async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
                        timeout_s=float(_PUBLIC_CHAT_TIMEOUT_S)),
     )
     if result.status != "available":
-        raise RuntimeError(f"M5 unavailable for {kind}: {result.status}")
+        raise RuntimeError(f"cognition tier unavailable for {kind}: {result.status}")
     return result.response
 
 

@@ -15,6 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
@@ -507,11 +508,31 @@ def section_services() -> list[str]:
     return out
 
 
+def _cognition_endpoint() -> tuple[str, int]:
+    """Host and port of the cognition tier's endpoint.
+
+    Since #308 the tier is Ollama Cloud over TLS, not a daemon on the LAN, so
+    the old hardcoded `M5:11434` would report a machine SPARK no longer needs
+    as a dependency. PX_M5_SPARK_HOST is honoured when it is set — px-motd runs
+    from PAM without `.env`, so it usually is not, and the default is what
+    actually gets checked.
+    """
+    raw = os.environ.get("PX_M5_SPARK_HOST", "https://ollama.com").strip() or "https://ollama.com"
+    if "//" not in raw:
+        raw = "//" + raw
+    try:
+        parts = urlsplit(raw)
+        return parts.hostname or "ollama.com", parts.port or 443
+    except ValueError:
+        return "ollama.com", 443
+
+
 def section_connectivity() -> list[str]:
     """Quick TCP checks to external dependencies — parallel."""
     from concurrent.futures import ThreadPoolExecutor
+    cognition_host, cognition_port = _cognition_endpoint()
     checks = [
-        ("M5 Ollama",  "M5",                   11434),
+        ("Ollama",     cognition_host,          cognition_port),
         ("Frigate",    "pi5-hailo.local",       5000),
         ("Home Asst",  "homeassistant.local",   8123),
     ]
