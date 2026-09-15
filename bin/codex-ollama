@@ -39,6 +39,21 @@ def _int_from_env(var: str, default: int | None) -> int | None:
     return value
 
 
+def api_key() -> str:
+    """Bearer token for a hosted endpoint; empty when none is configured.
+
+    `OLLAMA_API_KEY` first — the name the `ollama` CLI itself reads. Then the
+    repo's original `OLLAMA_CLOUD_API_KEY`, which is what the live robot's
+    `.env` actually holds: honouring it means deploying this needs no credential
+    to be copied or renamed.
+    """
+    for var in ("OLLAMA_API_KEY", "OLLAMA_CLOUD_API_KEY"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def main() -> int:
     prompt = sys.stdin.read()
     if not prompt:
@@ -72,7 +87,7 @@ def main() -> int:
     }
     data_bytes = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    key = api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
     request = urllib.request.Request(url, data=data_bytes, headers=headers)
