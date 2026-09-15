@@ -52,8 +52,8 @@ STALE_AFTER_S: dict[str, int] = {
     "px-post": 3600,          # only runs when a postable thought appears
     "px-blog": 86400,         # daily cadence at its most frequent
     # Memory consolidation is nightly like px-blog, but it fires inside a
-    # four-hour window (02:00-06:00 Hobart) rather than at a fixed hour, so two
-    # perfectly healthy runs can sit ~28h apart (02:00 one night, 05:59 the
+    # window (03:00-06:00 Hobart, #310) rather than at a fixed hour, so two
+    # perfectly healthy runs can sit ~27h apart (03:00 one night, 05:59 the
     # next). px-blog's 86400 would therefore report a working job as stale most
     # afternoons — the classic way an alarm teaches its reader to ignore it.
     # 30h clears that worst case with ~2h to spare, and a night that produced

@@ -1658,7 +1658,7 @@ def test_consolidation_tick_not_due_launches_nothing(monkeypatch, tmp_path):
     pxh.mind._consolidation_worker = None
     called = []
     monkeypatch.setattr(pxh.mind.spark_memory, "consolidation_due",
-                        lambda *a, **kw: "outside the 02:00-06:00 window")
+                        lambda *a, **kw: "outside the 03:00-06:00 window")
     monkeypatch.setattr(pxh.mind.spark_memory, "maybe_consolidate",
                         lambda dry: called.append(1))
     pxh.mind._consolidation_tick({"persona": "spark"}, dry=False)

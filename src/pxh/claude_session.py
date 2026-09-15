@@ -75,12 +75,20 @@ _TYPE_COOLDOWNS: dict[str, int] = {
     "compose": 14400,      # 4 hours
     "conversation": 900,   # 15 min
     "blog": 1800,          # 30 min
-    # 40 min, matching memory.RETRY_SPACING_S (#291). It was 20 hours, which
-    # meant the *first* attempt of a night consumed the only slot the second
-    # one could ever have used: `memory.MAX_ATTEMPTS_PER_DAY` promised two
-    # tries between 02:00 and 06:00 and this made the second structurally
-    # unreachable. 40 min also clears the 30-min global cooldown, so attempt 2
-    # is spaced past it rather than exempted from it.
+    # 40 min (#291). It was 20 hours, which meant the *first* attempt of a
+    # night consumed the only slot the second one could ever have used:
+    # `memory.MAX_ATTEMPTS_PER_DAY` promised two tries between 03:00 and 06:00
+    # and this made the second structurally unreachable. 40 min also clears the
+    # 30-min global cooldown, so attempt 2 is spaced past it rather than
+    # exempted from it.
+    #
+    # Deliberately *shorter* than `memory.RETRY_SPACING_S` (55 min), which is
+    # no longer "matching" it (#310). These measure different intervals: this
+    # one starts when the previous attempt finished, that one when it started.
+    # Setting them equal is the defect that cost nine nights — an attempt that
+    # spent its whole 600s deadline arrived at the retry with 1800s elapsed
+    # here and 2400s elapsed there. The retry is spaced wide enough to cover
+    # both; this stays at the contention bound it was chosen for.
     "consolidate": 2400,
 }
 
@@ -124,6 +132,43 @@ def _load_session_log() -> list[dict]:
         except json.JSONDecodeError:
             continue
     return entries
+
+
+def _answered(entry: dict) -> bool:
+    """True if this entry records a session the resident model actually answered.
+
+    `_log_session` writes exactly two shapes: rc=0/`success` once the session
+    answered, and rc=1/`brain_unavailable` when it never did — no session, no
+    validated marker, a mailbox that would not take the request, an injection
+    that did not land, or an injected request the session never answered before
+    its deadline. Only the first is spend.
+
+    Reading the second as if it were spend is #310's third defect. On
+    2026-09-15 02:32:10 `research` logged rc=1 while the brain was down for
+    every caller, and that one entry refused `consolidate` its own 02:41 retry
+    with "global cooldown (554s / 1800s)" — a component that could not have
+    contended for the Pi locking out every other component for half an hour.
+    It compounds, too: on an outage night every failing component writes one of
+    these, and each re-arms the cooldown for the next, so the components
+    serialise each other through a gate none of them can satisfy.
+
+    A missing `returncode` counts as answered. Entries predate the field only
+    in theory, and the safe direction on an unknown shape is to keep the
+    cooldown the old code applied rather than to widen a gate on a parse
+    failure.
+    """
+    return entry.get("returncode", 0) == 0
+
+
+def _latest_ts(entries: list[dict]) -> dt.datetime | None:
+    """The newest parsable `ts` in `entries` (oldest-first), or None."""
+    for entry in reversed(entries):
+        ts_str = entry.get("ts", "")
+        try:
+            return dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _today_entries(entries: list[dict]) -> list[dict]:
@@ -171,37 +216,27 @@ def check_budget(session_type: str) -> str | None:
     if len(type_today) >= quota:
         return f"{session_type} quota reached ({len(type_today)}/{quota})"
 
-    # Global cooldown (except self_debug)
-    if session_type not in _GLOBAL_COOLDOWN_EXEMPT and entries:
-        latest_ts = None
-        for e in reversed(entries):
-            ts_str = e.get("ts", "")
-            try:
-                latest_ts = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                break
-            except (ValueError, TypeError):
-                continue
+    # Global cooldown (except self_debug). Only an *answered* session arms it;
+    # see `_answered` for why an rc=1 entry must not (#310's third defect).
+    if session_type not in _GLOBAL_COOLDOWN_EXEMPT:
+        latest_ts = _latest_ts([e for e in entries if _answered(e)])
         if latest_ts:
             elapsed = (dt.datetime.now(dt.timezone.utc) - latest_ts).total_seconds()
             if elapsed < COOLDOWN_S:
                 return f"global cooldown ({int(elapsed)}s / {COOLDOWN_S}s)"
 
-    # Per-type cooldown
+    # Per-type cooldown. Deliberately *not* filtered by `_answered`: this one
+    # bounds how often a kind may reach for the model at all, and a kind that
+    # fails on its own schedule should not get to retry sooner because the
+    # failure spent nothing. `memory.RETRY_SPACING_S` is raised to clear it
+    # rather than this being weakened to accommodate the retry (#310).
     type_cooldown = _TYPE_COOLDOWNS.get(session_type, COOLDOWN_S)
     type_entries = [e for e in entries if e.get("type") == session_type]
-    if type_entries:
-        latest_ts = None
-        for e in reversed(type_entries):
-            ts_str = e.get("ts", "")
-            try:
-                latest_ts = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                break
-            except (ValueError, TypeError):
-                continue
-        if latest_ts:
-            elapsed = (dt.datetime.now(dt.timezone.utc) - latest_ts).total_seconds()
-            if elapsed < type_cooldown:
-                return f"{session_type} cooldown ({int(elapsed)}s / {type_cooldown}s)"
+    latest_ts = _latest_ts(type_entries)
+    if latest_ts:
+        elapsed = (dt.datetime.now(dt.timezone.utc) - latest_ts).total_seconds()
+        if elapsed < type_cooldown:
+            return f"{session_type} cooldown ({int(elapsed)}s / {type_cooldown}s)"
 
     return None
 

@@ -247,7 +247,7 @@ Three-layer architecture:
   `state/thoughts.jsonl` only after a valid response.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. **Redaction is a property of the record, not of a call site.** `mind.redact_private_dm()` moves the private text off `thought["thought"]` (replacing it with `mind.PRIVATE_DM_PLACEHOLDER`) the moment the thought exists, onto `PRIVATE_DM_TEXT_KEY` — an in-process delivery field that `without_private_dm_text()` strips from every persistence path and that exactly one consumer reads (`_emit_message_obi`). It is applied twice, idempotently: at record creation in `reflection()` and again at the dispatch boundary in `expression()`, so a record built by anything else is still safe. This shape exists because the previous one — a `display_text` local used only for the thoughts-file write — leaked the raw DM into session history, and from there into the voice-loop prompt (GREMLIN/VIXEN included), the awareness conversation digest, the reflection prompt and `GET /api/v1/session`. **Do not reintroduce a sink that reads `thought["thought"]` expecting raw text.** Pinned by `tests/test_message_obi_redaction.py`.
-- **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day ≥40min apart, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. **Runs on a background daemon thread with an identity-keyed job marker (`state/consolidation_job.json`), never inline on the tick** — see the health section. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
+- **Memory consolidation**: nightly Haiku pass (03:00–06:00 Hobart, ≤2 attempts/day ≥55min apart, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. **Runs on a background daemon thread with an identity-keyed job marker (`state/consolidation_job.json`), never inline on the tick** — see the health section. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
 
 **Critical gotchas:**
 - All time-of-day logic uses `ZoneInfo("Australia/Hobart")` — never hardcoded UTC offsets
@@ -320,6 +320,14 @@ second nightly attempt can actually be spent (#291). 40min also clears the
 30-min global cooldown, so the retry is *spaced past* it rather than exempted
 from it.
 
+**The retry gap is `memory.RETRY_SPACING_S` (55min), not the 40min cooldown
+(#310).** They measure different intervals — the cooldown starts when an attempt
+*finished*, the spacing when it *started* — and setting them equal is what cost
+nine nights of memory: an attempt that spent its whole 600s deadline left the
+retry 1800s into a 2400s cooldown, so it was refused on exactly the nights the
+first attempt was slow. The spacing has to cover the cooldown *plus* the attempt
+that precedes it.
+
 **Deadlines are declared once, in `brain._DEADLINE_S`, and `timeout=` on
 `run_claude_session` defaults to `None` so that table is what reaches
 `ask_brain`.** Pass a number only when you mean to override the kind's declared
@@ -331,7 +339,10 @@ success took 30–65s. Callers still passing ad-hoc values for classified kinds
 `bin/tool-compose`, `bin/tool-blog` passing 300, which matches) are redundant at
 best and drift at worst.
 
-Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
+Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap.
+Only a session the model actually *answered* arms that cooldown: an rc=1
+`brain_unavailable` entry is a record that nothing was spent, and letting it
+lock out every other component for 30 minutes is #310's third defect. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
 
 ### The Brain — persistent Claude session (`src/pxh/brain.py`)
 

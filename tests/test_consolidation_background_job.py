@@ -12,6 +12,12 @@ section here:
 3. **Attempt 2 could not be spent.** `MAX_ATTEMPTS_PER_DAY` promised two tries
    a night while the `consolidate` quota was 1 and its type cooldown 20 hours.
 
+Section 4 is #310, where three more defects kept the pass failing for nine
+nights — attempt 1 landed inside the brain's own nightly recycle, the retry
+spacing was measured against the wrong end of attempt 1, and a `research`
+failure that spent nothing armed the global cooldown against everyone — plus
+the attempt number, which logged one too high all along.
+
 Inert by construction: no service is touched, no tmux session is reached, no
 Claude call is made, and every duration in here is synthetic — a "600s"
 deadline is asserted as a *plumbed number*, never waited for. The one real
@@ -442,15 +448,15 @@ def test_retry_spacing_clears_the_global_cooldown():
     assert memory.RETRY_SPACING_S > claude_session.COOLDOWN_S
     assert memory.RETRY_SPACING_S >= claude_session._TYPE_COOLDOWNS["consolidate"]
     assert "consolidate" not in claude_session._GLOBAL_COOLDOWN_EXEMPT
-    # Two spaced attempts still fit inside the 02:00-06:00 window.
+    # Two spaced attempts still fit inside the 03:00-06:00 window.
     window_s = (memory.CONSOLIDATION_WINDOW[1]
                 - memory.CONSOLIDATION_WINDOW[0]) * 3600
     assert memory.RETRY_SPACING_S * (memory.MAX_ATTEMPTS_PER_DAY - 1) < window_s
 
 
 def test_a_failed_attempt_one_leaves_attempt_two_reachable(monkeypatch):
-    """The end-to-end gate: fail at 02:00, and 02:40 is a real second attempt."""
-    at2 = dt.datetime(2026, 7, 11, 2, 0, tzinfo=memory.HOBART_TZ)
+    """The end-to-end gate: fail at 03:00, and the spaced retry really runs."""
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=memory.HOBART_TZ)
     calls = []
 
     def _fail(**kw):
@@ -458,11 +464,11 @@ def test_a_failed_attempt_one_leaves_attempt_two_reachable(monkeypatch):
         return {"status": "failed", "error": "brain unavailable"}
 
     monkeypatch.setattr(memory, "consolidate", _fail)
-    assert memory.maybe_consolidate(now=at2)["status"] == "failed"
+    assert memory.maybe_consolidate(now=at3)["status"] == "failed"
     # Immediately after, the spacing gate holds it back...
-    assert memory.consolidation_due(now=at2 + dt.timedelta(minutes=5)) is not None
+    assert memory.consolidation_due(now=at3 + dt.timedelta(minutes=5)) is not None
     # ...and once the gap has passed, attempt 2 really runs.
-    later = at2 + dt.timedelta(seconds=memory.RETRY_SPACING_S)
+    later = at3 + dt.timedelta(seconds=memory.RETRY_SPACING_S)
     assert memory.consolidation_due(now=later) is None
     assert memory.maybe_consolidate(now=later)["status"] == "failed"
     assert len(calls) == 2
@@ -485,31 +491,153 @@ def test_the_budget_gate_admits_attempt_two(monkeypatch, tmp_path):
 
 
 def test_success_marks_the_day_done(monkeypatch):
-    at2 = dt.datetime(2026, 7, 11, 2, 0, tzinfo=memory.HOBART_TZ)
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=memory.HOBART_TZ)
     monkeypatch.setattr(memory, "consolidate",
                         lambda **kw: {"status": "ok", "written": 3})
-    assert memory.maybe_consolidate(now=at2)["status"] == "ok"
-    later = at2 + dt.timedelta(seconds=memory.RETRY_SPACING_S)
+    assert memory.maybe_consolidate(now=at3)["status"] == "ok"
+    later = at3 + dt.timedelta(seconds=memory.RETRY_SPACING_S)
     assert memory.consolidation_due(now=later) == "already done for this date"
 
 
 def test_a_correct_skip_also_marks_the_day_done(monkeypatch):
     # Too few thoughts in 24h is a correct outcome; retrying it at 03:40 would
     # spend a session to reach the same answer.
-    at2 = dt.datetime(2026, 7, 11, 2, 0, tzinfo=memory.HOBART_TZ)
+    at3 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=memory.HOBART_TZ)
     monkeypatch.setattr(memory, "consolidate",
                         lambda **kw: {"status": "skipped", "reason": "3 thoughts"})
-    assert memory.maybe_consolidate(now=at2)["status"] == "skipped"
+    assert memory.maybe_consolidate(now=at3)["status"] == "skipped"
     assert memory.consolidation_due(
-        now=at2 + dt.timedelta(hours=1)) == "already done for this date"
+        now=at3 + dt.timedelta(hours=1)) == "already done for this date"
 
 
-def test_the_window_and_meta_shape_are_unchanged():
-    """The existing contract other code and the operator read."""
-    assert memory.CONSOLIDATION_WINDOW == (2, 6)
+def test_the_window_and_meta_shape_are_what_the_operator_reads():
+    """The contract other code, the health record and the operator read."""
+    assert memory.CONSOLIDATION_WINDOW == (3, 6)
     assert memory.consolidation_due(
         now=dt.datetime(2026, 7, 11, 12, 0, tzinfo=memory.HOBART_TZ)
-    ) == "outside the 02:00-06:00 window"
+    ) == "outside the 03:00-06:00 window"
+    # Built from the constant, so the refusal an operator reads cannot describe
+    # a window the gate no longer applies.
+    assert memory.consolidation_due(
+        now=dt.datetime(2026, 7, 11, 2, 30, tzinfo=memory.HOBART_TZ)
+    ) == "outside the 03:00-06:00 window"
     assert memory.consolidation_meta_file().name == "consolidation_meta.json"
-    at2 = dt.datetime(2026, 7, 11, 2, 30, tzinfo=memory.HOBART_TZ)
-    assert memory.consolidation_due(now=at2) is None
+    at3 = dt.datetime(2026, 7, 11, 3, 30, tzinfo=memory.HOBART_TZ)
+    assert memory.consolidation_due(now=at3) is None
+
+
+# ---------------------------------------------------------------------------
+# 4. The retry survives a night the brain is having (#310)
+#
+# Nine nights of memory were lost to three defects that all lived in the gap
+# between two gates: consolidation's window and the brain's nightly recycle,
+# the retry spacing's clock and the type cooldown's clock, and the global
+# cooldown's reading of an entry that spent nothing. None of these tests calls
+# Claude: every duration is a number the code declares, and the session log is
+# written by hand.
+# ---------------------------------------------------------------------------
+
+def test_the_window_opens_after_the_brains_nightly_recycle():
+    """#310.1: the first attempt raced the brain's own 02:00 recycle.
+
+    A recycle clears the session's validation marker on purpose — that is what
+    makes a caller fall back instead of typing into a session that has just
+    forgotten its identity prompt — so everyone who arrives during the boot
+    that follows is refused *immediately* (`brain_unavailable`, dur=0.0s)
+    rather than timing out. The first attempt landed in that boot on every one
+    of the nine nights measured, and failed on arrival on every one of them.
+
+    Pinned against `NIGHTLY_RECYCLE_HOUR` rather than against "3", so moving
+    the recycle without moving the window fails here instead of on the robot.
+    """
+    from pxh import brain_daemon
+
+    assert memory.CONSOLIDATION_WINDOW[0] * 3600 >= (
+        brain_daemon.NIGHTLY_RECYCLE_HOUR * 3600 + brain.VALIDATION_CEILING_S)
+
+
+def test_retry_spacing_covers_the_cooldown_and_the_attempt_before_it():
+    """#310.2: the spacing gate and the type cooldown measure different things.
+
+    This gate reads attempt 1's *start*; the `consolidate` type cooldown reads
+    its *finish*. So the spacing has to clear the cooldown plus the attempt
+    that sits between the two clocks. "40 minutes clears the global cooldown
+    with ten minutes of margin" assumed attempt 1 ended when it started.
+    """
+    assert memory.RETRY_SPACING_S >= (
+        claude_session._TYPE_COOLDOWNS["consolidate"]
+        + brain._DEADLINE_S["consolidate"])
+
+
+def test_a_slow_first_attempt_still_leaves_the_retry_admissible(monkeypatch, tmp_path):
+    """#310.2, end to end: attempt 1 fails *after* using its whole deadline.
+
+    The entry is built the way the real attempt leaves the log — written at
+    start + 600s, which is exactly the disagreement between the two clocks —
+    and then asked of claude_session's own gate rather than of a restatement of
+    it. Put RETRY_SPACING_S back to 2400 and this returns "consolidate cooldown
+    (1800s / 2400s)", which is the refusal that cost the nine nights.
+    """
+    deadline = brain._DEADLINE_S["consolidate"]
+    started = dt.datetime.now(UTC) - dt.timedelta(seconds=memory.RETRY_SPACING_S)
+    finished = started + dt.timedelta(seconds=deadline)
+    log = tmp_path / "claude_sessions.jsonl"
+    log.write_text(json.dumps({
+        "ts": finished.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "consolidate", "model": "haiku",
+        "duration_s": float(deadline),
+        "returncode": 1, "outcome": "brain_unavailable",
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_session, "SESSION_LOG", log)
+    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", False)
+    assert claude_session.check_budget("consolidate") is None
+
+
+def test_a_failure_that_spent_nothing_does_not_lock_out_the_retry(monkeypatch, tmp_path):
+    """#310.3, the defect that cost 09-15 on its own.
+
+    At 02:32:10 `research` logged rc=1 — the brain was down for every caller —
+    and that entry, which spent nothing, was read as spend and refused
+    `consolidate` the 02:41 retry it had finally been spaced correctly for:
+    "global cooldown (554s / 1800s)".
+    """
+    entry = {
+        "ts": (dt.datetime.now(UTC) - dt.timedelta(seconds=554))
+                .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "type": "research", "model": "haiku", "duration_s": 0.0,
+        "returncode": 1, "outcome": "brain_unavailable",
+    }
+    log = tmp_path / "claude_sessions.jsonl"
+    log.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    monkeypatch.setattr(claude_session, "SESSION_LOG", log)
+    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", False)
+    assert claude_session.check_budget("consolidate") is None
+
+    # The same entry *answered* is a real cooldown. This narrows the gate to
+    # spend; it does not remove it.
+    entry["returncode"], entry["outcome"] = 0, "success"
+    log.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    assert "global cooldown" in claude_session.check_budget("consolidate")
+
+
+def test_the_first_attempt_of_a_night_is_reported_as_the_first(monkeypatch):
+    """#310.4: every night logged its first attempt as "attempt 3/2".
+
+    `next_consolidation_attempt` runs before `maybe_consolidate` resets the
+    attempts for the new Hobart date, so it read the *previous* night's two
+    attempts and added one — 3/2 on the first run of the night, 2/2 on the
+    second, nightly. Reporting only; nothing was gated on it.
+    """
+    night1 = dt.datetime(2026, 7, 11, 3, 0, tzinfo=memory.HOBART_TZ)
+    night2 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=memory.HOBART_TZ)
+    monkeypatch.setattr(memory, "consolidate",
+                        lambda **kw: {"status": "failed", "error": "brain unavailable"})
+    assert memory.next_consolidation_attempt(now=night1) == 1
+    assert memory.maybe_consolidate(now=night1)["status"] == "failed"
+    assert memory.next_consolidation_attempt(now=night1) == 2
+    assert memory.maybe_consolidate(
+        now=night1 + dt.timedelta(seconds=memory.RETRY_SPACING_S))["status"] == "failed"
+    assert memory.next_consolidation_attempt(now=night1) == 3
+    # The rollover is what the cap is keyed to: last night's two are spent.
+    assert memory.next_consolidation_attempt(now=night2) == 1
+    assert memory.maybe_consolidate(now=night2)["status"] == "failed"
