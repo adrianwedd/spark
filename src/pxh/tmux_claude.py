@@ -166,6 +166,20 @@ def pane_ready(spec: SessionSpec | None = None) -> bool:
     return pane is not None and READY_GLYPH in pane
 
 
+def pane_text(spec: SessionSpec | None = None) -> str:
+    """The pane's current contents, or "" if it cannot be read.
+
+    Read-only, and the supervisor's only look at what the session is actually
+    saying rather than what it replies. Kept to one narrow question — did the
+    session print a refusal we recognise? — because rendered terminal output is
+    exactly the thing the mailbox exists to avoid trusting. `pane_ready` is the
+    same observation for a weaker purpose; neither is a substitute for a round
+    trip.
+    """
+    s = _spec(spec)
+    return _tmux("capture-pane", "-t", s.name, "-p", socket=s.socket) or ""
+
+
 def _ensure_socket_dir(path: Path) -> None:
     """Create the tmux socket directory 0700, and repair it if it isn't.
 

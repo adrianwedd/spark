@@ -117,6 +117,50 @@ SELF_HEAL_HANDSHAKE_FAILURES = int(
 # was never actually a problem.
 SELF_HEAL_SLOW_TURNS = int(os.environ.get("PX_BRAIN_SELF_HEAL_SLOW_TURNS", "3"))
 
+# The recovery methods a self-heal can reach for, in escalating order of how
+# little the session itself has to cooperate.
+#
+# The original design had one rung, and it is a *prompt*: _inject_recycle asks
+# the session to append to the journal and then run /clear, which needs a
+# working Claude turn. On 2026-09-15 a session whose OAuth refresh token had
+# expired rejected every prompt it was given —
+#
+#   Prompt is too long · automatic compaction failed: Login expired
+#
+# — so the recovery was refused by the very condition it exists to repair. It
+# looped for 17 hours: 400 exhausted handshakes, 133 self-heals, 0 recoveries,
+# and no escalation, because run_handshake deliberately never kills (#237) and
+# check_wedge's kill is gated on the pane NOT showing the prompt glyph, which
+# this failure renders anyway. Every recovery path this supervisor owned
+# required the cooperation of the thing that had stopped cooperating.
+#
+#   recycle   journal-then-/clear as a prompt    a real turn; preserves work
+#   clear     /clear typed at the pane           a local command, no turn
+#   recreate  kill the session; the next tick's
+#             start_session rebuilds it empty    needs nothing from it at all
+#
+# The ladder advances only when a rung has demonstrably failed — a landed
+# recovery followed by another run of exhausted handshakes — never on the first
+# failure, so #237's rule stands for the first cycle and the escalation exists
+# for a repeated one.
+SELF_HEAL_METHODS = ("recycle", "clear", "recreate")
+
+# How long to hold once the ladder is exhausted, before letting it start again.
+# Bounded rather than permanent: exhaustion is evidence about the cause that
+# was live at the time, and a different cause an hour later must not find the
+# escalation switched off for good.
+SELF_HEAL_HOLD_S = float(os.environ.get("PX_BRAIN_SELF_HEAL_HOLD_S", "1800"))
+
+# Text the session prints when it cannot act on what we inject. Matching it is
+# what turns "handshake failed after 2 attempts" — true, and useless — into a
+# named cause somebody can act on. Both observed on the Pi on 2026-09-15.
+_SESSION_REFUSALS = (
+    ("Not logged in", "session not logged in — run /login on the host"),
+    ("Login expired", "session login expired — run /login on the host"),
+    ("Prompt is too long",
+     "session context exhausted and compaction unavailable"),
+)
+
 # Nightly recycle window opens at this hour, Hobart time. It does not close:
 # if overnight work (research, compose — both NIGHT_ALLOWED_ACTIONS) keeps the
 # brain busy past dawn, the recycle waits for idle rather than preempting a
@@ -228,6 +272,14 @@ class SessionState:
     # run_handshake increments it — a lock-busy defer is not a failure of the
     # session and must not count toward recycling it.
     consecutive_handshake_failures: int = 0
+    # Which rung of SELF_HEAL_METHODS the next self-heal must use, i.e. how
+    # many methods have already been spent since the last real round trip.
+    # Reset by a successful handshake and by nothing else — see the comment
+    # on the success branch of run_handshake.
+    self_heal_stage: int = 0
+    # Monotonic time the ladder ran out, so the hold in _self_heal_method can
+    # expire. 0.0 means the ladder is live.
+    self_heal_held_since: float = 0.0
 
     @property
     def component(self) -> str:
@@ -537,6 +589,15 @@ def run_handshake(state: SessionState, reason: str) -> bool:
                 # A real round trip landed: whatever degraded the session is
                 # gone, so the self-heal counter starts over.
                 state.consecutive_handshake_failures = 0
+                # A real round trip is the only proof the session is working
+                # again, so it is the only thing that resets the recovery
+                # ladder. A session recreation deliberately does not: "we
+                # rebuilt it empty and it still cannot answer" is exactly the
+                # fact the ladder exists to remember, and resetting there
+                # would spend the escalation on a fresh context that was
+                # never the problem.
+                state.self_heal_stage = 0
+                state.self_heal_held_since = 0.0
                 return True
 
         # Attempts exhausted. Earlier this killed the session outright — see
@@ -753,6 +814,85 @@ def _inject_recycle(state: SessionState, reason: str) -> bool:
     return landed
 
 
+def _self_heal_method(state: SessionState, now: float) -> str | None:
+    """Which recovery rung this session is on, or None to hold.
+
+    None covers two different things, and the caller tells them apart by
+    watching `self_heal_held_since`: the ladder has just run out (report it
+    once), or it ran out earlier and the hold has not expired (say nothing).
+    """
+    if state.self_heal_held_since:
+        if now - state.self_heal_held_since < SELF_HEAL_HOLD_S:
+            return None
+        # The hold expired: a new episode, with the ladder available again.
+        state.self_heal_held_since = 0.0
+        state.self_heal_stage = 0
+    if state.self_heal_stage >= len(SELF_HEAL_METHODS):
+        state.self_heal_held_since = now
+        return None
+    return SELF_HEAL_METHODS[state.self_heal_stage]
+
+
+def _apply_self_heal(state: SessionState, method: str) -> bool:
+    """Carry out one rung. True if it landed.
+
+    Only the first rung asks the session to run a turn. The others exist
+    because a session that will not answer a prompt will not run one either —
+    which is how the 2026-09-15 outage survived 133 self-heals.
+    """
+    spec = brain.spec_for_session(state.name)
+    if method == "recycle":
+        return _inject_recycle(state, "self_heal")
+
+    # Both remaining rungs drop the marker before acting, for the same reason
+    # _inject_recycle does: a reader must see no_marker and fall back, rather
+    # than trust a round trip belonging to a context that is about to go.
+    brain.clear_validation_marker(state.name)
+
+    if method == "clear":
+        # A real slash command, typed at the pane. Claude Code handles it
+        # locally, so it needs no model turn and survives the exact condition
+        # that rejects prompts.
+        return tmux_claude.reset_context(spec=spec)
+
+    # "recreate": the only rung that asks nothing of the session at all.
+    # bin/px-claude-session starts claude with no --continue/--resume, so the
+    # replacement begins with an empty context by construction. start_session
+    # rebuilds it on the next tick.
+    if not tmux_claude.kill_session(spec):
+        return False
+    state.holder = None  # the holder is attached to a session that is gone
+    return True
+
+
+def _session_refusal(spec: tmux_claude.SessionSpec) -> str | None:
+    """The session's own account of why it will not act, if it printed one."""
+    text = tmux_claude.pane_text(spec)
+    for needle, reason in _SESSION_REFUSALS:
+        if needle in text:
+            return reason
+    return None
+
+
+def _report_self_heal_exhausted(state: SessionState, reason: str) -> None:
+    """Record that every method a machine had was tried and none of them worked.
+
+    On the health file rather than only in the log, because this is the state
+    that needs a human: the supervisor will hold now, not retry. Naming the
+    cause off the pane is the difference between an operator reading "px-brain
+    is failing" — which 400 identical failures had already said, for 17 hours —
+    and reading "run /login".
+    """
+    spec = brain.spec_for_session(state.name)
+    cause = _session_refusal(spec)
+    _log("self_heal_exhausted", session=state.name, reason=reason,
+         stage=state.self_heal_stage, cause=cause)
+    health.record_failure(
+        state.component,
+        f"self-heal exhausted all {len(SELF_HEAL_METHODS)} recovery methods: "
+        + (cause or "the session is not answering prompts by any method"))
+
+
 def maybe_self_heal(state: SessionState) -> None:
     """Recycle a session that is degraded by either of two independent signals.
 
@@ -770,9 +910,11 @@ def maybe_self_heal(state: SessionState) -> None:
        detector (1) can ever see. Every caller just times out and falls back,
        indefinitely (#258).
 
-    Both land on the same recovery: same idle+lock+journal/clear machinery as
-    maybe_recycle, because a context reset is what demonstrably recovers the
-    narrating-instead-of-running state, and nothing else in the loop will.
+    Both land on the same escalation ladder as maybe_recycle's idle+lock
+    machinery, because a context reset is what demonstrably recovers the
+    narrating-instead-of-running state and nothing else in the loop will. The
+    ladder exists because that reset was originally reachable only by asking
+    the session to perform it — see SELF_HEAL_METHODS.
 
     Never mid-request, and non-blocking on the lock, for the same reasons
     maybe_recycle is: a /clear between a nudge and a reply loses the request,
@@ -798,16 +940,33 @@ def maybe_self_heal(state: SessionState) -> None:
         return
 
     try:
+        now = time.monotonic()
         reason = "handshake_failures" if handshake_due else "slow_turns"
-        _log("self_heal", session=state.name, reason=reason,
+        held_before = state.self_heal_held_since
+        method = _self_heal_method(state, now)
+        if method is None:
+            # Holding after the ladder ran out. Report the transition into the
+            # hold and nothing after it: this runs on every idle tick, and 180
+            # identical log lines are not a signal.
+            if not held_before and state.self_heal_held_since:
+                _report_self_heal_exhausted(state, reason)
+            return
+        _log("self_heal", session=state.name, reason=reason, method=method,
+             stage=state.self_heal_stage,
              consecutive_handshake=state.consecutive_handshake_failures,
              consecutive_slow=consecutive_slow)
-        if not _inject_recycle(state, "self_heal"):
+        if not _apply_self_heal(state, method):
+            # The prompt, the /clear or the kill did not land. Do NOT advance
+            # the ladder: the method was never actually tried, and spending a
+            # rung on a dropped keystroke would consume the escalation on
+            # nothing. Same rule _inject_recycle's caller follows — no
+            # bookkeeping for a recycle that never landed.
             return
-        # A landed recycle is the recovery attempt. Reset both detectors so
-        # the next window of degradation is measured fresh against the
-        # cleared context, and reset turns/baseline/last_recycle_at exactly
-        # as maybe_recycle does — the context is gone either way.
+        # A landed recovery is the attempt. Reset every detector so the next
+        # window of degradation is measured fresh against the new context, and
+        # reset turns/baseline/last_recycle_at exactly as maybe_recycle does —
+        # the context is gone either way.
+        state.self_heal_stage += 1
         state.turns = 0
         state.turns_baseline = brain.read_turn_health(state.name)["count"]
         brain.reset_consecutive_slow_turns(state.name)
