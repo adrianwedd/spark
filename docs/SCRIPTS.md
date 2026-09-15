@@ -918,7 +918,7 @@ echo "check status" | bin/run-voice-loop-claude --dry-run --max-turns 1
 
 ### bin/run-voice-loop-ollama
 
-**Purpose:** Launch the voice loop using a local Ollama model as the LLM backend.
+**Purpose:** Launch the voice loop using an Ollama model as the LLM backend — Ollama Cloud by default since #308.
 
 **Usage:**
 ```bash
@@ -929,16 +929,17 @@ bin/run-voice-loop-ollama [same flags as run-voice-loop]
 | Variable | Default | Description |
 |---|---|---|
 | `CODEX_CHAT_CMD` | `codex-ollama` | Adapter script (set automatically) |
-| `CODEX_OLLAMA_MODEL` | `deepseek-coder:1.3b` | Ollama model name |
+| `CODEX_OLLAMA_MODEL` | `deepseek-v4.1-flash:cloud` | Ollama model name |
 | `CODEX_OLLAMA_TEMPERATURE` | `0.2` | Sampling temperature |
-| `CODEX_OLLAMA_NUM_PREDICT` | `64` | Max tokens to generate |
-| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
+| `CODEX_OLLAMA_NUM_PREDICT` | `256` | Max tokens to generate (64 truncated a hosted model mid-JSON) |
+| `OLLAMA_HOST` | `https://ollama.com` | Ollama server URL (set to a local `http://…:11434` to use a LAN daemon) |
+| `OLLAMA_API_KEY` | — | Bearer token for a hosted `OLLAMA_HOST` |
 
 ---
 
 ### bin/codex-ollama
 
-**Purpose:** LLM adapter that reads a prompt from stdin and calls a local Ollama HTTP API, normalising the response to the tool-dispatch JSON format.
+**Purpose:** LLM adapter that reads a prompt from stdin and calls an Ollama HTTP API (Ollama Cloud by default), normalising the response to the tool-dispatch JSON format.
 
 **Usage:** Called as `CODEX_CHAT_CMD` by `run-voice-loop-ollama`.
 
@@ -953,10 +954,11 @@ bin/run-voice-loop-ollama [same flags as run-voice-loop]
 **Environment variables:**
 | Variable | Default | Description |
 |---|---|---|
-| `CODEX_OLLAMA_MODEL` | `deepseek-coder:1.3b` | Model to use |
-| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server |
+| `CODEX_OLLAMA_MODEL` | `deepseek-v4.1-flash:cloud` | Model to use |
+| `OLLAMA_HOST` | `https://ollama.com` | Ollama server |
+| `OLLAMA_API_KEY` | — | Bearer token for a hosted server |
 | `CODEX_OLLAMA_TEMPERATURE` | `0.2` | Temperature |
-| `CODEX_OLLAMA_NUM_PREDICT` | `64` | Max tokens |
+| `CODEX_OLLAMA_NUM_PREDICT` | `256` | Max tokens |
 
 ---
 

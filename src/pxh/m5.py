@@ -1,4 +1,31 @@
-"""Contention-aware access to a configured or already-resident M5 model."""
+"""Access to the cognition model: Ollama Cloud by default (see #308).
+
+This module used to borrow a model from the Ollama daemon running on
+``M5.local`` — Adrian's workstation — with ``/api/ps`` proving residency so a
+reflection never evicted his own workload. Since #308 the tier runs on Ollama
+Cloud (``https://ollama.com``, model ``deepseek-v4.1-flash:cloud``,
+authenticated with ``OLLAMA_API_KEY``) and borrows nothing from anyone.
+
+The tier keeps its old name — ``m5``, ``ask_m5``, ``M5_SESSION``,
+``state/m5/``, ``by_route.m5`` — because it names a *role*, not a host: the
+no-tools cognitive tier that carries text SPARK did not write. Renaming it is a
+separate, mechanical change; leaving the name while changing the host is
+deliberate, and this docstring is the record of it.
+
+What survives the move, and is more load-bearing than the host:
+
+- **No tools, no filesystem.** ``brain.py``'s ``_M5_KINDS`` boundary is "the
+  privileged session never sees untrusted text" (public chat, Obi chat, post
+  and blog QA). A cloud model has no tools and cannot read this repository
+  either — but that text now leaves the LAN. That is a change in *exposure*
+  even though it is not a change in privilege, and it is the one real cost of
+  this arrangement.
+- **Defer, never escalate.** A failure here is terminal for the caller
+  (``mind.py::call_llm``). It never falls through to the resident Claude
+  session and never reaches a Pi-local model.
+- **No waiting in line.** The process-shared gate has a zero timeout: a second
+  concurrent request defers rather than queueing behind the first.
+"""
 from __future__ import annotations
 
 import json
@@ -6,6 +33,7 @@ import os
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,9 +45,19 @@ from .state import PROJECT_ROOT, atomic_write
 from .time import utc_timestamp
 
 M5_SESSION = "m5"
-M5_HOST = os.environ.get("PX_M5_SPARK_HOST", "http://M5.local:11434")
-M5_TIMEOUT_S = float(os.environ.get("PX_M5_SPARK_TIMEOUT_S", "30"))
+M5_HOST = os.environ.get("PX_M5_SPARK_HOST", "https://ollama.com")
+# Hosted tiers need more headroom than a warm LAN daemon: a cold 486B model
+# behind an internet round trip can comfortably outlast the 30s that was sized
+# for `M5.local`. A timeout opens the five-minute circuit, so undersizing this
+# is a five-minute outage per miss.
+M5_TIMEOUT_S = float(os.environ.get("PX_M5_SPARK_TIMEOUT_S", "60"))
 CIRCUIT_OPEN_S = 300.0
+
+# Bearer token for a hosted host. PX_M5_SPARK_API_KEY is checked first so the
+# cognition tier can hold a different key from the persona tools; OLLAMA_API_KEY
+# is the fallback, because it is the name the `ollama` CLI itself reads — a host
+# already configured for cloud models needs no SPARK-specific duplicate.
+_API_KEY_VARS = ("PX_M5_SPARK_API_KEY", "OLLAMA_API_KEY")
 
 
 def _read_boot_id() -> str:
@@ -78,7 +116,45 @@ def _ensure_dir() -> bool:
         return False
 
 
-def _configured_model() -> str | None:
+def _api_key() -> str:
+    """Bearer token for a hosted host; empty when none is configured."""
+    for var in _API_KEY_VARS:
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def is_local_host(host: str) -> bool:
+    """Is this a daemon on this machine or the LAN?
+
+    Only a local daemon has a resident model set worth borrowing from, and only
+    a local daemon has a workload worth being polite to. Everything else is a
+    hosted endpoint reached over the internet, which needs a key and cannot
+    answer `/api/ps` at all.
+    """
+    try:
+        netloc = urllib.parse.urlsplit(host).netloc or host
+    except ValueError:
+        netloc = host
+    hostname = netloc.rsplit("@", 1)[-1].split(":")[0].strip("[]").lower()
+    return hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} \
+        or hostname.endswith(".local")
+
+
+def normalize_model(name: str) -> str:
+    """Compare cloud and local spellings of the same model.
+
+    Ollama Cloud lists `deepseek-v4.1-flash` in `/api/tags` but accepts — and
+    is conventionally invoked as — `deepseek-v4.1-flash:cloud`. A startup probe
+    that compared the raw strings would report a perfectly healthy tier as
+    missing its model.
+    """
+    return name.strip().removesuffix(":cloud").removesuffix("-cloud")
+
+
+def configured_model() -> str | None:
+    """The pinned cognition model, or None when it is unset or `auto`."""
     model = os.environ.get("PX_M5_SPARK_MODEL", "").strip()
     if not model or model.lower() == "auto":
         return None
@@ -161,12 +237,23 @@ def circuit_summary() -> dict:
 
 
 def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = None) -> M5Result:
-    """Run one no-tools turn on the pinned M5 model, without ever waiting in line."""
+    """Run one no-tools turn on the pinned cognition model, without queueing."""
     started = time.monotonic()
-    mode = _configured_model()
+    mode = configured_model()
     if mode is None:
         return _result("bad_response", kind=kind, started=started,
                        error="PX_M5_SPARK_MODEL must name a model explicitly (not auto)")
+
+    # Residency borrowing is a property of a local daemon. Asking a hosted host
+    # for it is not a degraded answer, it is a wrong question — and it fails as
+    # an opaque 401 that opens the five-minute circuit, which is exactly how
+    # reflection died silently on 2026-08-25 (#302). Refuse it by name instead.
+    if mode in {"resident", "resident-only"} and not is_local_host(M5_HOST):
+        return _result("bad_response", kind=kind, started=started,
+                       error=(f"PX_M5_SPARK_MODEL={mode} borrows a resident model from a "
+                              f"local Ollama daemon, but {M5_HOST} is hosted. Set "
+                              f"PX_M5_SPARK_MODEL to an explicit model "
+                              f"(e.g. deepseek-v4.1-flash:cloud)."))
 
     if not _ensure_dir():
         _open_circuit("offline")
@@ -202,11 +289,25 @@ def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = Non
             "prompt": prompt,
             "system": system,
             "stream": False,
+            # Reasoning chains re-enable refusal in small models and burn the
+            # whole budget on a  thinking block that never emits an answer.
             "think": False,
         }).encode()
+        headers = {"Content-Type": "application/json"}
+        key = _api_key()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        elif not is_local_host(M5_HOST):
+            # A missing credential is a configuration fault, not a transport
+            # one: report it every time rather than opening a circuit that
+            # would hide the message behind "M5 circuit open" for five
+            # minutes. Same fail-closed-without-a-network-probe shape as the
+            # missing-model check above.
+            return _result("bad_response", kind=kind, started=started,
+                           error=(f"no API key for hosted Ollama host {M5_HOST} — set "
+                                  f"{_API_KEY_VARS[1]} (or {_API_KEY_VARS[0]})"))
         request = urllib.request.Request(
-            f"{M5_HOST}/api/generate", data=payload,
-            headers={"Content-Type": "application/json"},
+            f"{M5_HOST}/api/generate", data=payload, headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout_s or M5_TIMEOUT_S) as response:
@@ -234,6 +335,47 @@ def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = Non
             lock.release()
         except OSError:
             pass
+
+
+def probe(timeout_s: float = 5.0) -> str:
+    """One-line, never-raising startup truth about the cognition tier.
+
+    Lives here rather than in `px-mind` so the probe cannot drift from the host,
+    key and model that `ask_m5` actually uses — the drift the old probe had, and
+    the reason #302 stayed invisible: it reported a model `ask_m5` never asked
+    for.
+    """
+    model = configured_model()
+    if model is None:
+        return "⚠ cognition tier: PX_M5_SPARK_MODEL must name a model explicitly (not auto)"
+
+    # Ask the most specific question first: a mode that cannot work where it
+    # is pointed is a stronger diagnosis than a credential that is missing.
+    if model in {"resident", "resident-only"} and not is_local_host(M5_HOST):
+        return (f"⚠ cognition tier: PX_M5_SPARK_MODEL={model} needs a local daemon, "
+                f"but {M5_HOST} is hosted")
+
+    headers = {}
+    key = _api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    elif not is_local_host(M5_HOST):
+        return f"⚠ cognition tier: no API key for hosted {M5_HOST} (set {_API_KEY_VARS[1]})"
+
+    try:
+        request = urllib.request.Request(f"{M5_HOST}/api/tags", headers=headers)
+        with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            body = json.loads(response.read())
+    except Exception as exc:  # noqa: BLE001 - a probe reports, it never raises
+        return f"⚠ cognition tier unreachable at startup: {exc}"
+
+    available = [m.get("name", "") for m in (body.get("models") or [])
+                 if isinstance(m, dict)]
+    wanted = normalize_model(model)
+    if any(normalize_model(name) == wanted for name in available):
+        return f"✓ cognition tier: model '{model}' available ({M5_HOST})"
+    return (f"⚠ cognition tier: model '{model}' NOT found on {M5_HOST} — "
+            f"available: {', '.join(available) or 'none'}")
 
 
 def reset_for_tests() -> None:

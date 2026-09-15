@@ -1,9 +1,18 @@
-"""Tests for px-mind three-tier LLM fallback: Claude -> M1 Ollama -> local Ollama."""
+"""Tests for px-mind's reflection tier: one tier, and a defer behind it.
+
+The ladder this file was written against (Claude -> M1 Ollama -> Ollama Cloud ->
+Pi-local Ollama) no longer exists. `call_llm()` reaches `pxh.m5.ask_m5()` and
+defers on failure (#308 moved that tier from a LAN daemon to Ollama Cloud, which
+changed where it points and nothing about the shape). The tests below that still
+name a ladder are the ones asserting a rung is *unreachable* — that is the
+property worth keeping, so they are re-stated rather than deleted.
+"""
 from __future__ import annotations
 
 import json
 import os
 import urllib.error
+import urllib.parse
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,6 +40,10 @@ def _pin_claude_binary(monkeypatch):
     """
     monkeypatch.setenv("PX_CLAUDE_BIN", "/nonexistent/claude-under-test")
     monkeypatch.setenv("PX_M5_SPARK_MODEL", "spark:fixed")
+    # The tier is hosted (#308): without a key every call fails closed before
+    # reaching the network, which would make these tests pass for the wrong
+    # reason.
+    monkeypatch.setenv("PX_M5_SPARK_API_KEY", "test-key")
 
 
 @pytest.fixture(autouse=True)
@@ -108,28 +121,24 @@ def test_empty_m5_response_defers_without_claude():
 
 # ── Tier-3 fallback: Claude + M1 fail → local Ollama succeeds ──────
 
-def test_non_spark_reflection_defers_when_m5_fails():
-    """The Ollama chain still walks, for the personas that actually use it.
+def test_non_spark_reflection_defers_when_the_cognition_tier_fails():
+    """Persona does not change the shape of a failure any more.
 
-    This used to run as `persona="spark"`, which no longer reaches here: for
-    SPARK the brain tier sits between M5 and the cloud, and a brain failure is
-    terminal. Tiers 3 and 4 are not dead code though — a non-SPARK persona
-    skips the brain tier entirely, so an M5 failure legitimately walks to
-    cloud and then to localhost. That distinction is the point, so the test is
-    re-pointed rather than deleted; the SPARK half is pinned by
-    test_spark_never_reaches_local_ollama_after_a_brain_failure below.
+    This test existed because a non-SPARK persona used to walk further down the
+    ladder than SPARK did. With the ladder gone (#308), every persona defers at
+    the same point — that uniformity is now the property, so the test asserts it
+    for the persona that used to diverge.
 
-    Distinguish by URL: M5 and cloud requests fail; localhost succeeds.
-    call_count-based mocking is fragile because _resolve_ollama_model makes
-    extra urlopen calls (api/ps + api/tags) before the actual generate request.
+    Distinguish by URL: the cognition tier fails; a Pi-local daemon would
+    succeed, so a walk to it would show up as a non-defer result.
     """
     import pxh.brain
 
     def urlopen_side(req, timeout=30):
         url = req.full_url if hasattr(req, "full_url") else str(req)
-        if "M5.local" in url or "localhost" not in url:
-            raise urllib.error.URLError("M5 unreachable")
-        return _fake_ollama_cm("running on fumes")
+        if "localhost" in url:
+            raise AssertionError("a persona reached a Pi-local Ollama daemon")
+        raise urllib.error.URLError("cognition tier unreachable")
 
     def _never(*a, **k):
         raise AssertionError("a non-SPARK persona reached the brain tier")
@@ -185,7 +194,7 @@ def test_spark_never_reaches_local_ollama_after_a_brain_failure():
 
 
 def test_skips_local_ollama_when_not_opted_in():
-    """Without PX_MIND_LOCAL_OLLAMA=1, M1 failure → error (no local fallback)."""
+    """A cognition-tier failure is an error, never a Pi-local fallback."""
     old_val = os.environ.pop("PX_MIND_LOCAL_OLLAMA", None)
     try:
         with patch("subprocess.run", return_value=_fake_claude(1, stderr="offline")), \
@@ -317,12 +326,13 @@ def test_reflection_defers_when_the_brain_is_unavailable():
     assert spawned == [], f"reflection spawned a process: {spawned}"
 
 
-def test_reflection_failure_does_not_reach_ollama_cloud():
-    """The 403 in the 2026-08-19 cascade was reached *from* a brain failure.
+def test_reflection_failure_does_not_escalate_past_the_cognition_tier():
+    """The 403 in the 2026-08-19 cascade was reached *from* a failure above it.
 
-    Tier 3 exists for an M5 failure, not as a rescue for the resident session.
-    Opening an internet request because a keystroke was slow is the escalation
-    this whole change removes.
+    #308 made the cloud the *primary* tier rather than the bottom rung, so the
+    invariant is no longer "nothing reaches ollama.com" — it is "nothing is
+    tried after the cognition tier fails": no resident Claude, no Pi-local
+    daemon, no second model. That is the escalation this whole shape removes.
     """
     import pxh.brain
 
@@ -330,19 +340,20 @@ def test_reflection_failure_does_not_reach_ollama_cloud():
 
     def _record(req, *a, **kw):
         seen_urls.append(req.full_url if hasattr(req, "full_url") else str(req))
-        raise urllib.error.URLError("M5 down")
+        raise urllib.error.URLError("cognition tier down")
 
     with patch("urllib.request.urlopen", side_effect=_record), \
          patch.object(pxh.brain, "ask_brain", return_value=None), \
          patch("subprocess.run", side_effect=AssertionError("spawned a process")):
         result = call_llm("prompt", "system", persona="spark")
 
-    # Assert on *where* the requests went, not how many there were: M5 may do a
-    # model-resolution probe before generating, and its own offline backoff may
-    # skip the network entirely, so any count is a hostage to unrelated state.
-    # What must hold is that nothing reached the cloud after the brain failed.
-    assert not [u for u in seen_urls if "ollama.com" in u], seen_urls
-    assert result.get(pxh.mind.BRAIN_DEFER) is True, "the brain tier did not stop the chain"
+    # Assert on *where* the requests went, not how many there were: the tier may
+    # probe before generating, and its own offline backoff may skip the network
+    # entirely, so any count is a hostage to unrelated state.
+    hosts = {urllib.parse.urlsplit(u).hostname for u in seen_urls}
+    assert hosts <= {"ollama.com"}, seen_urls
+    assert not [u for u in seen_urls if u.startswith("http://")], seen_urls
+    assert result.get(pxh.mind.BRAIN_DEFER) is True, "the tier did not stop the chain"
 
 
 def test_narrowing_the_dial_cannot_restore_a_cold_path():
