@@ -238,10 +238,24 @@ def test_resident_mode_on_a_hosted_host_fails_loudly_without_a_probe(monkeypatch
     assert "deepseek-v4.1-flash:cloud" in result.error
 
 
+def test_the_legacy_cloud_key_name_still_authenticates(monkeypatch, _isolated_m5):
+    """The live robot's `.env` holds its working cloud key as
+    `OLLAMA_CLOUD_API_KEY` — the name `mind.py`'s long-dead cloud tier read.
+    Honouring it is what makes deploying #308 a two-line `.env` change instead
+    of a credential copy."""
+    monkeypatch.delenv("PX_M5_SPARK_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.setenv("OLLAMA_CLOUD_API_KEY", "legacy-key")
+    with patch("urllib.request.urlopen", return_value=_response("thought")) as probe:
+        assert _isolated_m5.ask_m5("reflection", "p", "s").status == "available"
+    assert probe.call_args_list[0].args[0].get_header("Authorization") == "Bearer legacy-key"
+
+
 def test_missing_key_on_a_hosted_host_fails_loudly_without_a_probe(monkeypatch, _isolated_m5):
     """A configuration fault must be re-reported, never hidden behind a circuit."""
     monkeypatch.delenv("PX_M5_SPARK_API_KEY", raising=False)
     monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_CLOUD_API_KEY", raising=False)
     with patch("urllib.request.urlopen", side_effect=AssertionError("network probe")):
         result = _isolated_m5.ask_m5("reflection", "prompt", "system")
     assert result.status == "bad_response"
@@ -251,6 +265,7 @@ def test_missing_key_on_a_hosted_host_fails_loudly_without_a_probe(monkeypatch, 
 def test_a_local_host_needs_no_key(monkeypatch, _local_host):
     monkeypatch.delenv("PX_M5_SPARK_API_KEY", raising=False)
     monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_CLOUD_API_KEY", raising=False)
     with patch("urllib.request.urlopen", return_value=_response("thought")) as probe:
         assert _local_host.ask_m5("reflection", "prompt", "system").status == "available"
     assert probe.call_args_list[0].args[0].get_header("Authorization") is None
@@ -295,6 +310,7 @@ def test_probe_never_raises(monkeypatch, _isolated_m5):
         assert "unreachable" in _isolated_m5.probe()
     monkeypatch.delenv("PX_M5_SPARK_API_KEY", raising=False)
     monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_CLOUD_API_KEY", raising=False)
     assert "OLLAMA_API_KEY" in _isolated_m5.probe()
     monkeypatch.setenv("PX_M5_SPARK_MODEL", "resident")
     assert "local daemon" in _isolated_m5.probe()

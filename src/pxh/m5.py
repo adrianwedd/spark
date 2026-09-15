@@ -53,11 +53,17 @@ M5_HOST = os.environ.get("PX_M5_SPARK_HOST", "https://ollama.com")
 M5_TIMEOUT_S = float(os.environ.get("PX_M5_SPARK_TIMEOUT_S", "60"))
 CIRCUIT_OPEN_S = 300.0
 
-# Bearer token for a hosted host. PX_M5_SPARK_API_KEY is checked first so the
-# cognition tier can hold a different key from the persona tools; OLLAMA_API_KEY
-# is the fallback, because it is the name the `ollama` CLI itself reads — a host
-# already configured for cloud models needs no SPARK-specific duplicate.
-_API_KEY_VARS = ("PX_M5_SPARK_API_KEY", "OLLAMA_API_KEY")
+# Bearer token for a hosted host, in precedence order.
+#   1. PX_M5_SPARK_API_KEY — lets the cognition tier hold a different key from
+#      the persona tools.
+#   2. OLLAMA_API_KEY — the name the `ollama` CLI itself reads, so a host
+#      already configured for cloud models needs no SPARK-specific duplicate.
+#   3. OLLAMA_CLOUD_API_KEY — the repo's original name for this credential
+#      (`mind.py`'s long-dead cloud tier read it). The live robot still has the
+#      working key under this name, so it is kept as a real fallback rather
+#      than a migration note: honouring it means deploying #308 needs no
+#      credential to be copied or renamed anywhere.
+_API_KEY_VARS = ("PX_M5_SPARK_API_KEY", "OLLAMA_API_KEY", "OLLAMA_CLOUD_API_KEY")
 
 
 def _read_boot_id() -> str:

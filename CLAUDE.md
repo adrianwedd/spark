@@ -666,7 +666,7 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 |---|---|
 | `PX_DRY` | `1` = dry-run. **Default is live when unset.** |
 | `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
-| `OLLAMA_API_KEY` | Bearer token for Ollama Cloud. Read by `pxh.m5`, `tool-chat`, `tool-chat-vixen`, `tool-voice-persona` and `codex-ollama`; also the variable the `ollama` CLI itself reads. Required whenever the host is not local. |
+| `OLLAMA_API_KEY` | Bearer token for Ollama Cloud. Read by `pxh.m5`, `tool-chat`, `tool-chat-vixen`, `tool-voice-persona` and `codex-ollama`; also the variable the `ollama` CLI itself reads. Required whenever the host is not local. The legacy `OLLAMA_CLOUD_API_KEY` (what the live robot's `.env` already holds) is accepted as a fallback so no credential has to be copied or renamed to deploy; `PX_M5_SPARK_API_KEY` takes precedence over both for the cognition tier. |
 | `PX_M5_SPARK_HOST` | Cognition-tier endpoint. Default `https://ollama.com` (Ollama Cloud) — **not** `https://api.ollama.com`, which 403s. Point it at an `http://…:11434` daemon to borrow a LAN model instead; that is the only case where `resident` is legal. |
 | `PX_M5_SPARK_MODEL` | Cognition model for reflection, public/Obi chat, and publication QA: an explicit model; `auto` is rejected, and `resident`/`resident-only` are rejected against a hosted host (#308). Default per `.env.example`: `deepseek-v4.1-flash:cloud`. |
 | `PX_M5_SPARK_API_KEY` | Overrides `OLLAMA_API_KEY` for the cognition tier only. |

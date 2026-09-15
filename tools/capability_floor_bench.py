@@ -118,8 +118,17 @@ def score_plausibility(text: str) -> dict:
 
 def auth_headers() -> dict:
     """Bearer token for a hosted endpoint; empty for a local daemon."""
-    key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    key = auth_key()
     return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def auth_key() -> str:
+    """`OLLAMA_API_KEY`, then the legacy `OLLAMA_CLOUD_API_KEY` — see `pxh.m5`."""
+    for var in ("OLLAMA_API_KEY", "OLLAMA_CLOUD_API_KEY"):
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def get_models(host: str) -> list:
