@@ -201,7 +201,9 @@ is waiting on a 3am retry, and each exemption is one more way for a background
 job to crowd a session someone *is* waiting on. Success **or a correct skip**
 marks the date done; only a failure leaves the later retry open.
 
-**Claude spend visibility:** `token_log.log_usage()` takes a `backend` argument and splits totals under `by_backend` in `state/token_usage.json`. The top-level totals mix free Ollama with paid Claude and cannot answer "what am I spending". `call_llm()` also sets `result["backend"]` to the tier that actually served — the `backend=` reflection log line shows the *configured* primary, not the one that answered.
+**Claude spend visibility:** `token_log.log_usage()` takes a `backend` argument and splits totals under `by_backend` in `state/token_usage.json`. The top-level totals mix metered Claude and metered-in-a-different-way Ollama Cloud with robot-local work, and cannot answer "what am I spending". `call_llm()` also sets `result["backend"]` to the tier that actually served — the `backend=` reflection log line shows the *configured* primary, not the one that answered.
+
+**The `ollama-m5` bucket is no longer free (#308).** It used to mean "Adrian's own hardware, $0". It now means "Ollama Cloud, on a plan" — so a rising `ollama-m5` count is real consumption, not free local compute, and reading that label as `$0` is the mistake this note exists to prevent.
 
 ### Idle-Alive Daemon
 
@@ -233,12 +235,16 @@ bin/px-mind [--awareness-interval 30] [--dry-run]
 
 Three-layer architecture:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session + calendar + Frigate → `state/awareness.json`
-- **Layer 2 — Reflection** (on transition or every 5min idle): a pinned M5
-  Ollama model (`PX_M5_SPARK_MODEL`, never `auto`) handles reflection through a
-  process-shared nonblocking gate. `busy` defers without opening the circuit;
-  timeout, offline, and malformed responses open a five-minute monotonic
-  circuit. Reflection never falls back to Claude, Ollama Cloud, or Pi-local
-  Ollama. Writes to `state/thoughts.jsonl` only after a valid M5 response.
+- **Layer 2 — Reflection** (on transition or every 5min idle): the hosted
+  cognition tier (`PX_M5_SPARK_MODEL`, an explicit model — `auto` and, on a
+  hosted host, `resident` are rejected) handles reflection through a
+  process-shared nonblocking gate. Since #308 that tier is **Ollama Cloud**
+  (`https://ollama.com`, `deepseek-v4.1-flash:cloud`, `OLLAMA_API_KEY`), not a
+  daemon on a LAN machine. `busy` defers without opening the circuit; timeout,
+  offline, and malformed responses open a five-minute monotonic circuit.
+  Reflection never falls back to Claude or to Pi-local Ollama — the ladder is
+  gone, and a cognition-tier failure **defers**. Writes to
+  `state/thoughts.jsonl` only after a valid response.
 - **Layer 3 — Expression** (30min cooldown; `greet_arrival` bypasses it on a real arrival, 120s anti-flap): dispatches to tool-voice/tool-look/tool-remember and cognitive tools. Valid actions include (wait, greet, greet_arrival, comment, remember, look_at, weather_comment, scan, play_sound, photograph, emote, look_around, time_check, calendar_check, introspect, evolve, morning_fact, research, compose, self_debug, blog_essay, message_obi, set_goal, update_goal, complete_goal). Suppressed during school, quiet time, bedtime (all calendar-driven). **Hardcoded night silence: 19:00–07:00 Hobart time — no speech/audio/motion. Silent cognitive actions (`NIGHT_ALLOWED_ACTIONS`: wait, remember, research, compose, introspect, self_debug, set_goal, update_goal, complete_goal) are exempt and run overnight.**
 - **`message_obi` action**: SPARK initiates a direct message to Obi via the dashboard. Exponential backoff: starts at 10min, doubles on unanswered nudge, caps at 4h, resets when Obi replies. Respects all suppressors. **Redaction is a property of the record, not of a call site.** `mind.redact_private_dm()` moves the private text off `thought["thought"]` (replacing it with `mind.PRIVATE_DM_PLACEHOLDER`) the moment the thought exists, onto `PRIVATE_DM_TEXT_KEY` — an in-process delivery field that `without_private_dm_text()` strips from every persistence path and that exactly one consumer reads (`_emit_message_obi`). It is applied twice, idempotently: at record creation in `reflection()` and again at the dispatch boundary in `expression()`, so a record built by anything else is still safe. This shape exists because the previous one — a `display_text` local used only for the thoughts-file write — leaked the raw DM into session history, and from there into the voice-loop prompt (GREMLIN/VIXEN included), the awareness conversation digest, the reflection prompt and `GET /api/v1/session`. **Do not reintroduce a sink that reads `thought["thought"]` expecting raw text.** Pinned by `tests/test_message_obi_redaction.py`.
 - **Memory consolidation**: nightly Haiku pass (02:00–06:00 Hobart, ≤2 attempts/day ≥40min apart, state/consolidation_meta.json) distills the last 24h of thoughts into state/memories-spark.jsonl; reflection retrieves the top-3 relevant memories by keyword/tag overlap. **Runs on a background daemon thread with an identity-keyed job marker (`state/consolidation_job.json`), never inline on the tick** — see the health section. Goal persistence in state/intention-spark.json (7-day expiry, one active at a time).
@@ -356,17 +362,23 @@ Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<
 
 **Stage 2 (#242) removed `spark-io`.** Stage 1 had kept two resident sessions
 while `post_qa`, `blog_qa`, `public_chat` and `obi_chat` moved onto the pinned
-M5 model with no tools; the per-kind/per-session meters established that
+cognition model with no tools (that model lived on the `M5` workstation until
+#308 moved the tier to Ollama Cloud; the tier keeps its `m5` name); the per-kind/per-session meters established that
 `spark-io` received zero legitimate requests after that migration — only
 supervisor handshake traffic — so it was deleted rather than kept idle
 indefinitely. `spark-brain` is now SPARK's only resident Claude session, at
 the repo root, for voice and high-value visual kinds. The trust boundary
 `spark-io` used to enforce (untrusted text held away from a session with
-tools and repo access) is now M5's: it has no tools and no filesystem access
-at all, a stronger property than a scoped Claude Code session ever was.
+tools and repo access) is now the cognition tier's: it has no tools and no filesystem access
+at all, a stronger property than a scoped Claude Code session ever was. **The
+one thing that changed when the tier moved to Ollama Cloud (#308) is
+exposure**: untrusted text — public chat, Obi chat, post and blog QA — now
+leaves the LAN instead of staying on it. Privilege is unchanged (still no
+tools, still no filesystem); the disclosure surface is not, and that is the
+trade this arrangement consciously makes.
 
 **Critical gotchas:**
-- **`ask_brain()` returns `None` on every failure and never raises.** None means "fall back" — callers drop to the Ollama tiers exactly as they do today when Claude is unreachable. There is deliberately no exception path; this sits under daemons.
+- **`ask_brain()` returns `None` on every failure and never raises.** None means "fall back" — callers drop to the cognition tier exactly as they do today when Claude is unreachable. There is deliberately no exception path; this sits under daemons.
 - **Single-flight `FileLock` per session.** Two concurrent `send-keys` runs do not queue, they interleave into one garbled prompt — the failure mode is not "slow" but "both answers wrong". A caller that can't get the lock in `LOCK_WAIT_S` falls back rather than queueing.
 - **Mailbox directories are `1777`, and the lock file `0666`** — same reasoning as `state/health/`, and it is load-bearing for the same reason: SPARK's daemons do not all run as the same user, and a root-created 0755 dir locks every `pi` daemon out of `atomic_write`'s `mkstemp`. Do not tighten either.
 - **The glyph never proves a session can answer.** `run_handshake` does not gate on `pane_ready()` at all — the handshake's real reply-with-nonce is itself the authoritative readiness test, so checking the glyph first would only add a redundant, misleading gate (a permission dialog renders it too). `handshake_reason` is different: inside the bounded window right after a recycle it *does* consult `_is_idle` (which ends in `pane_ready`), because in that window the supervisor already knows a real turn — the recycle's own journal-append-then-`/clear` — is in flight, and the glyph is what tells it that turn has finished. Injecting mid-turn splices two prompts into one and produces a plausible-looking wrong answer.
@@ -532,8 +544,8 @@ out of the gate entirely.
 
 **The gate sits above both the persona reroute and the `PX_DRY` branch.**
 `tool-voice-persona` re-enters `tool-voice`, so a gate below the reroute would
-still catch the audio — but only after an Ollama round trip on text that was
-never going to be spoken. And a dry run must model the live decision, or every
+still catch the audio — but only after an Ollama round trip (now a hosted one,
+since #308) on text that was never going to be spoken. And a dry run must model the live decision, or every
 dry test of a speaking route asserts behaviour the robot will not show.
 
 `src/pxh/policy_context.py` is the **only** loader of the session/awareness/clock
@@ -654,8 +666,13 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 |---|---|
 | `PX_DRY` | `1` = dry-run. **Default is live when unset.** |
 | `PX_BYPASS_SUDO` | `1` = skip sudo (tests only) |
-| `PX_M5_SPARK_MODEL` | M5 model for reflection, public/Obi chat, and publication QA: an explicit model, `resident`, or `resident-only`; `auto` is rejected. `resident` uses only `/api/ps`-proven residency and may use explicit `PX_M5_SPARK_DEFAULT` when none is loaded. |
-| `PX_MIND_BACKEND` | Legacy introspection field; it does not alter Stage 1 reflection routing. |
+| `OLLAMA_API_KEY` | Bearer token for Ollama Cloud. Read by `pxh.m5`, `tool-chat`, `tool-chat-vixen`, `tool-voice-persona` and `codex-ollama`; also the variable the `ollama` CLI itself reads. Required whenever the host is not local. |
+| `PX_M5_SPARK_HOST` | Cognition-tier endpoint. Default `https://ollama.com` (Ollama Cloud) — **not** `https://api.ollama.com`, which 403s. Point it at an `http://…:11434` daemon to borrow a LAN model instead; that is the only case where `resident` is legal. |
+| `PX_M5_SPARK_MODEL` | Cognition model for reflection, public/Obi chat, and publication QA: an explicit model; `auto` is rejected, and `resident`/`resident-only` are rejected against a hosted host (#308). Default per `.env.example`: `deepseek-v4.1-flash:cloud`. |
+| `PX_M5_SPARK_API_KEY` | Overrides `OLLAMA_API_KEY` for the cognition tier only. |
+| `PX_M5_SPARK_TIMEOUT_S` | Cognition-tier request timeout, default 60s (a hosted tier needs more headroom than a warm LAN daemon, and a timeout opens the five-minute circuit). |
+| `PX_OLLAMA_HOST` / `PX_CHAT_MODEL` | Persona chat and rephrase endpoint/model (GREMLIN/VIXEN, `tool-voice-persona`). Default `https://ollama.com` / `deepseek-v4.1-flash:cloud`. |
+| `PX_MIND_BACKEND` | Legacy introspection field; it no longer alters reflection routing. |
 | `PX_WANDER_VISION_ENABLED` | `1` = allow autonomous wander to escalate to Claude vision on genuine local ambiguity (off by default — see Wander below) |
 | `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |
 | `PX_CLAUDE_MODEL_*` | Per-session-type model overrides (e.g. `PX_CLAUDE_MODEL_EVOLVE`) |

@@ -9,7 +9,8 @@ Awareness is enriched with weather (every 10 min), long-term memory,
 topic seeding for variety, and repetition detection to stay dynamic.
 
 Run with: bin/px-mind [--dry-run]
-Requires Ollama running on M5 (or PX_OLLAMA_HOST).
+Requires the cognition tier: Ollama Cloud by default (see pxh.m5, #308),
+or whatever PX_M5_SPARK_HOST points at.
 """
 from __future__ import annotations
 
@@ -294,71 +295,26 @@ def compute_obi_mode(awareness: dict, hour_override: int | None = None) -> str:
 
 # PERSONA_VOICE_ENV imported from pxh.voice_loop (canonical source)
 
-# Ollama config (same host as tool-chat)
-# "M5.local" (mDNS), not "M5" — the UDR7 stopped serving the bare hostname.
-# Verified on the Pi at cutover: `getent hosts M5` returns nothing while
-# `getent hosts M5.local` resolves to 192.168.0.249 and answers /api/tags with
-# HTTP 200 in 28ms. A bare "M5" makes tier 1 fail instantly, and reflection
-# then falls through to *paid* Claude Haiku without anything looking broken.
-OLLAMA_HOST       = os.environ.get("PX_OLLAMA_HOST", "http://M5.local:11434")
-_MODEL_ENV        = os.environ.get("PX_MIND_MODEL", "auto")
-OLLAMA_CLOUD_HOST = os.environ.get("PX_OLLAMA_CLOUD_HOST", "https://api.ollama.com")
-OLLAMA_CLOUD_KEY  = os.environ.get("OLLAMA_CLOUD_API_KEY", "")
-_CLOUD_MODEL_ENV  = os.environ.get("PX_OLLAMA_CLOUD_MODEL", "gemma3:4b")
-LOCAL_OLLAMA_HOST = os.environ.get("PX_MIND_LOCAL_OLLAMA_HOST", "http://localhost:11434")
-_LOCAL_MODEL_ENV  = os.environ.get("PX_MIND_LOCAL_MODEL", "auto")
+# Network failure backoff for the Home Assistant block: skip DNS+connect for a
+# host that just failed. Python's urllib timeout covers the socket but not the
+# DNS lookup, so a dead `homeassistant.local` stalls the awareness tick for
+# 15-20 s per call.
+_HOST_FAILURE_BACKOFF_S = 60
 
-# Lazy model resolution — resolved on first use, not import time.
-# Caches per-host and re-resolves every 30 min to track model swaps.
-_resolved_models: dict[str, tuple[str, float]] = {}  # host → (model, resolved_at_mono)
-_MODEL_CACHE_TTL = 1800  # 30 min
+# Reflection routing lives in pxh.m5 (host, model, key, circuit, meter). This
+# module used to carry its own local-Ollama ladder — OLLAMA_HOST,
+# OLLAMA_CLOUD_HOST, LOCAL_OLLAMA_HOST, `_resolve_ollama_model()` and
+# `call_ollama()`. All of it is gone (#308): the tier is Ollama Cloud, it is
+# reached through `ask_m5()`, and a failure there *defers* rather than walking
+# a ladder. Do not reintroduce a second place that decides where cognition runs
+# — the previous two-place arrangement is why `bin/px-mind`'s startup probe
+# could report a model `ask_m5` never asked for (#302).
 
-# Network failure cache: skip DNS+connect for hosts that recently failed.
-# Key is host URL prefix (e.g. "http://M5:11434"), value is monotonic
-# deadline after which the host should be retried. Suppresses the mDNS hang
-# (typically 15-20 s) that occurs when .local names are queried on a dead network,
-# since Python's urllib timeout covers the socket but not the DNS lookup.
-_host_failure_until: dict[str, float] = {}
-_HOST_FAILURE_BACKOFF_S = 60  # retry offline hosts after 60 s
-
-
-def _resolve_ollama_model(host: str, preferred: str) -> str:
-    """Resolve 'auto' to the currently-loaded model on the Ollama host.
-
-    Prefers /api/ps (in-memory) over /api/tags (all downloaded). Caches
-    per-host for 30 min, then re-queries to track model swaps.
-    """
-    if preferred != "auto":
-        return preferred
-    cached = _resolved_models.get(host)
-    if cached and (time.monotonic() - cached[1]) < _MODEL_CACHE_TTL:
-        return cached[0]
-    for endpoint in ("/api/ps", "/api/tags"):
-        try:
-            r = urllib.request.urlopen(f"{host}{endpoint}", timeout=3)
-            models = [m["name"] for m in json.loads(r.read()).get("models", [])]
-            if models:
-                _resolved_models[host] = (models[0], time.monotonic())
-                return models[0]
-        except Exception:
-            pass
-    if cached:
-        return cached[0]
-    return "gemma4:e4b"  # ultimate fallback if host is unreachable
-
-
-# Eagerly resolve at module load for startup logging, but non-blocking:
-# if host is down, falls back immediately without blocking imports.
-MODEL       = _resolve_ollama_model(OLLAMA_HOST, _MODEL_ENV)
-LOCAL_MODEL = _resolve_ollama_model(LOCAL_OLLAMA_HOST, _LOCAL_MODEL_ENV)
-TEMPERATURE  = 1.3   # high for variety — small models need more randomness
-TOP_P        = 0.95  # nucleus sampling to complement temperature
-MAX_TOKENS   = 200
-
-# Backend selection:
-#   "auto"   (default) — Claude for SPARK persona, Ollama for GREMLIN/VIXEN/default
-#   "claude" — always use Claude Haiku regardless of persona
-#   "ollama" — always use Ollama (for testing or when claude is unavailable)
+# Legacy introspection field, read by `bin/tool-introspect` and the startup log
+# line. It has not routed anything since reflection moved to the cognition tier
+# (#308) — the "Claude for SPARK, Ollama for GREMLIN/VIXEN" split it described
+# no longer exists anywhere in the code. Kept because removing it would break
+# those two readers; it decides no backend, and must not be re-pointed at one.
 MIND_BACKEND = os.environ.get("PX_MIND_BACKEND", "auto")
 CLAUDE_MODEL = os.environ.get("PX_MIND_CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
@@ -2285,71 +2241,6 @@ def extract_json(text: str) -> dict | None:
     return None
 
 
-def call_ollama(prompt: str, system: str,
-                host: str | None = None,
-                model: str | None = None,
-                auth_token: str | None = None) -> dict:
-    """Call Ollama for reflection. host defaults to OLLAMA_HOST (M5)."""
-    _host  = host  or OLLAMA_HOST
-    # Skip hosts that failed recently — avoids the mDNS hang on dead networks
-    # (Python's urllib timeout covers the socket but not DNS resolution, which
-    # can block 15-20 s per .local lookup on a fully offline network).
-    _now = time.monotonic()
-    if _host_failure_until.get(_host, 0) > _now:
-        return {"error": f"ollama {_host} skipped (offline backoff)"}
-    # Re-resolve model on each call (cached, re-checks every 30 min)
-    _model = model or _resolve_ollama_model(_host, _MODEL_ENV)
-
-    payload = json.dumps({
-        "model": _model,
-        "prompt": prompt,
-        "system": system,
-        "stream": False,
-        "think": False,
-        "options": {
-            "temperature": TEMPERATURE,
-            "top_p": TOP_P,
-            "num_predict": MAX_TOKENS,
-        },
-    }).encode()
-
-    headers = {"Content-Type": "application/json"}
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-
-    req = urllib.request.Request(
-        f"{_host}/api/generate",
-        data=payload,
-        headers=headers,
-    )
-    # Local Pi models need longer on cold start (~24s load + generation)
-    # Cloud gets extra time for cold model loads too
-    _timeout = 90 if _host in (LOCAL_OLLAMA_HOST, OLLAMA_CLOUD_HOST) else 30
-    try:
-        with urllib.request.urlopen(req, timeout=_timeout) as resp:
-            body = json.loads(resp.read())
-        # A 200 with an empty "response" isn't success — e.g. a thinking-capable
-        # model can burn the whole num_predict budget on a <think> block and
-        # never emit an answer (done_reason="length"). Treat it as a failure so
-        # call_llm() falls through to the next tier instead of silently
-        # returning nothing.
-        if not str(body.get("response", "")).strip():
-            _host_failure_until[_host] = time.monotonic() + _HOST_FAILURE_BACKOFF_S
-            return {"error": f"ollama {_model}@{_host} returned empty response (done_reason={body.get('done_reason')})"}
-        return body
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return {"error": f"ollama model '{_model}' not found on {_host} (404)"}
-        return {"error": f"ollama HTTP {exc.code} on {_host}: {exc}"}
-    except urllib.error.URLError as exc:
-        _host_failure_until[_host] = time.monotonic() + _HOST_FAILURE_BACKOFF_S
-        reason = str(exc.reason) if hasattr(exc, 'reason') else str(exc)
-        return {"error": f"ollama unreachable ({_host}): {reason}"}
-    except Exception as exc:
-        _host_failure_until[_host] = time.monotonic() + _HOST_FAILURE_BACKOFF_S
-        return {"error": str(exc)}
-
-
 def _reset_state():
     """Reset all mutable module globals to defaults. Called by test fixtures."""
     global _battery_history, _battery_glitch_count, _battery_glitch_first_mono
@@ -2367,7 +2258,7 @@ def _reset_state():
     global _mood_v, _mood_a
     global _time_period_start_mono, _last_image_cleanup
     global _last_known_findmyhub
-    global _ha_offline_until, _host_failure_until
+    global _ha_offline_until
     global _ha_sleep_entity_missing
 
     _battery_history = []
@@ -2401,7 +2292,6 @@ def _reset_state():
     _last_image_cleanup = 0.0
     _last_known_findmyhub = {}
     _ha_offline_until = 0.0
-    _host_failure_until.clear()
 
 
 
@@ -2859,10 +2749,13 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         append_thought(thought, persona=persona)
         return thought
 
-    # Tier 1 is Ollama for everyone unless MIND_BACKEND forces claude; the
-    # actual tier that serves is only known after call_llm() (see fallback logs)
-    effective_backend = "claude" if MIND_BACKEND == "claude" else "ollama"
-    log(f"reflecting... (backend={effective_backend}, persona={persona or 'default'})")
+    # Reflection is the cognition tier and nothing else: call_llm() reaches
+    # ask_m5() and defers on failure. PX_MIND_BACKEND is a legacy introspection
+    # field that no longer routes anything (see the env table in CLAUDE.md), so
+    # it is logged as what it is rather than as the backend this turn will use.
+    # The tier that actually served is recorded per-thought and per-backend —
+    # see `thought["backend"]` and token_log's by_backend split.
+    log(f"reflecting... (backend={MIND_BACKEND}, persona={persona or 'default'})")
     t0 = time.monotonic()
     if persona == "spark":
         angles = _pick_spark_angles()
@@ -3831,18 +3724,12 @@ def mind_loop(args) -> None:
     log(f"cognitive loop started (awareness every {args.awareness_interval}s, "
         f"reflection every {args.reflection_interval}s idle)")
 
-    # Startup check: verify Ollama models are available
-    for label, host, model in [("M1", OLLAMA_HOST, MODEL)]:
-        try:
-            r = urllib.request.urlopen(f"{host}/api/tags", timeout=3)
-            tags = json.loads(r.read())
-            available = [m["name"] for m in tags.get("models", [])]
-            if model in available:
-                log(f"✓ {label} ollama: model '{model}' available ({host})")
-            else:
-                log(f"⚠ {label} ollama: model '{model}' NOT found — available: {', '.join(available) or 'none'}")
-        except Exception as exc:
-            log(f"⚠ {label} ollama unreachable at startup: {exc}")
+    # Startup check: is the cognition tier reachable and serving the configured
+    # model? The probe lives in pxh.m5 so it cannot drift from what reflection
+    # actually calls — see the note where this module's own host constants used
+    # to live.
+    from pxh.m5 import probe as probe_cognition_tier
+    log(probe_cognition_tier())
 
     while True:
         now = time.monotonic()
@@ -3990,7 +3877,12 @@ def main(argv) -> int:
     _pid_tmp = PID_FILE.with_suffix(".pid.tmp")
     _pid_tmp.write_text(str(_my_pid))
     os.replace(str(_pid_tmp), str(PID_FILE))
-    log(f"starting pid={_my_pid} dry={args.dry_run} model={MODEL}")
+    # The model this daemon's reflection will actually use. Read from the
+    # cognition tier rather than module state, so a startup log can never again
+    # name a model the request does not ask for (#302).
+    from pxh.m5 import configured_model
+    log(f"starting pid={_my_pid} dry={args.dry_run} "
+        f"model={configured_model() or 'unset'}")
 
     def _safe_unlink_pid() -> None:
         try:

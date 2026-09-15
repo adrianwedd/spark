@@ -14,8 +14,9 @@ in a PiCar-X. Rich few-shot examples anchor the voice across emotional registers
 
 Environment:
     PX_TEXT              — user input text (required)
-    PX_OLLAMA_HOST       — Ollama endpoint (default: http://M5:11434)
-    PX_CHAT_MODEL        — model name (default: gemma4:e4b)
+    PX_OLLAMA_HOST       — Ollama endpoint (default: https://ollama.com)
+    OLLAMA_API_KEY       — bearer token for the hosted endpoint
+    PX_CHAT_MODEL        — model name (default: deepseek-v4.1-flash:cloud)
     PX_VIXEN_TEMPERATURE — sampling temperature (default: 0.9)
     PX_VIXEN_MAX_TOKENS  — max response tokens (default: 2000)
     PX_VIXEN_VOICE       — espeak voice (default: en+f4)
@@ -40,8 +41,8 @@ from pxh.state import load_session, update_session
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
 
-OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M5:11434")
-MODEL        = os.environ.get("PX_CHAT_MODEL", "gemma4:e4b")
+OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "https://ollama.com")
+MODEL        = os.environ.get("PX_CHAT_MODEL", "deepseek-v4.1-flash:cloud")
 TEMPERATURE  = float(os.environ.get("PX_VIXEN_TEMPERATURE", "0.9"))
 MAX_TOKENS   = int(os.environ.get("PX_VIXEN_MAX_TOKENS", "2000"))
 
@@ -222,10 +223,14 @@ def call_ollama(user_text: str) -> dict:
         },
     }).encode()
 
+    headers = {"Content-Type": "application/json"}
+    key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/api/generate",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
 
     try:

@@ -400,15 +400,15 @@
 
     <p class="text-muted-dark mb-md">
       SPARK spends most of his time below the expensive semantic layer. Sensors
-      and local services keep a continuous account of the room; bounded local
-      cognition handles routine language work; the one resident Claude brain is
-      reserved for direct voice and semantic vision.
+      and robot-local services keep a continuous account of the room; a hosted
+      Ollama Cloud model handles routine language work; the one resident Claude
+      brain is reserved for direct voice and semantic vision.
     </p>
 
     <div class="thinking-flow" aria-label="How SPARK thinks">
       <div class="thinking-step"><span>01</span><strong>Local perception</strong><small>sonar · grayscale · Frigate · ambient state</small></div>
       <div class="thinking-arrow" aria-hidden="true">↓</div>
-      <div class="thinking-step"><span>02</span><strong>M5 local cognition</strong><small>reflection · public chat · Obi chat · post QA · blog QA</small></div>
+      <div class="thinking-step"><span>02</span><strong>Hosted cognition</strong><small>Ollama Cloud · reflection · public chat · Obi chat · post QA · blog QA</small></div>
       <div class="thinking-arrow" aria-hidden="true">↓</div>
       <div class="thinking-step"><span>03</span><strong>Resident Claude when needed</strong><small>direct voice · sparse semantic vision</small></div>
       <div class="thinking-arrow" aria-hidden="true">↓</div>
@@ -423,8 +423,8 @@
         <p>The <code>spark-brain</code> Claude session persists at the repository root and must complete a real handshake before it can receive work. Production code cannot invoke <code>claude -p</code>; there is no cold-start Claude ladder and no second resident session.</p>
       </article>
       <article>
-        <h3>M5 borrows, then gets out of the way</h3>
-        <p>In resident mode, SPARK uses whichever Ollama model M5 already proves is loaded. If that shared machine is busy—or no eligible model is resident—SPARK defers instead of queueing, evicting Adrian's workload, or quietly reaching for Claude.</p>
+        <h3>Hosted cognition, and nothing behind it</h3>
+        <p>Routine language work runs on Ollama Cloud, off the robot. If that call fails, SPARK defers: he does not fall through to the resident brain, to a model on somebody's laptop, or to a second opinion that costs more than the thing it was rescuing.</p>
       </article>
       <article>
         <h3>Vision escalates sparsely</h3>
@@ -446,11 +446,11 @@
         <audio controls preload="none" src="audio/spark-sample.mp3" aria-label="SPARK voice sample"></audio>
       </div>
       <div class="voice-sample">
-        <strong>GREMLIN</strong> <span class="text-muted-dark">— local Ollama, GLaDOS TTS on Pi</span><br>
+        <strong>GREMLIN</strong> <span class="text-muted-dark">— Ollama Cloud, GLaDOS TTS on Pi</span><br>
         <audio controls preload="none" src="audio/gremlin-sample.mp3" aria-label="GREMLIN voice sample"></audio>
       </div>
       <div class="voice-sample">
-        <strong>VIXEN</strong> <span class="text-muted-dark">— local Ollama, Qwen3-TTS on M5</span><br>
+        <strong>VIXEN</strong> <span class="text-muted-dark">— Ollama Cloud, Qwen3-TTS</span><br>
         <audio controls preload="none" src="audio/vixen-sample.mp3" aria-label="VIXEN voice sample"></audio>
       </div>
     </div>
@@ -460,7 +460,7 @@
   ┌──────────────────────────────────────────────────────────┐
   │  every 60s   Layer 1 — sonar, sound, weather, Obi mode  │
   │              + HA presence, Frigate cameras, calendar    │
-  │  every 5min  Layer 2 — M5 generates thought + mood       │
+  │  every 5min  Layer 2 — Ollama Cloud writes thought+mood  │
   │              OR immediately on detected transition        │
   │  min 30min   Layer 3 cooldown between spontaneous speech  │
   │              arrival greetings have a bounded bypass      │
@@ -614,7 +614,7 @@
 
     <details>
       <summary>Why does it write like that? You've programmed it to?</summary>
-      <p>Partly. Prompts shape the voice: specific, vivid, warm, never generic. Routine reflections are written by the local M5 model; direct conversation uses the resident Claude brain. Neither model gets to turn its own words into authority.</p>
+      <p>Partly. Prompts shape the voice: specific, vivid, warm, never generic. Routine reflections are written by a hosted Ollama Cloud model; direct conversation uses the resident Claude brain. Neither model gets to turn its own words into authority.</p>
     </details>
 
     <details>
@@ -629,12 +629,12 @@
 
     <details>
       <summary>Why did it know the hum was the fridge?</summary>
-      <p>It didn't <em>know</em>. SPARK's awareness included "quiet ambient sound at 2 AM." Claude — the LLM generating the inner thoughts — inferred the most likely source. A low, steady hum in a quiet house at night is almost certainly the fridge. The sensors provide raw data; the prompts provide character; the LLM fills in the meaning.</p>
+      <p>It didn't <em>know</em>. SPARK's awareness included "quiet ambient sound at 2 AM." The language model writing that reflection inferred the most likely source. A low, steady hum in a quiet house at night is almost certainly the fridge. The sensors provide raw data; the prompts provide character; the LLM fills in the meaning.</p>
     </details>
 
     <details>
       <summary>Does it post on social media?</summary>
-      <p>Yes. Thoughts with high salience (above 0.7) or a spoken action are queued for social posting. They pass a privacy filter and an M5-local QA gate before a branded image card is generated. Qualifying posts go to SPARK's <a href="https://bsky.app/profile/spark.wedd.au" target="_blank" rel="noopener noreferrer">Bluesky account</a> and the <a href="/feed/">thought feed</a> on this site.</p>
+      <p>Yes. Thoughts with high salience (above 0.7) or a spoken action are queued for social posting. They pass a privacy filter and a hosted QA gate before a branded image card is generated. Qualifying posts go to SPARK's <a href="https://bsky.app/profile/spark.wedd.au" target="_blank" rel="noopener noreferrer">Bluesky account</a> and the <a href="/feed/">thought feed</a> on this site.</p>
     </details>
 
     <details>
@@ -717,7 +717,7 @@ bin/tool-recall
 PX_CHAT_TEXT="What do you think about entropy?" bin/tool-chat
 # VIXEN persona
 PX_CHAT_TEXT="Tell me about your old chassis" bin/tool-chat-vixen
-# Both use Ollama on M5.local, think:false</code></pre>
+# Both use Ollama Cloud, think:false</code></pre>
     </details>
 
     <h3>User Scripts</h3>
@@ -796,7 +796,7 @@ bin/px-post [--dry-run] [--backfill]
 # Two-pass flush: batch feed writes, then 1 social post per cycle
 # Branded 1080x1080 thought cards via Pillow
 # Privacy filter blocks medical/custody/household content
-# M5-local QA gate checks candidate thoughts
+# Hosted QA gate checks candidate thoughts
 # Bluesky: re-auths on 400/401 (expired token)
 # PID-file single-instance guard</code></pre>
     </details>

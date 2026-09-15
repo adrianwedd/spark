@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Voice-loop LLM adapter: prompt on stdin, one tool-call JSON object on stdout.
+
+Talks to Ollama over HTTP — Ollama Cloud by default (`https://ollama.com`,
+`deepseek-v4.1-flash:cloud`, `OLLAMA_API_KEY`), or any daemon `OLLAMA_HOST`
+names. `OLLAMA_HOST` is the variable the `ollama` CLI itself reads, so a host
+already configured for cloud models needs no SPARK-specific setting.
+"""
 from __future__ import annotations
 
 import json
@@ -36,15 +43,24 @@ def main() -> int:
     prompt = sys.stdin.read()
     if not prompt:
         return 0
-    model = os.environ.get("CODEX_OLLAMA_MODEL", "deepseek-coder:1.3b")
-    host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    model = os.environ.get("CODEX_OLLAMA_MODEL", "deepseek-v4.1-flash:cloud")
+    host = os.environ.get("OLLAMA_HOST", "https://ollama.com")
     if not host.startswith(("http://", "https://")):
-        host = "http://" + host
+        # A bare host is remote unless it names this machine or the LAN — the
+        # old unconditional "http://" would silently downgrade a cloud host to
+        # cleartext on port 80.
+        bare = host.split(":")[0].strip("[]").lower()
+        local = bare in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} or bare.endswith(".local")
+        host = ("http://" if local else "https://") + host
     url = host.rstrip("/") + "/api/generate"
     options: dict[str, object] = {
         "temperature": float(os.environ.get("CODEX_OLLAMA_TEMPERATURE", "0.2")),
     }
-    num_predict = _int_from_env("CODEX_OLLAMA_NUM_PREDICT", 64)
+    # 64 was sized for the local `deepseek-coder:1.3b` this adapter used to
+    # call, which emitted one short line. A hosted frontier model wraps the
+    # same object in more prose and gets truncated mid-JSON at 64 — observed
+    # 2026-09-15, `{"tool": "tool_status", "params":` with no closing brace.
+    num_predict = _int_from_env("CODEX_OLLAMA_NUM_PREDICT", 256)
     if num_predict and num_predict > 0:
         options["num_predict"] = num_predict
     payload = {
@@ -55,7 +71,11 @@ def main() -> int:
         "options": options,
     }
     data_bytes = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    request = urllib.request.Request(url, data=data_bytes, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=600) as response:
             data = json.load(response)

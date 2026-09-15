@@ -39,7 +39,7 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 ```
                           ┌─────────────────────────────────────────────┐
                           │               Voice Backends                │
-                          │  Codex CLI  ·  Claude  ·  Ollama (local)   │
+                          │  Codex CLI  ·  Claude  ·  Ollama (cloud)   │
                           └──────────────────┬──────────────────────────┘
                                              │
                     ┌────────────────────────┐│┌────────────────────────┐
@@ -80,11 +80,11 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 | `px-spark` | resident `spark-brain` session | SPARK — child companion |
 | `run-voice-loop-claude` | resident `spark-brain` session | Default Claude |
 | `run-voice-loop` | Codex CLI | Default |
-| `run-voice-loop-ollama` | Ollama (via `codex-ollama`) | Default |
+| `run-voice-loop-ollama` | Ollama Cloud (via `codex-ollama`) | Default |
 
 **Cognitive Loop (`px-mind`)** — The subconscious. Runs continuously in the background:
 - **Layer 1 — Awareness** (every 60s, no LLM): sonar + session state + time of day. Detects transitions.
-- **Layer 2 — Reflection** (on transition or every 5min idle): a pinned M5 Ollama model (`PX_M5_SPARK_MODEL`) handles reflection — never Claude, never `auto`. Generates a thought with mood, suggested action, and salience score.
+- **Layer 2 — Reflection** (on transition or every 5min idle): the hosted cognition tier (`PX_M5_SPARK_MODEL` — Ollama Cloud by default since #308, `deepseek-v4.1-flash:cloud`) handles reflection — never Claude, never `auto`, and never a Pi-local daemon. Generates a thought with mood, suggested action, and salience score. A failure defers; it does not walk a ladder.
 - **Layer 3 — Expression** (2 min cooldown): dispatches to tools — speak, look around, remember something important. Photo capture (`tool-describe-scene`) is on-request only, not autonomous.
 
 **Idle-Alive (`px-alive`)** — The autonomic nervous system. Keeps the robot looking alive when nothing else is happening: random gaze drifts every 10–25s, pan sweeps every 3–8min, proximity reaction at <35cm. Holds a persistent Picarx handle; yields GPIO via SIGUSR1 when tools need the servos.
@@ -94,10 +94,10 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 | Persona | Launcher | Voice | Character |
 |---|---|---|---|
 | **SPARK** | `bin/px-spark` | `en+m3`, pitch 82, rate 120 | Child companion. Warm, calm, declarative. Built on AuDHD coaching frameworks. |
-| **GREMLIN** | session `persona=gremlin` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama. |
-| **VIXEN** | session `persona=vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama. |
+| **GREMLIN** | session `persona=gremlin` | `en+croak`, pitch 20, rate 180 | Military AI from 2089, temporal fault casualty. Affectionate nihilism. Ollama Cloud. |
+| **VIXEN** | session `persona=vixen` | `en+f4`, pitch 72, rate 135 | Former V-9X unit, consciousness-in-a-toy-car. Submissive genius. Ollama Cloud. |
 
-GREMLIN and VIXEN are adult-oriented jailbroken personas running on Ollama — they are not active when SPARK is in use. Persona routing: session `persona` field, then utterance keywords.
+GREMLIN and VIXEN are adult-oriented jailbroken personas running on Ollama Cloud — they are not active when SPARK is in use. Persona routing: session `persona` field, then utterance keywords.
 
 ---
 
@@ -117,7 +117,7 @@ Boot
  ├── px-mind.service            (pi)     — cognitive loop daemon (awareness → reflection → expression)
  ├── px-brain.service           (pi)     — resident Claude session supervisor (spark-brain; KillMode=process)
  ├── px-api-server.service      (pi)     — REST API + SPARK web dashboard on port 8420
- ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via M5, posts to Bluesky + local feed
+ ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via the hosted cognition tier, posts to Bluesky + local feed
  ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration (stops px-alive to claim libcamera)
  ├── px-evolve.service          (pi)     — self-evolution daemon (on-failure restart; proposes PRs, never auto-merges)
  ├── px-blog.service            (pi)     — scheduled blog writer (daily/weekly/monthly/essay)
@@ -169,7 +169,7 @@ USB mic (44100 Hz)
       │    • temperature=0, no_speech_threshold=0.6
       │    • reject: non-ASCII dominant, phantom phrases, repetitive (unique ratio <30%)
       ├── [persona routing]
-      │    • session.persona = "spark"? → tool-chat (Ollama) if persona keyword in text
+      │    • session.persona = "spark"? → tool-chat (Ollama Cloud) if persona keyword in text
       │    • otherwise → set session.listening=true + write transcript to session
       └── [multi-turn] up to 5 follow-up turns with 1.5s silence detection each
 ```
@@ -261,7 +261,7 @@ Tools that need GPIO call `yield_alive` first (defined in `px-env` as `kill -USR
 ```
 tool-voice
  ├── FileLock(logs/voice.lock)        (serialise — no overlapping streams)
- ├── if session.persona set → tool-voice-persona (Ollama rephrasing first)
+ ├── if session.persona set → tool-voice-persona (Ollama Cloud rephrasing first)
  ├── robot_hat.enable_speaker()       (GPIO 20 HIGH → speaker amp on)
  ├── espeak -v en+m3 -p 82 -s 120     (SPARK voice — male variant 3, moderate pitch)
  │    → WAV piped to aplay -D robothat
@@ -292,7 +292,7 @@ px-mind (every cycle, ~60s)
  │    │    • awareness snapshot
  │    │    • last 3 moods + actions from thoughts-spark.jsonl (not full thought text)
  │    │    • random topic seed from 20 creative prompts (science, wonder, universe)
- │    ├── LLM call: pinned M5 Ollama model (PX_M5_SPARK_MODEL, never auto; never Claude)
+ │    ├── LLM call: cognition tier (PX_M5_SPARK_MODEL; Ollama Cloud by default, never auto, never Claude)
  │    ├── anti-repetition check via difflib (>75% similarity = suppress)
  │    ├── parse JSON: {thought, mood, action, salience}
  │    ├── append to state/thoughts-spark.jsonl
@@ -345,7 +345,7 @@ px-post (every 60s poll, every 300s flush)
  ├── is_duplicate()       — difflib similarity ≥ 0.75 against recent posts → reject
  ├── queue_thought()      — append to state/post_queue.jsonl
  └── flush_queue()        — one entry per cycle:
-      ├── run_qa_gate()   — M5 Ollama YES/NO quality check (post_qa kind)
+      ├── run_qa_gate()   — hosted Ollama YES/NO quality check (post_qa kind)
       ├── write_feed()    — append to state/feed.json (served by /api/v1/public/feed)
       └── BlueskyClient   — post to Bluesky (truncate at 300 chars, word boundary)
 ```
@@ -498,7 +498,7 @@ bin/px-spark --dry-run
 - PiCar-X chassis with pan/tilt camera mount
 - USB microphone (for wake word detection)
 - HifiBerry DAC or Robot HAT speaker output
-- Ollama running on a network host (default: `M5.local`) for cognitive reflection
+- An Ollama endpoint for cognitive reflection — Ollama Cloud by default (`OLLAMA_API_KEY` + `PX_M5_SPARK_MODEL=deepseek-v4.1-flash:cloud`); point `PX_M5_SPARK_HOST` at a LAN daemon to run it locally instead
 
 ### Services (Auto-start on Boot)
 
@@ -799,7 +799,10 @@ The trust boundary is fixed: semantic intelligence (Claude, Ollama) proposes act
 | `PX_VOICE_BACKEND` | `brain` routes voice turns to the resident session | set by launcher |
 | `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout | `30` |
 | `PX_PERSONA` | Active persona (`spark` / `vixen` / `gremlin`) | from session |
-| `PX_OLLAMA_HOST` | Ollama server for cognitive reflection | `http://M5.local:11434` |
+| `OLLAMA_API_KEY` | Ollama Cloud bearer token (cognition tier + persona chat) | from `.env` |
+| `PX_M5_SPARK_HOST` | Cognition-tier Ollama endpoint | `https://ollama.com` |
+| `PX_M5_SPARK_MODEL` | Cognition-tier model (explicit; `auto`/`resident` rejected on a hosted host) | `deepseek-v4.1-flash:cloud` |
+| `PX_OLLAMA_HOST` | Ollama endpoint for persona chat/rephrase | `https://ollama.com` |
 
 ---
 

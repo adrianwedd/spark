@@ -14,8 +14,9 @@ Ollama decides HOW to say it in the persona's voice.
 Environment:
     PX_TEXT            — text to rephrase and speak (required)
     PX_PERSONA         — persona name: "gremlin" or "vixen" (required)
-    PX_OLLAMA_HOST     — Ollama endpoint (default: http://M5:11434)
-    PX_CHAT_MODEL      — Ollama model (default: gemma4:e4b)
+    PX_OLLAMA_HOST     — Ollama endpoint (default: https://ollama.com)
+    OLLAMA_API_KEY     — bearer token for the hosted endpoint
+    PX_CHAT_MODEL      — Ollama model (default: deepseek-v4.1-flash:cloud)
     PX_VOICE_VARIANT   — espeak voice variant (set by persona config)
     PX_VOICE_PITCH     — espeak pitch (set by persona config)
     PX_VOICE_RATE      — espeak rate (set by persona config)
@@ -36,8 +37,8 @@ from pxh.logging import log_event
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
 
-OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "http://M5:11434")
-MODEL        = os.environ.get("PX_CHAT_MODEL", "gemma4:e4b")
+OLLAMA_HOST  = os.environ.get("PX_OLLAMA_HOST", "https://ollama.com")
+MODEL        = os.environ.get("PX_CHAT_MODEL", "deepseek-v4.1-flash:cloud")
 
 REPHRASE_PROMPTS = {
     "gremlin": (
@@ -103,10 +104,14 @@ def rephrase_via_ollama(text: str, persona: str) -> str:
         "options": {"temperature": 0.9, "num_predict": 120},
     }).encode()
 
+    headers = {"Content-Type": "application/json"}
+    key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/api/generate",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
 
     try:

@@ -23,14 +23,14 @@ def test_homepage_explains_current_cognition_routes():
     page = _read("index.html")
 
     assert "Local perception" in page
-    assert "M5 local cognition" in page
+    assert "Hosted cognition" in page
+    assert "Ollama Cloud" in page
     assert "Resident Claude" in page
     assert "Deterministic policy" in page
     assert "public chat" in page
     assert "Obi chat" in page
     assert "post QA" in page
     assert "blog QA" in page
-    assert "resident mode" in page
 
 
 def test_homepage_names_durable_provenance_types():

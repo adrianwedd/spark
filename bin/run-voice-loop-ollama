@@ -3,9 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CMD="$SCRIPT_DIR/codex-ollama"
-DEFAULT_MODEL="deepseek-coder:1.3b"
+# Ollama Cloud (#308). The local-daemon models this used to name
+# (`deepseek-coder:1.3b`) are no longer the target; `OLLAMA_HOST` +
+# `OLLAMA_API_KEY` decide where the call actually goes.
+DEFAULT_MODEL="deepseek-v4.1-flash:cloud"
 DEFAULT_TEMP="0.2"
-DEFAULT_NUM_PREDICT="64"
+# Raised from 64 with the move to Ollama Cloud (#308): the old value was tuned
+# for a 1.3B local model and truncates a hosted model mid-JSON.
+DEFAULT_NUM_PREDICT="256"
 export CODEX_CHAT_CMD="${CODEX_CHAT_CMD:-$DEFAULT_CMD}"
 export CODEX_OLLAMA_MODEL="${CODEX_OLLAMA_MODEL:-$DEFAULT_MODEL}"
 export CODEX_OLLAMA_TEMPERATURE="${CODEX_OLLAMA_TEMPERATURE:-$DEFAULT_TEMP}"

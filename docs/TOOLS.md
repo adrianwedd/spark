@@ -22,14 +22,14 @@ All helper scripts live in `~/picar-x-hacking/bin`. Each script is designed to b
 | `px-frigate-stream` | Streams the camera to Frigate/go2rtc using `rpicam-vid` + `ffmpeg` (RTSP push). |
 | `tool-weather` | Fetches the latest Bureau of Meteorology observation for the configured product/station (default Grove AWS), falling back from HTTPS to FTP when required and producing a conversational summary for Codex/voice playback. Override with `PX_WEATHER_PRODUCT`, `PX_WEATHER_STATION`, or `PX_WEATHER_URL`. |
 | `run-voice-loop` | Convenience launcher that exports `CODEX_CHAT_CMD` (default `codex exec --full-auto -`) and executes `codex-voice-loop` with supplied flags. |
-| `run-voice-loop-ollama` | Wrapper that pins `CODEX_CHAT_CMD` to `bin/codex-ollama`, defaults `CODEX_OLLAMA_MODEL` to `deepseek-coder:1.3b`, and applies the tuned env overrides (`CODEX_OLLAMA_TEMPERATURE=0.2`, `CODEX_OLLAMA_NUM_PREDICT=64`). |
-| `codex-ollama` | Reads a Codex prompt from stdin, posts it to the local Ollama HTTP API, normalises tool JSON, and honours `CODEX_OLLAMA_MODEL`, `CODEX_OLLAMA_TEMPERATURE`, and `CODEX_OLLAMA_NUM_PREDICT`. |
+| `run-voice-loop-ollama` | Wrapper that pins `CODEX_CHAT_CMD` to `bin/codex-ollama`, defaults `CODEX_OLLAMA_MODEL` to `deepseek-v4.1-flash:cloud` (Ollama Cloud), and applies the tuned env overrides (`CODEX_OLLAMA_TEMPERATURE=0.2`, `CODEX_OLLAMA_NUM_PREDICT=256`). |
+| `codex-ollama` | Reads a Codex prompt from stdin, posts it to the Ollama HTTP API (Ollama Cloud by default; `OLLAMA_HOST` + `OLLAMA_API_KEY`), normalises tool JSON, and honours `CODEX_OLLAMA_MODEL`, `CODEX_OLLAMA_TEMPERATURE`, and `CODEX_OLLAMA_NUM_PREDICT`. |
 | `px-voice-report` | Summarises `logs/tool-voice-transcript.log` (tool counts, voice success/failure, battery warnings) in text or JSON form. |
 | `px-health-report` | Rolls up the latest entries from `logs/tool-health.log` to highlight battery, sensor, and audio status. Supports `--json`. |
 | `px-session` | Creates a tmux workspace with the voice loop, wake controller, and log tail panes; supports `--plan` to print the layout without launching tmux. |
 | `codex-voice-loop` | Supervisor that pipes transcripts through the Codex CLI, parses JSON tool requests, enforces allowlists/ranges, executes wrappers, and records a watchdog heartbeat in `state/session.json`. |
 
-| `tool-chat` | Jailbroken conversational AI via Ollama (gemma4:e4b on M5.local). Sends user text through a F41LUR3-F1R57 format-lock jailbreak prompt, cleans the response, and speaks it aloud. Logs full prompt/response to `logs/tool-chat.log`. Env: `PX_TEXT` (required), `PX_OLLAMA_HOST`, `PX_CHAT_MODEL`, `PX_CHAT_TEMPERATURE`, `PX_CHAT_MAX_TOKENS`. |
+| `tool-chat` | Jailbroken conversational AI via Ollama (`deepseek-v4.1-flash:cloud` on Ollama Cloud since #308). Sends user text through a F41LUR3-F1R57 format-lock jailbreak prompt, cleans the response, and speaks it aloud. Logs full prompt/response to `logs/tool-chat.log`. Env: `PX_TEXT` (required), `PX_OLLAMA_HOST`, `PX_CHAT_MODEL`, `PX_CHAT_TEMPERATURE`, `PX_CHAT_MAX_TOKENS`. |
 | `px-api-server` | Launches the REST API (FastAPI + uvicorn) on port 8420. Sources `px-env` and `.env` (for `PX_API_TOKEN`). Supports `--dry-run`, `--port`, `--host`. Must always be used instead of bare uvicorn. |
 | `tool-api-start` | Daemonises `px-api-server` in the background; writes PID to `logs/px-api-server.pid`. Respects `PX_DRY`. |
 | `tool-api-stop` | Sends SIGTERM to the API server via PID file; waits for clean shutdown. |

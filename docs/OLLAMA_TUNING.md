@@ -1,5 +1,14 @@
 # Ollama DeepSeek Tuning Notes
 
+> **Historical (superseded 2026-09-15, #308).** These numbers were measured
+> against a small model running on the Pi's own CPU, and the defaults they
+> recommend (`deepseek-coder:1.3b`, `num_predict=64`) describe a *local* tier
+> that no longer exists: the voice-loop Ollama backend now points at Ollama
+> Cloud with `deepseek-v4.1-flash:cloud`. Kept because the measurements are
+> evidence for a design question that will come back — how small a model can
+> be and still emit a parseable tool call — not as current guidance. Re-run
+> the harness before quoting any latency from this table.
+
 ## Test Harness
 - Commands were issued via the voice loop prompt builder (`pxh.voice_loop.build_model_prompt`) using the current `state/session.json`.
 - Each configuration evaluated the same five prompts:
