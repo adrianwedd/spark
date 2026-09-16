@@ -198,9 +198,9 @@ def main() -> int:
     evolve_history = load_evolve_history(EVOLVE_LOG_FILE)
 
     # ── Claude session stats ─────────────────────────────────────
-    claude_sessions = {}
+    model_sessions = {}
     try:
-        from pxh.claude_session import _load_session_log, _today_entries, DAILY_CAP
+        from pxh.model_session import _load_session_log, _today_entries, DAILY_CAP
         all_entries = _load_session_log()
         today = _today_entries(all_entries)
         by_type = {}
@@ -209,7 +209,7 @@ def main() -> int:
             t = e.get("type", "unknown")
             by_type[t] = by_type.get(t, 0) + 1
             total_duration += e.get("duration_s", 0)
-        claude_sessions = {
+        model_sessions = {
             "today_count": len(today),
             "daily_cap": DAILY_CAP,
             "by_type": by_type,
@@ -244,7 +244,7 @@ def main() -> int:
         "mind":                mind_info,
         "architecture":        ARCHITECTURE_TEXT,
         "evolve_history":      evolve_history,
-        "claude_sessions":     claude_sessions,
+        "model_sessions":     model_sessions,
         "evolve_outcomes":     evolve_outcomes,
         "dry":                 dry_mode,
     }

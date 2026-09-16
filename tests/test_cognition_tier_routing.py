@@ -26,9 +26,16 @@ from unittest.mock import patch
 
 import pytest
 
-from pxh import claude_session as cs, m5
+from pxh import model_session as cs, m5
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def _safe_read(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return ""
 
 MIGRATED = ("consolidate", "research", "compose", "blog", "self_debug")
 
@@ -39,7 +46,7 @@ def _ok(response="the answer", **kw):
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
-    monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
+    monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "model_sessions.jsonl")
     monkeypatch.setattr(cs, "STATE_DIR", tmp_path)
     monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
 
@@ -74,7 +81,7 @@ def test_the_brain_dial_cannot_route_anything_anywhere(monkeypatch):
     monkeypatch.setenv("PX_BRAIN_KINDS", ",".join(MIGRATED))
     monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: _ok())
     for kind in MIGRATED:
-        assert cs.run_claude_session(kind, "a prompt", timeout=5).returncode == 0
+        assert cs.run_model_session(kind, "a prompt", timeout=5).returncode == 0
     assert not hasattr(cs, "brain_kinds")
 
 
@@ -82,7 +89,7 @@ def test_the_brain_dial_cannot_route_anything_anywhere(monkeypatch):
 def test_a_migrated_kind_is_served_by_the_cognition_tier(kind, monkeypatch):
     monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: _ok())
 
-    result = cs.run_claude_session(kind, "a prompt", timeout=5)
+    result = cs.run_model_session(kind, "a prompt", timeout=5)
 
     assert result.returncode == 0
     assert result.stdout == "the answer"
@@ -99,7 +106,7 @@ def test_the_prompt_and_timeout_reach_the_cognition_tier_intact(monkeypatch):
 
     monkeypatch.setattr(m5, "ask_m5", _capture)
 
-    cs.run_claude_session("consolidate", "distil the day", timeout=600)
+    cs.run_model_session("consolidate", "distil the day", timeout=600)
 
     assert seen == {"kind": "consolidate", "prompt": "distil the day",
                     "system": "", "timeout_s": 600, "model": None}
@@ -112,7 +119,7 @@ def test_a_failure_is_classified_and_never_falls_back_to_claude(status, monkeypa
     monkeypatch.setattr(m5, "ask_m5",
                         lambda *a, **k: m5.M5Result(status=status, error="boom"))
 
-    result = cs.run_claude_session("research", "a question", timeout=5)
+    result = cs.run_model_session("research", "a question", timeout=5)
 
     assert result.returncode != 0
     assert result.stdout == ""
@@ -127,7 +134,7 @@ def test_the_log_names_the_tier_that_answered(monkeypatch):
     monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: _ok(
         model="deepseek-v4.1-flash:cloud", prompt_eval_count=1200, eval_count=310))
 
-    cs.run_claude_session("blog", "write a post", timeout=60)
+    cs.run_model_session("blog", "write a post", timeout=60)
 
     entry = _entries()[-1]
     assert entry["provider"] == "ollama-cloud"
@@ -142,23 +149,39 @@ def test_a_provider_neutral_model_override_is_honoured(monkeypatch):
                         seen.update(model=model) or _ok())
     monkeypatch.setenv("PX_MODEL_RESEARCH", "qwen3:32b-cloud")
 
-    cs.run_claude_session("research", "a question", timeout=5)
+    cs.run_model_session("research", "a question", timeout=5)
 
     assert seen["model"] == "qwen3:32b-cloud"
 
 
-def test_the_claude_era_model_variable_is_not_handed_to_ollama(monkeypatch):
-    """`PX_CLAUDE_MODEL_RESEARCH` holds a Claude model id. Ignoring it is the
-    honest outcome; passing it to Ollama would be a second, quieter bug."""
+def test_the_claude_era_model_variables_are_gone(monkeypatch):
+    """`PX_CLAUDE_MODEL_*` held Claude model ids for a session that no longer
+    exists. There were two possible endings: delete the names, or keep reading
+    them and ignore what they say.
+
+    Deleting them is the only one that cannot go wrong. A variable that still
+    exists is a variable someone will set, and an override that is silently
+    ignored reads exactly like one that is broken — so this asserts the names
+    are absent from the tree, and that setting one changes nothing.
+    """
     seen = {}
     monkeypatch.setattr(m5, "ask_m5",
                         lambda kind, prompt, system, *, timeout_s=None, model=None:
                         seen.update(model=model) or _ok())
     monkeypatch.setenv("PX_CLAUDE_MODEL_RESEARCH", "claude-opus-4-6")
 
-    cs.run_claude_session("research", "a question", timeout=5)
+    cs.run_model_session("research", "a question", timeout=5)
 
-    assert seen["model"] is None
+    assert seen["model"] is None, "a Claude-era model id reached the tier"
+
+    # A read, not a mention: the retirement is worth explaining in prose, and
+    # prose is not a call path. This is the same distinction
+    # tools/check_resident_claude.py draws between a comment and an argv list.
+    reads = [p for p in list((REPO / "src").rglob("*.py")) + list((REPO / "bin").rglob("*"))
+             if p.is_file()
+             and ("environ.get(\"PX_CLAUDE_MODEL" in _safe_read(p)
+                  or "getenv(\"PX_CLAUDE_MODEL" in _safe_read(p))]
+    assert reads == [], f"PX_CLAUDE_MODEL_* is read again in: {reads}"
 
 
 def test_budget_and_quota_still_apply_to_migrated_kinds(monkeypatch):
@@ -168,7 +191,7 @@ def test_budget_and_quota_still_apply_to_migrated_kinds(monkeypatch):
     monkeypatch.setattr(cs, "check_budget", lambda kind: "daily cap reached")
 
     with pytest.raises(cs.SessionBudgetExhausted):
-        cs.run_claude_session("research", "a question")
+        cs.run_model_session("research", "a question")
 
     assert called == [], "the tier must not be called once the budget refuses"
 
@@ -185,7 +208,7 @@ def test_a_cognition_kind_asked_for_tools_is_refused(monkeypatch):
     monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: called.append(1) or _ok())
 
     with pytest.raises(cs.CognitionTierToolsForbidden) as excinfo:
-        cs.run_claude_session("self_debug", "diagnose",
+        cs.run_model_session("self_debug", "diagnose",
                               allowed_tools="Read,Glob,Grep",
                               skip_permissions=True, timeout=10)
 

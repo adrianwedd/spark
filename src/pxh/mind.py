@@ -2519,7 +2519,7 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
     # Claude budget visibility: let the model reason about its own scarcity
     # instead of blindly choosing research/compose/evolve when they're blocked.
     try:
-        from pxh.claude_session import budget_summary
+        from pxh.model_session import budget_summary
         _budget = budget_summary()
         if _budget:
             context_parts.append(f"Your Claude session budget today: {_budget}")
@@ -3427,14 +3427,14 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
         elif action == "self_debug":
             log("expression: self_debug triggered — gathering diagnostics")
             try:
-                from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+                from pxh.model_session import run_model_session, SessionBudgetExhausted
                 # The snapshot is assembled here, in Python, so the model needs
                 # no repo authority to answer (#317 Phase 2). No `timeout=`
                 # either: on the cognition tier the deadline is the tier's own
                 # (`PX_M5_SPARK_TIMEOUT_S`), and #291 is what an ad-hoc number
                 # costs — the tighter value always won and the declared budget
                 # was never once reachable.
-                result = run_claude_session(
+                result = run_model_session(
                     session_type="self_debug",
                     prompt=(
                         "SPARK's reflection layer is failing. Diagnose what is "
@@ -3463,7 +3463,7 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
             except SessionBudgetExhausted as exc:
                 log(f"expression: self_debug budget exhausted: {exc}")
             except ImportError:
-                log("expression: self_debug skipped — claude_session not available")
+                log("expression: self_debug skipped — model_session not available")
             except Exception as exc:
                 log(f"expression: self_debug error: {exc}")
 

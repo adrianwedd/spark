@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import pytest
 
-from pxh import claude_session
+from pxh import model_session
 
 
 # ── Fail closed ────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("kind", sorted(claude_session._DEFAULT_MODELS))
+@pytest.mark.parametrize("kind", sorted(model_session.KNOWN_KINDS))
 def test_no_kind_reaches_a_cli(kind, monkeypatch):
     """Either a kind runs on the cognition tier, or it has no backend at all.
 
@@ -31,18 +31,18 @@ def test_no_kind_reaches_a_cli(kind, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("cold-started a CLI")
 
-    monkeypatch.setattr(claude_session.subprocess, "run", _boom)
-    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", True)
-    monkeypatch.setattr(claude_session, "_log_session", lambda *a, **kw: None)
+    monkeypatch.setattr(model_session.subprocess, "run", _boom)
+    monkeypatch.setattr(model_session, "BUDGET_DISABLED", True)
+    monkeypatch.setattr(model_session, "_log_session", lambda *a, **kw: None)
 
-    if kind in claude_session._COGNITION_KINDS:
+    if kind in model_session._COGNITION_KINDS:
         from pxh import m5
         monkeypatch.setattr(m5, "ask_m5",
                             lambda *a, **k: m5.M5Result(status="available", response="ok"))
-        assert claude_session.run_claude_session(kind, "hi").returncode == 0
+        assert model_session.run_model_session(kind, "hi").returncode == 0
     else:
-        with pytest.raises(claude_session.ColdStartForbidden):
-            claude_session.run_claude_session(kind, "hi")
+        with pytest.raises(model_session.ColdStartForbidden):
+            model_session.run_model_session(kind, "hi")
 
 
 def test_evolve_is_disabled_not_cold_started(monkeypatch):
@@ -52,10 +52,10 @@ def test_evolve_is_disabled_not_cold_started(monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("cold-started a CLI for evolve")
 
-    monkeypatch.setattr(claude_session.subprocess, "run", _boom)
+    monkeypatch.setattr(model_session.subprocess, "run", _boom)
 
-    with pytest.raises(claude_session.ColdStartForbidden):
-        claude_session.run_claude_session("evolve", "hi", skip_budget_check=True)
+    with pytest.raises(model_session.ColdStartForbidden):
+        model_session.run_model_session("evolve", "hi", skip_budget_check=True)
 
 
 def test_every_known_kind_has_a_home_or_a_stated_reason_for_not():
@@ -65,7 +65,7 @@ def test_every_known_kind_has_a_home_or_a_stated_reason_for_not():
     With one backend the invariant is: every kind in the quota/priority tables
     is either served by the tier or named here as deliberately backendless.
     """
-    cognition = claude_session._COGNITION_KINDS
+    cognition = model_session._COGNITION_KINDS
     assert cognition == {"consolidate", "research", "compose", "blog", "self_debug"}
 
     # Deliberately backendless, and named rather than omitted:
@@ -73,7 +73,7 @@ def test_every_known_kind_has_a_home_or_a_stated_reason_for_not():
     #   conversation — legacy kind kept only in the quota/priority tables; no
     #                  caller has used it since before the resident session
     backendless = {"evolve", "conversation"}
-    for kind in claude_session._DEFAULT_MODELS:
+    for kind in model_session.KNOWN_KINDS:
         if kind in backendless:
             continue
         assert kind in cognition, (
@@ -86,9 +86,9 @@ def test_asking_for_tools_on_the_tier_is_refused_not_ignored(monkeypatch):
     called = []
     monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: called.append(1) or
                         m5.M5Result(status="available", response="ok"))
-    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", True)
+    monkeypatch.setattr(model_session, "BUDGET_DISABLED", True)
 
-    with pytest.raises(claude_session.CognitionTierToolsForbidden):
-        claude_session.run_claude_session("self_debug", "hi", allowed_tools="Read")
+    with pytest.raises(model_session.CognitionTierToolsForbidden):
+        model_session.run_model_session("self_debug", "hi", allowed_tools="Read")
 
     assert called == []

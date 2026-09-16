@@ -32,9 +32,9 @@ def main():
         return
 
     try:
-        from pxh.claude_session import run_claude_session, SessionBudgetExhausted
+        from pxh.model_session import run_model_session, SessionBudgetExhausted
     except ImportError:
-        print(json.dumps({"status": "error", "error": "claude_session not available"}))
+        print(json.dumps({"status": "error", "error": "model_session not available"}))
         return
 
     prompt = (
@@ -46,7 +46,7 @@ def main():
     )
 
     try:
-        result = run_claude_session(
+        result = run_model_session(
             session_type="compose",
             prompt=prompt,
             timeout=300,

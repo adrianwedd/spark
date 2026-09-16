@@ -21,7 +21,7 @@ no imports from mind.py or voice_loop.py (the dependency runs one way, so there
 is no cycle). Callers pass the session/awareness dicts they already hold.
 
 This module and tests/test_policy_invariants.py are blacklisted from
-self-evolution — see pxh.claude_session.BLACKLIST_FILES.
+self-evolution — see pxh.model_session.BLACKLIST_FILES.
 """
 from __future__ import annotations
 

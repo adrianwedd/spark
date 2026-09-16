@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from pxh.claude_session import COGNITION_PROVIDER
+from pxh.model_session import COGNITION_PROVIDER
 from pxh.m5 import configured_model
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.logging import log_event

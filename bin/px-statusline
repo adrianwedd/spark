@@ -160,10 +160,10 @@ def services() -> str:
     return " ".join(states)
 
 
-def claude_budget() -> str:
-    """Claude session budget: used/cap today."""
+def model_budget() -> str:
+    """Cognition budget: used/cap today."""
     try:
-        from pxh.claude_session import _load_session_log, _today_entries, DAILY_CAP, SESSION_LOG
+        from pxh.model_session import _load_session_log, _today_entries, DAILY_CAP, SESSION_LOG
         entries = _load_session_log()
         today = _today_entries(entries)
         used = len(today)
@@ -205,8 +205,8 @@ def main() -> None:
     parts.append(mem())
     parts.append(battery())
 
-    # Claude budget
-    cb = claude_budget()
+    # Cognition budget
+    cb = model_budget()
     if cb:
         parts.append(cb)
 

@@ -23,7 +23,7 @@ reply tool; what is left is one direct API call to the cognition tier per kind.
   (argv lists with `-p`, shell execs, forbidden helpers, fossil artifacts) **and
   fails if any retired transport path reappears** (`FORBIDDEN_PATHS`)
 - `tests/test_resident_only_invariant.py` — pins the scanner and its canaries
-- Both are blacklisted from px-evolve (`claude_session.BLACKLIST_FILES`)
+- Both are blacklisted from px-evolve (`model_session.BLACKLIST_FILES`)
 
 **Verify on the Pi:**
 ```bash
@@ -33,7 +33,7 @@ ps aux | grep claude    # no production process; a human's own session only
 ### 2. One route per kind, and no dial
 
 There is no `PX_BRAIN_KINDS` and no second destination. A kind is either in
-`claude_session._COGNITION_KINDS` or it has no backend and raises
+`model_session._COGNITION_KINDS` or it has no backend and raises
 `ColdStartForbidden`. `evolve` is the one deliberate member of the second set.
 
 **Verify on the Pi:**
@@ -52,7 +52,7 @@ through to Claude (there is none), and they do not reach a Pi-local model.
 
 **Code paths:**
 - `mind.py::call_llm()` → `m5.ask_m5()` → defer on failure
-- `api.py::_call_claude_public()` → `m5.ask_m5()` → raise on failure (no fallback)
+- `api.py::_call_tier_public()` → `m5.ask_m5()` → raise on failure (no fallback)
 - `bin/px-post::run_qa_gate()` → `m5.ask_m5()` → defer on failure
 - `bin/px-blog::_qa_gate()` → `m5.ask_m5()` → defer on failure
 - `voice_loop.run_voice_turn()` → `m5.ask_m5()` → one retry on transport
@@ -92,10 +92,10 @@ rather than read by a local session.
 | Call site | Route | Classification |
 |---|---|---|
 | `mind.py::reflection()` | `call_llm()` → `m5.ask_m5("reflection")` | Cognition tier, defers on failure |
-| `mind.py::self_debug` action | `run_claude_session("self_debug")` → tier | Cognition tier, budget-gated |
-| `memory.py::consolidate()` | `run_claude_session("consolidate")` → tier | Cognition tier, budget-gated; the nightly pass |
-| `bin/px-blog::generate_post()` | `run_claude_session("blog")` → tier | Cognition tier, budget-gated |
-| `bin/tool-research` / `tool-compose` / `tool-blog` | `run_claude_session(...)` → tier | Cognition tier, budget-gated |
+| `mind.py::self_debug` action | `run_model_session("self_debug")` → tier | Cognition tier, budget-gated |
+| `memory.py::consolidate()` | `run_model_session("consolidate")` → tier | Cognition tier, budget-gated; the nightly pass |
+| `bin/px-blog::generate_post()` | `run_model_session("blog")` → tier | Cognition tier, budget-gated |
+| `bin/tool-research` / `tool-compose` / `tool-blog` | `run_model_session(...)` → tier | Cognition tier, budget-gated |
 | `bin/px-blog::_qa_gate()` | `m5.ask_m5("blog_qa")` | Cognition tier, defers on failure |
 | `bin/px-post::run_qa_gate()` | `m5.ask_m5("post_qa")` | Cognition tier, defers on failure |
 | `bin/px-cron-say::call_model()` | `m5.ask_m5("cron_say")` | Cognition tier, skips the slot on failure |
@@ -103,11 +103,11 @@ rather than read by a local session.
 | `api.py::post_obi_chat()` | `m5.ask_m5("obi_chat")` | Cognition tier, raises on failure |
 | `vision.py::describe_image()` | `m5.ask_m5("describe_scene")` | Cognition tier, honest fallback |
 | `voice_loop.py` (voice turn) | `m5.ask_m5("voice_turn")` | Cognition tier, one bounded retry then the ack |
-| `bin/px-evolve` | `run_claude_session("evolve")` | **No backend** — raises `ColdStartForbidden` |
+| `bin/px-evolve` | `run_model_session("evolve")` | **No backend** — raises `ColdStartForbidden` |
 
-**Every model-bearing path goes through `pxh.m5.ask_m5()`.** `claude_session`
+**Every model-bearing path goes through `pxh.m5.ask_m5()`.** `model_session`
 is a budget/quota/logging wrapper in front of it, not a second transport:
-`state/claude_sessions.jsonl` records the budget-gated kinds, `state/m5/meter.json`
+`state/model_sessions.jsonl` records the budget-gated kinds, `state/m5/meter.json`
 counts every tier request, and `provider` in the session log says which one
 served the call. There is no path around both.
 
@@ -119,7 +119,7 @@ compute".**
 
 ## Budget controls
 
-- `claude_session.py`: per-type cooldowns, daily quotas, global 8/day cap
+- `model_session.py`: per-kind cooldowns, daily quotas, global 8/day cap
 - `m5.py::_record_request()`: per-kind per-route per-status meter (observability, not a cap)
 - `token_log.log_usage()`: `by_backend` split in `state/token_usage.json`
 
@@ -139,7 +139,7 @@ cat state/m5/meter.json
 jq '.by_backend | keys' state/token_usage.json
 
 # Budget-gated session log
-tail -20 state/claude_sessions.jsonl
+tail -20 state/model_sessions.jsonl
 
 # No scheduled tasks spawning a model CLI
 crontab -l    # only px-cron-say, which calls pxh.m5

@@ -126,7 +126,7 @@ def test_reflection_context_includes_budget_summary(monkeypatch):
         return {"response": json.dumps(
             {"thought": "x", "mood": "content", "action": "wait", "salience": 0.2})}
 
-    import pxh.claude_session as cs
+    import pxh.model_session as cs
     monkeypatch.setattr(cs, "budget_summary", lambda: "3/8 used (BUDGET-MARKER)")
     monkeypatch.setattr(mind, "call_llm", _fake_llm)
     monkeypatch.setattr(mind, "load_session", lambda: {"persona": ""})

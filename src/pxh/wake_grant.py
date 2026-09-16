@@ -78,7 +78,7 @@ session is gone (#317 Phase 3) and the argument survives it, because a
 process holding a shell was never what this module claimed to stop.
 
 Blacklisted from self-evolution alongside policy.py — see
-pxh.claude_session.BLACKLIST_FILES.
+pxh.model_session.BLACKLIST_FILES.
 """
 from __future__ import annotations
 
