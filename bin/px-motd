@@ -249,9 +249,11 @@ def _svc_status(name: str) -> tuple[bool, str]:
         return False, ""
 
 
-# tmux servers we know about. px-mind runs SPARK's brain/io sessions on a
-# dedicated socket so they survive independently of user sessions; that also
-# means a bare `tmux attach` will never find them.
+# tmux servers we know about. The dedicated px-mind socket used to hold
+# SPARK's resident brain/io sessions; #317 Phase 3 retired those, so what is
+# left on it is whatever an operator or a long-lived session happens to own.
+# The socket is still scanned rather than removed, because a stale assumption
+# about which socket holds what is exactly what made `px-motd` lie before.
 PI_DEFAULT_SOCKET = "/tmp/tmux-1000/default"
 PI_PXMIND_SOCKET  = "/tmp/tmux-1000/px-mind"
 
@@ -551,13 +553,16 @@ def section_connectivity() -> list[str]:
 
 def section_tmux() -> list[str]:
     SESSION_INFO = {
-        "spark-brain": "SPARK's mind — live, watch only",
         "px-claude":   "SPARK reflection — monitor only",
         "picar-x":     "voice + wake + logs",
     }
     OWNED = {"px-claude"}
-    # Attach to these with -r. They are supervised Claude sessions, not shells.
-    READ_ONLY = {"spark-brain"}
+    # Attach to these with -r. They are supervised model sessions, not shells.
+    #
+    # `spark-brain` was the fourth entry here until #317 Phase 3 deleted the
+    # resident session. It is not carried as a dead key: a name that no longer
+    # exists in the system should not still be a name this tool explains.
+    READ_ONLY: set[str] = set()
 
     sessions = _tmux_sessions()
     if not sessions:
@@ -585,13 +590,6 @@ def section_tmux() -> list[str]:
         out.append(f"          {CYAN}{cmd}{RESET}")
 
     session_names = {s["name"] for s in sessions}
-    if session_names & READ_ONLY:
-        # The failure this exists to prevent: "/exit" in a brain pane ends the
-        # Claude session. The supervisor does respawn it, but a bare
-        # `tmux ls` afterwards looks at the default socket, says "no server
-        # running", and reads as though the brain never came back.
-        out.append(f"          {DIM}leave a pane:{RESET} {CYAN}Ctrl-b d{RESET} "
-                   f"{DIM}— never{RESET} {CYAN}/exit{RESET}{DIM}, it ends the session{RESET}")
     if "picar-x" not in session_names:
         out.append(f"          {DIM}start voice:{RESET} {CYAN}bin/px-session{RESET}")
     return out

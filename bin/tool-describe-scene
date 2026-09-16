@@ -19,7 +19,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
-from pxh.brain import BRAIN_SESSION, configured_model
+from pxh.claude_session import COGNITION_PROVIDER
+from pxh.m5 import configured_model
 from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore
 from pxh.logging import log_event
 from pxh.state import update_session
@@ -245,8 +246,12 @@ def main() -> int:
             "origin": vision_origin,
             "reason": vision_reason,
             "task_id": vision_task_id,
-            "backend": BRAIN_SESSION,
-            "model": configured_model(BRAIN_SESSION),
+            # What actually answered, not what used to (#317 Phase 3): this
+            # was `BRAIN_SESSION` while a resident Claude session read the
+            # photo through its own Read tool. The photo now goes to the
+            # cognition tier inline and the vision-capable model answers it.
+            "backend": COGNITION_PROVIDER,
+            "model": configured_model() or "",
         }
         log_event("describe_scene", payload)
         update_session(

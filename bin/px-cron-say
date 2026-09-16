@@ -103,6 +103,8 @@ def build_prompt(scene: str | None, custom_prompt: str | None) -> str:
 
 # Was `brain._DEADLINE_S["cron_say"]` while the resident session answered this
 # kind. 90s stays: nobody is waiting on a cron line, and four more slots follow.
+# It is now the only declaration of this kind's deadline — the table it was
+# copied from went with the session (#317 Phase 3).
 CRON_SAY_DEADLINE_S = 90.0
 
 RESPOND_WITH = (
@@ -115,9 +117,9 @@ RESPOND_WITH = (
 def call_model(prompt: str) -> str:
     """Ask the cognition tier for the scheduled line.
 
-    This ran five times a day as a cold `claude -p`, then on the resident
-    spark-brain session, and now on the cognition tier (#317 Phase 3): one
-    direct API call, no session, no mailbox, no request id.
+    This ran five times a day as a cold `claude -p`, then on a resident session
+    and its mailbox, and now on the cognition tier (#317 Phase 3): one direct
+    API call, no session, no mailbox, no request id.
 
     On unavailability it returns "" and the caller skips this slot. Nobody is
     waiting on a cron line; there are four more today. Deferring is the whole

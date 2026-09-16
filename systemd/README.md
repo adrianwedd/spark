@@ -37,7 +37,7 @@ sudo systemctl daemon-reload
 Verify a unit picked it up without restarting it:
 
 ```bash
-systemctl show px-brain.service -p MemoryHigh,MemoryMax,OOMPolicy,CPUWeight,MemoryCurrent
+systemctl show px-wake-listen.service -p MemoryHigh,MemoryMax,OOMPolicy,CPUWeight,MemoryCurrent
 ```
 
 ## Maintenance timer: pip /tmp cleanup

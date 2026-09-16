@@ -109,10 +109,7 @@ def test_empty_m5_response_defers_without_claude():
             return _fake_ollama_empty_cm()
         raise urllib.error.URLError("skip model-resolution probe")
 
-    import pxh.brain
     with patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
-         patch.object(pxh.brain, "ask_brain",
-                      return_value={"reply": {"thought": "recovered via claude"}}), \
          patch("urllib.request.urlopen", side_effect=urlopen_side):
         result = call_llm("prompt", "system", persona="spark")
 
@@ -132,23 +129,17 @@ def test_non_spark_reflection_defers_when_the_cognition_tier_fails():
     Distinguish by URL: the cognition tier fails; a Pi-local daemon would
     succeed, so a walk to it would show up as a non-defer result.
     """
-    import pxh.brain
-
     def urlopen_side(req, timeout=30):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         if "localhost" in url:
             raise AssertionError("a persona reached a Pi-local Ollama daemon")
         raise urllib.error.URLError("cognition tier unreachable")
 
-    def _never(*a, **k):
-        raise AssertionError("a non-SPARK persona reached the brain tier")
-
     # Local fallback is opt-in via PX_MIND_LOCAL_OLLAMA=1
     old_val = os.environ.get("PX_MIND_LOCAL_OLLAMA")
     os.environ["PX_MIND_LOCAL_OLLAMA"] = "1"
     try:
         with patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
-             patch.object(pxh.brain, "ask_brain", side_effect=_never), \
              patch("urllib.request.urlopen", side_effect=urlopen_side):
             result = call_llm("prompt", "system", persona="vixen")
 
@@ -160,28 +151,25 @@ def test_non_spark_reflection_defers_when_the_cognition_tier_fails():
             os.environ["PX_MIND_LOCAL_OLLAMA"] = old_val
 
 
-def test_spark_never_reaches_local_ollama_after_a_brain_failure():
+def test_spark_never_reaches_local_ollama_after_a_tier_failure():
     """Loading a model on the Pi is the largest escalation available.
 
     Tier 4 is off by default precisely because a Pi 4 cannot hold a model
     alongside px-wake-listen and SenseVoice without filling swap. Reaching it
-    *because the brain was slow* would be the 2026-08-19 cascade with a worse
+    *because the tier was slow* would be the 2026-08-19 cascade with a worse
     ending. Enabled here on purpose: the assertion is that it stays unreached
     even when it is available.
     """
-    import pxh.brain
-
     def urlopen_side(req, timeout=30):
         url = req.full_url if hasattr(req, "full_url") else str(req)
         if "localhost" in url:
-            raise AssertionError("SPARK reached local ollama after a brain failure")
+            raise AssertionError("SPARK reached local ollama after a tier failure")
         raise urllib.error.URLError("M5 unreachable")
 
     old_val = os.environ.get("PX_MIND_LOCAL_OLLAMA")
     os.environ["PX_MIND_LOCAL_OLLAMA"] = "1"
     try:
         with patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
-             patch.object(pxh.brain, "ask_brain", return_value=None), \
              patch("urllib.request.urlopen", side_effect=urlopen_side):
             result = call_llm("prompt", "system", persona="spark")
 
@@ -229,16 +217,18 @@ def test_result_is_labelled_with_the_tier_that_served():
     assert result["backend"] == "ollama-m5"
 
 
-def test_m5_failure_never_uses_claude():
-    """M5 down, SPARK falls through to the resident brain — still labelled
-    `claude`, because the tier is still Claude; what changed is that it is a
-    session already running rather than a process started for this thought."""
-    import pxh.brain
+def test_m5_failure_never_spawns_a_process():
+    """A cognition-tier failure is terminal for reflection.
+
+    This used to assert that a failed tier reached a *resident* session
+    instead of spawning one. #317 Phase 3 deleted the resident session, so the
+    surviving half is the one that always mattered: no process appears, and the
+    result is a defer. The module it used to reach is asserted absent in
+    `tests/test_cognition_tier_routing.py`.
+    """
     with patch("urllib.request.urlopen",
                side_effect=urllib.error.URLError("M5 unreachable")), \
-         patch("subprocess.run", side_effect=AssertionError("spawned a process")), \
-         patch.object(pxh.brain, "ask_brain",
-                      return_value={"reply": {"thought": "hi", "mood": "curious"}}):
+         patch("subprocess.run", side_effect=AssertionError("spawned a process")):
         result = call_llm("prompt", "system", persona="spark")
     assert result.get(pxh.mind.BRAIN_DEFER) is True
 
@@ -270,28 +260,24 @@ def test_token_usage_backend_defaults_to_unknown(tmp_path, monkeypatch):
     assert data["by_backend"]["unknown"]["call_count"] == 1
 
 
-# ── Tier 2 is the resident brain, with NOTHING behind it ──────────────────
+# ── There is no tier 2 ────────────────────────────────────────────────────
 #
-# There used to be a `claude -p` subprocess here, and these tests used to pin
-# it. The old comment said "a brain that is down must be invisible" — that was
-# the bug, stated as a requirement. Making a down brain invisible meant
-# spawning a fresh Claude on a Pi that was already saturated, which is how one
-# slow tmux keystroke became two competing Claude processes, a 120s timeout, an
-# M5 timeout and a 403 from Ollama Cloud (2026-08-19).
+# There used to be a `claude -p` subprocess here, then a resident session, and
+# these tests pinned both in turn. The old comment said "a brain that is down
+# must be invisible" — that was the bug, stated as a requirement. Making a down
+# brain invisible meant spawning a fresh Claude on a Pi that was already
+# saturated, which is how one slow tmux keystroke became two competing Claude
+# processes, a 120s timeout, an M5 timeout and a 403 from Ollama Cloud
+# (2026-08-19).
 #
-# A down brain is now *visible and cheap*: reflection defers and backs off.
-# Reflection is the most skippable work SPARK does; failing to have a thought
-# costs nothing, and a loaded Pi should be doing less, not searching wider.
-
-def _brain_reply(obj):
-    """Shape of what ask_brain() hands back: the session's JSON under 'reply'."""
-    return {"id": "x", "reply": obj}
+# There is no tier 2 at all now (#317 Phase 3). A failure is *visible and
+# cheap*: reflection defers and backs off. Reflection is the most skippable
+# work SPARK does; failing to have a thought costs nothing, and a loaded Pi
+# should be doing less, not searching wider.
 
 
-def test_reflection_m5_failure_does_not_use_resident_brain():
-    """With the brain up, the Claude tier must not spawn a subprocess at all."""
-    import pxh.brain
-
+def test_reflection_spawns_nothing_when_the_tier_is_down():
+    """No process, no wider search, whatever the failure looked like."""
     ran = []
 
     def _record(*args, **kwargs):
@@ -299,25 +285,18 @@ def test_reflection_m5_failure_does_not_use_resident_brain():
         return _fake_claude(1, stderr="should never be reached")
 
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
-         patch.object(pxh.brain, "ask_brain",
-                      return_value=_brain_reply({"thought": "from the brain",
-                                                 "mood": "curious"})) as ask, \
          patch("subprocess.run", side_effect=_record):
         result = call_llm("prompt", "system", persona="spark")
 
     assert result.get(pxh.mind.BRAIN_DEFER) is True
-    assert ask.call_count == 0
-    assert not any("-p" in (cmd or []) for cmd in ran), ran
+    assert ran == [], ran
 
 
-def test_reflection_defers_when_the_brain_is_unavailable():
-    """A resident-brain failure is terminal. No process, no wider search."""
-    import pxh.brain
-
+def test_reflection_defers_when_the_tier_is_unavailable():
+    """A cognition-tier failure is terminal. No process, no wider search."""
     spawned = []
 
     with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
-         patch.object(pxh.brain, "ask_brain", return_value=None), \
          patch("subprocess.run", side_effect=lambda *a, **k: spawned.append(a)):
         result = call_llm("prompt", "system", persona="spark")
 
@@ -331,11 +310,10 @@ def test_reflection_failure_does_not_escalate_past_the_cognition_tier():
 
     #308 made the cloud the *primary* tier rather than the bottom rung, so the
     invariant is no longer "nothing reaches ollama.com" — it is "nothing is
-    tried after the cognition tier fails": no resident Claude, no Pi-local
-    daemon, no second model. That is the escalation this whole shape removes.
+    tried after the cognition tier fails": no CLI, no Pi-local daemon, no
+    second model. Since #317 Phase 3 there is no second destination to try,
+    which is the strongest form this invariant can take.
     """
-    import pxh.brain
-
     seen_urls = []
 
     def _record(req, *a, **kw):
@@ -343,7 +321,6 @@ def test_reflection_failure_does_not_escalate_past_the_cognition_tier():
         raise urllib.error.URLError("cognition tier down")
 
     with patch("urllib.request.urlopen", side_effect=_record), \
-         patch.object(pxh.brain, "ask_brain", return_value=None), \
          patch("subprocess.run", side_effect=AssertionError("spawned a process")):
         result = call_llm("prompt", "system", persona="spark")
 
@@ -356,17 +333,15 @@ def test_reflection_failure_does_not_escalate_past_the_cognition_tier():
     assert result.get(pxh.mind.BRAIN_DEFER) is True, "the tier did not stop the chain"
 
 
-def test_narrowing_the_dial_cannot_restore_a_cold_path():
+def test_the_retired_dial_cannot_restore_a_cold_path():
     """There is no rollback destination any more, so the dial cannot open one.
 
-    PX_BRAIN_KINDS used to be able to route reflection back to `claude -p`.
-    Whatever it is set to now, no process may be spawned.
+    PX_BRAIN_KINDS used to be able to route reflection back to a session, and
+    before that to `claude -p`. The variable is still read by nothing; whatever
+    it is set to, no process may be spawned.
     """
-    import pxh.brain
-
     with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,compose"}), \
          patch("urllib.request.urlopen", side_effect=urllib.error.URLError("M5 down")), \
-         patch.object(pxh.brain, "ask_brain", return_value=None), \
          patch("subprocess.run", side_effect=AssertionError("spawned a process")):
         result = call_llm("prompt", "system", persona="spark")
 

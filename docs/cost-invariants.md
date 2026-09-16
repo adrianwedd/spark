@@ -12,117 +12,125 @@ code, tests, and CLAUDE.md are the authoritative references.
 
 ## The five invariants
 
-### 1. No production `claude -p`
+### 1. No production model CLI at all
 
-No production code may invoke Claude non-residently. The resident `spark-brain`
-tmux session is SPARK's sole Claude execution substrate.
+No production code may invoke Claude — not residently, not cold. #317 Phase 3
+deleted the resident `spark-brain` session, its supervisor, its mailbox and its
+reply tool; what is left is one direct API call to the cognition tier per kind.
 
 **Enforcement:**
 - `tools/check_resident_claude.py` — CI scanner that detects cold-start patterns
-  (argv lists with `-p`, shell execs, forbidden helpers, fossil artifacts)
+  (argv lists with `-p`, shell execs, forbidden helpers, fossil artifacts) **and
+  fails if any retired transport path reappears** (`FORBIDDEN_PATHS`)
 - `tests/test_resident_only_invariant.py` — pins the scanner and its canaries
 - Both are blacklisted from px-evolve (`claude_session.BLACKLIST_FILES`)
 
 **Verify on the Pi:**
 ```bash
-ps aux | grep claude    # exactly one process, no -p flag
+ps aux | grep claude    # no production process; a human's own session only
 ```
 
-### 2. One resident Claude session only
+### 2. One route per kind, and no dial
 
-`spark-brain` is the only resident Claude session. The old `spark-io` session
-was removed in #242 once M5 absorbed all its kinds. An unclassified kind
-**fails closed** — `brain.ask_brain()` returns `None`, `claude_session.py`
-raises `ColdStartForbidden`.
+There is no `PX_BRAIN_KINDS` and no second destination. A kind is either in
+`claude_session._COGNITION_KINDS` or it has no backend and raises
+`ColdStartForbidden`. `evolve` is the one deliberate member of the second set.
 
 **Verify on the Pi:**
 ```bash
-tmux -S /tmp/tmux-1000/px-mind list-sessions    # spark-brain only
+python tools/check_resident_claude.py --list    # debt map, expect clean
 ```
 
 ### 3. One cognition tier, and it defers
 
-Reflection, post QA, blog QA, public chat, and Obi chat run on the cognition
-tier — **Ollama Cloud by default since #308** (`https://ollama.com`,
+Reflection, post QA, blog QA, public chat, Obi chat, direct voice, semantic
+vision, `self_debug` and `consolidate` all run on the cognition tier —
+**Ollama Cloud by default since #308** (`https://ollama.com`,
 `deepseek-v4.1-flash:cloud`, `OLLAMA_API_KEY`); set `PX_M5_SPARK_HOST` to a LAN
 daemon to run it locally instead. On failure these **defer** — they do not fall
-through to Claude, and they do not reach a Pi-local model.
+through to Claude (there is none), and they do not reach a Pi-local model.
 
 **Code paths:**
-- `mind.py::call_llm()` → `m5.ask_m5()` → defer on failure (never `call_claude`)
+- `mind.py::call_llm()` → `m5.ask_m5()` → defer on failure
 - `api.py::_call_claude_public()` → `m5.ask_m5()` → raise on failure (no fallback)
-- `bin/px-post::_qa_via_m5()` → defer on failure
+- `bin/px-post::run_qa_gate()` → `m5.ask_m5()` → defer on failure
 - `bin/px-blog::_qa_gate()` → `m5.ask_m5()` → defer on failure
+- `voice_loop.run_voice_turn()` → `m5.ask_m5()` → one retry on transport
+  failure, then the deterministic acknowledgement
+- `vision.describe_image()` → `m5.ask_m5()` (image inlined) → honest fallback
 
 **Pinned by:** `tests/test_mind_fallback.py` (every deferral path),
-`tests/test_dead_tier_functions.py` (the ladder stays deleted)
+`tests/test_dead_tier_functions.py` (the ladder stays deleted),
+`tests/test_cognition_tier_routing.py` (the retired transport is *absent*,
+not disabled)
 
 ### 4. No second destination
 
 The old reflection ladder — `call_ollama()`, `LOCAL_OLLAMA_HOST`,
-`OLLAMA_CLOUD_HOST` — was deleted in #308 rather than left dead. `call_llm()`
-reaches `m5.ask_m5()` and defers; nothing else is tried. A local daemon is
-reachable **only** by an explicit `PX_M5_SPARK_HOST`, and `resident` mode is
-rejected outright against a hosted host (asking for a residency set from a
-cloud endpoint is a 401, which is how #302 turned into a 22-hour silent
-outage).
+`OLLAMA_CLOUD_HOST` — was deleted in #308 rather than left dead, and the
+resident session followed in #317 Phase 3. A local daemon is reachable
+**only** by an explicit `PX_M5_SPARK_HOST`, and `resident` mode is rejected
+outright against a hosted host (asking for a residency set from a cloud
+endpoint is a 401, which is how #302 turned into a 22-hour silent outage).
 
-### 5. Raw public/Obi/post text never reaches privileged spark-brain
+### 5. Untrusted text has no tools anywhere
 
 Untrusted text (public chat, Obi chat, post QA, blog QA) runs on the cognition
-tier, which has no tools and no filesystem access — a stronger boundary than
-any scoped Claude session. The `spark-brain` session's `Read` grant is narrowed
-in code (`vision._within_photos`) and pinned by `tests/test_brain_envelope.py`.
+tier, which has no tools and no filesystem access. That was already true before
+the retirement — it was the reason the tier existed — and it is now the only
+boundary there is, rather than one of two.
 
-**#308 caveat, stated rather than implied:** that text now leaves the LAN (it
-goes to Ollama Cloud) where it used to stay on it. The *privilege* boundary is
+**#308 caveat, stated rather than implied:** that text leaves the LAN (it goes
+to Ollama Cloud) where it used to stay on it. The *privilege* boundary is
 unchanged — no tools, no filesystem, no repository. The *disclosure* surface is
-not, and it is the reason this is written down here.
+not, and it is the reason this is written down here. The same caveat now
+applies to photos on `describe_scene`, which are inlined into the request
+rather than read by a local session.
 
-## Claude call site inventory
+## Model call site inventory
 
 | Call site | Route | Classification |
 |---|---|---|
-| `mind.py::reflection()` | `call_llm()` → `m5.ask_m5("reflection")` | Cognition tier (Ollama Cloud by default), defers on failure |
-| `mind.py::self_debug` action | `claude_session.run_claude_session("self_debug")` | Brain, budget-gated |
-| `memory.py::consolidate()` | `claude_session.run_claude_session("consolidate")` | Brain, budget-gated |
-| `bin/px-blog::generate_post()` | `claude_session.run_claude_session("blog")` | Brain, budget-gated |
+| `mind.py::reflection()` | `call_llm()` → `m5.ask_m5("reflection")` | Cognition tier, defers on failure |
+| `mind.py::self_debug` action | `run_claude_session("self_debug")` → tier | Cognition tier, budget-gated |
+| `memory.py::consolidate()` | `run_claude_session("consolidate")` → tier | Cognition tier, budget-gated; the nightly pass |
+| `bin/px-blog::generate_post()` | `run_claude_session("blog")` → tier | Cognition tier, budget-gated |
+| `bin/tool-research` / `tool-compose` / `tool-blog` | `run_claude_session(...)` → tier | Cognition tier, budget-gated |
 | `bin/px-blog::_qa_gate()` | `m5.ask_m5("blog_qa")` | Cognition tier, defers on failure |
 | `bin/px-post::run_qa_gate()` | `m5.ask_m5("post_qa")` | Cognition tier, defers on failure |
-| `bin/px-cron-say::call_claude()` | `brain.ask_brain("cron_say")` | Brain, metered |
-| `bin/px-evolve` | `claude_session.run_claude_session("evolve")` | Brain, raises `ColdStartForbidden` |
+| `bin/px-cron-say::call_model()` | `m5.ask_m5("cron_say")` | Cognition tier, skips the slot on failure |
 | `api.py::public_chat()` | `m5.ask_m5("public_chat")` | Cognition tier, raises on failure |
 | `api.py::post_obi_chat()` | `m5.ask_m5("obi_chat")` | Cognition tier, raises on failure |
-| `vision.py::describe_image()` | `brain.ask_brain("describe_scene")` | Brain, metered |
-| `voice_loop.py` (voice turn) | `brain.ask_brain("voice_turn")` | Brain, metered |
+| `vision.py::describe_image()` | `m5.ask_m5("describe_scene")` | Cognition tier, honest fallback |
+| `voice_loop.py` (voice turn) | `m5.ask_m5("voice_turn")` | Cognition tier, one bounded retry then the ack |
+| `bin/px-evolve` | `run_claude_session("evolve")` | **No backend** — raises `ColdStartForbidden` |
 
-**Every Claude-bearing path goes through either `brain.ask_brain()` (metered
-at `state/brain/meter.json`) or `claude_session.run_claude_session()` (budget-
-gated at `state/claude_sessions.jsonl`). There is no path around both.**
+**Every model-bearing path goes through `pxh.m5.ask_m5()`.** `claude_session`
+is a budget/quota/logging wrapper in front of it, not a second transport:
+`state/claude_sessions.jsonl` records the budget-gated kinds, `state/m5/meter.json`
+counts every tier request, and `provider` in the session log says which one
+served the call. There is no path around both.
 
-**Cognition-tier spend is metered too, but not capped.** `state/m5/meter.json`
-counts requests by kind/route/status. There is no daily cap on this tier, so
-"how much Ollama Cloud are we using" is answered by that file and by
-`by_backend["ollama-m5"]` in `state/token_usage.json`. Since #308 that label no
-longer means "free local compute".**
+**Tier spend is metered, but not capped.** `state/m5/meter.json` counts requests
+by kind/route/status. There is no daily cap on this tier, so "how much Ollama
+Cloud are we using" is answered by that file and by `by_backend["ollama-m5"]`
+in `state/token_usage.json`. Since #308 that label no longer means "free local
+compute".**
 
 ## Budget controls
 
 - `claude_session.py`: per-type cooldowns, daily quotas, global 8/day cap
-- `brain.py::record_request()`: per-kind per-day meter (observability, not a cap)
+- `m5.py::_record_request()`: per-kind per-route per-status meter (observability, not a cap)
 - `token_log.log_usage()`: `by_backend` split in `state/token_usage.json`
 
 ## Operator checks
 
 ```bash
-# Zero cold claude -p processes
+# Zero production model CLI processes of any kind
 ps aux | grep "[c]laude.*-p"   # should be empty
 
-# Exactly one resident session
-tmux -S /tmp/tmux-1000/px-mind list-sessions   # spark-brain only
-
-# Brain meter (today's request counts by kind)
-cat state/brain/meter.json
+# The retired transport is gone, and CI will fail if it comes back
+python tools/check_resident_claude.py --list    # expect clean
 
 # Cognition-tier meter (by kind, by route, by status)
 cat state/m5/meter.json
@@ -130,12 +138,9 @@ cat state/m5/meter.json
 # Token usage by backend
 jq '.by_backend | keys' state/token_usage.json
 
-# Claude session log (budget-gated sessions)
+# Budget-gated session log
 tail -20 state/claude_sessions.jsonl
 
-# Run the invariant scanner
-python tools/check_resident_claude.py --list
-
-# No scheduled tasks hitting Claude
-crontab -l    # only px-cron-say, which uses brain.ask_brain
+# No scheduled tasks spawning a model CLI
+crontab -l    # only px-cron-say, which calls pxh.m5
 ```

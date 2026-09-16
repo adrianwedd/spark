@@ -6,10 +6,12 @@
 two separate days, a brcmfmac SDIO `-110` control-path timeout (Wi-Fi dies
 with no self-recovery) with generic host resource starvation: load ~18 on 4
 cores, swap nearly exhausted, userspace deadlines blown by orders of
-magnitude. A third data point on 2026-08-20 caught a local `spark-brain`
+magnitude. A third data point on 2026-08-20 caught a local resident-session
 handshake failing in the same second as the SDIO timeout — the first
 cross-subsystem evidence that the shared cause is host-wide CPU/IO/memory
-contention, not anything RF-specific.
+contention, not anything RF-specific. (That session was retired in #317
+Phase 3; the observation is kept because the conclusion was about this host,
+not about the session.)
 
 [#218](https://github.com/adrianwedd/spark/issues/218) found the reason
 containment couldn't previously be built at all: the kernel cmdline carried
@@ -53,7 +55,6 @@ now that #218 restored it) plus process RSS/PSS from `/proc/<pid>/smaps_rollup`:
 
 | Service | MemoryCurrent | RSS | PSS | Notes |
 |---|---:|---:|---:|---|
-| px-brain | ~500M | — | — | single spark-brain session (post-#242); see drop-in comment for sizing |
 | px-wake-listen | 522M | 571M | 561M | #219's named outlier; ~446M single anon heap, matches prior finding |
 | px-tts-glados | 501M | 485M | 474M | new finding — comparably sized to wake-listen, not previously characterized |
 | px-frigate-stream | 122M | — | — | 41 tasks (go2rtc + ffmpeg + rpicam-vid) |
@@ -82,7 +83,6 @@ cpu:    some avg10=6.15  avg60=5.19  avg300=4.16
 
 | Service | MemoryHigh | MemoryMax | CPUWeight | Rationale (full text in each drop-in) |
 |---|---:|---:|---:|---|
-| px-brain | 960M | 1536M | 150 | ~3x expected single-session steady state; raised priority — #217's strongest evidence implicates this process losing scheduler contention |
 | px-wake-listen | 896M | 1280M | default | **Recalibrated 2026-08-23 — see "Track B" below.** High clears the measured 707-730M one-time model-load peak; the original 640M/1024M pair (superseded) was set below that peak and guaranteed throttling on every start |
 | px-tts-glados | 576M | 768M | default | conservative multiple; no documented peak exists (new finding) |
 | px-frigate-stream | 224M | 384M | 50 | bursty; lowered priority — should yield under contention |
@@ -110,8 +110,8 @@ the whole scope, still uncontained).
 
 ## Operator/development Claude containment (`bin/px-claude-dev`, 2026-08-23)
 
-`bin/px-claude-dev` wraps `claude` (an operator working the repo — not
-`spark-brain`, which is already contained above) in its own transient
+`bin/px-claude-dev` wraps `claude` (an operator working the repo — a human's
+session, not a SPARK daemon) in its own transient
 `systemd-run --user --scope --collect`, with `MemoryHigh=1024M` /
 `MemoryMax=2048M` by default (`PX_DEV_CLAUDE_MEMORY_HIGH` /
 `PX_DEV_CLAUDE_MEMORY_MAX` override either). Use it in place of a bare
@@ -254,14 +254,14 @@ production wiring behaves as the profiler proxy predicts.
 Run after deployment, on the live host. See the PR/commit for the actual
 results of the run performed for this change.
 
-**A. Healthy baseline** — robot responsive; `bin/px-brain-status` validated;
+**A. Healthy baseline** — robot responsive;
 a reflection cycle completes through M5; a real voice turn works; no
 contained unit sits constantly at `MemoryHigh`; no new swap growth.
 
 **B. Bounded pressure test** — a safe, reversible, single-cgroup load (e.g.
 `systemd-run` a throwaway scope, or a load generator inside one contained
 unit's own cgroup) proving: pressure stays local to the targeted cgroup;
-other units keep scheduling; `spark-brain` handshake stays responsive;
+other units keep scheduling; `px-wake-listen` stays responsive;
 Wi-Fi stays usable; PSI does not enter the #217 pathological regime; crossing
 `MemoryHigh` is observable as throttling; crossing `MemoryMax` in the
 synthetic target only affects that cgroup and systemd's `Restart=` recovers
@@ -286,7 +286,7 @@ event-driven only (no new high-frequency logging), to add:
   (`memory.current` / `memory.high`, omitted when uncapped),
   `events_high_<unit>_<prefix>` (cumulative) and
   `events_high_rate_<unit>_<prefix>` (delta since this process's last call)
-  for `px-brain` and `px-wake-listen`, the two units this episode found
+  for the units this episode found
   chronically pressed against their own ceiling.
 
 Existing keys (`load1_<prefix>`, `psi_cpu_avg10_<prefix>`) are unchanged, for
@@ -297,7 +297,7 @@ backward compatibility with existing log analysis over #270/#283 events.
 Instrumented and locally contained, not proven fixed. This PR gives every
 named daemon a cgroup boundary so a memory runaway in any one of them can no
 longer freely consume the shared pool that #217's evidence ties to the SDIO
-timeout, and gives the two latency-sensitive daemons (`px-brain`, `px-alive`)
+timeout, and gives the latency-sensitive daemons (`px-wake-listen`, `px-alive`)
 scheduling priority under contention. It does not (and structurally cannot,
 from systemd alone) prove the brcmfmac mechanism itself, and it does not
 contain the interactive/operator session #217's own text flags as a

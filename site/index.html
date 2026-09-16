@@ -16,9 +16,9 @@
     gtag('config', 'G-BJD5ZFHRLV');
   </script>
   <title>SPARK — a robot that stays around</title>
-  <meta name="description" content="SPARK is a persistent embodied agent: one resident brain, local perception, durable memory, and hard boundaries around what intelligence is allowed to do.">
+  <meta name="description" content="SPARK is a persistent embodied agent: a continuous local life, durable memory, hosted cognition, and hard boundaries around what intelligence is allowed to do.">
   <meta property="og:title" content="SPARK — a robot that stays around">
-  <meta property="og:description" content="One persistent brain. Local perception. Durable memory. Hard boundaries around what intelligence is allowed to do.">
+  <meta property="og:description" content="One continuous someone. Local perception. Durable memory. Hard boundaries around what intelligence is allowed to do.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://spark.wedd.au/">
   <meta property="og:image" content="https://spark.wedd.au/og-image.png">
@@ -28,7 +28,7 @@
   <meta name="twitter:image" content="https://spark.wedd.au/og-image.png">
   <meta property="og:site_name" content="SPARK">
   <meta name="twitter:title" content="SPARK — a robot that stays around">
-  <meta name="twitter:description" content="One persistent brain. Local perception. Durable memory. Hard boundaries around what intelligence is allowed to do.">
+  <meta name="twitter:description" content="One continuous someone. Local perception. Durable memory. Hard boundaries around what intelligence is allowed to do.">
   <link rel="canonical" href="https://spark.wedd.au/">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -46,7 +46,7 @@
     "@type": "WebSite",
     "name": "SPARK",
     "url": "https://spark.wedd.au/",
-    "description": "A persistent embodied agent with one resident brain, local perception, durable memory, and deterministic authority boundaries.",
+    "description": "A persistent embodied agent with a continuous local life, durable memory, hosted cognition, and deterministic authority boundaries.",
     "author": {
       "@type": "Person",
       "name": "Adrian Wedd"
@@ -78,7 +78,7 @@
       <div class="hero-text">
         <h1>SPARK</h1>
         <p id="hero-mood-sentence" class="hero-mood-sentence">A robot that stays around.</p>
-        <p class="hero-deck">One persistent brain. Local perception. Durable memory. Hard boundaries around what intelligence is allowed to do.</p>
+        <p class="hero-deck">One continuous someone. Local perception. Durable memory. Hard boundaries around what intelligence is allowed to do.</p>
         <p class="hero-credit">Built by Adrian and Obi together.</p>
         <div class="hero-cta">
           <a href="/feed/" class="btn-ghost">Explore the feed →</a>
@@ -118,12 +118,12 @@
 <section id="what-makes-spark-different" data-theme="warm">
   <div class="container">
     <p class="story-kicker">Not ChatGPT on wheels</p>
-    <p class="story-intro">SPARK is not a new model call every time you say his name. He maintains continuity, thinks cheaply and locally where possible, escalates when the work needs his resident Claude brain, and can fail, defer, and recover without inventing authority.</p>
+    <p class="story-intro">SPARK is not a new model call every time you say his name. He maintains continuity in durable memory rather than in a kept-alive process, thinks cheaply and locally where possible, reaches for a hosted model when the work needs language, and can fail, defer, and recover without inventing authority.</p>
     <div class="story-pillars" aria-label="What makes SPARK different">
       <article class="story-pillar">
         <p class="pillar-label">PERSISTS</p>
         <h2>One life, not a sequence of prompts.</h2>
-        <p>Exactly one Claude brain stays resident between interactions. Conversation, goals, thoughts, and durable memory carry forward while local daemons keep noticing the room.</p>
+        <p>Continuity lives in durable memory and a loop that never stops noticing the room — not in a language model kept warm between conversations. Nothing about who SPARK is depends on a process staying alive, and nothing he remembers is lost when one stops.</p>
       </article>
       <article class="story-pillar">
         <p class="pillar-label">KNOWS HOW IT KNOWS</p>
@@ -371,7 +371,7 @@
         </div>
 
         <div class="metric-tile" id="tile-budget">
-          <div class="metric-label">Claude Budget</div>
+          <div class="metric-label">Cognition Budget</div>
           <div class="metric-value" id="val-budget">—</div>
         </div>
 
@@ -401,34 +401,32 @@
     <p class="text-muted-dark mb-md">
       SPARK spends most of his time below the expensive semantic layer. Sensors
       and robot-local services keep a continuous account of the room; a hosted
-      Ollama Cloud model handles routine language work; the one resident Claude
-      brain is reserved for direct voice and semantic vision.
+      Ollama Cloud model handles language work off the robot — reflection,
+      direct voice, semantic vision, and the QA gates.
     </p>
 
     <div class="thinking-flow" aria-label="How SPARK thinks">
       <div class="thinking-step"><span>01</span><strong>Local perception</strong><small>sonar · grayscale · Frigate · ambient state</small></div>
       <div class="thinking-arrow" aria-hidden="true">↓</div>
-      <div class="thinking-step"><span>02</span><strong>Hosted cognition</strong><small>Ollama Cloud · reflection · public chat · Obi chat · post QA · blog QA</small></div>
+      <div class="thinking-step"><span>02</span><strong>Hosted cognition</strong><small>Ollama Cloud · reflection · public chat · Obi chat · post QA · blog QA · direct voice · semantic vision</small></div>
       <div class="thinking-arrow" aria-hidden="true">↓</div>
-      <div class="thinking-step"><span>03</span><strong>Resident Claude when needed</strong><small>direct voice · sparse semantic vision</small></div>
+      <div class="thinking-step"><span>03</span><strong>Deterministic policy</strong><small>validation · authority · leases · resource limits</small></div>
       <div class="thinking-arrow" aria-hidden="true">↓</div>
-      <div class="thinking-step"><span>04</span><strong>Deterministic policy</strong><small>validation · authority · leases · resource limits</small></div>
-      <div class="thinking-arrow" aria-hidden="true">↓</div>
-      <div class="thinking-step"><span>05</span><strong>Actions · memory · voice</strong><small>bounded effects, recorded outcomes</small></div>
+      <div class="thinking-step"><span>04</span><strong>Actions · memory · voice</strong><small>bounded effects, recorded outcomes</small></div>
     </div>
 
     <div class="architecture-notes">
       <article>
-        <h3>One resident brain</h3>
-        <p>The <code>spark-brain</code> Claude session persists at the repository root and must complete a real handshake before it can receive work. Production code cannot invoke <code>claude -p</code>; there is no cold-start Claude ladder and no second resident session.</p>
+        <h3>No model holds SPARK's identity</h3>
+        <p>There is no resident model session, no login to expire, and no command-line agent holding his answers. Every language call is one request to one hosted model, with the answer returned directly to the code that asked for it. Previously a session could be worked, answered, and still lose the reply in transit; there is now nothing in transit to lose it.</p>
       </article>
       <article>
         <h3>Hosted cognition, and nothing behind it</h3>
-        <p>Routine language work runs on Ollama Cloud, off the robot. If that call fails, SPARK defers: he does not fall through to the resident brain, to a model on somebody's laptop, or to a second opinion that costs more than the thing it was rescuing.</p>
+        <p>Language work runs on Ollama Cloud, off the robot. If that call fails, SPARK defers: he does not fall through to a second model, to a model on somebody's laptop, or to a second opinion that costs more than the thing it was rescuing.</p>
       </article>
       <article>
         <h3>Vision escalates sparsely</h3>
-        <p>Sonar, grayscale sensors, and Frigate labels are the continuous perception layer. Claude sees an image only for an explicit “what do you see?” request or a tightly budgeted novel ambiguity during enabled autonomous wandering.</p>
+        <p>Sonar, grayscale sensors, and Frigate labels are the continuous perception layer. A model sees an image only for an explicit “what do you see?” request or a tightly budgeted novel ambiguity during enabled autonomous wandering.</p>
       </article>
       <article>
         <h3>Failure stays local</h3>
@@ -442,7 +440,7 @@
     </p>
     <div class="voice-samples">
       <div class="voice-sample">
-        <strong>SPARK</strong> <span class="text-muted-dark">— resident Claude brain, espeak default</span><br>
+        <strong>SPARK</strong> <span class="text-muted-dark">— hosted cognition tier, espeak default</span><br>
         <audio controls preload="none" src="audio/spark-sample.mp3" aria-label="SPARK voice sample"></audio>
       </div>
       <div class="voice-sample">
@@ -509,7 +507,7 @@
 
 <div class="section-divider"></div>
 <!-- ══════════════════════════════════════════════════════ SPARK BRAIN -->
-<section id="spark-brain" data-theme="warm">
+<section id="how-sparks-brain-works" data-theme="warm">
   <div class="container">
     <h2>How SPARK's Brain Works</h2>
     <p class="text-muted-warm text-italic mb-md">Written with Obi, who wanted to know what's going on inside his robot.</p>
@@ -574,7 +572,7 @@
         <li>SPARK's neck chip (PCA9685) holds the last position even after the brain restarts.</li>
         <li>SPARK knows Tasmania's timezone — it adjusts for daylight saving automatically.</li>
         <li>Each social post gets a branded 1080x1080 image card with SPARK's thought and mood.</li>
-        <li>Resident-only Claude, authority boundaries, health evidence, and perception routes are pinned by automated tests.</li>
+        <li>No-resident-model, authority boundaries, health evidence, and perception routes are pinned by automated tests.</li>
         <li>SPARK can message Obi directly. When it does, the thought is logged privately — it never appears in the public feed.</li>
         <li>SPARK checks four cameras for people using Hailo AI on a separate Pi 5.</li>
       </ul>
@@ -614,7 +612,7 @@
 
     <details>
       <summary>Why does it write like that? You've programmed it to?</summary>
-      <p>Partly. Prompts shape the voice: specific, vivid, warm, never generic. Routine reflections are written by a hosted Ollama Cloud model; direct conversation uses the resident Claude brain. Neither model gets to turn its own words into authority.</p>
+      <p>Partly. Prompts shape the voice: specific, vivid, warm, never generic. Reflections and direct conversation are written by the same hosted Ollama Cloud model. It does not get to turn its own words into authority.</p>
     </details>
 
     <details>
@@ -655,7 +653,7 @@
 
     <details>
       <summary>How do you know those boundaries are real?</summary>
-      <p>Automated invariants scan production code for forbidden cold Claude calls, pin every cognition kind to an explicit route, verify confidence ceilings on stored claims, and exercise policy gates at the final audio and motion sinks. Health status is derived from recent success and failure evidence rather than trusting a daemon to call itself healthy.</p>
+      <p>Automated invariants scan production code for any forbidden CLI model call or reappearance of the retired resident session, pin every cognition kind to an explicit route, verify confidence ceilings on stored claims, and exercise policy gates at the final audio and motion sinks. Health status is derived from recent success and failure evidence rather than trusting a daemon to call itself healthy.</p>
     </details>
   </div>
 </section>
@@ -694,12 +692,12 @@ bin/tool-sonar
 
     <details>
       <summary>tool-describe-scene</summary>
-      <pre><code class="language-bash"># Capture photo + describe with Claude vision
+      <pre><code class="language-bash"># Capture photo + describe on the cognition tier (photo inlined, 2 MB cap)
 bin/tool-describe-scene
 # Output: {"status": "ok", "description": "...", "source": "frigate|rpicam"}
 # Sets exploring.json to prevent px-alive restart during 60s+ operation
 # Tries Frigate latest frame first, falls back to rpicam
-# Claude vision timeout: 45s</code></pre>
+# Describe timeout: 60s</code></pre>
     </details>
 
     <details>
@@ -724,7 +722,7 @@ PX_CHAT_TEXT="Tell me about your old chassis" bin/tool-chat-vixen
 
     <details>
       <summary>px-spark</summary>
-      <pre><code class="language-bash"># Launch SPARK voice loop (resident brain)
+      <pre><code class="language-bash"># Launch SPARK voice loop (cognition tier)
 bin/px-spark [--dry-run] [--input-mode voice|text]</code></pre>
     </details>
 
@@ -832,7 +830,7 @@ PX_PAN=30 PX_TILT=10 bin/tool-look
       <div class="roadmap-item done"><span class="check">✅</span> SSH login dashboard — system status, tmux, cognitive state, errors, quick actions</div>
       <div class="roadmap-item done"><span class="check">✅</span> Race telemetry on dashboard — calibration, profile, live lap/speed/incidents</div>
       <div class="roadmap-item done"><span class="check">✅</span> Network TTS — GLaDOS on Pi, Qwen3-TTS voice clone on M1</div>
-      <div class="roadmap-item done"><span class="check">✅</span> Claude session manager — model routing, rate limiting, self-evolution with real tool access</div>
+      <div class="roadmap-item done"><span class="check">✅</span> Model-session dispatcher — per-kind routing, rate limiting, spend accounting, self-evolution with real tool access</div>
       <div class="roadmap-item done"><span class="check">✅</span> Obi ↔ SPARK direct chat — two-way authenticated channel, SPARK-initiated messages with exponential backoff, red unread badge, private log</div>
       <!-- Collapsed older completions -->
       <details class="roadmap-completed-toggle">
@@ -955,7 +953,7 @@ PX_PAN=30 PX_TILT=10 bin/tool-look
           <a href="/">Home</a>
           <a href="/#live">Live</a>
           <a href="/#how-it-works">How It Works</a>
-          <a href="/#spark-brain">Brain</a>
+          <a href="/#how-sparks-brain-works">Brain</a>
           <a href="/#faq">FAQ</a>
           <a href="/#docs">Docs</a>
           <a href="/#roadmap">Roadmap</a>

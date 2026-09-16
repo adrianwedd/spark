@@ -72,8 +72,10 @@ still worth having — no caller can pass wake-ness as an argument
 variable is read as a truth value. PX_WAKE_GRANT_DIR names a *location*; the
 document found there must still carry a matching boot id and an unexpired
 boottime. That closes the prompt-driven and accidental bypasses, which are the
-ones that actually happen here — including SPARK's own resident brain session,
-whose tool envelope is the whole bin/ directory.
+ones that actually happen here. The strongest of them used to be SPARK's own
+resident session, whose tool envelope was the whole bin/ directory; that
+session is gone (#317 Phase 3) and the argument survives it, because a
+process holding a shell was never what this module claimed to stop.
 
 Blacklisted from self-evolution alongside policy.py — see
 pxh.claude_session.BLACKLIST_FILES.

@@ -1389,15 +1389,17 @@ async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
                               kind: str = "public_chat") -> str:
     """Answer a chat turn on the pinned cognition model, with no tool envelope.
 
-    `public_chat` and `obi_chat` have been classified as io kinds in brain.py
-    since the brain was built — deadlines, session routing, the lot. This
+    `public_chat` and `obi_chat` were classified as io kinds from the day the
+    resident brain was built — deadlines, session routing, the lot. This
     function ignored all of it and shelled out to `claude -p` anyway, which is
     the "designed on paper, bypassed in execution" failure the 2026-08-19 audit
-    turned up. The classification is now actually used.
+    turned up. The classification became real, and the session it named then
+    retired with the rest of the transport (#317 Phase 3); what remains is the
+    part that always mattered here —
 
-    The io session is the right one and always was: this text is typed by
-    strangers into a public box. It holds one tool, runs outside the repo, and
-    cannot reach SPARK's code, state or keys — so a payload that tries to talk
+    this text is typed by strangers into a public box. The path that serves it
+    holds no tools, cannot reach SPARK's code, state or keys, and never ran
+    inside the repo — so a payload that tries to talk
     it into something has nothing to talk it into.
 
     Raises on unavailability rather than falling back. The endpoints already

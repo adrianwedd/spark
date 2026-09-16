@@ -82,15 +82,15 @@ A test that wants the real log dir or the real tmux socket must be marked `live`
 
 Three backends, same `pxh.voice_loop` core:
 
-| Launcher | Backend | System prompt |
+| Launcher | `--backend` | System prompt |
 |---|---|---|
-| `bin/run-voice-loop` | Codex CLI | `docs/prompts/codex-voice-system.md` |
-| `bin/run-voice-loop-claude` | `bin/claude-voice-bridge` | `docs/prompts/claude-voice-system.md` |
-| `bin/run-voice-loop-ollama` | `bin/codex-ollama` | `docs/prompts/codex-voice-system.md` |
+| `bin/run-voice-loop` | `command` (Codex CLI) | `docs/prompts/codex-voice-system.md` |
+| `bin/run-voice-loop-tier` | `tier` (cognition tier) | `docs/prompts/voice-system.md` |
+| `bin/run-voice-loop-ollama` | `command` (`bin/codex-ollama`) | `docs/prompts/codex-voice-system.md` |
 
-Loop: wait for `listening: true` → build prompt (system + session + transcript + thoughts) → call LLM subprocess → parse last JSON `{tool, params}` → `validate_action()` → `execute_tool()` → update session. Override via `CODEX_CHAT_CMD`.
+Loop: wait for `listening: true` → build prompt (system + session + transcript + thoughts) → call the model → parse last JSON `{tool, params}` → `validate_action()` → `execute_tool()` → update session.
 
-**`--backend brain` no longer means "the resident Claude session" (#317 Phase 3).** `voice_loop.run_voice_turn` calls the **cognition tier** (`pxh.m5`) directly, with the same 45s deadline and the same `VOICE_UNAVAILABLE_ACK` fallback. Nothing about the turn changed for the person standing there; what changed is that a lost answer is now a *classified* failure (`busy` / `timeout` / `offline` / `bad_response`) instead of an unattributed `None`, so the retry rule is stated instead of inferred: only `offline`/`bad_response` — the faults a cheap immediate retry actually fixes — are retried, and `busy`/`timeout` go straight to the acknowledgement rather than asking a saturated tier twice. The lock wait is the one place the interactive path *differs* from the tier's default: background callers wait zero (`do not enqueue`), while a voice turn waits `VOICE_TURN_LOCK_WAIT_S` (5s), because reflection holds the same lock for a few seconds every few minutes and refusing a child instantly trades a certain answer for a certain "give me a second".
+**`--backend brain` is now `--backend tier`, and the wake listener uses it.** `voice_loop.run_voice_turn` calls the **cognition tier** (`pxh.m5`) directly, with the same 45s deadline and the same `VOICE_UNAVAILABLE_ACK` fallback. Nothing about the turn changed for the person standing there; what changed is that a lost answer is now a *classified* failure (`busy` / `timeout` / `offline` / `bad_response`) instead of an unattributed `None`, so the retry rule is stated instead of inferred: only `offline`/`bad_response` — the faults a cheap immediate retry actually fixes — are retried, and `busy`/`timeout` go straight to the acknowledgement rather than asking a saturated tier twice. The lock wait is the one place the interactive path *differs* from the tier's default: background callers wait zero (`do not enqueue`), while a voice turn waits `VOICE_TURN_LOCK_WAIT_S` (5s), because reflection holds the same lock for a few seconds every few minutes and refusing a child instantly trades a certain answer for a certain "give me a second". The old spelling named the session that used to serve the turn; #317 Phase 3 deleted the session, and a flag named after a deleted thing is a flag that lies in `--help`. **Deploying this rename needs `px-wake-listen` restarted as well as `px-mind`** — the listener resolves the launcher path once at startup.
 
 **Conversation buffer**: each turn is appended to `state/conversation-{persona}.jsonl` (rolling window, `PX_CONVERSATION_TURNS`, default 10) and injected back into the next prompt as a "Recent conversation" section — gives SPARK short-term memory across turns without relying solely on file-injected session state. Per-persona file so GREMLIN/VIXEN/Spark histories never bleed. SPARK's utterance is the action's `params.text`, falling back to `(tool_name)` for non-speech actions.
 
@@ -186,14 +186,15 @@ is genuinely alive and has simply stopped ticking; the identity checks are
 exactness and speed, not a replacement. Missing or unparseable identity reads as
 **stale**, the module's lenient-read posture: an unreadable marker must never
 block tonight's attempt. `boot_id` is the same idiom as
-`brain_daemon._read_boot_id` / `m5` / `wake_grant`, and earns its place for the
+`m5` / `wake_grant` (and, before #317 Phase 3 deleted it,
+`brain_daemon`), and earns its place for the
 same host-specific reason — this Pi has no RTC and timesyncd steps the clock, so
 boot_id is the one member of the tuple a clock step cannot move. A restart
 therefore cannot leave a false in-progress claim behind, and the tick records
 that cleanup as a *failure* — no memory formed that night — rather than
 silently resetting. The
 heartbeat is written by the **tick**, not the worker: the worker spends its
-whole life blocked in `ask_brain` and could not beat if it wanted to. Past
+whole life blocked in the tier call and could not beat if it wanted to. Past
 `JOB_OVERRUN_AFTER_S` an unfinished run is reported **once**, not every 60s.
 
 **Two attempts a night, spaced 40 min apart** (`memory.RETRY_SPACING_S`). All
@@ -332,91 +333,144 @@ retry 1800s into a 2400s cooldown, so it was refused on exactly the nights the
 first attempt was slow. The spacing has to cover the cooldown *plus* the attempt
 that precedes it.
 
-**Deadlines are declared once, in `brain._DEADLINE_S`, and `timeout=` on
-`run_claude_session` defaults to `None` so that table is what reaches
-`ask_brain`.** Pass a number only when you mean to override the kind's declared
-budget — an override that is *tighter* silently wins and makes the declared
-value unreachable, which is exactly what an ad-hoc `timeout=180` did to
-`consolidate`'s 600s: every live failure timed out at 180.1s while every
-success took 30–65s. Callers still passing ad-hoc values for classified kinds
-(`mind.py` self_debug 600 vs. declared 900; `bin/px-blog`, `bin/tool-research`,
-`bin/tool-compose`, `bin/tool-blog` passing 300, which matches) are redundant at
-best and drift at worst.
+**Deadlines are declared once per kind, at the caller, and the provider's own
+HTTP timeout is the ceiling.** `run_claude_session`'s `timeout` defaults to
+`None`; interactive kinds declare their own (`VOICE_TURN_DEADLINE_S` 45s,
+`px-cron-say` 90s, vision 60s, `memory.CONSOLIDATE_DEADLINE_S` via the tier).
+The per-kind table this used to defer to (`brain._DEADLINE_S`) was deleted with
+the session it belonged to. An override that is *tighter* than the provider's
+silently wins and makes the declared value unreachable — an ad-hoc
+`timeout=180` did exactly that to `consolidate`'s then-600s: every live failure
+measured 180.1s while every success took 30–65s (#291). On a tier call the
+binding limit is `PX_M5_SPARK_TIMEOUT_S`, so a caller's larger number is a
+comment rather than a budget.
 
-Global: 30min cooldown between sessions (except `self_debug`/`blog`), 8/day cap.
-Only a session the model actually *answered* arms that cooldown: an rc=1
-`brain_unavailable` entry is a record that nothing was spent, and letting it
-lock out every other component for 30 minutes is #310's third defect. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
+Global: 30min cooldown between calls (except `self_debug`/`blog`), 8/day cap.
+Only a call the model actually *answered* arms that cooldown: an rc=1 entry —
+`cognition_timeout`, `cognition_offline`, `cognition_bad_response`,
+`cognition_busy`, and in the historical log `brain_unavailable` — is a record
+that nothing was spent, and letting it lock out every other component for 30
+minutes is #310's third defect. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
 
-### The Brain — persistent Claude session (`src/pxh/brain.py`)
+### Cognition — one tier, one call (`src/pxh/m5.py`)
 
-> ### Hard invariant — resident-only Claude
+> ### Hard invariant — no production code invokes Claude
 >
-> **No production code may invoke Claude non-residently.**
+> **No `claude -p`. No helper whose implementation is `claude -p`. No resident
+> session, no mailbox, no reply tool, no tmux delivery.**
 >
-> No `claude -p`. No helper whose implementation is `claude -p`. No fallback to
-> `call_claude_haiku`. No unclassified "cold Claude" kinds.
->
-> The resident `spark-brain` session is SPARK's **sole** Claude execution
-> substrate. Enforced by `tools/check_resident_claude.py` in CI, pinned
-> by `tests/test_resident_only_invariant.py`, and both are blacklisted from
-> px-evolve. This is not a migration, a rollout, or a preference — it is a rule,
-> and "we'll classify that one later" is how it was breached the first time.
+> The resident `spark-brain` session was SPARK's sole permitted Claude
+> substrate from 2026-08 to 2026-09-16; it is **deleted**, not stopped. Every
+> kind that needs a model runs on the cognition tier as one direct API call.
+> Enforced by `tools/check_resident_claude.py` in CI (which now also fails if
+> any of the retired paths reappears), pinned by
+> `tests/test_resident_only_invariant.py`, and both are blacklisted from
+> px-evolve.
 
-**Why it is a rule and not a preference.** A one-shot subprocess throws away context on every call and cannot use SPARK's own tools — that was the original argument, and it was not enough, because it framed the choice as latency-versus-simplicity. The load-bearing reason is that **a cold start costs more to run than the resident session it claims to be rescuing.** A resident-brain failure answered by spawning a fresh Claude on the same 4-core Pi does not degrade; it amplifies the contention that caused the failure.
+**Why the rule changed shape rather than being dropped.** The rule was never
+"Claude is good" — it was *nothing reaches a language model by an unmeasured
+second path*. The second path was a cold `claude -p`, and the reason it was
+banned is worth keeping in full, because it is the argument for the tier as
+well:
 
-Observed 2026-08-19: a 5-second tmux *delivery* timeout under load was reported as "brain unavailable", reflection fell through to `claude -p`, that second Claude competed with the voice turn's own `claude -p`, both slowed, the 120s timeout tripped, and the ladder continued into Ollama M5 and Ollama Cloud (403). A child said "Hey Spark" and waited **151 seconds** for an answer. The brain was healthy and idle throughout. Every tier below the resident session made the problem worse, and each spawn was billed API usage rather than covered by the Max subscription the resident sessions run under.
+> A cold start costs more to run than the session it claims to be rescuing. A
+> resident-brain failure answered by spawning a fresh Claude on the same 4-core
+> Pi does not degrade; it amplifies the contention that caused the failure.
+> Observed 2026-08-19: a 5-second tmux *delivery* timeout under load was
+> reported as "brain unavailable", reflection fell through to `claude -p`, that
+> second Claude competed with the voice turn's own `claude -p`, both slowed,
+> the 120s timeout tripped, and the ladder continued into Ollama M5 and Ollama
+> Cloud (403). A child said "Hey Spark" and waited **151 seconds** for an
+> answer. The brain was healthy and idle throughout.
 
-`bin/px-claude-session` is the session; `src/pxh/tmux_claude.py` drives it in tmux; `src/pxh/brain.py` is the request/reply channel.
+**Why the resident session went too (#317 Phase 3).** It solved the cold-start
+problem and introduced a worse one: the transport could lose an answer the
+model had already produced. Not theoretically — every item below is an observed
+event on this robot:
 
-**Replies come back through the filesystem, never the pane.** `capture-pane` returns *rendered* terminal output — wrapping, spinners, ANSI escapes, a finite scrollback — so an answer scraped from it is at the mercy of the terminal. The session answers by running a tool instead. Pane for humans, filesystem for machines.
+| what happened | cost |
+|---|---|
+| the session answered `tool-brain-reply <previous-turn-id>` from its own context | the answer was discarded; the caller waited its full 600s deadline (#314) |
+| a `Contains subshell / Do you want to proceed?` dialog appeared in the pane | nobody is attached to answer it; the whole night's consolidation sat behind it (#314) |
+| the Claude login expired | **no** supervisor recovery rung could manufacture a credential; `/login` by a human was the terminal action (#311) |
+| the supervisor's 02:00 recycle cleared the session's validation marker | every caller refused with `brain_unavailable` at dur=0.0s; nine consecutive nights lost (#310, #278) |
 
-Mailbox at `state/brain/<session>/`: `inbox/<uuid>.json` (request) → `outbox/<uuid>.json` (reply, written by `bin/tool-brain-reply`) → `dead/` (swept on session recreate), plus `current.json` (the in-flight request — what wedge detection keys on) and `validation.json` (proof a real handshake landed — what readiness means now).
+The fix was not a better mailbox. It was to delete the mailbox: **the
+application owns transport, the model supplies content.** A direct API call has
+no session to be logged out of, no correlation id to copy, no permission dialog
+and no reply command, so a produced answer cannot be lost in transit.
 
-**Readiness is a proven round trip, never the prompt glyph.** The glyph renders identically for a session that is actually listening and for one sitting behind a permission dialog it cannot answer — that collapse is the bug this file used to document as the design. `bin/px-brain` sends one real request through `tool-brain-reply` and requires one real reply echoing a nonce, recording the outcome in `validation.json`. `brain.session_state()` derives one of four strings from that marker at read time, never stored: `validated` (a real round trip landed on the model the marker records — noticing that the *configured* model has since changed is `handshake_reason`'s separate job, and is what triggers a re-handshake), `validating` (a handshake is in flight, or aged out if it's been too long), `no_marker` (the session is up but has never proven it can answer, or its marker just expired), `session_absent` (tmux has no such session). `ask_brain()` only proceeds on `validated`. `bin/px-brain-status` prints all four states plus the model and marker age in one command — start there before attaching to a pane. The supervisor itself is guarded by an `fcntl` flock keyed to the tmux socket it guards — `<socket>.supervisor.lock`, i.e. `/tmp/tmux-1000/px-mind.supervisor.lock` — so a second copy started by hand refuses to run rather than racing the systemd-managed one for the same sessions. Keyed to the socket, not the checkout: `flock` is per-inode, and the old `state/brain/.supervisor.lock` gave each of this host's checkouts a private guard that contended with nothing (#221). During migration the supervisor holds the legacy checkout-relative lock as well, so a pre-bridge binary in the same checkout still loses the race. The cost of that bridge is stated rather than hidden: while it holds, two supervisors on *different* sockets in the *same* checkout also contend, because both must take that checkout's legacy lock. The migration-era namespace is the pair (socket, checkout); only once the legacy lock is removed does the socket alone become the whole namespace.
+**What remains, and where to look:**
 
-**Stage 2 (#242) removed `spark-io`.** Stage 1 had kept two resident sessions
-while `post_qa`, `blog_qa`, `public_chat` and `obi_chat` moved onto the pinned
-cognition model with no tools (that model lived on the `M5` workstation until
-#308 moved the tier to Ollama Cloud; the tier keeps its `m5` name); the per-kind/per-session meters established that
-`spark-io` received zero legitimate requests after that migration — only
-supervisor handshake traffic — so it was deleted rather than kept idle
-indefinitely. `spark-brain` is now SPARK's only resident Claude session, at
-the repo root, for voice and high-value visual kinds. The trust boundary
-`spark-io` used to enforce (untrusted text held away from a session with
-tools and repo access) is now the cognition tier's: it has no tools and no filesystem access
-at all, a stronger property than a scoped Claude Code session ever was. **The
-one thing that changed when the tier moved to Ollama Cloud (#308) is
-exposure**: untrusted text — public chat, Obi chat, post and blog QA — now
-leaves the LAN instead of staying on it. Privilege is unchanged (still no
-tools, still no filesystem); the disclosure surface is not, and that is the
-trade this arrangement consciously makes.
+- `claude_session.run_claude_session(kind, prompt, ...)` is still the dispatcher
+  — the `claude_*` names are provenance and are the next thing to go. Every
+  kind it serves is in `_COGNITION_KINDS`; anything else raises
+  `ColdStartForbidden`. There is no dial, no `PX_BRAIN_KINDS`, and no second
+  destination.
+- A cognition kind that asks for `allowed_tools` is **refused**
+  (`CognitionTierToolsForbidden`), not quietly answered without them: a
+  tool-less answer to a tool-bearing request is indistinguishable from a
+  working one.
+- Failures are classified (`cognition_timeout`, `cognition_offline`,
+  `cognition_bad_response`, `cognition_busy`) and the session log records the
+  `provider` that actually served the call, so "which tier spent this" is
+  answerable after the fact.
+- **Deadlines are declared once per kind, at the caller, and the tier's own
+  `PX_M5_SPARK_TIMEOUT_S` is the ceiling.** `run_claude_session`'s `timeout`
+  defaults to `None`; interactive kinds declare their own
+  (`VOICE_TURN_DEADLINE_S` 45s, `px-cron-say` 90s, vision 60s). An override
+  that is *tighter* than the provider's silently wins and makes the declared
+  number unreachable — an ad-hoc `timeout=180` did exactly that to
+  `consolidate`'s then-600s budget, and every live failure measured 180.1s
+  while every success took 30–65s (#291). On a tier call the binding limit is
+  the HTTP timeout, so a caller's number larger than `PX_M5_SPARK_TIMEOUT_S`
+  is a comment, not a budget.
 
-**Critical gotchas:**
-- **`ask_brain()` returns `None` on every failure and never raises.** None means "fall back" — callers drop to the cognition tier exactly as they do today when Claude is unreachable. There is deliberately no exception path; this sits under daemons.
-- **Single-flight `FileLock` per session.** Two concurrent `send-keys` runs do not queue, they interleave into one garbled prompt — the failure mode is not "slow" but "both answers wrong". A caller that can't get the lock in `LOCK_WAIT_S` falls back rather than queueing.
-- **Mailbox directories are `1777`, and the lock file `0666`** — same reasoning as `state/health/`, and it is load-bearing for the same reason: SPARK's daemons do not all run as the same user, and a root-created 0755 dir locks every `pi` daemon out of `atomic_write`'s `mkstemp`. Do not tighten either.
-- **The glyph never proves a session can answer.** `run_handshake` does not gate on `pane_ready()` at all — the handshake's real reply-with-nonce is itself the authoritative readiness test, so checking the glyph first would only add a redundant, misleading gate (a permission dialog renders it too). `handshake_reason` is different: inside the bounded window right after a recycle it *does* consult `_is_idle` (which ends in `pane_ready`), because in that window the supervisor already knows a real turn — the recycle's own journal-append-then-`/clear` — is in flight, and the glyph is what tells it that turn has finished. Injecting mid-turn splices two prompts into one and produces a plausible-looking wrong answer.
-- **There is exactly one spelling of `tool-brain-reply`, and it is absolute.** Claude Code matches a `Bash(...)` allowlist rule against the command by *prefix*, so `Bash($PROJECT_ROOT/bin/tool-brain-reply:*)` admits an absolute invocation and nothing else — a bare or repo-relative spelling misses it and raises a permission dialog nobody is attached to answer, which is a wedge. `brain.TOOL_BRAIN_REPLY` is the constant; the nudge and allowlist use it, and the system prompt carries a `{{TOOL_BRAIN_REPLY}}` placeholder that `bin/px-claude-session` substitutes at launch. **Never write a literal `tool-brain-reply` into a prompt** — pinned by `test_launcher_renders_one_absolute_reply_spelling`.
-- **`tool-brain-reply` validates everything** — bare-uuid4 id (it becomes a filename), the id must name a *pending* request (otherwise a valid uuid is a write primitive aimed at the outbox), JSON payload under `MAX_REPLY_BYTES`. It is reachable only from `spark-brain` now; the untrusted io session that used to reach it was removed in Stage 2 (#242).
-- **`ask_brain` meters every request** (`state/brain/meter.json`, per kind per day). It is the first chokepoint every Claude request passes through. Reflection reaches it via `ask_brain` without going through `claude_session.py`'s per-type cooldowns — deliberately, since reflection runs every 5 min and a daily cap would simply stop it. The meter gives visibility without a cap, and with the cold fallback removed there is no longer an unmetered path beneath it.
-- `tests/conftest.py` has an **autouse** fixture redirecting `brain_root()` to tmp. Without it an in-process test drops a real request into the running robot's inbox, where the live session answers it.
+**`self_debug` collects its evidence in Python.** `mind.self_debug_snapshot()`
+assembles a bounded snapshot (health board, awareness through the *reflection*
+allowlist, the tail of px-mind.log) truncated to `SELF_DEBUG_SNAPSHOT_CHARS`.
+It used to ask for `Read,Glob,Grep` and send a model looking through the repo
+to answer a question about px-mind's own recent behaviour. Giving a cloud model
+repo authority to reach data the caller already has is the trade this avoids.
 
-**`px-brain` supervisor (`bin/px-brain`, `src/pxh/brain_daemon.py`):** owns the session so callers don't have to. **Its first job is holding a read-only attached tmux client** — 3.3a's `send-keys` fails outright when no client is attached, so without the holder injection fails precisely when nobody is watching. `TERM` must be set in the unit (`tmux attach` refuses without one). `KillMode=process` is deliberate: restarting the supervisor must not kill the sessions it supervises. It also sweeps pending requests to `dead/` on session (re)create, unwedges (Escape, then kill after `ESCAPE_GRACE_S`), and recycles context on turn count + nightly at 02:00 Hobart — **always at an idle moment**, since a `/clear` between nudge and reply loses the request. Wedge detection keys on `current.json`, never on stale inbox files (an abandoned inbox entry means a caller gave up, not that the session is stuck).
+**`describe_scene` runs on the tier, with the photo inlined** (`pxh.m5`'s
+`images`, base64). This **inverts** a property the previous design asserted on
+purpose — the old comment read "the image is never inlined into the payload …
+it would put the photo through the mailbox, the log and any future outbox
+dump", which was true and is now the reason the bytes travel: the mailbox is
+what was retired. The scope rule is unchanged and now guards more than it did:
+`vision._within_photos` used to bound what a session was *told to read*; it
+bounds what leaves the robot, and `vision.MAX_IMAGE_BYTES` (2 MB) bounds how
+much of it. `vision.CLAUDE_TIMEOUT` became `DESCRIBE_TIMEOUT_S` in the same
+change — a constant named after a provider outlives the provider. The
+disclosure surface is deliberately unchanged: photos already left the robot for
+a cloud model on this exact path; only the vendor is different.
 
-**Kind routing — two destinations, and a kind must be in exactly one (#317).** `research`, `compose`, `blog`, `consolidate`, `self_debug` and — since Phase 3 — `voice_turn`, `cron_say` and `describe_scene` are served by the **cognition tier** (`pxh.m5`, a direct Ollama Cloud call): each caller's prompt is self-contained, so none of them needs Claude Code's envelope or system prompt. Four were already tool-free; `self_debug` was not, and it is the one place the migration changed a *caller* rather than a constant — it used to ask for `Read,Glob,Grep` and send a model looking through the repo to answer a question about px-mind's own recent behaviour. The Phase 3 kinds are the ones whose *classification* has not moved yet — `describe_scene`'s for the same reason, since `vision.describe_image` calls the tier directly now: `run_voice_turn` calls the tier directly, so nothing travels the mailbox for it, but `brain.py` still lists it as a resident kind and keeps its `_DEADLINE_S` entry (`voice_loop.VOICE_TURN_DEADLINE_S` is pinned equal to it by a test). That half-retirement is deliberate — `_VALIDATION_WAIT_KINDS` (`{"voice_turn"}`, #273's wait-out-a-handshake rule) and the mailbox's own removal belong to the same deletion, and splitting them would leave a tested behaviour guarding nothing. `mind.self_debug_snapshot()` similarly assembles its answer in Python (health board, awareness through the *reflection* allowlist, the tail of px-mind.log) and truncates it to `SELF_DEBUG_SNAPSHOT_CHARS`, so the model needs no authority it was only ever granted to reach the data this code can hand it directly. A cognition kind that asks for `allowed_tools` is **refused** (`CognitionTierToolsForbidden`), not quietly answered without them: a tool-less answer to a tool-bearing request is indistinguishable from a working one. `claude_session._COGNITION_KINDS` is checked *before* the brain dial and is not overridable — a migrated kind cannot be routed back into the mailbox by `PX_BRAIN_KINDS`, because "rolled back into the resident session by an environment variable" is precisely the silent Claude fallback the migration exists to remove. A migrated call is one HTTP request: no inbox file, no request id, no reply command, no permission dialog, nothing that can lose an answer after the model produced it (#314). Its failures are classified (`cognition_timeout`, `cognition_offline`, `cognition_bad_response`, `cognition_busy`) rather than collapsed into "the session did not answer", and the session log records the `provider` that actually served it. `tests/test_resident_routing.py` fails if a known kind ends up in neither destination or in both.
+**`evolve` is disabled, not cold-started.** It needs a git worktree, and a
+tool-free API call has no filesystem to widen. `px-evolve` raises
+`ColdStartForbidden` — a deliberate outage rather than an exemption.
 
-`_DEFAULT_BRAIN_KINDS` is now **empty** — no kind is served residently through `claude_session` any more. The mechanism stays only because `bin/px-post` consults the dial — `_run_via_brain` has **no production caller at all** now, and is kept solely so the deletion happens in one piece with the mailbox it opens onto.
+**The retired paths are forbidden by name**, not merely absent:
+`src/pxh/brain.py`, `src/pxh/brain_daemon.py`, `src/pxh/tmux_claude.py`,
+`bin/px-claude-session`, `bin/tool-brain-reply`, `bin/px-brain`,
+`bin/px-brain-status` and `systemd/px-brain.service` are each a CI failure if
+they reappear (`tools/check_resident_claude.py`'s `FORBIDDEN_PATHS`). An `if`
+that is currently false can be flipped and a stopped service can be started; a
+file that does not exist cannot be reached.
 
-`PX_BRAIN_KINDS` therefore selects which of the *remaining* kinds route to the brain. An unclassified kind **fails closed** — no backend, no cold start. The old default pointed the other way (unclassified → `claude -p`), which made "I forgot to classify it" and "I decided it may cold-start Claude" the same act; that is the identical trust-direction bug already fixed in `brain.py`'s own kind classification, where `session_for_kind` raises rather than defaulting to a session for an unclassified kind. Read at call time so the rollout can be widened or rolled back live — `bin/px-post` consults the same dial for its QA gate. `evolve` cannot move until the brain can work inside a git worktree: a resident session's tool envelope is fixed at launch and cannot be widened per call. There is no "legacy cold Claude" bucket, and `bin/claude-voice-bridge` is **deleted rather than deprecated** — leaving fossils executable is how they turn back into architecture. Run `python tools/check_resident_claude.py --list` for the live debt map.
+**Readiness is now the HTTP response.** There is no handshake to prove, no
+glyph to misread, and no four-state session marker. `ask_m5` returns a
+classified `M5Result`; `probe()` answers "is the tier reachable and serving the
+configured model" once at px-mind startup. Run
+`python tools/check_resident_claude.py --list` for the live debt map.
 
-`evolve` is **disabled**, not cold-started: it needs a git worktree and a resident session's tool envelope is fixed at launch. `px-evolve` raises `ColdStartForbidden` until the brain can hold a worktree — a deliberate outage rather than an exemption.
-
-`describe_scene` runs on the **cognition tier**, with the photo inlined into the one request (`pxh.m5`'s `images`, base64). No session, no mailbox, no shim, no subprocess. This **inverts** a property the previous design asserted on purpose — the old comment read "the image is never inlined into the payload … it would put the photo through the mailbox, the log and any future outbox dump", which was true and is now the reason the bytes travel: the mailbox is what is being retired. The scope rule is unchanged and now guards more than it did: `vision._within_photos` used to bound what a session was *told to read*; it bounds what leaves the robot, and `vision.MAX_IMAGE_BYTES` bounds how much of it. `vision.CLAUDE_TIMEOUT` became `DESCRIBE_TIMEOUT_S` in the same change — a constant named after a provider outlives the provider.
-
-**`Read` materially broadens spark-brain, and the broadening is wider than the use.** That session's cwd is the repo root, so `Read` reaches `.env`, `state/` and `~/.claude` credentials. Before it, the session could only *write*, through four named tools, and could read nothing at all. The grant is unscoped because a `Read(<glob>)` rule that fails to match does not fail closed — it raises a permission dialog into a pane nobody is attached to answer, wedging the session until the deadline. The narrowing is therefore enforced in code (`vision._within_photos`) and in the system prompt, and the envelope is pinned exactly by `tests/test_brain_envelope.py` so any future widening is a deliberate edit against a failing test — including a per-call override: the launcher has no such hook, on purpose. Untrusted text never reaches this envelope at all — it runs on M5, which holds no tools and no filesystem access; that boundary held through Stage 2's removal of the `spark-io` session that used to enforce a narrower version of it. Design: `docs/superpowers/specs/2026-08-01-px-brain-design.md` (Stage 1 architecture; superseded by #242 for the session count).
-
-**`bin/tool-describe-scene` may be a bug fix, not just a migration.** `bin/tool-wander:64` runs `px-wander` under `sudo -n`, and `wander._call_describe_scene` passes that environment straight down — so the tool's `claude -p` runs **as root**, with root's `HOME`. If root has no Claude credentials there, vision silently returns `FALLBACK_DESCRIPTION` on every real wander and nothing logs a credential error. The sudo chain is verified in the code; **the credential failure itself has not been confirmed on the robot** — check before claiming it fixed. Under the brain the root process only drops a JSON file and the authenticated `claude` runs as `pi`, which sidesteps it either way.
+**Historical detail is in git, not here.** The mailbox layout
+(`state/brain/<session>/{inbox,outbox,dead}`, `current.json`,
+`validation.json`), the handshake protocol, the supervisor's recycle and wedge
+detection, and the `Read`-envelope argument all lived in this file until
+#317 Phase 3 deleted the machinery they described. They are recoverable with
+`git log -p CLAUDE.md`, and the design docs are in
+`docs/superpowers/specs/` and `docs/superpowers/plans/`.
 
 ### Self-Evolution (px-evolve)
 
@@ -510,7 +564,6 @@ See `src/pxh/api.py` for full endpoint list.
 | `px-wake-listen` | `bin/px-wake-listen` | pi | always, 10s |
 | `px-battery-poll` | `bin/px-battery-poll` | root | always, 10s |
 | `px-mind` | `bin/px-mind` | pi | always, 10s |
-| `px-brain` | `bin/px-brain` | pi | always, 10s (`KillMode=process`) |
 | `px-post` | `bin/px-post` | pi | always, 30s |
 | `px-api-server` | `bin/px-api-server` | pi | always, 2s |
 | `px-frigate-stream` | `bin/px-frigate-stream` | pi | always, 10s |
@@ -549,11 +602,13 @@ their own vocabulary into an `Effect` and pass the context in.
 The first two are dispatchers, so they only bind callers that go *through* a
 dispatcher. `bin/tool-voice` is the sink every speech producer funnels into
 (`tool-chat`, `tool-chat-vixen`, `tool-voice-persona`, `px-cron-say`,
-`px-battery-poll`), and it is also what anything holding a shell reaches —
-including the resident `spark-brain` session, whose tool envelope is SPARK's own
-`bin/`. Before the sink gate, prose in a system prompt was the only thing
-between that session and the speaker at 3am. The upstream checks stay as defence
-in depth; **do not remove one because the other exists.**
+`px-battery-poll`), and it is also what anything holding a shell reaches. The
+strongest such thing used to be the resident `spark-brain` session, whose tool
+envelope was SPARK's own `bin/`; that session is gone (#317 Phase 3) and the
+argument did not depend on which process was holding the shell. Before the sink
+gate, prose in a system prompt was the only thing between a tool-bearing model
+and the speaker at 3am. The upstream checks stay as defence in depth; **do not
+remove one because the other exists.**
 
 **The sink pins `origin` and `effect` rather than accepting them.** A sink
 cannot know its caller — that is precisely why it needs its own gate —
@@ -671,7 +726,7 @@ validates its target allowlist and chooses its own environment; `systemctl`/
 1. Create `bin/tool-<name>` (bash + embedded Python heredoc; see existing tools)
 2. Add to `ALLOWED_TOOLS` and `TOOL_COMMANDS` in `src/pxh/voice_loop.py`
 3. Add `validate_action` branch to sanitize params into env vars
-4. Add to `docs/prompts/claude-voice-system.md` (and codex version)
+4. Add to `docs/prompts/voice-system.md` (and codex version)
 5. Add to `docs/prompts/persona-gremlin.md` and `persona-vixen.md`
 6. Add a dry-run test in `tests/test_tools.py` using the `isolated_project` fixture
 

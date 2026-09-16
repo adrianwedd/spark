@@ -41,24 +41,20 @@ LOCK_TIMEOUT_S = 10
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 DEDUPE_SIMILARITY = 0.85
 DEDUPE_WINDOW_DAYS = 14
-# Hobart hours [start, end) for the nightly pass. The start is not the hour the
-# night begins, it is the first hour the brain is usable again.
+# Hobart hours [start, end) for the nightly pass.
 #
-# `brain_daemon.NIGHTLY_RECYCLE_HOUR` is 02:00, and a recycle deliberately
-# clears the session's validation marker — that is what makes a caller fall
-# back instead of typing into a session that has just forgotten its identity
-# prompt. So for the whole boot that follows, every caller is refused with
-# `brain_unavailable` at dur=0.0s: an immediate refusal, not a timeout.
+# This was 02:00 and #310 moved it to 03:00. The reason was structural and is
+# worth keeping even though the structure it named is gone: the resident
+# session's supervisor recycled at 02:00, and a recycle cleared the session's
+# validation marker, so every caller was refused with `brain_unavailable` at
+# dur=0.0s — an immediate refusal, not a timeout — for as long as the handshake
+# took to re-validate. The first attempt landed at 02:00:0x-02:03 on every one
+# of the nine measured nights and failed on arrival on every one of them.
 #
-# #310: the first attempt landed at 02:00:0x-02:03 on every one of the nine
-# nights it was measured and failed on arrival on every one of them, for this
-# structural reason and no other. `brain.VALIDATION_CEILING_S` (180s) is the
-# ceiling on that blackout, so 03:00 clears it by most of an hour and still
-# leaves both spaced attempts inside the window.
-#
-# tests/test_consolidation_background_job.py pins the coupling to
-# `NIGHTLY_RECYCLE_HOUR` rather than to this number, so moving the recycle
-# without moving the window fails a test instead of costing nine more nights.
+# The supervisor and the session are gone (#317 Phase 3), so 03:00 is no longer
+# load-bearing for that reason. It stays because it is the hour this pass was
+# diagnosed and fixed at, both spaced attempts fit inside it, and there is no
+# evidence for moving it back.
 CONSOLIDATION_WINDOW = (3, 6)     # Hobart hours [start, end)
 MAX_ATTEMPTS_PER_DAY = 2
 MIN_THOUGHTS = 5
@@ -75,31 +71,40 @@ MAX_MEMORIES_PER_DAY = 8
 # The gap is measured against the attempt it is spacing, and the two clocks are
 # not the same instant. This gate reads `meta["last_attempt_ts"]`, stamped when
 # attempt 1 *started*; the `consolidate` type cooldown reads the session log,
-# written when attempt 1 *finished*. An attempt that spends its declared
-# `brain._DEADLINE_S` of 600s therefore reaches attempt 2 with 2400s elapsed
-# here and only 1800s elapsed there, and is refused. That is the whole of
+# written when attempt 1 *finished*. An attempt that spends its whole deadline
+# therefore reaches attempt 2 with `cooldown` elapsed here and only
+# `cooldown - deadline` elapsed there, and is refused. That is the whole of
 # #310's second defect. The history matches it exactly: attempt 2 was admitted
 # on 09-04..09-07, which are precisely the nights attempt 1 failed instantly,
 # and refused on 09-08 and 09-10, which are the nights it ran to its deadline.
 #
-# So the spacing has to cover the attempt's own worst case, not a nominal one:
-# `_TYPE_COOLDOWNS["consolidate"]` (2400) + `_DEADLINE_S["consolidate"]` (600)
-# = 3000s, plus margin for prompt assembly. 3300s clears that with five minutes
-# to spare, and two spaced attempts still fit inside 03:00-06:00.
+# So the spacing has to cover the attempt's own worst case, not a nominal one.
+# #310 derived it as `_TYPE_COOLDOWNS["consolidate"]` (2400) + the declared
+# deadline then in force (600) = 3000s, plus margin; 3300s cleared that with
+# five minutes to spare.
+#
+# The deadline has since shrunk and the number has deliberately *not* moved
+# with it (#317 Phase 3). The kind's 600s was sized for a resident session plus
+# mailbox delivery; it is now one tier call, measured at 13.1s end to end on
+# the robot, bounded by `PX_M5_SPARK_TIMEOUT_S` (120 on the deployed Pi). So
+# 2400 + 120 = 2520s, and 3300 clears it with thirteen minutes to spare. Moving
+# 3300 down to match would buy nothing — two spaced attempts still fit inside
+# 03:00-06:00 either way — and would spend margin against a slower model, on
+# the one pass whose failure is invisible for nine days.
 #
 # Spacing past the cooldown is deliberate, rather than adding `consolidate` to
-# `_GLOBAL_COOLDOWN_EXEMPT`. The cooldown exists because two Claude sessions
-# close together contend on a 4-core Pi, and that reason applies to
-# consolidation exactly as written — the attempt is 600s of resident-session
-# time. An exemption would buy the retry by denying the premise.
+# `_GLOBAL_COOLDOWN_EXEMPT`. The cooldown exists because two model calls close
+# together contend on a 4-core Pi, and that reason applies to consolidation
+# exactly as written — the attempt is minutes of tier time. An exemption would
+# buy the retry by denying the premise.
 RETRY_SPACING_S = 3300
 
 # A consolidation worker that has held the job marker this long has overrun its
-# own budget (brain._DEADLINE_S["consolidate"] is 600s, plus prompt assembly and
-# the single-flight lock wait). Reported once, then left alone: the worker is a
-# daemon thread blocked inside ask_brain, which has its own deadline, so the
-# honest thing is to make the overrun visible rather than to pretend it can be
-# cancelled.
+# own budget (the tier's own timeout — `PX_M5_SPARK_TIMEOUT_S`, 120 on the
+# deployed Pi — plus prompt assembly and the single-flight lock wait). Reported
+# once, then left alone: the worker is a daemon thread blocked inside the tier
+# call, which has its own deadline, so the honest thing is to make the overrun
+# visible rather than to pretend it can be cancelled.
 JOB_OVERRUN_AFTER_S = 900
 
 # How long the marker's heartbeat may lag before its owner is presumed gone.
@@ -402,13 +407,20 @@ def consolidate(dry: bool = False, persona: str = "spark",
 
         import pxh.claude_session as claude_session
         try:
-            # No `timeout=` on purpose (#291). The deadline for a classified
-            # brain kind is declared once, in brain._DEADLINE_S — 600s for
-            # `consolidate` — and `ask_brain` only reaches for it when the
-            # caller passes nothing. The ad-hoc 180 that used to sit here was
-            # tighter, so it won every time and the declared budget was never
-            # once reachable: every live failure measured exactly 180.1s while
-            # the successes measured 30-65s.
+            # No `timeout=` on purpose (#291). One deadline has to be the
+            # source of truth and it is the tier's own configured one
+            # (`PX_M5_SPARK_TIMEOUT_S`); passing a second number here is how
+            # the ad-hoc 180 that used to sit here won every time and made the
+            # budget it was supposedly honouring unreachable — every live
+            # failure measured exactly 180.1s while the successes measured
+            # 30-65s.
+            #
+            # This kind's declared budget used to be 600s, sized for a resident
+            # session plus mailbox delivery. It is now 120s on the deployed Pi,
+            # and that is a real narrowing rather than a rename: measured at
+            # 13.1s end to end on the tier, so the margin is large, but if a
+            # night ever times out here the fix is `PX_M5_SPARK_TIMEOUT_S` — not
+            # a second deadline in this module.
             result = claude_session.run_claude_session(
                 "consolidate", prompt, allowed_tools="")
         except claude_session.SessionBudgetExhausted as exc:
@@ -544,8 +556,10 @@ def maybe_consolidate(dry: bool = False, persona: str = "spark",
     """Once-per-Hobart-date gate for consolidate(). None = not now, or dry mode.
 
     Runs on px-mind's consolidation worker thread, never on the awareness tick
-    itself (#291): a single attempt is allowed up to `brain._DEADLINE_S`'s 600s,
-    which is twice px-mind's own 300s health-staleness window.
+    itself (#291): a single attempt is allowed the tier's own timeout, which on
+    the deployed Pi (120s) is under px-mind's 300s health-staleness window but
+    was 600s when this was written, which is why the threading is load-bearing
+    rather than tidy.
     """
     if dry:
         return None
@@ -652,9 +666,10 @@ def _pid_is_px_mind(pid: object) -> bool:
 def _read_boot_id() -> str | None:
     """The kernel's boot id, or None when it cannot be read.
 
-    Same idiom as `brain_daemon._read_boot_id` (and `m5`, `wake_grant`), for the
-    same host-specific reason: this Pi has no RTC and timesyncd steps the clock,
-    so boot_id is the one member of an identity tuple a clock step cannot move.
+    Same idiom as `m5` and `wake_grant` (and, while it existed,
+    `brain_daemon`), for the same host-specific reason: this Pi has no RTC and
+    timesyncd steps the clock, so boot_id is the one member of an identity tuple
+    a clock step cannot move.
     """
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text(
@@ -783,7 +798,7 @@ def touch_consolidation_job(now: dt.datetime | None = None) -> dict:
     """Refresh the heartbeat from the owning process and report an overrun once.
 
     The heartbeat is written by px-mind's tick, not by the worker: the worker
-    spends its whole life blocked inside `ask_brain` and could not beat if it
+    spends its whole life blocked inside the tier call and could not beat if it
     wanted to. "px-mind still observes this thread alive" is exactly the fact a
     later reader needs, so that is what gets recorded.
 

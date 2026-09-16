@@ -46,7 +46,7 @@ Comprehensive documentation for every script in `bin/` and every module in `src/
 9. [Voice Assistant Loop](#voice-assistant-loop)
    - [bin/codex-voice-loop](#bincodex-voice-loop)
    - [bin/run-voice-loop](#binrun-voice-loop)
-   - [bin/run-voice-loop-claude](#binrun-voice-loop-claude)
+   - [bin/run-voice-loop-tier](#binrun-voice-loop-tier)
    - [bin/run-voice-loop-ollama](#binrun-voice-loop-ollama)
    - [bin/codex-ollama](#bincodex-ollama)
 10. [Wake Word and STT](#wake-word-and-stt)
@@ -893,25 +893,27 @@ bin/run-voice-loop [--input-mode text|voice] [--dry-run] [--auto-log] [--max-tur
 
 ---
 
-### bin/run-voice-loop-claude
+### bin/run-voice-loop-tier
 
-**Purpose:** Launch the voice loop using Claude Code as the LLM backend, via the resident `spark-brain` session.
+**Purpose:** Launch the voice loop on the cognition tier — one direct Ollama Cloud API call per turn.
 
 **Usage:**
 ```bash
-bin/run-voice-loop-claude [--input-mode text|voice] [--dry-run] [--max-turns N] [...]
+bin/run-voice-loop-tier [--input-mode text|voice] [--dry-run] [--max-turns N] [...]
 ```
 
 **What it does:**
-1. Sets `PX_VOICE_BACKEND=brain` — voice turns route to the resident `spark-brain` session (the sole permitted Claude substrate; see the resident-only invariant in CLAUDE.md).
+1. Sets `PX_VOICE_BACKEND=tier` — voice turns call the cognition tier directly (`pxh.m5`; see the no-resident-Claude invariant in CLAUDE.md).
 2. Passes `--backend brain --prompt docs/prompts/claude-voice-system.md` to `codex-voice-loop`.
 3. Calls `codex-voice-loop` with all remaining arguments forwarded.
 
-There is no cold `claude -p` path — `bin/claude-voice-bridge` was deleted (not deprecated) when voice turns moved to the resident brain.
+There is no cold `claude -p` path and no resident session — `bin/claude-voice-bridge`, `bin/px-claude-session` and the mailbox were all deleted rather than deprecated (#317 Phase 3).
+
+**Note:** renamed from `run-voice-loop-claude` when the session it was named after was retired. `px-wake-listen` resolves this path once at startup, so deploying the rename needs that unit restarted too — not just `px-mind`.
 
 **Example (single non-interactive turn):**
 ```bash
-echo "check status" | bin/run-voice-loop-claude --dry-run --max-turns 1
+echo "check status" | bin/run-voice-loop-tier --dry-run --max-turns 1
 ```
 
 ---
@@ -993,7 +995,7 @@ USB Mic (44100 Hz)
   → record until 1.5s silence (max 8s)
   → sherpa-onnx Zipformer transcribe (int8, ~RTF 0.78x)
   → transcript text
-  → bin/run-voice-loop-claude --max-turns 1 (stdin pipe)
+  → bin/run-voice-loop-tier --max-turns 1 (stdin pipe)
 ```
 
 **Vosk model:** `vosk-model-small-en-us-0.15` (~40MB). Grammar-based `KaldiRecognizer` checks only whether the wake phrase appears — very low CPU, ~1–5ms per chunk.

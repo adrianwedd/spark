@@ -1,4 +1,4 @@
-"""Tool-free kinds are served by the cognition tier, not the resident session (#317).
+"""Tool-free kinds are served by the cognition tier, and only by it (#317).
 
 The point of the migration is a failure mode that cannot happen: the answer is
 the HTTP response body, so there is no session to be logged out of, no inbox
@@ -8,22 +8,27 @@ that was worked and answered in 47s and then never reached its caller.
 
 So these tests pin three things, in order of how much they matter:
 
-1. A migrated kind cannot reach the resident session, at all, ever — not even
-   when `PX_BRAIN_KINDS` still names it. A rollback dial that worked would be
-   the silent Claude fallback this migration exists to remove.
+1. There is no resident session to reach. #317 Phase 3 deleted the module, the
+   reply tool, the session launcher and its unit — so this is asserted by
+   *absence* rather than by a dial whose off position is trusted, because a
+   disabled route is one environment variable away from being a route again.
 2. A failure is reported, classified, and left failed. It does not escalate.
 3. The session log says what actually served the call (`provider` + model),
    because `model` alone was ambiguous the moment two tiers existed.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from pxh import brain, claude_session as cs, m5
+from pxh import claude_session as cs, m5
+
+REPO = Path(__file__).resolve().parent.parent
 
 MIGRATED = ("consolidate", "research", "compose", "blog", "self_debug")
 
@@ -44,13 +49,37 @@ def _entries():
     return [json.loads(line) for line in text.splitlines() if line]
 
 
-def _no_brain(*_a, **_k):
-    raise AssertionError("a cognition-tier kind reached the resident session")
+def test_the_resident_transport_is_deleted_rather_than_disabled():
+    """#317 Phase 3. A route that is switched off is a route.
+
+    Deleting the module is the assertion: an `if` that is currently false can
+    be flipped, and a supervisor that is stopped on the Pi can be started
+    again. This is the only form of "cannot reach it" that survives someone
+    re-enabling something at 3am.
+    """
+    with pytest.raises(ImportError):
+        importlib.import_module("pxh.brain")
+    with pytest.raises(ImportError):
+        importlib.import_module("pxh.brain_daemon")
+    with pytest.raises(ImportError):
+        importlib.import_module("pxh.tmux_claude")
+
+    for gone in ("bin/tool-brain-reply", "bin/px-claude-session", "bin/px-brain",
+                 "systemd/px-brain.service"):
+        assert not (REPO / gone).exists(), f"{gone} is still present"
+
+
+def test_the_brain_dial_cannot_route_anything_anywhere(monkeypatch):
+    """`PX_BRAIN_KINDS` used to be a live dial. Setting it must do nothing."""
+    monkeypatch.setenv("PX_BRAIN_KINDS", ",".join(MIGRATED))
+    monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: _ok())
+    for kind in MIGRATED:
+        assert cs.run_claude_session(kind, "a prompt", timeout=5).returncode == 0
+    assert not hasattr(cs, "brain_kinds")
 
 
 @pytest.mark.parametrize("kind", MIGRATED)
 def test_a_migrated_kind_is_served_by_the_cognition_tier(kind, monkeypatch):
-    monkeypatch.setattr(brain, "ask_brain", _no_brain)
     monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: _ok())
 
     result = cs.run_claude_session(kind, "a prompt", timeout=5)
@@ -58,21 +87,6 @@ def test_a_migrated_kind_is_served_by_the_cognition_tier(kind, monkeypatch):
     assert result.returncode == 0
     assert result.stdout == "the answer"
     assert result.provider == cs.COGNITION_PROVIDER
-
-
-@pytest.mark.parametrize("kind", MIGRATED)
-def test_the_brain_dial_cannot_route_a_migrated_kind_back(kind, monkeypatch):
-    """`PX_BRAIN_KINDS` is still a live dial for the kinds that remain resident.
-
-    It must not be one for these: the incident this migration answers was nine
-    nights of a mailbox nobody could make reliable, and "rolled back into the
-    mailbox by an environment variable" is not a shape a fix should have.
-    """
-    monkeypatch.setenv("PX_BRAIN_KINDS", ",".join(MIGRATED))
-    monkeypatch.setattr(brain, "ask_brain", _no_brain)
-    monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: _ok())
-
-    assert cs.run_claude_session(kind, "a prompt", timeout=5).returncode == 0
 
 
 def test_the_prompt_and_timeout_reach_the_cognition_tier_intact(monkeypatch):
@@ -95,7 +109,6 @@ def test_the_prompt_and_timeout_reach_the_cognition_tier_intact(monkeypatch):
 def test_a_failure_is_classified_and_never_falls_back_to_claude(status, monkeypatch):
     """#317: "Ollama failure should be explicit/deferred under the existing
     caller semantics, not silently resurrect the old transport." """
-    monkeypatch.setattr(brain, "ask_brain", _no_brain)
     monkeypatch.setattr(m5, "ask_m5",
                         lambda *a, **k: m5.M5Result(status=status, error="boom"))
 

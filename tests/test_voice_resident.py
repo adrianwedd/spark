@@ -100,10 +100,15 @@ def test_voice_turn_goes_to_the_cognition_tier(monkeypatch):
 
 
 def test_voice_turn_kind_is_classified():
-    """An unclassified kind cannot reach the privileged session by any path."""
-    from pxh import brain
-    assert brain.is_classified_kind(voice_loop.VOICE_TURN_KIND)
-    assert brain.session_for_kind(voice_loop.VOICE_TURN_KIND) == brain.BRAIN_SESSION
+    """The kind this turn uses must be one the dispatcher knows.
+
+    This used to ask the mailbox which session the kind belonged to. The
+    mailbox is gone (#317 Phase 3), so the question is the one that still has
+    an answer: this is a declared kind, its name is not shared with anything
+    else, and it is not one of the kinds the dispatcher would refuse.
+    """
+    assert voice_loop.VOICE_TURN_KIND == "voice_turn"
+    assert voice_loop.VOICE_TURN_KIND not in ("reflection", "public_chat", "obi_chat")
 
 
 def test_the_call_carries_the_act_dont_narrate_frame(monkeypatch):
@@ -205,17 +210,19 @@ def test_the_interactive_deadline_and_lock_wait_are_the_ones_passed(monkeypatch)
     assert 0 < voice_loop.VOICE_TURN_LOCK_WAIT_S < voice_loop.VOICE_TURN_DEADLINE_S
 
 
-def test_the_deadline_still_matches_the_brain_table():
-    """Two homes for one number, pinned together until Phase 3 deletes one.
+def test_the_deadline_has_exactly_one_home():
+    """`brain._DEADLINE_S` was the single source of truth while the session
+    answered this kind, and this test pinned the caller's copy to it.
 
-    `brain._DEADLINE_S` was the single source of truth while the brain answered
-    this kind. It answers no longer, but the entry is still there, so the two
-    must not drift in the meantime — a silent 45s → 90s change is a longer wait
-    for a child, and a silent 45s → 10s change is a turn that gives up while
-    the model is still working.
+    #317 Phase 3 deleted the table, so the property that test protected — "one
+    number, not two that can drift" — is now protected by there being nowhere
+    else to put it. What is worth pinning is the value itself: a silent
+    45s → 90s change is a longer wait for a child, and a silent 45s → 10s
+    change is a turn that gives up while the model is still working.
     """
-    from pxh import brain
-    assert voice_loop.VOICE_TURN_DEADLINE_S == brain._DEADLINE_S["voice_turn"]
+    assert voice_loop.VOICE_TURN_DEADLINE_S == 45.0
+    # The lock wait is a slice of the same budget, never a second one.
+    assert 0 < voice_loop.VOICE_TURN_LOCK_WAIT_S < voice_loop.VOICE_TURN_DEADLINE_S
 
 
 # ── The deterministic acknowledgement ──────────────────────────────────────
@@ -271,8 +278,8 @@ def test_cron_say_answers_from_the_cognition_tier_too():
     describe-scene timeout pin.
 
     It speaks, so it is the same voice question as `voice_turn`, and it fails
-    the same way if it drifts back: a resident session that is logged out or
-    mid-recycle takes the slot with it.
+    the same way if it drifts back: a resident session that was logged out or
+    mid-recycle took the slot with it.
     """
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent / "bin" / "px-cron-say").read_text(encoding="utf-8")

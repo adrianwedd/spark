@@ -289,20 +289,22 @@ def test_reflection_dry_thought_contains_dry_run_marker(mind_state):
     assert result["thought"].startswith("Dry-run thought:")
 
 
-@patch.dict(os.environ, {"PX_CLAUDE_BIN": "/usr/bin/claude"})
-def test_a_brain_error_is_carried_into_the_result():
+def test_a_tier_error_is_carried_into_the_result():
     """Replaces test_call_claude_logs_stdout_on_failure.
 
     That test pinned how `call_claude_haiku` surfaced a non-zero exit from a
-    `claude -p` subprocess. The subprocess is gone, but the property it cared
-    about is not: whatever went wrong has to reach the caller as an error
-    rather than as a silent empty thought.
+    `claude -p` subprocess; `call_claude` then pinned the same property for a
+    resident session's error. Both are gone (#317 Phase 3) — `call_llm` is the
+    whole of reflection's model access now — and the property they were both
+    reaching for is the one that survives: whatever went wrong has to reach the
+    caller as an error rather than as a silent empty thought.
     """
-    from pxh import mind
-    import pxh.brain
+    from pxh import mind, m5
 
-    with patch.object(pxh.brain, "ask_brain", return_value=None):
-        result = mind.call_claude("test prompt", "test system")
+    with patch.object(m5, "ask_m5",
+                      return_value=m5.M5Result(status="offline", error="tier down")):
+        result = mind.call_llm("test prompt", "test system")
 
     assert "error" in result
     assert result.get(mind.BRAIN_DEFER) is True
+    assert "tier down" in result["error"]

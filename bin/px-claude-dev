@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # px-claude-dev — launch the interactive/development Claude Code session
-# (an operator working the repo over SSH, not SPARK's resident spark-brain)
+# (an operator working the repo over SSH — this is a human's session, and it
 # under a dedicated memory-bounded systemd scope.
 #
 # Why this exists (2026-08-23 memory-pressure investigation): an uncontained
 # operator session was the single largest live memory consumer on this
 # 3.71 GiB robot — ~862 MiB PSS for the claude process alone, ~1.43 GiB
 # current / 1.67 GiB peak for its whole session-N.scope — with no
-# MemoryHigh/MemoryMax at all. Nothing stopped it from starving px-brain,
+# MemoryHigh/MemoryMax at all. Nothing stopped it from starving px-mind,
 # px-wake-listen or any other production daemon competing for the same RAM.
 # docs/operations/resource-containment.md already flagged this session as
 # the deliberately-deferred follow-up to the #217/#218/#219 containment work;

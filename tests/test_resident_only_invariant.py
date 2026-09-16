@@ -1,6 +1,13 @@
 """Constitutional suite: resident-only Claude.
 
-    No production code may invoke Claude non-residently.
+    No production code may invoke Claude at all.
+
+#317 Phase 3 removed the second half of this rule by removing what it guarded:
+the resident session, its supervisor, its mailbox and its reply tool are
+deleted, so "reach the substrate" is no longer a thing production code can do.
+The scan below still forbids cold starts (there is now no legitimate way to
+start Claude from production at all), and it additionally forbids the retired
+paths from reappearing.
 
 BLACKLISTED from px-evolve (see pxh.claude_session.BLACKLIST_FILES) together
 with tools/check_resident_claude.py, on the same footing as the policy
@@ -39,13 +46,16 @@ import check_resident_claude as guard  # noqa: E402
 # ── The invariant ──────────────────────────────────────────────────────────
 
 def test_no_cold_claude_in_production():
-    """No production path may cold-start Claude.
+    """No production path may cold-start Claude, and the retired transport
+    may not come back.
 
-    The resident spark-brain session is the sole Claude execution substrate.
-    A cold `claude -p` discards context per call, cannot use SPARK's
-    tools, is unmetered, and costs more to run than the resident session it
-    purports to rescue — so a resident-brain failure that spawns one amplifies
-    the contention that caused the failure instead of degrading.
+    A cold `claude -p` discards context per call, cannot use SPARK's tools, is
+    unmetered, and cost more to run than the session it was supposed to rescue
+    — so a failure that spawned one amplified the contention that caused it.
+    That was the first half of this rule. The second half used to be "reach the
+    resident session instead"; #317 Phase 3 deleted the session, so what
+    replaces it is the stronger statement: nothing in production invokes Claude,
+    and the paths that used to are `FORBIDDEN_PATHS`.
     """
     violations = guard.scan(REPO_ROOT)
     assert violations == [], (
@@ -116,8 +126,10 @@ def test_canary_bridge_existence(tmp_path):
     # espeak's -p is pitch. tmux's -p is print. Neither is Claude.
     ("src/pxh/speech.py", 'run(["espeak", "-v", v, "-p", pitch, "--stdout", text])\n'),
     ("src/pxh/panes.py", 'out = _tmux("capture-pane", "-t", name, "-p")\n'),
-    # Prose describing the ban must not trip it.
-    ("src/pxh/brain.py", '"""This module is the replacement for `claude -p`."""\n'),
+    # Prose describing the ban must not trip it. (Not named brain.py: that
+    # *path* is now itself a finding — see FORBIDDEN_PATHS — which is a
+    # different assertion from "this line contains forbidden syntax".)
+    ("src/pxh/model_client.py", '"""This module is the replacement for `claude -p`."""\n'),
     # A resident launch has no -p and is the thing we want people to use.
     ("bin/px-session", '#!/usr/bin/env bash\nexec "$CLAUDE_BIN" --model "$M"\n'),
 ])
@@ -125,6 +137,26 @@ def test_negative_canaries(tmp_path, rel, body):
     assert guard.scan(_tree(tmp_path, {rel: body})) == []
 
 
-def test_allowlist_is_narrow():
-    """The exemption list is an attack surface; keep it to the launcher."""
-    assert set(guard.ALLOWLIST) == {"bin/px-claude-session"}
+def test_allowlist_is_empty():
+    """The exemption list is an attack surface, and there is nothing left to
+    exempt: the one entry was the resident session launcher, deleted in #317
+    Phase 3. An allowlist that has to name a file is already a compromise."""
+    assert guard.ALLOWLIST == {}
+
+
+# ── The retired transport must not come back ───────────────────────────────
+
+@pytest.mark.parametrize("rel", sorted(guard.FORBIDDEN_PATHS))
+def test_a_retired_transport_path_is_a_finding(tmp_path, rel):
+    """A clean-looking `brain.py` is still the mailbox.
+
+    Checked by existence rather than by content, because the regression this
+    guards against is someone re-adding the file with nothing wrong in it yet.
+    """
+    root = _tree(tmp_path, {rel: "#!/usr/bin/env bash\necho hi\n"})
+    kinds = {v.kind for v in guard.scan(root)}
+    assert "retired_transport" in kinds, f"{rel} reappeared and the guard shrugged"
+
+
+def test_the_retired_paths_do_not_fire_on_a_clean_tree(tmp_path):
+    assert guard.scan(_tree(tmp_path, {"src/pxh/other.py": "x = 1\n"})) == []

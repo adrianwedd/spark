@@ -24,7 +24,7 @@ Flow:
   1. Grammar recognizer listens continuously for the wake word (low CPU).
   2. On detection: play ack chime, record utterance, transcribe.
   3. Run conversation loop (up to --convo-turns turns):
-     a. Pipe utterance to run-voice-loop-claude --max-turns 1.
+     a. Pipe utterance to run-voice-loop-tier --max-turns 1.
      b. Flush stale buffer, play soft follow-up chime, listen for reply.
      c. If reply detected within timeout → next turn; else → end conversation.
   4. Restart px-alive, return to step 1.
@@ -141,7 +141,7 @@ PERSONAS = {
 }
 # Legacy mapping used for utterance keyword routing
 PERSONA_WAKE = {f"hey {name}": cfg["chat_tool"] for name, cfg in PERSONAS.items()}
-DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-claude")
+DEFAULT_VOICE_CMD = str(PROJECT_ROOT / "bin" / "run-voice-loop-tier")
 DEFAULT_STT_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-streaming-zipformer-en-2023-06-26")
 DEFAULT_SENSEVOICE_MODEL = str(PROJECT_ROOT / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
 

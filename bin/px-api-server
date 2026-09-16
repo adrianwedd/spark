@@ -53,9 +53,9 @@ if [[ -z "${PX_API_TOKEN:-}" ]]; then
     exit 1
 fi
 
-# Chat turns run on the resident sessions, not a cold Claude. See the
-# resident-only invariant in CLAUDE.md.
-export PX_VOICE_BACKEND=brain
+# Chat turns run on the cognition tier — one direct API call, no session.
+# See the retirement note in CLAUDE.md (#317 Phase 3).
+export PX_VOICE_BACKEND=tier
 
 echo "Starting PiCar-X API on $HOST:$PORT (dry=${PX_DRY:-0})"
 exec uvicorn pxh.api:app \

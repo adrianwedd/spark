@@ -86,9 +86,9 @@ yield_alive() {
             # check below can never succeed for it; every caller used to wait
             # out the full budget (up to 30s) and report "wedged" even though
             # px-alive's own log said "no GPIO held, nothing to yield" the
-            # whole time (#279 — reproduced live: every GPIO tool the brain
-            # picked mid-conversation failed this way, in a system prompt
-            # that explicitly prefers such tools for expressiveness). px-alive
+            # whole time (#279 — reproduced live: every GPIO tool picked
+            # mid-conversation failed this way, in a system prompt that
+            # explicitly prefers such tools for expressiveness). px-alive
             # writes mode="lease_wait" into its heartbeat every
             # LEASE_RECHECK_S=2s while parked, so a fresh reading of it is
             # positive, current evidence of "nothing held" — not a guess —

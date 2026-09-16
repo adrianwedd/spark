@@ -979,25 +979,24 @@ def test_qa_gate_still_defaults_ambiguous_to_pass():
         assert run_qa_gate("hmm not sure") == "ambiguous"
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
-def test_a_silent_brain_defers_the_post_rather_than_publishing_it():
-    """None means "skip and retry next cycle". Falling back to `claude -p`
-    here would keep alive the exact thing being removed."""
-    from pxh import brain
-    with patch.object(brain, "ask_brain", return_value=None):
+@patch.dict(os.environ, {"PX_POST_QA": "1"})
+def test_a_silent_tier_defers_the_post_rather_than_publishing_it():
+    """None means "skip and retry next cycle". Falling back to a CLI here would
+    keep alive the exact thing being removed."""
+    from pxh.m5 import M5Result
+    with patch("pxh.m5.ask_m5", return_value=M5Result("offline")):
         assert run_qa_gate("anything") is None
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "1", "PX_BRAIN_KINDS": "post_qa"})
-def test_a_raising_brain_never_takes_the_poster_down():
-    from pxh import brain
-    with patch.object(brain, "ask_brain", side_effect=RuntimeError("tmux gone")):
+@patch.dict(os.environ, {"PX_POST_QA": "1"})
+def test_a_raising_tier_never_takes_the_poster_down():
+    """A post is not worth a traceback in the daemon that publishes it."""
+    with patch("pxh.m5.ask_m5", side_effect=RuntimeError("tier gone")):
         assert run_qa_gate("anything") is None
 
 
-@patch.dict(os.environ, {"PX_POST_QA": "0", "PX_BRAIN_KINDS": "post_qa"})
-def test_qa_disabled_still_short_circuits_before_the_brain():
-    """PX_POST_QA=0 must not reach the session at all — tests rely on it."""
-    from pxh import brain
-    with patch.object(brain, "ask_brain", side_effect=AssertionError("reached the brain")):
+@patch.dict(os.environ, {"PX_POST_QA": "0"})
+def test_qa_disabled_still_short_circuits_before_the_tier():
+    """PX_POST_QA=0 must not reach the model at all — tests rely on it."""
+    with patch("pxh.m5.ask_m5", side_effect=AssertionError("reached the tier")):
         assert run_qa_gate("anything") == "pass"

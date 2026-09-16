@@ -213,9 +213,11 @@ def test_override_mechanism_stays_narrow():
 # Everything above pins a *dispatcher*. These pin bin/tool-voice, which is the
 # final common boundary every speech producer funnels through — tool-chat,
 # tool-chat-vixen, tool-voice-persona, px-cron-say, px-battery-poll and both
-# dispatchers all end here. Anything holding a shell reaches it directly,
-# including the resident spark-brain session, whose tool envelope is SPARK's
-# whole bin/ directory. Before this gate existed, only prose stopped it.
+# dispatchers all end here. Anything holding a shell reaches it directly —
+# and the strongest such thing used to be the resident session, whose tool
+# envelope was SPARK's whole bin/ directory. That session is gone (#317 Phase
+# 3); the gate stays, because the argument never depended on which process was
+# holding the shell. Before this gate existed, only prose stopped it.
 #
 # The proof of silence is a canary in place of the speaker: PX_VOICE_PLAYER
 # names a script that touches a marker file. A leak through the gate leaves
@@ -1205,10 +1207,10 @@ def test_acknowledgement_is_still_downgraded_by_night_silence_without_a_grant(mo
 
 def test_a_timed_out_voice_turn_acknowledges_exactly_once_without_a_grant(monkeypatch):
     """End-to-end shape of the fix, at the real supervisor_loop call site: a
-    resident-brain timeout must produce exactly one deterministic
-    acknowledgement and stop — not loop back to re-ask a brain already
-    established unavailable — even though the wake grant that opened the turn
-    reads inactive by the time the timeout is handled."""
+    tier timeout must produce exactly one deterministic acknowledgement and
+    stop — not loop back to re-ask a model already established unavailable —
+    even though the wake grant that opened the turn reads inactive by the time
+    the timeout is handled."""
     monkeypatch.setattr(voice_loop, "_policy_now", lambda: DAY_TS)
     monkeypatch.setattr(voice_loop, "load_session", lambda: {})
     monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
@@ -1222,7 +1224,7 @@ def test_a_timed_out_voice_turn_acknowledges_exactly_once_without_a_grant(monkey
     monkeypatch.setattr(
         voice_loop, "run_voice_turn",
         lambda prompt, **kw: turn_calls.append(prompt) or
-        (voice_loop.VOICE_BRAIN_UNAVAILABLE, "", "resident brain unavailable"),
+        (voice_loop.VOICE_TIER_UNAVAILABLE, "", "cognition tier unavailable"),
     )
 
     acked = []
@@ -1232,12 +1234,12 @@ def test_a_timed_out_voice_turn_acknowledges_exactly_once_without_a_grant(monkey
     )
 
     args = voice_loop.parse_args([
-        "--backend", "brain", "--max-turns", "5",
+        "--backend", "tier", "--max-turns", "5",
         "--input-mode", "text", "--dry-run",
     ])
     voice_loop.supervisor_loop(args)
 
-    assert len(turn_calls) == 1, "a saturated brain must not be re-asked"
+    assert len(turn_calls) == 1, "a saturated tier must not be re-asked"
     assert acked == [True]
 
 

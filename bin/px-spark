@@ -65,15 +65,14 @@ subprocess.run(
 )
 PY
 
-# Launch the SPARK voice loop on the resident brain.
-# Voice turns run on the resident spark-brain session — the sole permitted
-# Claude substrate (see the resident-only invariant in CLAUDE.md). There is no
-# bridge to a cold `claude -p` any more: the fossil was deleted rather than
-# deprecated, because leaving one executable is how it turns back into
-# architecture.
-export PX_VOICE_BACKEND=brain
+# Launch the SPARK voice loop on the cognition tier.
+# Voice turns are one direct API call (#317 Phase 3). There is no session to
+# hold a system prompt and no mailbox to carry an answer, which is the whole
+# point: a spoken sentence cannot be produced and then lost in transit when
+# nothing carries it but the socket.
+export PX_VOICE_BACKEND=tier
 
 exec "$SCRIPT_DIR/codex-voice-loop" \
-    --backend brain \
+    --backend tier \
     --prompt "$SCRIPT_DIR/../docs/prompts/spark-voice-system.md" \
     "$@"

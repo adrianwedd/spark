@@ -1,10 +1,10 @@
 """Session dispatcher — provider routing, rate limiting, execution, logging.
 
 Central entry point for every SPARK-initiated model call that is not ordinary
-reflection. The name is historical: since #317 the tool-free kinds are served
-by the cognition tier (a direct Ollama Cloud API call, `pxh.m5`) and only the
-kinds that genuinely need Claude Code's tool envelope still reach the resident
-`spark-brain` session.
+reflection. The name is historical: all of it now runs on the cognition tier —
+one direct Ollama Cloud API call (`pxh.m5`) — and none of it reaches a CLI.
+The `claude_*` names are kept for provenance in this change and are the next
+thing to go; see the retirement note in `docs/` and #317 Phase 3.
 """
 from __future__ import annotations
 
@@ -138,19 +138,19 @@ def _load_session_log() -> list[dict]:
 
 
 def _answered(entry: dict) -> bool:
-    """True if this entry records a session the resident model actually answered.
+    """True if this entry records a call the model actually answered.
 
-    `_log_session` writes exactly two shapes: rc=0/`success` once the session
-    answered, and rc=1/`brain_unavailable` when it never did — no session, no
-    validated marker, a mailbox that would not take the request, an injection
-    that did not land, or an injected request the session never answered before
-    its deadline. Only the first is spend.
+    `_log_session` writes two shapes: rc=0/`success` once the tier answered,
+    and rc=1 with a failure outcome (`cognition_timeout`, `cognition_offline`,
+    `cognition_bad_response`, `cognition_busy`) when it never did. Only the
+    first is spend.
 
     Reading the second as if it were spend is #310's third defect. On
-    2026-09-15 02:32:10 `research` logged rc=1 while the brain was down for
-    every caller, and that one entry refused `consolidate` its own 02:41 retry
-    with "global cooldown (554s / 1800s)" — a component that could not have
-    contended for the Pi locking out every other component for half an hour.
+    2026-09-15 02:32:10 `research` logged rc=1 while the model was unreachable
+    for every caller, and that one entry refused `consolidate` its own 02:41
+    retry with "global cooldown (554s / 1800s)" — a component that could not
+    have contended for the Pi locking out every other component for half an
+    hour.
     It compounds, too: on an outage night every failing component writes one of
     these, and each re-arms the cooldown for the next, so the components
     serialise each other through a gate none of them can satisfy.
@@ -267,13 +267,15 @@ class CognitionTierToolsForbidden(ValueError):
 
 
 class ColdStartForbidden(RuntimeError):
-    """Raised when a session type has no resident route.
+    """Raised when a session type has no backend at all.
 
-    The resident spark-brain session is SPARK's sole Claude execution
-    substrate. There is deliberately no fallback behind this: a
-    caller that cannot be served resident must fail loudly rather than quietly
-    spawn a fresh Claude, because every cold start costs more to run than the
-    session it bypasses and is metered API usage rather than Max.
+    This is what is left of the old "fail loudly rather than quietly spawn a
+    fresh Claude" rule, and it is now the only rule: there is no second
+    provider to fall back to, so an unclassified kind has nothing to fall back
+    *from*. Every cold start used to cost more than the session it bypassed
+    and billed metered API usage rather than Max; the tier is a single call
+    with a declared budget, so the honest failure is a refusal, not a retry
+    against something else.
     """
 
 
@@ -365,40 +367,29 @@ def budget_summary() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Routing: persistent session vs. one-shot subprocess
-# ---------------------------------------------------------------------------
-
-# Which session types are served by the resident Claude session in tmux
-# (src/pxh/brain.py). There is no longer an "else" branch: a type absent from
-# this set does not cold-start Claude, it raises. See ColdStartForbidden below.
-#
-# This used to be a rollout dial whose unlisted types "still take the old
-# path", and that phrasing is the whole bug — it made "not yet migrated" and
-# "may spawn a fresh Claude" the same state, so a type could sit in the second
-# one indefinitely while the docs described the first.
-#
-# `evolve` is deliberately NOT here and is therefore disabled: it needs to work
-# inside a git worktree, and a resident session's tool envelope is fixed at
-# launch and cannot be widened per call. Disabled is the honest state for it —
-# the alternative was a "legacy cold Claude" bucket, which is what this whole
-# change exists to abolish. px-evolve will raise until the brain can hold a
-# worktree; that is a known, deliberate outage, not a regression.
-# ---------------------------------------------------------------------------
 # Provider routing (#317)
 # ---------------------------------------------------------------------------
-# Kinds served by the cognition tier — a direct Ollama Cloud API call — instead
-# of the resident Claude session. All four are tool-free (`allowed_tools=""`)
-# and every caller's prompt is self-contained: each opens with "You are SPARK
-# ..." and states its own output format, so nothing depends on the resident
-# session's system prompt or on Claude Code's tool envelope.
+# Every classified kind is served by the cognition tier: one direct HTTP call.
+# None of them needs tools (`allowed_tools=""`), and every caller's prompt is
+# self-contained — each opens with "You are SPARK ..." and states its own
+# output format — so nothing depended on a resident session's system prompt or
+# on a tool envelope that only a CLI could provide.
 #
-# This set is checked *before* the brain dial, and deliberately so. #317's
-# requirement is that no migrated kind silently falls back to Claude; a
-# rollback dial that could still route `consolidate` back into the mailbox
-# would be exactly that fallback, and the mailbox is the thing that cost nine
-# nights (#310, #314).
+# The resident Claude session is gone (#317 Phase 3), and this comment is
+# deliberately longer than the code it explains, because "we deleted the
+# mailbox" is a change a future reader will otherwise try to undo. What it
+# cost, all of it observed on this robot: answers lost when the model copied
+# yesterday's request id; a turn worked and answered in 47s and then reported
+# as a ten-minute timeout because nothing carried the answer; a whole night's
+# consolidation behind an unanswered "Contains subshell / Do you want to
+# proceed?" dialog (#314); nine consecutive nights with no long-term memory
+# (#310); and a human-only `/login` as the terminal recovery action (#311).
+#
+# None of it is reachable from here any more, and the reason is structural
+# rather than a promise: there is no session to be logged out of, no inbox
+# file addressed by a request id, and no reply command to shell-quote. The
+# answer *is* the HTTP response body.
 COGNITION_PROVIDER = "ollama-cloud"
-RESIDENT_PROVIDER = "claude-resident"
 
 _COGNITION_KINDS = frozenset({"consolidate", "research", "compose", "blog",
                                "self_debug"})
@@ -416,96 +407,12 @@ _COGNITION_MODEL_ENV = {
     "self_debug": "PX_MODEL_SELF_DEBUG",
 }
 
-# Empty, and that is the state the migration was for: no kind is served
-# through this dispatcher by the resident session any more. `research`,
-# `compose`, `blog`, `consolidate` moved in #317 Phase 1 and `self_debug` in
-# Phase 2 — the last one, and the only one that ever needed tools. `post_qa`
-# and `reflection` were listed here but never served residently (`brain.py`
-# classifies both as M5 kinds and refuses them at the mailbox). `evolve` stays
-# absent and disabled on purpose (see the note above).
-#
-# The dial itself is kept rather than deleted because `bin/px-post` consults
-# it, and because `_run_via_brain` is still the one door to the mailbox that
-# `ask_brain` itself uses for the interactive kinds (`voice_turn`, `cron_say`,
-# `describe_scene`). Removing the mechanism is Phase 3, where the mailbox goes
-# with it.
-_DEFAULT_BRAIN_KINDS = ""
-
-
-def brain_kinds() -> frozenset[str]:
-    """Read at call time so the rollout can be widened or rolled back live.
-
-    Kinds in `_COGNITION_KINDS` are not served residently no matter what this
-    returns — see `run_claude_session`.
-    """
-    raw = os.environ.get("PX_BRAIN_KINDS", _DEFAULT_BRAIN_KINDS)
-    return frozenset(part.strip() for part in raw.split(",") if part.strip())
-
-
-# Kept as the old private spelling for in-tree callers and tests.
-_brain_kinds = brain_kinds
-
-
-def _run_via_brain(
-    session_type: str,
-    prompt: str,
-    timeout: int | None,
-    model: str,
-) -> RunResult:
-    """Serve a session from the resident Claude session instead of a subprocess.
-
-    The RunResult contract is unchanged, so callers keep their existing
-    error handling: a brain that is down, wedged or busy comes back as a
-    non-zero returncode, which is exactly what they already do on a failed
-    `claude -p`.
-
-    `allowed_tools`, `skip_permissions` and `cwd` have no meaning here — a
-    resident session's envelope is fixed when it launches and cannot be
-    widened for one request. That is a security property, not a limitation to
-    work around.
-
-    `timeout=None` means "use the deadline this kind declares" —
-    `brain._DEADLINE_S`, which is the single source of truth for how long a
-    classified kind may take. A caller that passes a number overrides it, and
-    #291 is what that costs when the number is wrong: `consolidate` declares
-    600s, memory.py passed an ad-hoc 180, and because the tighter value always
-    wins the declared budget was unreachable — every live failure timed out at
-    exactly 180.1s.
-    """
-    from . import brain  # local import keeps the tmux dependency off the hot path
-
-    start = time.monotonic()
-    reply = brain.ask_brain(session_type, {"prompt": prompt},
-                            timeout_s=timeout, model=model)
-    duration = time.monotonic() - start
-
-    if reply is None:
-        _log_session(session_type, model, duration, 1, "brain_unavailable",
-                     provider=RESIDENT_PROVIDER)
-        return RunResult(
-            stdout="",
-            stderr="brain unavailable — the resident Claude session did not answer",
-            returncode=1,
-            duration_s=duration,
-            model_used=model,
-        )
-
-    answer = reply.get("reply")
-    if not isinstance(answer, str):
-        # The session replied with structured JSON. Callers of this function
-        # all read stdout as text, so hand it back the way a subprocess would.
-        answer = json.dumps(answer)
-
-    _log_session(session_type, model, duration, 0, "success",
-                 provider=RESIDENT_PROVIDER)
-    return RunResult(
-        stdout=answer,
-        stderr="",
-        returncode=0,
-        duration_s=duration,
-        model_used=model,
-        provider=RESIDENT_PROVIDER,
-    )
+# `evolve` is deliberately absent from `_COGNITION_KINDS` and therefore has no
+# backend at all: it needs to work inside a git worktree, and the tier is one
+# tool-free API call with no filesystem to widen. Disabled is the honest state
+# for it — the alternative was a "legacy cold Claude" bucket, which is what
+# this whole change exists to abolish. px-evolve raises until the tier can
+# hold a worktree; that is a known, deliberate outage, not a regression.
 
 
 def cognition_model(session_type: str, override: str | None = None) -> str | None:
@@ -581,27 +488,26 @@ def run_claude_session(
     model_override: str | None = None,
     skip_budget_check: bool = False,
 ) -> RunResult:
-    """Run a Claude session with budget checking, model routing, and logging.
+    """Run a session with budget checking, provider routing, and logging.
 
     timeout: seconds, or None (the default) to use the deadline the kind
-    declares in `brain._DEADLINE_S`. Prefer None — the declared per-kind
-    deadline is the one source of truth, and an ad-hoc override that is
-    tighter silently replaces it (see #291).
+    declares. Prefer None — the declared per-kind deadline is the one source
+    of truth, and an ad-hoc override that is tighter silently replaces it (see
+    #291).
     model_override: use this model instead of the session-type default.
     skip_budget_check: skip rate-limit check (use for sub-phases of an already-checked session).
     Raises SessionBudgetExhausted if rate-limited (unless skip_budget_check=True).
+
+    `cwd`, `allowed_tools` and `skip_permissions` are still accepted because
+    callers still pass them, and they are all meaningless on a tool-free API
+    call. `allowed_tools` is *refused* rather than ignored — see below.
     """
     if not skip_budget_check:
         reason = check_budget(session_type)
         if reason:
             raise SessionBudgetExhausted(reason)
 
-    work_dir = str(cwd) if cwd else str(PROJECT_ROOT)
-
     if session_type in _COGNITION_KINDS:
-        # Ordered before the brain dial on purpose (#317): a migrated kind must
-        # not be able to reach the resident session, including via a
-        # `PX_BRAIN_KINDS` that still lists it.
         if allowed_tools or skip_permissions:
             # Not ignored, and not silently answered without them: a caller
             # that asked for tools and got a tool-less answer would have no
@@ -613,24 +519,15 @@ def run_claude_session(
             )
         return _run_via_cognition(session_type, prompt, timeout, model_override)
 
-    model = model_override or _model_for_type(session_type)
-
-    if session_type in _brain_kinds():
-        return _run_via_brain(session_type, prompt, timeout, model)
-
-    # Fail closed. The old default pointed the other way — an unrecognised kind
-    # fell through to `claude -p` — which made "I forgot to classify this" and
-    # "I decided this may cold-start Claude" the same act. That is the identical
-    # trust-direction bug already fixed for brain.py's own kind classification
-    # (session_for_kind raises rather than defaulting to a session), and it
-    # pointed the wrong way for the same reason: the person adding a kind is
-    # exactly the person who will forget, so the default must be the safe one.
-    # An unclassified kind now has no backend at all.
+    # Fail closed, and now there is nothing to fail *open* to. The old default
+    # pointed the other way — an unrecognised kind fell through to `claude -p`
+    # — which made "I forgot to classify this" and "I decided this may spawn a
+    # fresh Claude" the same act. `evolve` is the one kind that lands here, on
+    # purpose; see the note above `_COGNITION_KINDS`.
     raise ColdStartForbidden(
-        f"session_type {session_type!r} is not routed to a resident session. "
-        f"Classify it in PX_BRAIN_KINDS (currently: {sorted(_brain_kinds())}) or "
-        f"give it a non-Claude backend. Cold-starting Claude is prohibited — see "
-        f"the resident-only invariant in CLAUDE.md."
+        f"session_type {session_type!r} has no backend. The kinds this "
+        f"dispatcher serves are {sorted(_COGNITION_KINDS)}; a new kind needs a "
+        f"provider, not a cold-started CLI."
     )
 
 

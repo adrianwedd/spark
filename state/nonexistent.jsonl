@@ -1,0 +1,4 @@
+{"ts": "2026-09-16T09:04:37Z", "type": "consolidate", "model": "", "provider": "ollama-cloud", "duration_s": 0.0, "returncode": 0, "outcome": "success", "session_id": "sess-20260916-090437-830", "tokens": {"prompt": 0, "eval": 0}}
+{"ts": "2026-09-16T09:17:44Z", "type": "consolidate", "model": "", "provider": "ollama-cloud", "duration_s": 0.0, "returncode": 0, "outcome": "success", "session_id": "sess-20260916-091744-946", "tokens": {"prompt": 0, "eval": 0}}
+{"ts": "2026-09-16T09:27:43Z", "type": "consolidate", "model": "", "provider": "ollama-cloud", "duration_s": 0.0, "returncode": 0, "outcome": "success", "session_id": "sess-20260916-092743-160", "tokens": {"prompt": 0, "eval": 0}}
+{"ts": "2026-09-16T09:38:28Z", "type": "consolidate", "model": "", "provider": "ollama-cloud", "duration_s": 0.0, "returncode": 0, "outcome": "success", "session_id": "sess-20260916-093828-337", "tokens": {"prompt": 0, "eval": 0}}

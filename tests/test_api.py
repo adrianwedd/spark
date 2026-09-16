@@ -1286,15 +1286,19 @@ class TestPublicChat:
         assert reply == "hello from M5"
 
     def test_public_chat_unavailable_raises_rather_than_falling_back(self):
-        """A quiet chat box costs nothing. A Claude per stranger's message does."""
+        """A quiet chat box costs nothing. A model call per stranger's message
+        — or a subprocess per stranger's message — does.
+
+        Re-pointed at the tier in #317 Phase 3: this used to make the *resident
+        session* unavailable. There is no session, so the unavailable thing is
+        the tier itself, which is also the only remaining provider.
+        """
         import asyncio
         from pxh import api as _api
-        import pxh.brain as _brain
+        from pxh.m5 import M5Result
 
-        async def _unavailable(kind, payload, **kw):
-            return None
-
-        with unittest.mock.patch.object(_brain, "ask_brain_async", _unavailable):
+        with unittest.mock.patch("pxh.m5.ask_m5",
+                                 return_value=M5Result("offline", error="down")):
             with pytest.raises(RuntimeError, match="unavailable"):
                 asyncio.run(_api._call_claude_public("hi"))
 

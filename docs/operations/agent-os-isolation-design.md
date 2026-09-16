@@ -162,7 +162,8 @@ Notes on specific choices:
   shared-lock ownership hazard).
 - **`px-research-run`'s only caller-controlled input is the uuid**, validated
   as bare-uuid4 before use as a filename component — the same discipline
-  `tool-brain-reply` already applies, for the same reason: a valid uuid that
+  `tool-brain-reply` used to apply, for the same reason (it was deleted with
+  the mailbox in #317 Phase 3): a valid uuid that
   wasn't checked against a real pending request is a write primitive.
 - **No new sudoers wildcard.** The sudoers line would be exactly one entry:
   `pi ALL=(root) NOPASSWD: /usr/local/sbin/px-research-run` — no argument
@@ -199,7 +200,7 @@ session is the only actor with write access to the production checkout or
 `state/`; applying a finding is a manual, reviewed step by the operator (or,
 eventually, a PR the way `px-evolve` already gates self-proposed changes) —
 never an automatic action taken by the sandboxed process itself. This mirrors
-`ask_brain()`'s mailbox pattern and `px-evolve`'s "changes never auto-apply"
+the retired mailbox's request/approve pattern and `px-evolve`'s "changes never auto-apply"
 rule; delegated OS-isolated research inherits the same posture rather than
 inventing a new one.
 
