@@ -258,6 +258,69 @@ def test_consolidated_memory_cites_the_thought_window_it_came_from():
     assert any("8" in ref for ref in evidence), "cites how many thoughts fed it"
 
 
+def _write_thoughts_at(specs, persona="spark"):
+    """Write thoughts at exact instants — `_write_thoughts` is relative to now."""
+    f = memory._state_dir() / f"thoughts-{persona}.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("\n".join(
+        json.dumps({"ts": ts, "thought": text, "mood": "curious",
+                    "action": "wait", "salience": 0.6})
+        for ts, text in specs) + "\n", encoding="utf-8")
+
+
+def test_the_thought_window_ends_at_now_not_at_the_present():
+    """`now` closes the window as well as opening it (#310).
+
+    The selection used to be bounded below only, so *every* instant selected
+    everything from `now - 24h` on to the present. Nothing in production could
+    notice — with `now` omitted the present is the only possible end — but it
+    makes a historical replay a fiction: ten candidate nights measured on the
+    robot all selected the same 200 thoughts, 09-15 13:48 onward, because the
+    prompt carries `thoughts[-200:]`. Nine catch-up turns on nine different
+    nights would each have distilled tonight.
+    """
+    end = dt.datetime(2026, 9, 8, 3, 0, tzinfo=memory.HOBART_TZ)   # 09-07T17:00Z
+    _write_thoughts_at([
+        ("2026-09-06T16:00:00Z", "before the window"),     # 1h before the cutoff
+        ("2026-09-07T16:00:00Z", "inside the window"),     # 1h before the end
+        ("2026-09-07T17:00:00Z", "exactly at the end"),    # the closing edge
+        ("2026-09-16T04:00:00Z", "today"),                 # after the end
+    ])
+
+    got = [t["thought"] for t in memory._thoughts_last_24h("spark", now=end)]
+
+    assert got == ["inside the window", "exactly at the end"]
+
+
+def test_consolidate_distils_the_window_that_ended_at_now():
+    """The end-to-end form of the bound: what reaches the model is the window,
+    not the present."""
+    end = dt.datetime(2026, 9, 8, 3, 0, tzinfo=memory.HOBART_TZ)
+    _write_thoughts_at([
+        ("2026-09-06T16:00:00Z", "a thought from before the window"),
+        ("2026-09-16T04:00:00Z", "a thought from today"),
+    ] + [(f"2026-09-07T{hour:02d}:00:00Z", "a thought from inside the window")
+         for hour in range(10, 16)])
+    payload = [{"text": "a durable thing happened", "tags": [], "importance": 0.5}]
+    seen = {}
+
+    def _capture(session_type, prompt, **kw):
+        seen["prompt"] = prompt
+        return _claude_ok(payload)
+
+    with patch("pxh.claude_session.run_claude_session", side_effect=_capture):
+        res = memory.consolidate(now=end)
+
+    assert res["status"] == "ok"
+    assert "a thought from inside the window" in seen["prompt"]
+    assert "a thought from today" not in seen["prompt"]
+    assert "a thought from before the window" not in seen["prompt"]
+    # And the provenance cites the historical window, not the present.
+    evidence = provenance.read_provenance(memory.load_memories()[0])["evidence"]
+    window = [ref for ref in evidence if ref.startswith("window:")]
+    assert window and window[0] == "window:2026-09-07T10:00:00Z..2026-09-07T15:00:00Z"
+
+
 def test_model_supplied_provenance_claims_are_ignored():
     """The consolidating model must not be able to type its own output.
 
