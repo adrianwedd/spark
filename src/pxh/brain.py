@@ -147,7 +147,7 @@ _DEADLINE_S: dict[str, int] = {
     # Nobody is waiting on a cron line. It can afford to queue behind a real
     # conversation, and if it misses this slot there are four more today.
     "cron_say": 90,
-    # Matches vision.CLAUDE_TIMEOUT, which sits inside wander's outer
+    # Matches vision.DESCRIBE_TIMEOUT_S, which sits inside wander's outer
     # DESCRIBE_SCENE_TIMEOUT budget (pinned by tests/test_wander.py). A resident
     # session should beat the cold path it replaces — that was measured at 22s
     # warm and >45s cold — so this is headroom, not a target.

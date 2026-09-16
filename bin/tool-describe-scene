@@ -226,7 +226,7 @@ def main() -> int:
         # whole tool mid-run instead of the tool degrading to a silent but
         # successful scene description. This 60s is the "bounded speech" term in
         # wander.DESCRIBE_SCENE_TIMEOUT's budget; the vision term is
-        # vision.CLAUDE_TIMEOUT. Deliberately no totals here — a comment
+        # vision.DESCRIBE_TIMEOUT_S. Deliberately no totals here — a comment
         # asserting a constant that lives in another file is a test that never
         # runs. The arithmetic is checked by
         # tests/test_wander.py::test_describe_scene_timeout_has_margin_over_claude
