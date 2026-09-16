@@ -59,7 +59,7 @@ All valid actions are defined in `VALID_ACTIONS` (line 366 of `mind.py`). There 
 | `research` | `tool-research` | Haiku-powered deep dive. Passes thought text as `PX_RESEARCH_QUERY`. 360s timeout. |
 | `compose` | `tool-compose` | Haiku-powered creative writing. Passes thought text as `PX_COMPOSE_TOPIC`. 360s timeout. |
 | `blog_essay` | `tool-blog` | Writes a blog post. Passes thought text as `PX_BLOG_TOPIC`. 360s timeout. |
-| `self_debug` | `run_claude_session()` | Sonnet with read-only tools (`Read,Glob,Grep`). Triggered by consecutive reflection failures. Saves to `state/debug_reports.jsonl`. 600s timeout. Not a subprocess tool -- calls `claude_session.run_claude_session()` directly. |
+| `self_debug` | `run_model_session()` | Sonnet with read-only tools (`Read,Glob,Grep`). Triggered by consecutive reflection failures. Saves to `state/debug_reports.jsonl`. 600s timeout. Not a subprocess tool -- calls `claude_session.run_model_session()` directly. |
 
 ### No-op
 
@@ -145,10 +145,10 @@ The main loop enforces `EXPRESSION_COOLDOWN_S = 1800` seconds (30 minutes) betwe
 | `morning_fact` | Once per calendar day (Hobart timezone) | `_last_morning_fact_date` compared to `YYYY-MM-DD` (line 2624). Reset on daemon restart. |
 | `explore` | 1200 seconds (20 minutes) | `_can_explore()` at line 1064 reads `state/exploration_meta.json` `last_explore_ts`. Persists across restarts. |
 | `introspect` | 1800 seconds (30 minutes) | Enforced inside `tool-introspect` via `state/introspection.json` timestamp. |
-| `evolve` | 86400 seconds (24 hours) | Enforced inside `tool-evolve` via `state/evolve_queue.jsonl` timestamps. Additionally rate-limited by `claude_session.py` (1/day Opus quota). |
-| `research` | 7200 seconds (2 hours) | Enforced by `claude_session.py` research session cooldown. |
-| `compose` | 14400 seconds (4 hours) | Enforced by `claude_session.py` compose session cooldown. |
-| `self_debug` | 21600 seconds (6 hours) | Enforced by `claude_session.py` self_debug session cooldown. |
+| `evolve` | 86400 seconds (24 hours) | Enforced inside `tool-evolve` via `state/evolve_queue.jsonl` timestamps. Additionally rate-limited by `model_session.py` (1/day Opus quota). |
+| `research` | 7200 seconds (2 hours) | Enforced by `model_session.py` research session cooldown. |
+| `compose` | 14400 seconds (4 hours) | Enforced by `model_session.py` compose session cooldown. |
+| `self_debug` | 21600 seconds (6 hours) | Enforced by `model_session.py` self_debug session cooldown. |
 
 ### Explore preconditions (`_can_explore()`, line 1064)
 
@@ -200,7 +200,7 @@ Most tools have explicit timeouts passed to `subprocess.run()`:
 | `tool-describe-scene` (photograph) | 120s |
 | `tool-wander` (explore) | 240s |
 | `tool-research`, `tool-compose`, `tool-blog` | 360s |
-| `run_claude_session` (self_debug) | 600s |
+| `run_model_session` (self_debug) | 600s |
 
 Long-running tools (`explore`, `photograph`) use `Popen` with SIGTERM-first graceful shutdown: on `TimeoutExpired`, send `SIGTERM`, wait 15s, then `SIGKILL` if still alive. This is necessary because `subprocess.run(timeout=)` sends `SIGKILL` directly, which prevents cleanup (motor stop, servo reset).
 

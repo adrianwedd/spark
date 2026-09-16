@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from pxh import claude_session, memory, mind, people, voice_loop
+from pxh import model_session, memory, mind, people, voice_loop
 
 SRC = Path(mind.__file__).resolve().parent
 
@@ -138,7 +138,7 @@ def test_the_writer_holds_no_model_call():
     call of any kind, so a fact exists only because a human sentence asserted
     it. Deterministic extraction is the strongest available form of that."""
     src = Path(people.__file__).read_text(encoding="utf-8")
-    for token in ("claude", "ask_brain", "call_llm", "ollama", "run_claude_session",
+    for token in ("claude", "ask_brain", "call_llm", "ollama", "run_model_session",
                   "subprocess"):
         assert token not in src.lower(), token
 
@@ -165,8 +165,8 @@ def test_voice_loop_passes_the_live_persona_through_to_the_gate():
 
 def test_writer_and_its_invariants_are_blacklisted_from_self_evolution():
     for path in ("src/pxh/people.py", "tests/test_people_invariants.py"):
-        assert path in claude_session.BLACKLIST_FILES
-        assert not claude_session.file_in_whitelist(path)
+        assert path in model_session.BLACKLIST_FILES
+        assert not model_session.file_in_whitelist(path)
 
 
 def test_the_person_store_is_gitignored():

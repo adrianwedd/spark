@@ -1,17 +1,37 @@
-"""Session dispatcher — provider routing, rate limiting, execution, logging.
+"""Model-call dispatcher — budget policy, provider routing, logging.
 
 Central entry point for every SPARK-initiated model call that is not ordinary
-reflection. The name is historical: all of it now runs on the cognition tier —
-one direct Ollama Cloud API call (`pxh.m5`) — and none of it reaches a CLI.
-The `claude_*` names are kept for provenance in this change and are the next
-thing to go; see the retirement note in `docs/` and #317 Phase 3.
+reflection. All of it runs on the cognition tier: one direct HTTP call
+(`pxh.m5`), no CLI and no session.
+
+**This module was `pxh.claude_session` until #317 Phase 3.** The old name, the
+`run_model_session` function and every `PX_CLAUDE_*` variable went with the
+resident Claude session they were named after — a name that outlives the thing
+it names stops being a historical note and starts being a wrong answer to
+"what does this do?". The one piece kept on purpose is `state/claude_sessions.jsonl`:
+it is the log as written, it is never rewritten, and #317 requires that
+provenance be preserved rather than tidied.
+
+**One consequence is worth stating rather than discovering.** `state/` now
+holds two log files, and only `state/model_sessions.jsonl` is read. The daily
+cap, the global cooldown and the per-kind cooldowns are all computed from
+today's entries in it, so the first deploy of this rename starts the day's
+accounting fresh — once. A handful of extra calls on that one day, and the
+per-kind cooldowns clearing is neutral-to-helpful for the nightly pass. The
+alternative was a permanent read of a file named after a deleted provider,
+which is the fossil this repository deletes rather than deprecates.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
 import os
-import subprocess
+# Unused by this module now, and kept on purpose: `tests/test_resident_routing.py`
+# patches `subprocess.run` through this reference to prove that asking the
+# dispatcher for a kind never spawns a process. Deleting the import would not
+# break that test — it patches the shared module object — but it would leave the
+# intent ("nothing on this path may start a CLI") invisible where it applies.
+import subprocess  # noqa: F401
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,50 +46,54 @@ except ImportError:
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
-SESSION_LOG = STATE_DIR / "claude_sessions.jsonl"
+# The live log. `state/claude_sessions.jsonl` is the same log under its
+# historical name: written by the retired `claude_session` module, never read
+# here, and never rewritten. See the module docstring.
+SESSION_LOG = STATE_DIR / "model_sessions.jsonl"
 SESSION_LOCK = str(SESSION_LOG) + ".lock"
 LOCK_TIMEOUT_S = 10
 
 # ---------------------------------------------------------------------------
-# Model routing
+# Known kinds
 # ---------------------------------------------------------------------------
+# This was `_DEFAULT_MODELS` — a kind→Claude-model-id map, plus `_ENV_OVERRIDES`
+# mapping each kind to its `PX_CLAUDE_MODEL_*` variable, plus `_model_for_type`.
+# All three existed to choose a model for a resident Claude session. When the
+# session was retired every one of them became dead weight *except* as a
+# registry of which kinds this dispatcher recognises, and a table of Claude
+# model ids that nothing calls is worse than no table: it invites a reader to
+# believe `consolidate` still runs on Haiku.
+#
+# So the registry is what survives, named for what it is. Model choice is the
+# tier's (`_COGNITION_MODEL_ENV`, below, and `PX_M5_SPARK_MODEL`).
+KNOWN_KINDS = frozenset({
+    "evolve",
+    "self_debug",
+    "research",
+    "compose",
+    "conversation",
+    "blog",
+    "consolidate",
+})
 
-_DEFAULT_MODELS: dict[str, str] = {
-    "evolve": "claude-opus-4-6",
-    "self_debug": "claude-sonnet-4-6",
-    "research": "claude-haiku-4-5-20251001",
-    "compose": "claude-haiku-4-5-20251001",
-    "conversation": "claude-sonnet-4-6",
-    "blog": "claude-haiku-4-5-20251001",
-    "consolidate": "claude-haiku-4-5-20251001",
-}
-
-_ENV_OVERRIDES: dict[str, str] = {
-    "evolve": "PX_CLAUDE_MODEL_EVOLVE",
-    "self_debug": "PX_CLAUDE_MODEL_DEBUG",
-    "research": "PX_CLAUDE_MODEL_RESEARCH",
-    "compose": "PX_CLAUDE_MODEL_COMPOSE",
-    "conversation": "PX_CLAUDE_MODEL_CONVERSATION",
-    "blog": "PX_CLAUDE_MODEL_BLOG",
-    "consolidate": "PX_CLAUDE_MODEL_CONSOLIDATE",
-}
-
-
-def _model_for_type(session_type: str) -> str:
-    """Return the Claude model ID for a given session type."""
-    if session_type not in _DEFAULT_MODELS:
-        raise ValueError(f"Unknown session type: {session_type!r}")
-    env_var = _ENV_OVERRIDES[session_type]
-    return os.environ.get(env_var, _DEFAULT_MODELS[session_type])
+# Kinds that were once routed here and now exist only in the quota and priority
+# tables. Kept visible rather than deleted so their rows below are not mistaken
+# for live kinds.
+_LEGACY_KINDS = frozenset({"conversation", "evolve"})
 
 
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-DAILY_CAP = int(os.environ.get("PX_CLAUDE_DAILY_CAP", "8"))
-COOLDOWN_S = int(os.environ.get("PX_CLAUDE_COOLDOWN_S", "1800"))  # 30 min
-BUDGET_DISABLED = os.environ.get("PX_CLAUDE_BUDGET_DISABLED", "0") != "0"
+# Provider-neutral by construction: these bound *model calls*, not Claude
+# calls, and they always did — they were only ever spelled `PX_CLAUDE_*`
+# because Claude was the only thing behind them. The old spellings are gone
+# rather than aliased; a compatibility alias for a variable that bounds spend
+# is a second way for an operator to be surprised by a number.
+DAILY_CAP = int(os.environ.get("PX_MODEL_DAILY_CAP", "8"))
+COOLDOWN_S = int(os.environ.get("PX_MODEL_COOLDOWN_S", "1800"))  # 30 min
+BUDGET_DISABLED = os.environ.get("PX_MODEL_BUDGET_DISABLED", "0") != "0"
 
 _TYPE_COOLDOWNS: dict[str, int] = {
     "evolve": 86400,       # 24 hours
@@ -195,7 +219,7 @@ def check_budget(session_type: str) -> str | None:
     if BUDGET_DISABLED:
         return None
 
-    if session_type not in _DEFAULT_MODELS:
+    if session_type not in KNOWN_KINDS:
         return f"unknown session type: {session_type}"
 
     entries = _load_session_log()
@@ -394,11 +418,12 @@ COGNITION_PROVIDER = "ollama-cloud"
 _COGNITION_KINDS = frozenset({"consolidate", "research", "compose", "blog",
                                "self_debug"})
 
-# Provider-neutral per-kind model override. The Claude-era names
-# (`PX_CLAUDE_MODEL_RESEARCH` and friends) deliberately do not apply here: the
-# value they hold is a Claude model id, and handing that to Ollama would be a
-# different mistake than ignoring it. Set these only to override the tier's
-# configured model (`PX_M5_SPARK_MODEL`) for one kind.
+# Provider-neutral per-kind model override. Set these only to override the
+# tier's configured model (`PX_M5_SPARK_MODEL`) for one kind. The Claude-era
+# names (`PX_CLAUDE_MODEL_RESEARCH` and friends) held Claude model ids and are
+# deleted along with the table they belonged to, not aliased onto these: an
+# environment variable holding last month's provider's model id is not a
+# fallback, it is a wrong answer waiting for a quiet night.
 _COGNITION_MODEL_ENV = {
     "consolidate": "PX_MODEL_CONSOLIDATE",
     "research": "PX_MODEL_RESEARCH",
@@ -478,7 +503,7 @@ def _run_via_cognition(session_type: str, prompt: str, timeout: int | None,
     )
 
 
-def run_claude_session(
+def run_model_session(
     session_type: str,
     prompt: str,
     timeout: int | None = None,

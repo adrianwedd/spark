@@ -218,7 +218,7 @@ def test_consolidate_success_writes_deduped_memories():
         {"text": "Adrian rewired my memory so I can keep a real past now",
          "tags": ["adrian", "self"], "importance": 0.9},
     ]
-    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+    with patch("pxh.model_session.run_model_session", return_value=_claude_ok(payload)):
         res = memory.consolidate()
     assert res["status"] == "ok"
     assert res["written"] == 1
@@ -234,7 +234,7 @@ def test_consolidated_memory_is_stamped_as_generated_narrative():
     payload = [{"text": "I watched Obi come through the door", "tags": ["obi"],
                 "importance": 0.9}]
 
-    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+    with patch("pxh.model_session.run_model_session", return_value=_claude_ok(payload)):
         result = memory.consolidate()
 
     assert result["status"] == "ok"
@@ -250,7 +250,7 @@ def test_consolidated_memory_cites_the_thought_window_it_came_from():
     _write_thoughts(None, n=8)
     payload = [{"text": "a durable thing happened", "tags": [], "importance": 0.5}]
 
-    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+    with patch("pxh.model_session.run_model_session", return_value=_claude_ok(payload)):
         memory.consolidate()
 
     evidence = provenance.read_provenance(memory.load_memories()[0])["evidence"]
@@ -308,7 +308,7 @@ def test_consolidate_distils_the_window_that_ended_at_now():
         seen["prompt"] = prompt
         return _claude_ok(payload)
 
-    with patch("pxh.claude_session.run_claude_session", side_effect=_capture):
+    with patch("pxh.model_session.run_model_session", side_effect=_capture):
         res = memory.consolidate(now=end)
 
     assert res["status"] == "ok"
@@ -340,7 +340,7 @@ def test_model_supplied_provenance_claims_are_ignored():
         "supersedes": ["some-other-memory"],
     }]
 
-    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+    with patch("pxh.model_session.run_model_session", return_value=_claude_ok(payload)):
         result = memory.consolidate()
 
     assert result["status"] == "ok"
@@ -360,7 +360,7 @@ def test_provenance_survives_the_whole_round_trip_from_consolidation_to_retrieva
     payload = [{"text": "Obi and I built a lego tower", "tags": ["lego"],
                 "importance": 0.6}]
 
-    with patch("pxh.claude_session.run_claude_session", return_value=_claude_ok(payload)):
+    with patch("pxh.model_session.run_model_session", return_value=_claude_ok(payload)):
         memory.consolidate()
 
     out = memory.retrieve_memories("lego tower", n=1)
@@ -413,9 +413,9 @@ def test_recent_mode_still_shows_superseded_memories_but_marks_them():
 
 
 def test_consolidate_budget_exhausted_is_failed_not_raised():
-    from pxh.claude_session import SessionBudgetExhausted
+    from pxh.model_session import SessionBudgetExhausted
     _write_thoughts(None, n=8)
-    with patch("pxh.claude_session.run_claude_session",
+    with patch("pxh.model_session.run_model_session",
                side_effect=SessionBudgetExhausted("consolidate quota reached (1/1)")):
         res = memory.consolidate()
     assert res["status"] == "failed" and "quota" in res["error"]
@@ -424,7 +424,7 @@ def test_consolidate_budget_exhausted_is_failed_not_raised():
 def test_consolidate_unparseable_response_is_failed():
     _write_thoughts(None, n=8)
     bad = MagicMock(stdout="I could not produce JSON today.", stderr="", returncode=0)
-    with patch("pxh.claude_session.run_claude_session", return_value=bad):
+    with patch("pxh.model_session.run_model_session", return_value=bad):
         res = memory.consolidate()
     assert res["status"] == "failed"
 

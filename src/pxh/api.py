@@ -829,13 +829,13 @@ async def public_status() -> Dict[str, Any]:
         pass  # expected on missing/corrupt thoughts file
 
     # Claude session budget
-    claude_sessions_today = 0
-    claude_budget_remaining = 8
+    model_sessions_today = 0
+    model_budget_remaining = 8
     try:
-        from pxh.claude_session import _load_session_log, _today_entries, DAILY_CAP
+        from pxh.model_session import _load_session_log, _today_entries, DAILY_CAP
         today = _today_entries(_load_session_log())
-        claude_sessions_today = len(today)
-        claude_budget_remaining = max(0, DAILY_CAP - claude_sessions_today)
+        model_sessions_today = len(today)
+        model_budget_remaining = max(0, DAILY_CAP - model_sessions_today)
     except Exception:
         pass
 
@@ -849,8 +849,8 @@ async def public_status() -> Dict[str, Any]:
         "salience": last.get("salience"),
         "ts": last.get("ts"),
         "listening": session.get("listening", False),
-        "claude_sessions_today": claude_sessions_today,
-        "claude_budget_remaining": claude_budget_remaining,
+        "model_sessions_today": model_sessions_today,
+        "model_budget_remaining": model_budget_remaining,
     }
 
 
@@ -1107,11 +1107,11 @@ async def public_race():
 
 @app.get("/api/v1/public/budget")
 async def public_budget():
-    """Claude session budget aggregate — unauthenticated.
-    Per-session detail (timestamps, models, types, outcomes) is kept off the
+    """Cognition budget aggregate — unauthenticated.
+    Per-call detail (timestamps, models, kinds, outcomes) is kept off the
     public surface; use the authenticated /api/v1/budget for that."""
     try:
-        from pxh.claude_session import DAILY_CAP, _load_session_log, _today_entries
+        from pxh.model_session import DAILY_CAP, _load_session_log, _today_entries
 
         today = _today_entries(_load_session_log())
         return {
@@ -1125,9 +1125,9 @@ async def public_budget():
 
 @app.get("/api/v1/budget", dependencies=[Depends(_verify_token)])
 async def budget():
-    """Claude session budget with per-session detail. Authenticated only."""
+    """Cognition budget with per-call detail. Authenticated only."""
     try:
-        from pxh.claude_session import DAILY_CAP, _load_session_log, _today_entries
+        from pxh.model_session import DAILY_CAP, _load_session_log, _today_entries
 
         today = _today_entries(_load_session_log())
         sessions = [
@@ -1385,7 +1385,7 @@ _PUBLIC_CHAT_ENV_ALLOWLIST = {
 # guarded is gone rather than merely guarded. See test_public_chat_spawns_no
 # _subprocess, which pins the stronger property their test was approximating.
 
-async def _call_claude_public(prompt: str, system_prompt: Optional[str] = None,
+async def _call_tier_public(prompt: str, system_prompt: Optional[str] = None,
                               kind: str = "public_chat") -> str:
     """Answer a chat turn on the pinned cognition model, with no tool envelope.
 
@@ -1535,7 +1535,7 @@ async def public_chat(req: PublicChatRequest, request: Request):
 
     try:
         reply = await asyncio.wait_for(
-            _call_claude_public(prompt),
+            _call_tier_public(prompt),
             timeout=_PUBLIC_CHAT_TIMEOUT_S,
         )
     except (asyncio.TimeoutError, subprocess.TimeoutExpired):
@@ -1659,7 +1659,7 @@ async def post_obi_chat(req: ObiChatRequest) -> Dict[str, Any]:
 
     try:
         reply = await asyncio.wait_for(
-            _call_claude_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT,
+            _call_tier_public(prompt, system_prompt=_OBI_CHAT_SYSTEM_PROMPT,
                                 kind="obi_chat"),
             timeout=_PUBLIC_CHAT_TIMEOUT_S,
         )

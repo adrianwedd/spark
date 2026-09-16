@@ -37,7 +37,7 @@ import time
 import pytest
 
 import pxh.mind as mind
-from pxh import claude_session, m5, memory
+from pxh import model_session, m5, memory
 
 # The deadline a consolidation attempt actually gets, now that the resident
 # session's per-kind table is gone (#317 Phase 3). It is the tier's own
@@ -369,18 +369,18 @@ def test_consolidate_passes_no_ad_hoc_timeout(monkeypatch, tmp_path):
     def _fake(session_type, prompt, **kw):
         seen["type"] = session_type
         seen["kw"] = kw
-        return claude_session.RunResult(
+        return model_session.RunResult(
             stdout="[]", stderr="", returncode=0, duration_s=0.0,
             model_used="haiku")
 
-    monkeypatch.setattr(claude_session, "run_claude_session", _fake)
+    monkeypatch.setattr(model_session, "run_model_session", _fake)
     memory.consolidate()
     assert seen["type"] == "consolidate"
     assert "timeout" not in seen["kw"], (
         f"consolidate() still overrides the declared deadline: {seen['kw']}")
 
 
-def test_consolidate_passes_no_timeout_and_the_tier_decides(monkeypatch):
+def test_consolidate_passes_no_timeout_and_the_tier_decides(monkeypatch, tmp_path):
     """`timeout=None` is the default and reaches the tier as None.
 
     None is what makes the tier's own configured deadline authoritative. The
@@ -397,10 +397,14 @@ def test_consolidate_passes_no_timeout_and_the_tier_decides(monkeypatch):
         return m5.M5Result(status="available", response="[]")
 
     monkeypatch.setattr(m5, "ask_m5", _fake_ask)
-    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", True)
-    monkeypatch.setattr(claude_session, "SESSION_LOG",
-                        claude_session.PROJECT_ROOT / "state" / "nonexistent.jsonl")
-    result = claude_session.run_claude_session("consolidate", "prompt")
+    monkeypatch.setattr(model_session, "BUDGET_DISABLED", True)
+    # tmp_path, never a path under the live state tree. This said
+    # `PROJECT_ROOT / "state" / "nonexistent.jsonl"` — a name that reads as
+    # deliberately harmless and is not: the dispatcher *creates* the log it is
+    # pointed at, so the test wrote production-shaped session records into the
+    # robot's own state dir, and #326 then committed six of them.
+    monkeypatch.setattr(model_session, "SESSION_LOG", tmp_path / "model_sessions.jsonl")
+    result = model_session.run_model_session("consolidate", "prompt")
     assert result.returncode == 0
     assert seen == {"kind": "consolidate", "timeout_s": None}
     assert _attempt_deadline_s() > 0
@@ -412,7 +416,7 @@ def test_consolidate_passes_no_timeout_and_the_tier_decides(monkeypatch):
 
 def test_quota_matches_the_attempts_memory_promises():
     """A quota of 1 against MAX_ATTEMPTS_PER_DAY=2 made the retry unspendable."""
-    assert (claude_session._TYPE_QUOTAS["consolidate"]
+    assert (model_session._TYPE_QUOTAS["consolidate"]
             == memory.MAX_ATTEMPTS_PER_DAY == 2)
 
 
@@ -424,9 +428,9 @@ def test_retry_spacing_clears_the_global_cooldown():
     way for the nightly job to crowd a session someone *is* waiting on. Spacing
     is the cheaper answer, but it only works if the gap really is larger.
     """
-    assert memory.RETRY_SPACING_S > claude_session.COOLDOWN_S
-    assert memory.RETRY_SPACING_S >= claude_session._TYPE_COOLDOWNS["consolidate"]
-    assert "consolidate" not in claude_session._GLOBAL_COOLDOWN_EXEMPT
+    assert memory.RETRY_SPACING_S > model_session.COOLDOWN_S
+    assert memory.RETRY_SPACING_S >= model_session._TYPE_COOLDOWNS["consolidate"]
+    assert "consolidate" not in model_session._GLOBAL_COOLDOWN_EXEMPT
     # Two spaced attempts still fit inside the 03:00-06:00 window.
     window_s = (memory.CONSOLIDATION_WINDOW[1]
                 - memory.CONSOLIDATION_WINDOW[0]) * 3600
@@ -456,17 +460,17 @@ def test_a_failed_attempt_one_leaves_attempt_two_reachable(monkeypatch):
 
 
 def test_the_budget_gate_admits_attempt_two(monkeypatch, tmp_path):
-    """claude_session's own quota/cooldown must not be what blocks the retry."""
-    log = tmp_path / "claude_sessions.jsonl"
+    """model_session's own quota/cooldown must not be what blocks the retry."""
+    log = tmp_path / "model_sessions.jsonl"
     then = dt.datetime.now(UTC) - dt.timedelta(seconds=memory.RETRY_SPACING_S)
     log.write_text(json.dumps({
         "ts": then.isoformat().replace("+00:00", "Z"),
         "session_type": "consolidate", "model": "haiku",
         "duration_s": 1.0, "returncode": 1, "status": "brain_unavailable",
     }) + "\n", encoding="utf-8")
-    monkeypatch.setattr(claude_session, "SESSION_LOG", log)
-    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", False)
-    assert claude_session.check_budget("consolidate") is None
+    monkeypatch.setattr(model_session, "SESSION_LOG", log)
+    monkeypatch.setattr(model_session, "BUDGET_DISABLED", False)
+    assert model_session.check_budget("consolidate") is None
 
 
 def test_success_marks_the_day_done(monkeypatch):
@@ -549,7 +553,7 @@ def test_retry_spacing_covers_the_cooldown_and_the_attempt_before_it():
     with ten minutes of margin" assumed attempt 1 ended when it started.
     """
     assert memory.RETRY_SPACING_S >= (
-        claude_session._TYPE_COOLDOWNS["consolidate"] + _attempt_deadline_s())
+        model_session._TYPE_COOLDOWNS["consolidate"] + _attempt_deadline_s())
 
 
 def test_a_slow_first_attempt_still_leaves_the_retry_admissible(monkeypatch, tmp_path):
@@ -557,23 +561,23 @@ def test_a_slow_first_attempt_still_leaves_the_retry_admissible(monkeypatch, tmp
 
     The entry is built the way the real attempt leaves the log — written at
     start + the deadline, which is exactly the disagreement between the two
-    clocks — and then asked of claude_session's own gate rather than of a
+    clocks — and then asked of model_session's own gate rather than of a
     restatement of it. Put RETRY_SPACING_S back to 2400 and this returns "consolidate cooldown
     (1800s / 2400s)", which is the refusal that cost the nine nights.
     """
     deadline = _attempt_deadline_s()
     started = dt.datetime.now(UTC) - dt.timedelta(seconds=memory.RETRY_SPACING_S)
     finished = started + dt.timedelta(seconds=deadline)
-    log = tmp_path / "claude_sessions.jsonl"
+    log = tmp_path / "model_sessions.jsonl"
     log.write_text(json.dumps({
         "ts": finished.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "type": "consolidate", "model": "haiku",
         "duration_s": float(deadline),
         "returncode": 1, "outcome": "brain_unavailable",
     }) + "\n", encoding="utf-8")
-    monkeypatch.setattr(claude_session, "SESSION_LOG", log)
-    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", False)
-    assert claude_session.check_budget("consolidate") is None
+    monkeypatch.setattr(model_session, "SESSION_LOG", log)
+    monkeypatch.setattr(model_session, "BUDGET_DISABLED", False)
+    assert model_session.check_budget("consolidate") is None
 
 
 def test_a_failure_that_spent_nothing_does_not_lock_out_the_retry(monkeypatch, tmp_path):
@@ -591,17 +595,17 @@ def test_a_failure_that_spent_nothing_does_not_lock_out_the_retry(monkeypatch, t
         "type": "research", "model": "haiku", "duration_s": 0.0,
         "returncode": 1, "outcome": "brain_unavailable",
     }
-    log = tmp_path / "claude_sessions.jsonl"
+    log = tmp_path / "model_sessions.jsonl"
     log.write_text(json.dumps(entry) + "\n", encoding="utf-8")
-    monkeypatch.setattr(claude_session, "SESSION_LOG", log)
-    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", False)
-    assert claude_session.check_budget("consolidate") is None
+    monkeypatch.setattr(model_session, "SESSION_LOG", log)
+    monkeypatch.setattr(model_session, "BUDGET_DISABLED", False)
+    assert model_session.check_budget("consolidate") is None
 
     # The same entry *answered* is a real cooldown. This narrows the gate to
     # spend; it does not remove it.
     entry["returncode"], entry["outcome"] = 0, "success"
     log.write_text(json.dumps(entry) + "\n", encoding="utf-8")
-    assert "global cooldown" in claude_session.check_budget("consolidate")
+    assert "global cooldown" in model_session.check_budget("consolidate")
 
 
 def test_the_first_attempt_of_a_night_is_reported_as_the_first(monkeypatch):

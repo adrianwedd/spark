@@ -61,7 +61,7 @@ def _blog_qa_off(monkeypatch):
     """Default the Claude QA gate OFF for every test in this file.
 
     `_qa_gate()` in bin/px-blog shells out to a real `claude` subprocess. Tests
-    that mocked `run_claude_session` but not the gate were making live billed
+    that mocked `run_model_session` but not the gate were making live billed
     calls on whatever machine ran pytest — and then failing when the real Claude
     answered NO to the mock post. A test that needs the gate must opt back in.
     """
@@ -134,7 +134,7 @@ def _make_weekly_post(date, title="Weekly Reflections"):
 
 
 # ---------------------------------------------------------------------------
-# Mock for run_claude_session
+# Mock for run_model_session
 # ---------------------------------------------------------------------------
 
 def _mock_claude_result(title="Test Blog Title", body="This is the blog body.\n\nSecond paragraph."):
@@ -174,7 +174,7 @@ class TestBlogSchedule:
         yesterday = dt.datetime.now(HOBART_TZ) - dt.timedelta(days=1)
         _write_thoughts(state_dir, yesterday, count=5)
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
             post = ns["generate_post"]("daily", yesterday, {"posts": []})
 
         assert post is not None
@@ -210,7 +210,7 @@ class TestBlogSchedule:
 
         # Each run_once call processes one day (generate or skip); run enough iterations
         # to flush the full backlog: 1 real post (day 5) + 4 skips (days 4..1).
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
             with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
                 for _ in range(6):
                     ns["run_once"](dry=False)
@@ -242,7 +242,7 @@ class TestBlogSchedule:
         today = dt.datetime.now(HOBART_TZ)
         _write_thoughts(state_dir, today, count=2)
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
             post = ns["generate_post"]("daily", today, {"posts": []})
 
         assert post is None, "Should skip daily with fewer than 3 thoughts"
@@ -252,7 +252,7 @@ class TestBlogSchedule:
         ns, state_dir, _ = blog_mod
         sunday = dt.datetime.now(HOBART_TZ)
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
             post = ns["generate_post"]("weekly", sunday, {"posts": []})
 
         assert post is None, "Should skip weekly with no daily posts"
@@ -285,9 +285,9 @@ class TestBlogSchedule:
         today = dt.datetime.now(HOBART_TZ)
         _write_thoughts(state_dir, today, count=5)
 
-        from pxh.claude_session import SessionBudgetExhausted
+        from pxh.model_session import SessionBudgetExhausted
 
-        with patch("pxh.claude_session.run_claude_session",
+        with patch("pxh.model_session.run_model_session",
                     side_effect=SessionBudgetExhausted("daily cap reached")):
             with pytest.raises(SessionBudgetExhausted):
                 ns["generate_post"]("daily", today, {"posts": []})
@@ -646,7 +646,7 @@ class TestGenerationFailureCap:
         mock_result.stdout = "Only A Title Line With No Body At All"
         mock_result.model_used = "claude-haiku-4-5-20251001"
 
-        with patch("pxh.claude_session.run_claude_session", return_value=mock_result):
+        with patch("pxh.model_session.run_model_session", return_value=mock_result):
             post = ns["generate_post"]("daily", today, {"posts": []})
 
         assert post is None
@@ -668,7 +668,7 @@ class TestGenerationFailureCap:
         logged = []
         ns["log"] = lambda msg: logged.append(msg)
 
-        with patch("pxh.claude_session.run_claude_session", return_value=mock_result):
+        with patch("pxh.model_session.run_model_session", return_value=mock_result):
             post = ns["generate_post"]("daily", today, {"posts": []})
 
         assert post is None
@@ -682,9 +682,9 @@ class TestGenerationFailureCap:
         _write_thoughts(state_dir, today, count=5)
         pid = ns["id_for_post"]("daily", today)
 
-        from pxh.claude_session import SessionBudgetExhausted
+        from pxh.model_session import SessionBudgetExhausted
 
-        with patch("pxh.claude_session.run_claude_session",
+        with patch("pxh.model_session.run_model_session",
                    side_effect=SessionBudgetExhausted("daily cap reached")):
             with pytest.raises(SessionBudgetExhausted):
                 ns["generate_post"]("daily", today, {"posts": []})
@@ -716,7 +716,7 @@ class TestGenerationFailureCap:
         # Opt back into the QA gate (autouse fixture turns it off) — the gate's
         # subprocess is mocked here, so no live `claude` call is made.
         with patch.dict(os.environ, {"PX_BLOG_QA": "1"}):
-            with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+            with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
                 with _brain_says("NO"):
                     post = ns["generate_post"]("daily", today, {"posts": []})
 
@@ -737,7 +737,7 @@ class TestGenerationFailureCap:
         ns["record_generation_failure"](pid, "empty body")
         assert ns["load_blog_failures"]()[pid]["failures"] == 2
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()):
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
             with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
                 post = ns["generate_post"]("daily", today, {"posts": []})
 
@@ -780,7 +780,7 @@ class TestGenerationFailureCap:
             ns["record_generation_failure"](pid, "empty body")
         assert ns["is_generation_skipped"](pid) is True
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()) as mock_run:
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()) as mock_run:
             with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
                 ns["run_once"](dry=False)
 
@@ -801,7 +801,7 @@ class TestBackfillRespectsFailureCap:
             ns["record_generation_failure"](pid, "empty body")
         assert ns["is_generation_skipped"](pid) is True
 
-        with patch("pxh.claude_session.run_claude_session", return_value=_mock_claude_result()) as mock_run:
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()) as mock_run:
             with patch.dict(os.environ, {"PX_BLOG_QA": "0"}):
                 ns["run_backfill"](dry=False)
 

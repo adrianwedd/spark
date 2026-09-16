@@ -64,7 +64,7 @@ MAX_MEMORIES_PER_DAY = 8
 # the first (#291, corrected by #310).
 #
 # Both attempts used to land ~60s apart, which made the retry decorative twice
-# over: `claude_session.COOLDOWN_S` (the 30-minute global session cooldown)
+# over: `model_session.COOLDOWN_S` (the 30-minute global session cooldown)
 # rejected it outright, and even without that a second Haiku turn started one
 # minute after the first failed is a retry of the same load conditions.
 #
@@ -405,7 +405,7 @@ def consolidate(dry: bool = False, persona: str = "spark",
         prompt = (CONSOLIDATION_PROMPT + "\nThoughts from the last 24 hours:\n"
                   + thought_lines + outcome_lines + intent_line + existing_lines)
 
-        import pxh.claude_session as claude_session
+        import pxh.model_session as model_session
         try:
             # No `timeout=` on purpose (#291). One deadline has to be the
             # source of truth and it is the tier's own configured one
@@ -421,9 +421,9 @@ def consolidate(dry: bool = False, persona: str = "spark",
             # 13.1s end to end on the tier, so the margin is large, but if a
             # night ever times out here the fix is `PX_M5_SPARK_TIMEOUT_S` — not
             # a second deadline in this module.
-            result = claude_session.run_claude_session(
+            result = model_session.run_model_session(
                 "consolidate", prompt, allowed_tools="")
-        except claude_session.SessionBudgetExhausted as exc:
+        except model_session.SessionBudgetExhausted as exc:
             return {"status": "failed", "error": str(exc)}
         except Exception as exc:
             return {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}

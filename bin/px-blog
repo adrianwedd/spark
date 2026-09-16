@@ -735,8 +735,8 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
 
     # Call Claude via session manager
     try:
-        from pxh.claude_session import run_claude_session, SessionBudgetExhausted
-        result = run_claude_session(
+        from pxh.model_session import run_model_session, SessionBudgetExhausted
+        result = run_model_session(
             session_type="blog",
             prompt=prompt,
             timeout=300,
@@ -745,7 +745,7 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         raw_text = result.stdout.strip()
         model_used = result.model_used
     except ImportError:
-        log(f"claude_session not available, cannot generate {post_type}")
+        log(f"model_session not available, cannot generate {post_type}")
         return None
     except SessionBudgetExhausted as exc:
         log(f"budget exhausted for {post_type}: {exc}")
@@ -1090,7 +1090,7 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, _on_signal)
 
     try:
-        from pxh.claude_session import SessionBudgetExhausted as _BudgetError
+        from pxh.model_session import SessionBudgetExhausted as _BudgetError
     except ImportError:
         _BudgetError = None
 

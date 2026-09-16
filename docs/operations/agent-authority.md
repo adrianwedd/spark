@@ -42,7 +42,7 @@ and `tests/test_agent_authority_invariant.py`, wired into CI as its own
 step (same reasoning as the resident-only Claude check: a red build here
 should read as "the boundary was reopened," not as one failing test among
 1200). Both the checker and the agent definition are blacklisted from
-px-evolve (`claude_session.BLACKLIST_FILES`) for the same reason the
+px-evolve (`model_session.BLACKLIST_FILES`) for the same reason the
 resident-only pair is — an evolution PR that can edit the thing that
 checks the rule can satisfy the rule by weakening the check.
 

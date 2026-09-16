@@ -9,7 +9,7 @@ The scan below still forbids cold starts (there is now no legitimate way to
 start Claude from production at all), and it additionally forbids the retired
 paths from reappearing.
 
-BLACKLISTED from px-evolve (see pxh.claude_session.BLACKLIST_FILES) together
+BLACKLISTED from px-evolve (see pxh.model_session.BLACKLIST_FILES) together
 with tools/check_resident_claude.py, on the same footing as the policy
 invariants: an evolution PR must not be able to relax the rule by editing the
 test that pins it, nor by defanging the scanner the test calls.
@@ -148,7 +148,8 @@ def test_allowlist_is_empty():
 
 @pytest.mark.parametrize("rel", sorted(guard.FORBIDDEN_PATHS))
 def test_a_retired_transport_path_is_a_finding(tmp_path, rel):
-    """A clean-looking `brain.py` is still the mailbox.
+    """A clean-looking `brain.py` is still the mailbox, and a clean-looking
+    `claude_session.py` is still the old vocabulary.
 
     Checked by existence rather than by content, because the regression this
     guards against is someone re-adding the file with nothing wrong in it yet.

@@ -60,7 +60,7 @@ A test that wants the real log dir or the real tmux socket must be marked `live`
 | `voice_loop.py` | Supervisor loop. `ALLOWED_TOOLS` whitelist (41 tools). `validate_action()` sanitizes LLM params. |
 | `api.py` | FastAPI REST API, port 8420. Single worker only — not multi-worker safe. |
 | `race.py` | Autonomous racing controller. |
-| `claude_session.py` | Central dispatcher for all SPARK-initiated Claude interactions. |
+| `model_session.py` | Budget/quota dispatch for every SPARK-initiated model call that is not reflection. Was `claude_session.py` until #317 Phase 3; the `claude_*` name went with the session it was named after. |
 | `spark_config.py` | Tunable constants (reflection angles, topic seeds, prompts). Primary target for self-evolution PRs. |
 
 **Critical gotchas:**
@@ -334,7 +334,7 @@ first attempt was slow. The spacing has to cover the cooldown *plus* the attempt
 that precedes it.
 
 **Deadlines are declared once per kind, at the caller, and the provider's own
-HTTP timeout is the ceiling.** `run_claude_session`'s `timeout` defaults to
+HTTP timeout is the ceiling.** `run_model_session`'s `timeout` defaults to
 `None`; interactive kinds declare their own (`VOICE_TURN_DEADLINE_S` 45s,
 `px-cron-say` 90s, vision 60s, `memory.CONSOLIDATE_DEADLINE_S` via the tier).
 The per-kind table this used to defer to (`brain._DEADLINE_S`) was deleted with
@@ -350,7 +350,9 @@ Only a call the model actually *answered* arms that cooldown: an rc=1 entry —
 `cognition_timeout`, `cognition_offline`, `cognition_bad_response`,
 `cognition_busy`, and in the historical log `brain_unavailable` — is a record
 that nothing was spent, and letting it lock out every other component for 30
-minutes is #310's third defect. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_CLAUDE_BUDGET_DISABLED=1`. Session log: `state/claude_sessions.jsonl`.
+minutes is #310's third defect. When ≤2 remaining: only `self_debug`/`evolve` allowed. Bypass: `PX_MODEL_BUDGET_DISABLED=1`. Live log: `state/model_sessions.jsonl`.
+
+**The day the name changed, the day's accounting reset — once.** `check_budget` reads only the live log, and `state/claude_sessions.jsonl` is the same log under its historical name: written by the retired module, never read here, never rewritten (provenance). So the first deploy of #317 Phase 3's rename starts the day's cap and cooldowns fresh. That is a handful of extra calls on one day; the alternative was a permanent branch reading a file named after a provider that no longer exists.
 
 ### Cognition — one tier, one call (`src/pxh/m5.py`)
 
@@ -402,7 +404,7 @@ and no reply command, so a produced answer cannot be lost in transit.
 
 **What remains, and where to look:**
 
-- `claude_session.run_claude_session(kind, prompt, ...)` is still the dispatcher
+- `model_session.run_model_session(kind, prompt, ...)` is the dispatcher
   — the `claude_*` names are provenance and are the next thing to go. Every
   kind it serves is in `_COGNITION_KINDS`; anything else raises
   `ColdStartForbidden`. There is no dial, no `PX_BRAIN_KINDS`, and no second
@@ -416,7 +418,7 @@ and no reply command, so a produced answer cannot be lost in transit.
   `provider` that actually served the call, so "which tier spent this" is
   answerable after the fact.
 - **Deadlines are declared once per kind, at the caller, and the tier's own
-  `PX_M5_SPARK_TIMEOUT_S` is the ceiling.** `run_claude_session`'s `timeout`
+  `PX_M5_SPARK_TIMEOUT_S` is the ceiling.** `run_model_session`'s `timeout`
   defaults to `None`; interactive kinds declare their own
   (`VOICE_TURN_DEADLINE_S` 45s, `px-cron-say` 90s, vision 60s). An override
   that is *tighter* than the provider's silently wins and makes the declared
@@ -676,7 +678,7 @@ formality — a `delegates` claim is re-verified against the file rather than
 trusted.
 
 `src/pxh/policy.py` and `tests/test_policy_invariants.py` are blacklisted from
-px-evolve (see `claude_session.BLACKLIST_FILES`). Evolvable policy coverage
+px-evolve (see `model_session.BLACKLIST_FILES`). Evolvable policy coverage
 lives in `tests/test_policy.py` — keep that split.
 
 ### Delegated-Agent Authority Boundary (#281)
@@ -748,8 +750,8 @@ Non-obvious variables only — most names are self-documenting. Full list in `bi
 | `PX_OLLAMA_HOST` / `PX_CHAT_MODEL` | Persona chat and rephrase endpoint/model (GREMLIN/VIXEN, `tool-voice-persona`). Default `https://ollama.com` / `deepseek-v4.1-flash:cloud`. |
 | `PX_MIND_BACKEND` | Legacy introspection field; it no longer alters reflection routing. |
 | `PX_WANDER_VISION_ENABLED` | `1` = allow autonomous wander to escalate to cognition-tier vision on genuine local ambiguity (off by default — see Wander below) |
-| `PX_CLAUDE_BUDGET_DISABLED` | `1` = bypass all session rate limits |
-| `PX_CLAUDE_MODEL_*` | Per-session-type model overrides for the kinds still served residently (e.g. `PX_CLAUDE_MODEL_EVOLVE`). Deliberately **not** consulted for migrated kinds — the value is a Claude model id, and handing it to Ollama would be a different mistake than ignoring it. |
+| `PX_MODEL_BUDGET_DISABLED` | `1` = bypass every rate limit in `model_session` (was `PX_CLAUDE_BUDGET_DISABLED`) |
+| `PX_MODEL_DAILY_CAP` / `PX_MODEL_COOLDOWN_S` | Global daily cap (8) and inter-call cooldown (1800s). Provider-neutral, because they always bounded model calls rather than Claude calls. |
 | `PX_MODEL_<KIND>` | Provider-neutral per-kind model override for a migrated kind (`PX_MODEL_RESEARCH`, `PX_MODEL_COMPOSE`, `PX_MODEL_BLOG`, `PX_MODEL_CONSOLIDATE`, `PX_MODEL_SELF_DEBUG`). Falls back to `PX_M5_SPARK_MODEL`. |
 | `PX_EVOLVE_DRY` | `1` = skip worktree/PR (queue entry still written with `dry: true`) |
 | `PX_POST_QA` | `0` = skip Claude QA gate (testing) |

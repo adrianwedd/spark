@@ -22,23 +22,22 @@ from pxh.mind import call_llm, _reset_state
 
 
 @pytest.fixture(autouse=True)
-def _pin_claude_binary(monkeypatch):
-    """A canary: nothing in the Claude tier may resolve a binary any more.
+def _pin_tier_model(monkeypatch):
+    """Pin the model, and record why the environment must not decide these tests.
 
-    This originally existed because `call_claude_haiku` resolved the CLI
-    *before* the mocked `subprocess.run` got a look in, so on this robot the
-    tier ran and on any host without `claude` installed it short-circuited —
-    four tests passing for an environmental reason rather than the one they
-    stated. That helper is gone; the tier is the resident session now, and
-    nothing here looks up a binary at all.
+    This fixture used to also point `PX_CLAUDE_BIN` at a nonexistent path. That
+    was a real guard once: `call_claude_haiku` resolved the CLI *before* the
+    mocked `subprocess.run` got a look in, so four tests ran here and
+    short-circuited on any host without `claude` installed — passing for an
+    environmental reason rather than the one they stated.
 
-    The variable is kept, still pointing at a path that does not exist,
-    because that makes it a regression detector: if a future change
-    reintroduces binary resolution under this tier, it resolves to nothing and
-    fails loudly instead of quietly working on a developer machine where
-    `claude` happens to be installed.
+    There is no binary to resolve any more (#317 Phase 3), so the pointer is
+    gone. Nothing reads that variable on this path, and a fixture setting a
+    variable nothing reads is a fixture that looks like a guard and is not one.
+    What genuinely guards this property now is
+    `tools/check_resident_claude.py`, which fails CI on the syntax and on the
+    reappearance of the retired module.
     """
-    monkeypatch.setenv("PX_CLAUDE_BIN", "/nonexistent/claude-under-test")
     monkeypatch.setenv("PX_M5_SPARK_MODEL", "spark:fixed")
     # The tier is hosted (#308): without a key every call fails closed before
     # reaching the network, which would make these tests pass for the wrong

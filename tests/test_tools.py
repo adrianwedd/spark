@@ -1604,19 +1604,19 @@ _TOOLS_ROOT = _Path(__file__).parent.parent
 
 def _load_tool_heredoc(name, monkeypatch, tmp_path, extra_env=None):
     """Exec a bin/tool-* embedded Python heredoc into a namespace with a fake
-    pxh.claude_session so main() can run without a live Claude CLI."""
+    pxh.model_session so main() can run without a live Claude CLI."""
     monkeypatch.setenv("PROJECT_ROOT", str(_TOOLS_ROOT))
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("PX_DRY", "0")
     for k, v in (extra_env or {}).items():
         monkeypatch.setenv(k, v)
 
-    fake_cs = _types.ModuleType("pxh.claude_session")
+    fake_cs = _types.ModuleType("pxh.model_session")
     fake_cs.SessionBudgetExhausted = type("SessionBudgetExhausted", (Exception,), {})
-    fake_cs.run_claude_session = lambda **kw: _types.SimpleNamespace(
+    fake_cs.run_model_session = lambda **kw: _types.SimpleNamespace(
         returncode=0, stdout="A thoughtful multi-paragraph exploration of the topic.",
         model_used="claude-haiku-test")
-    monkeypatch.setitem(sys.modules, "pxh.claude_session", fake_cs)
+    monkeypatch.setitem(sys.modules, "pxh.model_session", fake_cs)
 
     text = (_TOOLS_ROOT / "bin" / name).read_text(encoding="utf-8")
     py = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]

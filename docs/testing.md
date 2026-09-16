@@ -42,15 +42,17 @@ Worked examples, all found by the first CI run:
 
 | Symptom | What was actually asserted |
 |---|---|
-| `test_mind_fallback` ×4 | `claude` is on `$PATH` here, so `call_claude_haiku` reached the mocked `subprocess.run`. Elsewhere the tier short-circuits at `mind.py:2445` and the Claude fallback these tests are named for never happens. |
+| `test_mind_fallback` ×4 *(historical — the fixture this describes was removed in #317 Phase 3)* | `claude` was on `$PATH` here, so `call_claude_haiku` reached the mocked `subprocess.run`. Elsewhere the tier short-circuited at `mind.py:2445` and the Claude fallback these tests were named for never happened. |
 | `test_tool_wander_sudo_env_carries_home` | The literal string `HOME=/home/pi`. `bin/tool-wander:81` reads `pwd.getpwuid(os.getuid()).pw_dir` precisely so a clobbered `$HOME` cannot reintroduce the bug — the test pinned this robot's value instead of the code's property. |
 | `test_tool_voice_lock_timeout` | Lock contention, but only on a host with `espeak`. Without a player `bin/tool-voice:229` takes the `not DEFAULT_PLAYER` branch, never enters `with VOICE_LOCK`, and reports ok. |
 
 The fix is never to make the runner more robot-like. Installing `claude` and
 `espeak` on CI would have turned all six green while leaving every assertion
-exactly as false as it was. Use the seam instead — `PX_CLAUDE_BIN`,
-`PX_VOICE_PLAYER`, `pwd.getpwuid()` — and force the precondition the test
-claims to be testing.
+exactly as false as it was. Use the seam instead — `PX_VOICE_PLAYER`,
+`pwd.getpwuid()` — and force the precondition the test claims to be testing.
+(`PX_CLAUDE_BIN` appears in the original list here; there is no binary to
+resolve on the reflection path any more, so that seam is gone rather than kept
+as a fixture that sets a variable nothing reads.)
 
 **A test named for a fallback path must force the state that causes the
 fallback.** Depending on whether an executable happens to be on `PATH` is not a

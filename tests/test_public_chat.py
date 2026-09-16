@@ -17,7 +17,7 @@ def client(isolated_project, monkeypatch):
 
 
 def test_valid_request_returns_reply(client):
-    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+    with patch("pxh.api._call_tier_public", new_callable=AsyncMock,
                return_value="Hello from SPARK."):
         r = client.post("/api/v1/public/chat",
                         json={"message": "Hi SPARK", "history": []})
@@ -53,7 +53,7 @@ def test_history_over_20_turns_returns_400(client):
 
 
 def test_rate_limit_11th_request_returns_429(client):
-    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+    with patch("pxh.api._call_tier_public", new_callable=AsyncMock,
                return_value="ok"):
         for _ in range(10):
             r = client.post("/api/v1/public/chat",
@@ -66,7 +66,7 @@ def test_rate_limit_11th_request_returns_429(client):
 
 
 def test_empty_claude_reply_returns_fallback(client):
-    with patch("pxh.api._call_claude_public", new_callable=AsyncMock,
+    with patch("pxh.api._call_tier_public", new_callable=AsyncMock,
                return_value="   "):
         r = client.post("/api/v1/public/chat",
                         json={"message": "Hi", "history": []})
@@ -76,7 +76,7 @@ def test_empty_claude_reply_returns_fallback(client):
 
 def test_claude_timeout_returns_504(client):
     import asyncio
-    with patch("pxh.api._call_claude_public", side_effect=asyncio.TimeoutError()):
+    with patch("pxh.api._call_tier_public", side_effect=asyncio.TimeoutError()):
         r = client.post("/api/v1/public/chat",
                         json={"message": "Hi", "history": []})
     assert r.status_code == 504

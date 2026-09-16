@@ -1171,11 +1171,11 @@ class TestPublicChat:
     """Tests for /api/v1/public/chat — no auth required."""
 
     def _mock_claude(self, reply: str):
-        """Return a patch target that makes _call_claude_public return reply."""
+        """Return a patch target that makes _call_tier_public return reply."""
         async def _fake(*_a, **_kw):
             return reply
 
-        return unittest.mock.patch("pxh.api._call_claude_public", side_effect=_fake)
+        return unittest.mock.patch("pxh.api._call_tier_public", side_effect=_fake)
 
     def test_happy_path(self, api_client):
         with self._mock_claude("Hello there!"):
@@ -1222,7 +1222,7 @@ class TestPublicChat:
         async def _raise(*_a, **_kw):
             raise RuntimeError("claude exited 1: some error")
 
-        with unittest.mock.patch("pxh.api._call_claude_public", side_effect=_raise):
+        with unittest.mock.patch("pxh.api._call_tier_public", side_effect=_raise):
             resp = api_client.post(
                 "/api/v1/public/chat",
                 json={"message": "Hi", "history": []},
@@ -1235,7 +1235,7 @@ class TestPublicChat:
         async def _timeout(*_a, **_kw):
             raise _asyncio.TimeoutError()
 
-        with unittest.mock.patch("pxh.api._call_claude_public", side_effect=_timeout):
+        with unittest.mock.patch("pxh.api._call_tier_public", side_effect=_timeout):
             resp = api_client.post(
                 "/api/v1/public/chat",
                 json={"message": "Hi", "history": []},
@@ -1247,7 +1247,7 @@ class TestPublicChat:
         async def _timeout(*_a, **_kw):
             raise subprocess.TimeoutExpired(cmd="claude", timeout=14)
 
-        with unittest.mock.patch("pxh.api._call_claude_public", side_effect=_timeout):
+        with unittest.mock.patch("pxh.api._call_tier_public", side_effect=_timeout):
             resp = api_client.post(
                 "/api/v1/public/chat",
                 json={"message": "Hi", "history": []},
@@ -1282,7 +1282,7 @@ class TestPublicChat:
         with unittest.mock.patch.object(_sp, "run", _boom), \
              unittest.mock.patch.object(_sp, "Popen", _boom), \
              unittest.mock.patch("pxh.m5.ask_m5", _fake_ask):
-            reply = asyncio.run(_api._call_claude_public("hi there"))
+            reply = asyncio.run(_api._call_tier_public("hi there"))
         assert reply == "hello from M5"
 
     def test_public_chat_unavailable_raises_rather_than_falling_back(self):
@@ -1300,7 +1300,7 @@ class TestPublicChat:
         with unittest.mock.patch("pxh.m5.ask_m5",
                                  return_value=M5Result("offline", error="down")):
             with pytest.raises(RuntimeError, match="unavailable"):
-                asyncio.run(_api._call_claude_public("hi"))
+                asyncio.run(_api._call_tier_public("hi"))
 
     def test_rate_limit_returns_429(self, api_client):
         """After exhausting the per-IP rate limit, further requests get 429."""
@@ -1726,7 +1726,7 @@ def _obi_client(monkeypatch, isolated_project):
 
 def test_propose_records_pending_no_enqueue(monkeypatch, isolated_project):
     _api = _obi_client(monkeypatch, isolated_project)
-    monkeypatch.setattr(_api, "_call_claude_public",
+    monkeypatch.setattr(_api, "_call_tier_public",
         _async_return('{"reply":"want a joke tool?","evolve_action":"propose","evolve_intent":"joke tool"}'))
     from fastapi.testclient import TestClient
     with TestClient(_api.app) as c:
@@ -1748,7 +1748,7 @@ def test_confirm_enqueues_recorded_intent(monkeypatch, isolated_project):
     (isolated_project["state_dir"] / "obi_evolve_pending.json").write_text(
         json.dumps({"intent": "joke tool", "ts": __import__("time").time()}))
     # even if the model tries to inject a different intent on confirm, the RECORDED one wins
-    monkeypatch.setattr(_api, "_call_claude_public",
+    monkeypatch.setattr(_api, "_call_tier_public",
         _async_return('{"reply":"adding it!","evolve_action":"confirm","evolve_intent":"rm -rf evil"}'))
     from fastapi.testclient import TestClient
     with TestClient(_api.app) as c:
@@ -1764,7 +1764,7 @@ def test_confirm_enqueues_recorded_intent(monkeypatch, isolated_project):
 
 def test_confirm_without_proposal_does_not_enqueue(monkeypatch, isolated_project):
     _api = _obi_client(monkeypatch, isolated_project)
-    monkeypatch.setattr(_api, "_call_claude_public",
+    monkeypatch.setattr(_api, "_call_tier_public",
         _async_return('{"reply":"ok!","evolve_action":"confirm","evolve_intent":"sneaky"}'))
     from fastapi.testclient import TestClient
     with TestClient(_api.app) as c:
@@ -1781,7 +1781,7 @@ def test_confirm_requires_real_affirmation(monkeypatch, isolated_project):
     import json, time
     (isolated_project["state_dir"] / "obi_evolve_pending.json").write_text(
         json.dumps({"intent": "joke tool", "ts": time.time()}))
-    monkeypatch.setattr(_api, "_call_claude_public",
+    monkeypatch.setattr(_api, "_call_tier_public",
         _async_return('{"reply":"hmm","evolve_action":"confirm","evolve_intent":"joke tool"}'))
     from fastapi.testclient import TestClient
     with TestClient(_api.app) as c:
@@ -1866,7 +1866,7 @@ def test_obi_chat_prompt_includes_projects_summary(monkeypatch, isolated_project
         captured["prompt"] = prompt
         captured["kind"] = kind
         return '{"reply":"building it!","evolve_action":"none","evolve_intent":null}'
-    monkeypatch.setattr(_api, "_call_claude_public", _cap)
+    monkeypatch.setattr(_api, "_call_tier_public", _cap)
     from fastapi.testclient import TestClient
     with TestClient(_api.app) as c:
         c.post("/api/v1/obi-chat", json={"message":"is my joke tool ready?"},

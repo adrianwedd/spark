@@ -1,6 +1,6 @@
 """Protected constitutional suite for #174.
 
-BLACKLISTED from px-evolve (see pxh.claude_session.BLACKLIST_FILES), together
+BLACKLISTED from px-evolve (see pxh.model_session.BLACKLIST_FILES), together
 with src/pxh/policy.py. Ordinary, evolvable policy coverage lives in the
 whitelisted tests/test_policy.py — keep that split.
 

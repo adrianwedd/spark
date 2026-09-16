@@ -318,9 +318,9 @@ Once Layer 3 is live:
 
 ### Step 3 — Agentic Claude (1-2 sessions)
 
-1. Add `--allowedTools` flag to `claude-voice-bridge` (configurable, not hardcoded)
-2. Add `PX_CLAUDE_ALLOWED_TOOLS` env var (default: `""` for safety)
-3. `px-spark` sets `PX_CLAUDE_ALLOWED_TOOLS=Read,Write,Edit,Bash,WebSearch` in agentic mode
+1. Add an `--allowed-tools` flag to the voice launcher (configurable, not hardcoded)
+2. Add an `PX_AGENTIC_ALLOWED_TOOLS` env var (default: `""` for safety)
+3. `px-spark` sets `PX_AGENTIC_ALLOWED_TOOLS=Read,Write,Edit,Bash,WebSearch` in agentic mode
 4. Add `spark/auto` branch setup to `px-spark`
 5. Update `spark-voice-system.md` with repo-modification guidance and safety rules
 6. Add Bash tool restriction config (`.claude/settings.json` `bash_restrictions`)

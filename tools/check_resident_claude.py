@@ -80,6 +80,12 @@ ALLOWLIST: dict[str, str] = {}
 # basename would fire on any honest prose that mentions it (and there is a lot,
 # because the retirement is worth explaining to whoever reads this next).
 FORBIDDEN_PATHS: dict[str, str] = {
+    # Renamed, not deleted: `pxh.model_session` is the same dispatcher under a
+    # name that does not claim a provider it stopped using. The old name is
+    # forbidden here anyway, because "it is only a rename" is exactly how the
+    # Claude-shaped vocabulary came back the last time — a module called
+    # `claude_session` reads as evidence that something here talks to Claude.
+    "src/pxh/claude_session.py": "the dispatcher's old name — it is pxh/model_session.py now",
     "src/pxh/brain.py": "the resident mailbox — requests, replies and the handshake",
     "src/pxh/brain_daemon.py": "the resident session supervisor",
     "src/pxh/tmux_claude.py": "tmux delivery into a resident session",
@@ -309,8 +315,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    :{v.line}  [{v.kind}] {v.detail}")
         print()
     print("Every one of these reaches Claude from production code, or brings")
-    print("back a path that used to. There is no permitted way to do either: the")
-    print("cognition tier is the whole transport (#317 Phase 3).")
+    print("back a name or a path that used to. There is no permitted way to do")
+    print("either: the cognition tier is the whole transport (#317 Phase 3).")
     return 0 if args.list else 1
 
 

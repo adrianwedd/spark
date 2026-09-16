@@ -154,7 +154,7 @@ def append_evolve_log(record: dict) -> None:
 def _whitelist_lines() -> tuple[str, str]:
     """Return (wl_lines, bl_lines) strings for prompt injection."""
     try:
-        from pxh.claude_session import WHITELIST_PATTERNS, BLACKLIST_FILES, BLACKLIST_PATTERNS
+        from pxh.model_session import WHITELIST_PATTERNS, BLACKLIST_FILES, BLACKLIST_PATTERNS
         wl = "\n".join(f"- {p}" for p in WHITELIST_PATTERNS)
         bl = "\n".join(f"- {f}" for f in sorted(BLACKLIST_FILES))
         bl += "\n" + "\n".join(f"- {p}*" for p in BLACKLIST_PATTERNS)
@@ -333,15 +333,15 @@ def _run_in_worktree(
         return "failed:no_changes"
 
     try:
-        from pxh.claude_session import run_claude_session, SessionBudgetExhausted, file_in_whitelist
+        from pxh.model_session import run_model_session, SessionBudgetExhausted, file_in_whitelist
     except ImportError:
-        log(f"[{entry_id}] claude_session not importable, using direct subprocess")
+        log(f"[{entry_id}] model_session not importable, using direct subprocess")
         return _run_claude_direct(entry_id, intent, build_implement_prompt(intent, {}), workdir)
 
     # ── Phase 1: Plan (Opus, budget-checked, read-only) ──────────────────────
     log(f"[{entry_id}] phase 1/4: planning with {PLAN_MODEL}")
     try:
-        plan_result = run_claude_session(
+        plan_result = run_model_session(
             session_type="evolve",
             prompt=build_plan_prompt(intent, introspection),
             timeout=120,
@@ -368,7 +368,7 @@ def _run_in_worktree(
     log(f"[{entry_id}] phase 2/4: implementing with {IMPLEMENT_MODEL}")
     impl_timeout = max(300, EVOLVE_TIMEOUT - 300)
     try:
-        impl_result = run_claude_session(
+        impl_result = run_model_session(
             session_type="evolve",
             prompt=build_implement_prompt(intent, plan),
             timeout=impl_timeout,
@@ -407,7 +407,7 @@ def _run_in_worktree(
     # ── Phase 3: Test (Haiku) ─────────────────────────────────────────────────
     log(f"[{entry_id}] phase 3/4: writing tests with {TEST_MODEL}")
     try:
-        run_claude_session(
+        run_model_session(
             session_type="evolve",
             prompt=build_test_prompt(intent, raw_diff, changed_so_far),
             timeout=120,
@@ -427,7 +427,7 @@ def _run_in_worktree(
     # ── Phase 4: QA (Sonnet, diff review) ────────────────────────────────────
     log(f"[{entry_id}] phase 4/4: QA review with {QA_MODEL}")
     try:
-        qa_result = run_claude_session(
+        qa_result = run_model_session(
             session_type="evolve",
             prompt=build_qa_prompt(intent, full_diff),
             timeout=90,
@@ -568,7 +568,7 @@ def _run_in_worktree(
 
 def _run_claude_direct(entry_id: str, intent: str, prompt: str, workdir: str) -> str:
     """Disabled: running without the session manager skips whitelist, diff, tests, and PR gate."""
-    log(f"[{entry_id}] REFUSING direct Claude execution — pxh.claude_session unavailable; "
+    log(f"[{entry_id}] REFUSING direct Claude execution — pxh.model_session unavailable; "
         "whitelist enforcement, test gate, and PR creation would all be bypassed. "
         "Fix the pxh package installation to restore evolution.")
     return "failed:no_session_manager"
