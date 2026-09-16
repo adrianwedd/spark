@@ -259,12 +259,23 @@ def circuit_summary() -> dict:
 
 
 def ask_m5(kind: str, prompt: str, system: str, *,
-           timeout_s: float | None = None, model: str | None = None) -> M5Result:
+           timeout_s: float | None = None, model: str | None = None,
+           lock_wait_s: float = 0.0) -> M5Result:
     """Run one no-tools turn on the pinned cognition model, without queueing.
 
     `model` overrides the tier's configured model for this one call — the seam
     a provider-neutral per-kind override needs (#317) — and the resolved model
     comes back on the result either way.
+
+    `lock_wait_s` is how long to wait for the tier's single-flight lock before
+    reporting `busy`. It defaults to 0 — *do not enqueue* — because a
+    background caller is better served by deferring than by queueing behind
+    another background caller. An **interactive** caller is the case that
+    rule did not anticipate: reflection holds this lock for a few seconds every
+    few minutes, and refusing a child instantly because a reflection started
+    300ms ago trades a certain answer for a certain "give me a second". A
+    short bounded wait buys the common case without making anyone queue behind
+    a 60-second consolidation.
     """
     started = time.monotonic()
     mode = (model or configured_model() or "").strip()
@@ -289,9 +300,10 @@ def ask_m5(kind: str, prompt: str, system: str, *,
 
     lock = FileLock(str(m5_lock_path()))
     try:
-        # Exactly zero wait: the lock spans processes and a caller must defer
-        # rather than enqueue behind another SPARK workload.
-        lock.acquire(timeout=0)
+        # Spans processes. Zero by default: a caller must defer rather than
+        # enqueue behind another SPARK workload — see `lock_wait_s` above for
+        # the one exception, which is the interactive path.
+        lock.acquire(timeout=max(0.0, lock_wait_s))
     except (FileLockTimeout, OSError):
         return _result("busy", kind=kind, started=started, error="M5 SPARK model busy")
     try:

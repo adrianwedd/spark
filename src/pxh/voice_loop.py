@@ -685,76 +685,89 @@ VOICE_TURN_KIND = "voice_turn"
 VOICE_UNAVAILABLE_ACK = "I heard you. Give me a second."
 
 
+# The interactive deadline, in seconds. 45s stays: a child is standing there.
+#
+# This duplicates `brain._DEADLINE_S["voice_turn"]` while both exist, and the
+# duplication is deliberate rather than an oversight. The number now belongs to
+# the caller — the kind is served by the cognition tier, and importing
+# `brain.py` (and through it tmux_claude) to read a constant is the dependency
+# this migration exists to remove. The two are pinned equal by
+# `tests/test_voice_turn_cognition.py::test_the_deadline_still_matches_the_brain_table`,
+# so drift fails a test instead of changing a child's wait in silence; the
+# brain-side entry and its pin are deleted together with the mailbox.
+VOICE_TURN_DEADLINE_S = float(os.environ.get("PX_VOICE_TURN_DEADLINE_S", "45"))
+
+# Interactive callers do not *enqueue* behind a background workload — that is
+# why the tier's lock is zero-wait — but they are the case that rule did not
+# anticipate. Reflection holds the same lock for a few seconds every few
+# minutes; refusing instantly because one started 300ms ago trades a certain
+# answer for a certain "give me a second". A short bounded wait buys the common
+# case without queueing anyone behind a 60-second consolidation.
+VOICE_TURN_LOCK_WAIT_S = float(os.environ.get("PX_VOICE_TURN_LOCK_WAIT_S", "5"))
+
+VOICE_TURN_RESPOND_WITH = (
+    'Respond with a single JSON object of the form {"tool": ..., "params": {...}} '
+    "exactly as the prompt instructs. Do not speak, move or remember anything "
+    "for this request — return the object and nothing else."
+)
+
+
 def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
-    """One conversation turn on the resident brain.
+    """One conversation turn on the cognition tier.
 
     Returns run_codex's (rc, stdout, stderr) shape so the turn loop below is
     unchanged, with VOICE_BRAIN_UNAVAILABLE for "could not be asked".
 
     **Retry is bounded by attempt count and by how the attempt failed, never by
-    sleeping.** `ask_brain` still collapses every failure into None (delivery
-    timeout, absent session, unvalidated session, lock contention, real request
-    timeout), so until brain.py preserves failure identity this uses the one
-    signal available: elapsed time. An attempt that returns well inside its
-    deadline did not think and fail — it failed to *deliver*, which is the
-    contention case a cheap immediate retry actually fixes. An attempt that
-    consumed its deadline means the brain is genuinely saturated, and asking it
-    twice would add load while a child waits. That one gets acknowledged, not
-    repeated.
+    sleeping — and now that failure has a name.** This used to be a heuristic
+    over elapsed time, because `ask_brain` collapsed delivery timeout, absent
+    session, unvalidated session, lock contention and a real request timeout
+    into one `None`. The tier reports which one it was, so the rule is stated
+    directly:
 
-    Nothing here escalates. There is no second model, no subprocess, no cloud
-    tier: a resident-brain failure must reduce work, and every tier that used
-    to sit under this path cost more to run than the session it was rescuing.
+      * `offline` / `bad_response` — a transport fault, and the one kind of
+        failure a cheap immediate retry actually fixes;
+      * `busy` — the lock was held for the whole bounded wait, so the tier is
+        genuinely occupied and a second ask would queue behind the same work;
+      * `timeout` — it told us it had none to give; asking twice adds load
+        while a child waits.
+
+    Only the first retries. Everything else goes straight to the acknowledgement.
+
+    Nothing here escalates. There is no second model and no subprocess: a
+    failed turn must *reduce* work, and the deterministic acknowledgement
+    (`VOICE_UNAVAILABLE_ACK`) is what tells a child he was heard. This is the
+    same policy as before, now enforced without guessing at the cause.
+
+    `trace_id` used to travel in the payload so brain.py could log the
+    wake-grant correlation id. The tier records kind, status and latency
+    instead; the correlation id's remaining job is in px-wake-listen, which
+    still exports it.
     """
-    from pxh import brain
+    from pxh import m5
 
-    deadline_s = float(brain.deadline_for_kind(VOICE_TURN_KIND))
-    fast_failure_s = deadline_s / 2
-    # px-wake-listen exports its wake-grant id as the one correlation id for
-    # this turn; absent when driven by --input-mode text or a bare voice loop
-    # invocation, in which case brain.py logs trace_id=null rather than
-    # inventing one — a missing id is honest signal that this call didn't
-    # originate from a real wake, not something to paper over.
-    trace_id = os.environ.get("PX_TRACE_ID")
-
+    last = "cognition tier did not answer"
     for attempt in range(1, attempts + 1):
-        started = time.monotonic()
         try:
-            reply = brain.ask_brain(VOICE_TURN_KIND, {
-                "prompt": prompt,
-                # The resident session's own prompt tells it to answer by
-                # acting. A voice turn is the opposite: voice_loop validates
-                # the action through policy and dispatches it, so a session
-                # that speaks here makes it happen twice — and does it without
-                # passing the audio gate.
-                "respond_with": (
-                    "a single JSON object of the form {\"tool\": ..., \"params\": {...}} "
-                    "exactly as the prompt instructs. Do not speak, move or "
-                    "remember anything for this request — return the object "
-                    "and nothing else."
-                ),
-                "trace_id": trace_id,
-            })
-        except Exception as exc:  # noqa: BLE001 - the loop must survive the brain
-            return VOICE_BRAIN_UNAVAILABLE, "", f"brain call raised: {exc}"
+            result = m5.ask_m5(
+                VOICE_TURN_KIND,
+                prompt + "\n\n" + VOICE_TURN_RESPOND_WITH + "\n",
+                "",
+                timeout_s=VOICE_TURN_DEADLINE_S,
+                lock_wait_s=VOICE_TURN_LOCK_WAIT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - the loop must survive the tier
+            return VOICE_BRAIN_UNAVAILABLE, "", f"cognition call raised: {exc}"
 
-        elapsed = time.monotonic() - started
-        if reply is not None:
-            answer = reply.get("reply")
-            try:
-                text = answer if isinstance(answer, str) else json.dumps(answer)
-            except (TypeError, ValueError):
-                return 1, "", "brain reply is not serialisable"
-            return 0, text, ""
+        if result.status == "available":
+            return 0, result.response, ""
 
-        if elapsed >= fast_failure_s or attempt == attempts:
-            return (VOICE_BRAIN_UNAVAILABLE, "",
-                    f"resident brain unavailable after {attempt} attempt(s) "
-                    f"({elapsed:.1f}s on the last)")
-        print(f"[voice-loop] brain delivery failed in {elapsed:.1f}s; one retry",
-              file=sys.stderr)
+        last = f"cognition tier {result.status}: {result.error}"
+        if result.status not in ("offline", "bad_response") or attempt == attempts:
+            break
+        print(f"[voice-loop] cognition {result.status}; one retry", file=sys.stderr)
 
-    return VOICE_BRAIN_UNAVAILABLE, "", "resident brain unavailable"
+    return VOICE_BRAIN_UNAVAILABLE, "", last
 
 
 def acknowledge_unavailable(dry_run: bool = False) -> bool:
