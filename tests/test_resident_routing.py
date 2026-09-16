@@ -50,7 +50,7 @@ def test_unrouted_kind_does_not_cold_start(monkeypatch):
     monkeypatch.setattr(claude_session.subprocess, "run", _boom)
 
     with pytest.raises(claude_session.ColdStartForbidden):
-        claude_session.run_claude_session("compose", "hi", skip_budget_check=True)
+        claude_session.run_claude_session("self_debug", "hi", skip_budget_check=True)
 
 
 def test_evolve_is_disabled_not_cold_started(monkeypatch):
@@ -67,10 +67,31 @@ def test_evolve_is_disabled_not_cold_started(monkeypatch):
         claude_session.run_claude_session("evolve", "hi", skip_budget_check=True)
 
 
-def test_default_routing_covers_every_kind_that_can_run_resident():
-    """If a kind can be served resident, it must be — otherwise it is disabled
-    by omission, which reads as a bug rather than a decision."""
+def test_every_known_kind_has_a_home_and_no_kind_has_two():
+    """The dial's old failure mode was a kind missing from it — disabled by
+    omission, which reads as a bug rather than a decision.
+
+    There are two destinations now (#317), so the invariant is stronger than
+    "every kind is listed": every kind the dispatcher knows about is served by
+    exactly one of them, and the two sets never overlap. An overlap would mean
+    a migrated kind could still be reached through the resident session, which
+    is the silent fallback the migration exists to remove.
+    """
     routed = claude_session.brain_kinds()
-    for kind in ("research", "compose", "post_qa", "reflection",
-                 "blog", "consolidate", "self_debug"):
-        assert kind in routed, f"{kind} would fail closed by accident"
+    cognition = claude_session._COGNITION_KINDS
+
+    assert not (routed & cognition)
+    assert routed == {"self_debug"}
+    assert cognition == {"consolidate", "research", "compose", "blog"}
+
+    # Deliberately backendless, and named rather than omitted:
+    #   evolve       — needs a git worktree the fixed tool envelope cannot give
+    #   conversation — legacy kind retained only in the quota/priority tables;
+    #                  no caller has used it since before the resident brain
+    backendless = {"evolve", "conversation"}
+    for kind in claude_session._DEFAULT_MODELS:
+        if kind in backendless:
+            continue
+        assert kind in routed or kind in cognition, (
+            f"{kind} has no backend — add it to _COGNITION_KINDS or to "
+            f"_DEFAULT_BRAIN_KINDS deliberately")

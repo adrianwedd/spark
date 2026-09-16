@@ -90,6 +90,12 @@ class M5Result:
     response: str = ""
     error: str = ""
     duration_ms: int = 0
+    # Reported so a caller can say what actually answered rather than what was
+    # configured (#317). Ollama echoes the served model in the response body;
+    # the counters are optional and read as 0 when absent.
+    model: str = ""
+    prompt_eval_count: int = 0
+    eval_count: int = 0
 
 
 def _state_dir() -> Path:
@@ -218,11 +224,21 @@ def meter_summary() -> dict:
     return data if isinstance(data, dict) else empty
 
 
+def _count(value: object) -> int:
+    """Ollama's token counters are optional; anything unusable reads as 0."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _result(status: M5Status, *, response: str = "", error: str = "",
-            kind: str, started: float) -> M5Result:
+            kind: str, started: float, model: str = "",
+            prompt_eval_count: int = 0, eval_count: int = 0) -> M5Result:
     duration_ms = round((time.monotonic() - started) * 1000)
     _record_request(kind, status, duration_ms)
-    return M5Result(status=status, response=response, error=error, duration_ms=duration_ms)
+    return M5Result(status=status, response=response, error=error, duration_ms=duration_ms,
+                    model=model, prompt_eval_count=prompt_eval_count, eval_count=eval_count)
 
 
 def _open_circuit(status: M5Status) -> None:
@@ -242,11 +258,17 @@ def circuit_summary() -> dict:
     return data if isinstance(data, dict) else {"status": None, "open_until_monotonic": 0.0}
 
 
-def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = None) -> M5Result:
-    """Run one no-tools turn on the pinned cognition model, without queueing."""
+def ask_m5(kind: str, prompt: str, system: str, *,
+           timeout_s: float | None = None, model: str | None = None) -> M5Result:
+    """Run one no-tools turn on the pinned cognition model, without queueing.
+
+    `model` overrides the tier's configured model for this one call — the seam
+    a provider-neutral per-kind override needs (#317) — and the resolved model
+    comes back on the result either way.
+    """
     started = time.monotonic()
-    mode = configured_model()
-    if mode is None:
+    mode = (model or configured_model() or "").strip()
+    if not mode:
         return _result("bad_response", kind=kind, started=started,
                        error="PX_M5_SPARK_MODEL must name a model explicitly (not auto)")
 
@@ -320,22 +342,26 @@ def ask_m5(kind: str, prompt: str, system: str, *, timeout_s: float | None = Non
                 body = json.loads(response.read())
         except (TimeoutError, socket.timeout) as exc:
             _open_circuit("timeout")
-            return _result("timeout", kind=kind, started=started, error=str(exc))
+            return _result("timeout", kind=kind, started=started, error=str(exc), model=model)
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
                 _open_circuit("timeout")
-                return _result("timeout", kind=kind, started=started, error=str(exc))
+                return _result("timeout", kind=kind, started=started, error=str(exc), model=model)
             _open_circuit("offline")
-            return _result("offline", kind=kind, started=started, error=str(exc))
+            return _result("offline", kind=kind, started=started, error=str(exc), model=model)
         except (urllib.error.HTTPError, OSError, ValueError) as exc:
             _open_circuit("bad_response")
-            return _result("bad_response", kind=kind, started=started, error=str(exc))
+            return _result("bad_response", kind=kind, started=started, error=str(exc), model=model)
 
         text = body.get("response") if isinstance(body, dict) else None
         if not isinstance(text, str) or not text.strip():
             _open_circuit("bad_response")
-            return _result("bad_response", kind=kind, started=started, error="M5 returned no usable response")
-        return _result("available", kind=kind, started=started, response=text.strip())
+            return _result("bad_response", kind=kind, started=started, model=model,
+                           error="M5 returned no usable response")
+        return _result("available", kind=kind, started=started, response=text.strip(),
+                       model=str(body.get("model") or model),
+                       prompt_eval_count=_count(body.get("prompt_eval_count")),
+                       eval_count=_count(body.get("eval_count")))
     finally:
         try:
             lock.release()

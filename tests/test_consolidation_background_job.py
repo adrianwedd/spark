@@ -375,6 +375,10 @@ def test_run_claude_session_defaults_to_the_declared_deadline(monkeypatch):
 
     None is what makes brain.py's per-kind table authoritative — ask_brain
     substitutes `deadline_for_kind(kind)` only when the caller passed nothing.
+
+    Driven with a kind that is still served residently: the tool-free kinds
+    (`consolidate` among them) moved to the cognition tier in #317 and no
+    longer reach `ask_brain` at all.
     """
     seen = {}
 
@@ -388,10 +392,10 @@ def test_run_claude_session_defaults_to_the_declared_deadline(monkeypatch):
     monkeypatch.setattr(claude_session, "SESSION_LOG",
                         claude_session.PROJECT_ROOT / "state" / "nonexistent.jsonl")
     monkeypatch.setattr(claude_session, "_log_session", lambda *a, **kw: None)
-    claude_session.run_claude_session("consolidate", "prompt", allowed_tools="")
-    assert seen["kind"] == "consolidate"
+    claude_session.run_claude_session("self_debug", "prompt", allowed_tools="")
+    assert seen["kind"] == "self_debug"
     assert seen["timeout_s"] is None
-    assert brain.deadline_for_kind("consolidate") == 600
+    assert brain.deadline_for_kind("self_debug") == 900
 
 
 def test_the_declared_600s_is_what_reaches_the_request(monkeypatch):
