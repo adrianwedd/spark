@@ -2451,6 +2451,75 @@ _REFLECTION_AWARENESS_KEYS = frozenset({
 })
 
 
+# How much of the world `self_debug` is allowed to carry into a prompt. The
+# model has no tools, so the snapshot *is* what it can see: bounded here, in
+# Python, rather than by an agent loop that could go looking (#317 Phase 2).
+SELF_DEBUG_LOG_LINES = 60
+SELF_DEBUG_SNAPSHOT_CHARS = 8000
+
+
+def self_debug_snapshot(awareness: dict | None = None,
+                        log_dir: Path | None = None) -> str:
+    """A bounded, tool-free diagnostic snapshot for `self_debug` (#317 Phase 2).
+
+    `self_debug` used to ask for `Read,Glob,Grep` and send a model looking. Two
+    things were wrong with that: the request went out over the resident Claude
+    session — the same mailbox that cost nine nights of memory (#310, #314) —
+    and answering "why is px-mind misbehaving" did not need a general-purpose
+    read capability over the repo, which is what that grant was (that session's
+    cwd is the repo root, so it reaches `state/` and `~/.claude` too).
+
+    The question is bounded, so the snapshot is:
+
+      * the health board — where a failing component actually shows up;
+      * awareness, through the *reflection* allowlist. This prompt now goes to
+        the same cloud provider reflection does, and it used to dump awareness
+        wholesale, so the allowlist is what keeps the two consistent;
+      * the tail of px-mind's own log.
+
+    Truncated to `SELF_DEBUG_SNAPSHOT_CHARS` so the prompt cannot grow with the
+    log file. Never raises: a diagnostic prompt that fails to build is worse
+    than one with a gap named in it.
+    """
+    parts: list[str] = []
+
+    try:
+        board = health_mod.read_health()
+        rows = []
+        for name, entry in sorted((board.get("components") or {}).items()):
+            status = entry.get("status")
+            if status and status != "ok":
+                rows.append(f"  {name}: {status} — "
+                            f"{entry.get('last_error') or 'no error recorded'} "
+                            f"(consecutive_failures={entry.get('consecutive_failures')})")
+        memory = board.get("memory_formation") or {}
+        if isinstance(memory, dict) and memory.get("overdue"):
+            rows.append(f"  memory_formation: last formed {memory.get('age_human')} "
+                        f"({memory.get('last_formed_ts')}) — overdue")
+        parts.append("Health board, non-ok components:\n" + ("\n".join(rows) or "  none"))
+    except Exception as exc:  # noqa: BLE001 - a snapshot reports, it never raises
+        parts.append(f"Health board: unavailable ({exc})")
+
+    try:
+        aware = {k: v for k, v in (awareness or {}).items()
+                 if k in _REFLECTION_AWARENESS_KEYS}
+        parts.append("Awareness:\n" + json.dumps(aware, indent=2, default=str))
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"Awareness: unavailable ({exc})")
+
+    try:
+        log_path = Path(log_dir or LOG_DIR) / "px-mind.log"
+        tail = log_path.read_text(encoding="utf-8").splitlines()[-SELF_DEBUG_LOG_LINES:]
+        parts.append(f"Recent px-mind log (last {len(tail)} lines):\n" + "\n".join(tail))
+    except Exception as exc:  # noqa: BLE001
+        parts.append(f"Recent px-mind log: unavailable ({exc})")
+
+    snapshot = "\n\n".join(parts)
+    if len(snapshot) > SELF_DEBUG_SNAPSHOT_CHARS:
+        snapshot = snapshot[:SELF_DEBUG_SNAPSHOT_CHARS] + "\n… (snapshot truncated)"
+    return snapshot
+
+
 def reflection(awareness: dict, dry: bool) -> dict | None:
     """Layer 2: produce a thought via Ollama."""
     global _last_spoken_text
@@ -3463,20 +3532,22 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
             log("expression: self_debug triggered — gathering diagnostics")
             try:
                 from pxh.claude_session import run_claude_session, SessionBudgetExhausted
-                # Gather diagnostic context
-                diag_context = f"Reflection failures detected. Awareness: {json.dumps(_aw)[:2000]}"
-                try:
-                    recent_log = (LOG_DIR / "px-mind.log").read_text(encoding="utf-8").splitlines()[-50:]
-                    diag_context += "\n\nRecent log:\n" + "\n".join(recent_log)
-                except Exception:
-                    pass
-
+                # The snapshot is assembled here, in Python, so the model needs
+                # no repo authority to answer (#317 Phase 2). No `timeout=`
+                # either: on the cognition tier the deadline is the tier's own
+                # (`PX_M5_SPARK_TIMEOUT_S`), and #291 is what an ad-hoc number
+                # costs — the tighter value always won and the declared budget
+                # was never once reachable.
                 result = run_claude_session(
                     session_type="self_debug",
-                    prompt=f"SPARK's reflection layer is failing. Diagnose:\n\n{diag_context}",
-                    timeout=600,
-                    allowed_tools="Read,Glob,Grep",
-                    skip_permissions=True,
+                    prompt=(
+                        "SPARK's reflection layer is failing. Diagnose what is "
+                        "wrong and what to check next.\n\n"
+                        "You have no tools and no filesystem access: the "
+                        "snapshot below is everything you can see.\n\n"
+                        + self_debug_snapshot(_aw)
+                    ),
+                    allowed_tools="",
                 )
                 # Save diagnostic report
                 report = {

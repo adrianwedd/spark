@@ -625,3 +625,46 @@ def test_expression_allows_presence_action_in_quiet_mode(monkeypatch):
     result = mind.expression({"action": "emote", "thought": "curious"}, dry=True, awareness=aw)
     assert result is True
     assert mock_run.called
+
+
+# --- #317 Phase 2: self_debug gets a snapshot, not a shell -------------------
+
+def _snapshot_env(tmp_path, monkeypatch, log_lines=60):
+    monkeypatch.setenv("PX_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("PX_HEALTH_DIR", str(tmp_path / "state" / "health"))
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / "px-mind.log").write_text(
+        "\n".join(f"log line {i}" for i in range(log_lines)) + "\n", encoding="utf-8")
+    return log_dir
+
+
+def test_self_debug_snapshot_is_allowlisted_and_carries_the_tail(tmp_path, monkeypatch):
+    """The model has no tools, so the snapshot *is* what it can see.
+
+    Same allowlist as the reflection prompt, and for a sharper reason: this
+    prompt now goes to the same cloud provider reflection does, and it used to
+    dump awareness wholesale to a *different* one.
+    """
+    log_dir = _snapshot_env(tmp_path, monkeypatch, log_lines=200)
+    snap = mind.self_debug_snapshot(
+        {"persona": "spark", "sonar_cm": 42,
+         "findmyhub": {"obi-bag": {"lat": -42.88, "lon": 147.32}},
+         "some_future_key": "NOVEL-KEY-MARKER"},
+        log_dir=log_dir)
+
+    assert "Health board" in snap
+    assert "sonar_cm" in snap and "42" in snap
+    assert "log line 199" in snap                     # the tail, not the head
+    assert "log line 0" not in snap
+    for leak in ("-42.88", "147.32", "findmyhub", "NOVEL-KEY-MARKER"):
+        assert leak not in snap, f"{leak} reached the self_debug prompt"
+
+
+def test_self_debug_snapshot_cannot_grow_with_the_log(tmp_path, monkeypatch):
+    """Bounded in Python, so the prompt cannot grow with the log file — which
+    is the property a tool-using agent would have had to enforce itself."""
+    log_dir = _snapshot_env(tmp_path, monkeypatch, log_lines=5000)
+    snap = mind.self_debug_snapshot({}, log_dir=log_dir)
+    assert len(snap) <= mind.SELF_DEBUG_SNAPSHOT_CHARS + 40
+    assert snap.endswith("(snapshot truncated)") or len(snap) < mind.SELF_DEBUG_SNAPSHOT_CHARS

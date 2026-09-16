@@ -25,7 +25,7 @@ import pytest
 
 from pxh import brain, claude_session as cs, m5
 
-MIGRATED = ("consolidate", "research", "compose", "blog")
+MIGRATED = ("consolidate", "research", "compose", "blog", "self_debug")
 
 
 def _ok(response="the answer", **kw):
@@ -122,18 +122,6 @@ def test_the_log_names_the_tier_that_answered(monkeypatch):
     assert entry["tokens"] == {"prompt": 1200, "eval": 310}
 
 
-def test_the_resident_path_records_its_provider_too(monkeypatch):
-    """One field, two values — a reader must never have to infer the tier."""
-    monkeypatch.setattr(brain, "ask_brain",
-                        lambda kind, payload, timeout_s=None, model=None: {"reply": "ok"})
-
-    cs.run_claude_session("self_debug", "diagnose", timeout=5)
-
-    entry = _entries()[-1]
-    assert entry["provider"] == cs.RESIDENT_PROVIDER
-    assert "tokens" not in entry
-
-
 def test_a_provider_neutral_model_override_is_honoured(monkeypatch):
     seen = {}
     monkeypatch.setattr(m5, "ask_m5",
@@ -170,3 +158,24 @@ def test_budget_and_quota_still_apply_to_migrated_kinds(monkeypatch):
         cs.run_claude_session("research", "a question")
 
     assert called == [], "the tier must not be called once the budget refuses"
+
+
+def test_a_cognition_kind_asked_for_tools_is_refused(monkeypatch):
+    """#317 Phase 2: the tier has no tool envelope, and the tempting failure
+    mode is to *ignore* the request and answer without the tools.
+
+    A caller that asked for `Read,Glob,Grep` and got a tool-less answer has no
+    way to tell that from a working one. `self_debug` was the last caller to
+    ask, and it now collects what it needs in Python instead.
+    """
+    called = []
+    monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: called.append(1) or _ok())
+
+    with pytest.raises(cs.CognitionTierToolsForbidden) as excinfo:
+        cs.run_claude_session("self_debug", "diagnose",
+                              allowed_tools="Read,Glob,Grep",
+                              skip_permissions=True, timeout=10)
+
+    assert "no tools" in str(excinfo.value)
+    assert "Read,Glob,Grep" in str(excinfo.value)
+    assert called == [], "the tier was called for a request it cannot honour"

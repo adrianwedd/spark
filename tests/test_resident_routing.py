@@ -37,20 +37,33 @@ def test_every_classified_kind_has_a_deadline():
 
 # ── Fail closed ────────────────────────────────────────────────────────────
 
-def test_unrouted_kind_does_not_cold_start(monkeypatch):
-    """The trust direction. Absent from the routing set must mean "no backend",
-    never "spawn a fresh Claude" — the same fix already made for
-    brain.session_for_kind (it raises rather than defaulting to a session),
-    applied to the one place that still defaulted open."""
-    monkeypatch.setenv("PX_BRAIN_KINDS", "research")
+@pytest.mark.parametrize("kind", sorted(claude_session._DEFAULT_MODELS))
+def test_no_kind_reaches_the_resident_session_any_more(kind, monkeypatch):
+    """#317 Phase 2: with `self_debug` migrated, the dispatcher's resident door
+    is shut for every kind it knows.
+
+    Either a kind is a cognition kind and is served by one API call, or it has
+    no backend at all and fails closed. Neither cold-starts Claude — the trust
+    direction the dial was introduced for, now stated over the whole table
+    instead of over a hand-listed subset, so a new kind cannot land in the gap.
+    """
+    monkeypatch.setenv("PX_BRAIN_KINDS", "self_debug")   # a dial entry routes nothing now
 
     def _boom(*a, **k):
-        raise AssertionError("cold-started Claude for an unrouted kind")
+        raise AssertionError("cold-started Claude")
 
     monkeypatch.setattr(claude_session.subprocess, "run", _boom)
+    monkeypatch.setattr(claude_session, "BUDGET_DISABLED", True)
+    monkeypatch.setattr(claude_session, "_log_session", lambda *a, **kw: None)
 
-    with pytest.raises(claude_session.ColdStartForbidden):
-        claude_session.run_claude_session("self_debug", "hi", skip_budget_check=True)
+    if kind in claude_session._COGNITION_KINDS:
+        from pxh import m5
+        monkeypatch.setattr(m5, "ask_m5",
+                            lambda *a, **k: m5.M5Result(status="available", response="ok"))
+        assert claude_session.run_claude_session(kind, "hi").returncode == 0
+    else:
+        with pytest.raises(claude_session.ColdStartForbidden):
+            claude_session.run_claude_session(kind, "hi")
 
 
 def test_evolve_is_disabled_not_cold_started(monkeypatch):
@@ -81,8 +94,8 @@ def test_every_known_kind_has_a_home_and_no_kind_has_two():
     cognition = claude_session._COGNITION_KINDS
 
     assert not (routed & cognition)
-    assert routed == {"self_debug"}
-    assert cognition == {"consolidate", "research", "compose", "blog"}
+    assert routed == frozenset(), "no kind is served residently by this dispatcher any more"
+    assert cognition == {"consolidate", "research", "compose", "blog", "self_debug"}
 
     # Deliberately backendless, and named rather than omitted:
     #   evolve       — needs a git worktree the fixed tool envelope cannot give
