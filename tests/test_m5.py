@@ -6,6 +6,7 @@ it names a role, not a host — see the module docstring.
 """
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
 from unittest.mock import MagicMock, patch
@@ -314,3 +315,96 @@ def test_probe_never_raises(monkeypatch, _isolated_m5):
     assert "OLLAMA_API_KEY" in _isolated_m5.probe()
     monkeypatch.setenv("PX_M5_SPARK_MODEL", "resident")
     assert "local daemon" in _isolated_m5.probe()
+
+
+# ---------------------------------------------------------------------------
+# HTTP status vs transport fault (#324)
+#
+# Every HTTP response used to arrive at the URLError branch, because
+# HTTPError is a subclass of URLError and that branch was written first. The
+# status was then reported as `offline` and opened the five-minute circuit,
+# so the actual reason survived exactly one log line and every later call in
+# the window read "M5 circuit open".
+# ---------------------------------------------------------------------------
+
+def _http_error(code: int, body: bytes = b"", url: str = "https://ollama.com/api/generate"):
+    return urllib.error.HTTPError(
+        url, code, f"HTTP {code}", MagicMock(), io.BytesIO(body))
+
+
+def test_http_status_is_caught_before_the_transport_branch(_isolated_m5):
+    """The regression itself: an HTTPError must not be read as URLError."""
+    with patch("urllib.request.urlopen", side_effect=_http_error(401, b'{"error":"invalid api key"}')):
+        result = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert result.status == "bad_response"
+    assert "offline" not in result.status
+    assert "401" in result.error
+    # The provider's own words, not just the number.
+    assert "invalid api key" in result.error
+
+
+def test_a_rejected_credential_reports_every_time_and_opens_no_circuit(_isolated_m5):
+    """A missing key is deliberately reported every time; a rejected one is
+    the same configuration fault and must not take the opposite path."""
+    # A fresh exception per call, deliberately: an HTTPError wraps one
+    # response body, and re-raising the same instance would read EOF the
+    # second time and make "the reason survives" untestable.
+    def _unauthorized(*_a, **_k):
+        raise _http_error(401, b'{"error":"invalid api key"}')
+
+    with patch("urllib.request.urlopen", side_effect=_unauthorized) as probe:
+        first = _isolated_m5.ask_m5("reflection", "prompt", "system")
+        second = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert first.status == second.status == "bad_response"
+    assert "invalid api key" in second.error, "the reason must survive the next call"
+    assert probe.call_count == 2, "no circuit means the probe is not suppressed"
+    assert _isolated_m5.circuit_summary()["status"] is None
+
+
+def test_a_refused_request_does_not_open_the_circuit(_isolated_m5):
+    """A 4xx is the request being refused; retrying it identically fails
+    identically, so a circuit buys nothing and costs the reason."""
+    for code in (400, 404, 413, 422):
+        _isolated_m5.reset_for_tests()
+        with patch("urllib.request.urlopen", side_effect=_http_error(code)):
+            assert _isolated_m5.ask_m5("describe_scene", "prompt", "system").status == "bad_response"
+        assert _isolated_m5.circuit_summary()["status"] is None, f"{code} opened a circuit"
+
+
+def test_rate_limiting_is_occupancy_not_an_outage(_isolated_m5):
+    """429 means slow down, which callers already model as `busy`."""
+    with patch("urllib.request.urlopen", side_effect=_http_error(429)):
+        result = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert result.status == "busy"
+    assert _isolated_m5.circuit_summary()["status"] is None
+
+
+def test_a_provider_fault_still_opens_the_circuit(_isolated_m5):
+    """5xx is the provider accepting the request and failing to serve it —
+    the case the circuit was built for. It must not be weakened away."""
+    def _unavailable(*_a, **_k):
+        raise _http_error(503)
+
+    with patch("urllib.request.urlopen", side_effect=_unavailable) as probe:
+        first = _isolated_m5.ask_m5("reflection", "prompt", "system")
+        second = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert first.status == "offline"
+    assert "503" in first.error
+    assert second.error == "M5 circuit open"
+    assert probe.call_count == 1
+    assert _isolated_m5.circuit_summary()["status"] == "offline"
+
+
+def test_an_unreadable_error_body_does_not_replace_the_status(_isolated_m5):
+    """Reading the provider's explanation must never be able to raise."""
+    broken = urllib.error.HTTPError(
+        "https://ollama.com/api/generate", 400, "HTTP 400", MagicMock(), None)
+
+    def _boom():
+        raise OSError("body gone")
+
+    broken.read = _boom
+    with patch("urllib.request.urlopen", side_effect=broken):
+        result = _isolated_m5.ask_m5("reflection", "prompt", "system")
+    assert result.status == "bad_response"
+    assert "400" in result.error
