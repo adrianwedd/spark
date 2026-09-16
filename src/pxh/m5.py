@@ -241,6 +241,80 @@ def _result(status: M5Status, *, response: str = "", error: str = "",
                     model=model, prompt_eval_count=prompt_eval_count, eval_count=eval_count)
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """The provider's own message from the error body, if it sent one.
+
+    A bare "HTTP Error 400" tells an operator nothing; the body usually names
+    the field that was wrong ("invalid api key", "model not found"). Bounded,
+    and never allowed to raise: failing to read the explanation must not
+    replace it.
+    """
+    try:
+        raw = exc.read()
+    except Exception:  # noqa: BLE001 - a missing body is not the failure being reported
+        return ""
+    if not raw:
+        return ""
+    try:
+        text = raw.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+            return parsed["error"][:300]
+    except ValueError:
+        pass
+    return " ".join(text.split())[:300]
+
+
+def _http_error_result(exc: urllib.error.HTTPError, kind: str, started: float,
+                       model: str) -> M5Result:
+    """Classify an HTTP status instead of reading every one as `offline`.
+
+    Three different things arrive as an HTTP status and only one of them is
+    the provider being unreachable:
+
+    * **401/403** — the credential was rejected. A configuration fault, and
+      the same one the missing-key branch above reports every time without
+      opening a circuit; an invalid key and an absent one should not take
+      two different paths through this function. (#317's acceptance names
+      this case explicitly.)
+    * **429** — the tier is telling us to slow down. That is occupancy, not
+      an outage, and `busy` is the status callers already read as "genuinely
+      occupied, do not queue behind it".
+    * **other 4xx** — the request was refused (bad image, bad field, model
+      not found). Retrying the identical request fails identically, so a
+      circuit buys nothing and costs the reason.
+
+    **5xx** is the one that stays a circuit: the provider accepted the
+    request and failed to serve it, which is what the circuit is for. The
+    status code stays in the message so the first failure of the window
+    still says what happened.
+    """
+    code = getattr(exc, "code", None)
+    label = f"HTTP {code}" if code is not None else f"HTTP error: {exc}"
+    detail = _http_error_detail(exc)
+    if detail:
+        label = f"{label}: {detail}"
+
+    if code in (401, 403):
+        # The provider's own words where it sent any: "invalid api key" is a
+        # better pointer than the status alone, and the remedy is worth
+        # spelling out because this one is fixed by a human, not a retry.
+        return _result("bad_response", kind=kind, started=started, model=model,
+                       error=(f"HTTP {code}: {detail or 'credential rejected'} — the "
+                              f"cognition tier rejected the credential; check "
+                              f"{_API_KEY_VARS[1]} (or {_API_KEY_VARS[0]})"))
+    if code == 429:
+        return _result("busy", kind=kind, started=started, model=model, error=label)
+    if code is not None and 400 <= code < 500:
+        return _result("bad_response", kind=kind, started=started, model=model, error=label)
+
+    _open_circuit("offline")
+    return _result("offline", kind=kind, started=started, model=model, error=label)
+
+
 def _open_circuit(status: M5Status) -> None:
     try:
         atomic_write(_circuit_path(), json.dumps({"status": status,
@@ -351,7 +425,9 @@ def ask_m5(kind: str, prompt: str, system: str, *,
             # one: report it every time rather than opening a circuit that
             # would hide the message behind "M5 circuit open" for five
             # minutes. Same fail-closed-without-a-network-probe shape as the
-            # missing-model check above.
+            # missing-model check above. A credential the provider *rejects*
+            # is the same fault and takes the same path — see
+            # `_http_error_result`, which is where that used to go wrong.
             return _result("bad_response", kind=kind, started=started,
                            error=(f"no API key for hosted Ollama host {M5_HOST} — set "
                                   f"{_API_KEY_VARS[1]} (or {_API_KEY_VARS[0]})"))
@@ -364,13 +440,24 @@ def ask_m5(kind: str, prompt: str, system: str, *,
         except (TimeoutError, socket.timeout) as exc:
             _open_circuit("timeout")
             return _result("timeout", kind=kind, started=started, error=str(exc), model=model)
+        except urllib.error.HTTPError as exc:
+            # Deliberately *before* the URLError branch, and the order is the
+            # whole fix: HTTPError is a subclass of URLError, so a
+            # transport-shaped `except urllib.error.URLError` catches every
+            # HTTP response and the status branch below it never runs at all.
+            # Every status therefore used to be read as a transport fault —
+            # a rejected credential came back as `offline`, opened the
+            # five-minute circuit, and the real status was gone from every
+            # later record. That is the identical hiding the missing-key
+            # branch above exists to prevent, reached from the other side.
+            return _http_error_result(exc, kind, started, model)
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
                 _open_circuit("timeout")
                 return _result("timeout", kind=kind, started=started, error=str(exc), model=model)
             _open_circuit("offline")
             return _result("offline", kind=kind, started=started, error=str(exc), model=model)
-        except (urllib.error.HTTPError, OSError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             _open_circuit("bad_response")
             return _result("bad_response", kind=kind, started=started, error=str(exc), model=model)
 
