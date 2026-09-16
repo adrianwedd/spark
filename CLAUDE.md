@@ -65,6 +65,8 @@ A test that wants the real log dir or the real tmux socket must be marked `live`
 
 **Critical gotchas:**
 - `update_session()` calls `ensure_session()` *before* acquiring the lock — `FileLock` is not reentrant
+- **The session lock is shared by two users, so its mode is a contract, not a default (#315).** `state/session.json.lock` is taken by the `pi` daemons *and* by root tools launched through `px-gpio-run` (`tool-look`, `tool-emote` and the rest call `update_session()`), and `filelock` opens it for *writing* — so whoever creates it sets the permissions for everyone. `_session_lock()` therefore creates it `0666` and reclaims one it cannot open (unlink, which needs write permission on `state/`, not on the file). Do not "tighten" it to 0644: a root-created 0644 lock is unopenable from every `pi` daemon, and px-mind crash-looped 59 times on exactly that on 2026-09-16. Note that a *held* lock leaves no file behind (`UnixFileLock._release()` unlinks it), so the hazardous state is a **lingering** one — what a holder that was killed rather than released leaves.
+- A **daemon that dies on startup records a health failure**. Absence is the one state the health store cannot report, so a crash-looping component used to read `ok` on the strength of the previous run's last write (`px-mind`, same incident). `mind.main()`'s fatal path now records before returning.
 - `api.py` PIN rate limit store capped at 10k IPs with oldest-first eviction; `X-Forwarded-For` trusted from localhost only
 
 ### os.getlogin() Under Systemd
