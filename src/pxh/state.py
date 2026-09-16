@@ -205,12 +205,77 @@ def _require_filelock():
         )
 
 
+# The session lock file is shared by two different users, so it is created
+# writable by both — the same shape /tmp and `state/health/` already use for
+# the same reason (`filelock` opens the lock for *writing*, so its mode decides
+# who may take it).
+SESSION_LOCK_MODE = 0o666
+
+
+def _reclaim_unusable_lock(lock_path: str) -> None:
+    """Unlink a session lock file this user cannot open (#315).
+
+    `filelock` opens the lock file for writing, so its ownership decides who
+    may take the session lock — and on this host two different users need to.
+    The `pi` daemons hold the session, and so do the tools launched through
+    `/usr/local/sbin/px-gpio-run`, which run as root (`tool-look`, `tool-emote`
+    and their siblings call `update_session()`). Whichever process creates the
+    file first sets its ownership, and a root-created 0644 lock is unopenable
+    from every `pi` daemon.
+
+    That is #315, live on 2026-09-16: the lock was `root:root 0644`, and
+    `px-mind` crash-looped — 59 restarts — on
+    `fatal: [Errno 13] Permission denied: '…/state/session.json.lock'` until a
+    human removed the file and restarted the unit.
+
+    A *held* lock leaves no file to trip over: `UnixFileLock._release()`
+    unlinks it. The hazardous state is therefore a **lingering** one, which is
+    what a holder that was killed rather than released leaves behind — and it
+    is exactly what a root tool killed mid-motion leaves.
+
+    Reclaiming it is permitted because the user who needs the session also
+    owns `state/`: unlinking needs write permission on the *directory*, not on
+    the file. This is the repair an operator applies by hand, automated.
+
+    The cost is a little strictness in a case that was already broken: if a
+    root tool holds the lock at the moment we reclaim it, both sides write.
+    Session writes are whole-document `atomic_write`s, so the worst case is one
+    field update lost between two writers — against a daemon that otherwise
+    cannot start at all.
+
+    Best-effort: any failure here leaves the previous behaviour, never a worse
+    one.
+    """
+    try:
+        os.close(os.open(lock_path, os.O_WRONLY))
+        return                                  # already usable
+    except FileNotFoundError:
+        return                                  # nothing to reclaim
+    except PermissionError:
+        pass                                    # exists, and is not ours to write
+    except OSError:
+        return
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+
+
+def _session_lock(lock_path: str) -> "FileLock":
+    """The session lock, prepared so either user can take it (#315)."""
+    _require_filelock()
+    _reclaim_unusable_lock(lock_path)
+    # `mode` is applied exactly, not through the umask, so this is what makes a
+    # freshly created lock 0666 rather than 0644.
+    return FileLock(lock_path, timeout=LOCK_TIMEOUT_S, mode=SESSION_LOCK_MODE)
+
+
 def ensure_session() -> Path:
     _require_filelock()
     path = session_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    with _session_lock(lock_path):
         if not path.exists():
             if TEMPLATE_PATH.exists():
                 atomic_write(path, TEMPLATE_PATH.read_text(encoding="utf-8"))
@@ -329,7 +394,7 @@ def _heal_corrupt_session(path: Path) -> Dict[str, Any]:
 def load_session() -> Dict[str, Any]:
     path = ensure_session()
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    with _session_lock(lock_path):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
@@ -363,7 +428,7 @@ def save_session(data: Dict[str, Any]) -> None:
     """
     path = ensure_session()
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    with _session_lock(lock_path):
         data = dict(data)
         # A caller round-tripping a recovered session writes deliberate state;
         # the recovery taint must not be re-persisted with it (#208).
@@ -407,7 +472,7 @@ def update_session(
     # the same lock internally and FileLock is not reentrant.
     path = ensure_session()
     lock_path = str(path) + ".lock"
-    with FileLock(lock_path, timeout=LOCK_TIMEOUT_S):
+    with _session_lock(lock_path):
         just_recovered = False
         try:
             data = json.loads(path.read_text(encoding="utf-8"))

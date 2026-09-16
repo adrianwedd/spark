@@ -3919,6 +3919,14 @@ def main(argv) -> int:
         pass
     except Exception as exc:
         log(f"fatal: {exc}")
+        # A daemon that dies on startup used to be invisible: it never reached
+        # the tick that records health, and "has never written a record" is the
+        # one state the health store cannot report (#310). On 2026-09-16
+        # px-mind crash-looped for a minute with its health file reading `ok`,
+        # because the last write was the *previous* run's. Recording the fatal
+        # is the difference between an operator reading "px-mind is failing"
+        # and an operator reading nothing at all.
+        health_mod.record_failure("px-mind", f"fatal: {exc}")
         return 1
     finally:
         _safe_unlink_pid()

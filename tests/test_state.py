@@ -1,4 +1,5 @@
 import json
+import os
 
 import pxh.state as state
 
@@ -533,3 +534,49 @@ def test_a_clean_session_never_carries_the_stamp(tmp_path, monkeypatch):
     monkeypatch.setenv("PX_SESSION_PATH", str(session_file))
     state.save_session({"history": []})
     assert state.RECOVERED_KEY not in state.load_session()
+
+
+# ---------------------------------------------------------------------------
+# Session lock ownership (#315)
+# ---------------------------------------------------------------------------
+
+def test_the_session_lock_is_created_writable_by_both_users(tmp_path, monkeypatch):
+    """The lock file is shared by `pi` and by root tools, so its mode is part
+    of the contract rather than an accident of whoever created it first.
+
+    Pinned *while held*: `filelock` unlinks the lock on release, so the file
+    only exists for the duration of a lock — or until a holder that was killed
+    before releasing leaves one behind.
+    """
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    lock = tmp_path / "session.json.lock"
+
+    with state._session_lock(str(lock)):
+        assert lock.exists()
+        assert (lock.stat().st_mode & 0o777) == 0o666
+
+
+def test_a_session_lock_we_cannot_open_is_reclaimed(tmp_path, monkeypatch):
+    """#315, the live failure: a root-owned 0644 lock made every `pi` daemon
+    fail with EACCES, and px-mind crash-looped 59 times until a human removed
+    the file.
+
+    A 000 lock file is the same *unopenable* state from this process's seat,
+    and it is reachable in a test. The daemon's job is to reclaim it and keep
+    working — not to die on it.
+    """
+    monkeypatch.setenv("PX_SESSION_PATH", str(tmp_path / "session.json"))
+    state.update_session(fields={"mode": "live", "persona": "spark"})
+
+    lock = tmp_path / "session.json.lock"
+    lock.write_bytes(b"")
+    os.chmod(lock, 0o000)
+
+    data = state.load_session()          # raised PermissionError before #315
+    assert data["persona"] == "spark"
+
+    # ...and the write path reclaims it too, not just the read path.
+    lock.write_bytes(b"")
+    os.chmod(lock, 0o000)
+    state.update_session(fields={"mode": "dry-run"})
+    assert state.load_session()["mode"] == "dry-run"
