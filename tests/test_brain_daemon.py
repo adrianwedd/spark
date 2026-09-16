@@ -43,6 +43,7 @@ class _FakeTmux:
         self.keys = []
         self.killed = []
         self.created = []
+        self.pane = ""
 
     def install(self, monkeypatch):
         monkeypatch.setattr(tmux_claude, "session_exists",
@@ -52,6 +53,7 @@ class _FakeTmux:
         monkeypatch.setattr(tmux_claude, "inject", self._inject)
         monkeypatch.setattr(tmux_claude, "send_key", self._send_key)
         monkeypatch.setattr(tmux_claude, "kill_session", self._kill)
+        monkeypatch.setattr(tmux_claude, "pane_text", lambda spec=None: self.pane)
         monkeypatch.setattr(tmux_claude, "HolderClient", _FakeHolder)
         return self
 
@@ -939,6 +941,177 @@ def test_self_heal_never_recycles_mid_request(fake_tmux):
     assert not any("/clear" in text for _, text in fake_tmux.injected)
     assert state.consecutive_handshake_failures >= brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES, \
         "a withheld self-heal must not reset the counter — the session is still degraded"
+
+
+# ---------------------------------------------------------------------------
+# The recovery ladder — what a session that refuses prompts gets instead
+#
+# 2026-09-15: a resident session whose OAuth refresh token had expired rejected
+# every prompt, including the self-heal's own journal+/clear turn, and did so
+# for 17 hours. 400 exhausted handshakes and 133 self-heals produced no
+# escalation, because every recovery this supervisor owned needed the
+# cooperation of the thing that had stopped cooperating: run_handshake never
+# kills (#237), and check_wedge's kill is gated on the pane NOT showing the
+# prompt glyph, which a rejecting session renders anyway.
+#
+# These pin the four load-bearing properties of the replacement: it escalates,
+# it escalates only on demonstrated failure, it stops, and it says what it
+# stopped on.
+# ---------------------------------------------------------------------------
+
+def _run_self_heal_episode(state):
+    """One recovery window: threshold failures, then one attempt."""
+    state.consecutive_handshake_failures = brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES
+    brain_daemon.maybe_self_heal(state)
+
+
+def test_self_heal_escalates_off_the_prompt_once_the_prompt_is_refused(fake_tmux):
+    """Rung 1 stays the prompt, because it is the only one that preserves work.
+    Rung 2 must NOT be another prompt — a session that refuses prompts refuses
+    the recovery prompt too, which is the whole finding."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+
+    _run_self_heal_episode(state)
+    assert any("journal.md" in text for _, text in fake_tmux.injected), \
+        "rung 1 is still the journal-then-/clear turn"
+    assert state.self_heal_stage == 1
+
+    _run_self_heal_episode(state)
+    assert fake_tmux.injected[-1] == (session, "/clear"), \
+        "rung 2 is the bare /clear keystroke — a local command needing no turn"
+    assert state.self_heal_stage == 2
+
+
+def test_self_heal_recreates_the_session_when_typed_clear_also_fails(fake_tmux):
+    """Rung 3 asks the session for nothing at all, and is certain rather than
+    hopeful: bin/px-claude-session launches claude with no --continue, so the
+    replacement's context is empty by construction."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    state.holder = object()
+
+    for _ in range(3):
+        _run_self_heal_episode(state)
+
+    assert fake_tmux.killed == [session]
+    assert state.holder is None, "the holder is attached to a session that is gone"
+    assert state.self_heal_stage == len(brain_daemon.SELF_HEAL_METHODS)
+
+
+def test_the_ladder_holds_and_names_the_cause_once_it_runs_out(fake_tmux):
+    """Stopping is the point. Past the last rung nothing a machine can do
+    remains, so the supervisor holds and the health file names the cause
+    instead of repeating "handshake failed" for another 17 hours."""
+    from pxh import health
+
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    fake_tmux.pane = "\u25cf Login expired \u00b7 Please run /login"
+
+    for _ in range(len(brain_daemon.SELF_HEAL_METHODS) + 1):
+        _run_self_heal_episode(state)
+
+    injected_before = len(fake_tmux.injected)
+    killed_before = list(fake_tmux.killed)
+    _run_self_heal_episode(state)
+
+    assert len(fake_tmux.injected) == injected_before, "there is no fourth method"
+    assert fake_tmux.killed == killed_before, "and nothing left to kill"
+    assert state.self_heal_held_since > 0.0, "the ladder holds rather than retrying"
+
+    record = health.read_health(("px-brain",))["components"]["px-brain"]
+    assert "run /login" in record["last_error"], \
+        "the health file names the cause read off the pane"
+
+
+def test_the_ladder_is_not_reset_by_the_recreate_it_asked_for(fake_tmux):
+    """A fresh context is not evidence that the cause is gone. If a recreation
+    reset the ladder it would cycle recycle -> clear -> recreate forever, which
+    is the churn the ladder exists to replace."""
+    session = brain.BRAIN_SESSION
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    state.self_heal_stage = len(brain_daemon.SELF_HEAL_METHODS)
+
+    assert brain_daemon.start_session(
+        state, datetime.now(brain_daemon.HOBART)) is True
+    assert session in fake_tmux.sessions, "start_session rebuilt it"
+    assert state.self_heal_stage == len(brain_daemon.SELF_HEAL_METHODS), \
+        "the replacement session inherits the episode's escalation history"
+
+
+def test_a_successful_handshake_resets_the_recovery_ladder(
+        fake_tmux, _fast_handshake, monkeypatch):
+    """A real round trip is the only proof the session is working again, so it
+    is the only thing that starts the ladder over."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", _echo_when_nudged(fake_tmux, session))
+
+    state = _state(session)
+    state.self_heal_stage = 2
+    state.self_heal_held_since = 123.0
+    assert brain_daemon.run_handshake(state, "no_marker") is True
+    assert state.self_heal_stage == 0
+    assert state.self_heal_held_since == 0.0
+
+
+def test_a_dropped_keystroke_does_not_spend_a_rung(fake_tmux, monkeypatch):
+    """A recovery whose keystroke never landed was never tried. Advancing on it
+    would spend the escalation on nothing — the same rule _inject_recycle's
+    caller already follows for its own bookkeeping."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    monkeypatch.setattr(tmux_claude, "inject", lambda text, spec=None: False)
+
+    state = _state(session)
+    _run_self_heal_episode(state)
+    assert state.self_heal_stage == 0, "no rung was actually used"
+    assert state.consecutive_handshake_failures == brain_daemon.SELF_HEAL_HANDSHAKE_FAILURES, \
+        "and the session is still recorded as degraded"
+
+
+def test_the_ladder_restarts_after_the_hold_expires(fake_tmux):
+    """The hold is bounded on purpose: exhaustion is evidence about the cause
+    that was live at the time, and a different cause arriving later must not
+    find the escalation switched off for good."""
+    session = brain.BRAIN_SESSION
+    fake_tmux.sessions.add(session)
+    brain.ensure_mailbox(session)
+    state = _state(session)
+    state.self_heal_stage = len(brain_daemon.SELF_HEAL_METHODS)
+    state.self_heal_held_since = time.monotonic() - (brain_daemon.SELF_HEAL_HOLD_S + 1.0)
+
+    _run_self_heal_episode(state)
+
+    assert state.self_heal_held_since == 0.0, "the hold expired"
+    assert state.self_heal_stage == 1, "back to the rung that preserves work"
+    assert any("journal.md" in text for _, text in fake_tmux.injected)
+
+
+def test_a_session_refusal_is_read_off_the_pane(monkeypatch):
+    """The session's own words are the only thing that separates "slow" from
+    "cannot act at all" — the distinction this supervisor did not have, and the
+    reason 400 failures could not be told apart from a bad afternoon."""
+    spec = brain.spec_for_session(brain.BRAIN_SESSION)
+
+    monkeypatch.setattr(
+        tmux_claude, "pane_text",
+        lambda spec=None: "\u276f hi\n  \u23bf  Prompt is too long \u00b7 automatic "
+                          "compaction failed: Login expired")
+    assert "run /login" in brain_daemon._session_refusal(spec)
+
+    monkeypatch.setattr(tmux_claude, "pane_text", lambda spec=None: "\u276f all good")
+    assert brain_daemon._session_refusal(spec) is None
 
 
 def test_the_prompt_explains_the_handshake_with_the_placeholder():
