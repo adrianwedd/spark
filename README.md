@@ -18,7 +18,9 @@ SPARK is not a therapist, a tutor, or an assistant. It's a robot friend that hap
 - **Meltdown protocol** — Three S's: Safety, Silence, Space. Robot goes quiet and stays present. No words.
 - **Sideways engagement** — when demand-avoidance is high, SPARK narrates rather than instructs, lets curiosity do the work
 
-SPARK runs on Claude (via `px-spark` / `run-voice-loop-claude`, both routing to the resident `spark-brain` session), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en+m3`, pitch 82, rate 120) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
+SPARK's voice runs on the hosted **cognition tier** (via `px-spark` and `run-voice-loop-tier`, both landing on `pxh.m5` — one direct Ollama Cloud API call), with the full intelligence of the model behind every response. It uses clear, measured espeak settings (`en+m3`, pitch 82, rate 120) and a system prompt grounded entirely in the AuDHD (ADHD + ASD comorbid) profile.
+
+There is no resident model session and no CLI in the path (#317 Phase 3). The application owns transport; the model supplies content. A spoken sentence cannot be produced by the model and then lost between the model and the child, because nothing carries it but the socket.
 
 ```bash
 bin/px-spark [--dry-run] [--input-mode voice|text]
@@ -73,12 +75,11 @@ bin/px-spark [--dry-run] [--input-mode voice|text]
 
 ### The Three Brains
 
-**Voice Loop** — The reactive mind. Listens for commands, calls LLMs, dispatches tools. Four backends share the same `pxh.voice_loop` core:
+**Voice Loop** — The reactive mind. Listens for commands, calls a model, dispatches tools. Three launchers share the same `pxh.voice_loop` core, and the wake listener uses the first:
 
 | Launcher | Backend | Persona |
 |---|---|---|
-| `px-spark` | resident `spark-brain` session | SPARK — child companion |
-| `run-voice-loop-claude` | resident `spark-brain` session | Default Claude |
+| `run-voice-loop-tier` | cognition tier (`pxh.m5`) | SPARK — child companion (`px-spark` delegates here) |
 | `run-voice-loop` | Codex CLI | Default |
 | `run-voice-loop-ollama` | Ollama Cloud (via `codex-ollama`) | Default |
 
@@ -115,7 +116,6 @@ Boot
  ├── px-wake-listen.service     (pi)     — loads Vosk wake word model; starts mic capture loop
  ├── px-battery-poll.service    (root)   — polls Robot HAT ADC every 30s → state/battery.json; plays rising/falling sweep tones on plug/unplug with voice announcement; escalating warnings + emergency shutdown at 10%
  ├── px-mind.service            (pi)     — cognitive loop daemon (awareness → reflection → expression)
- ├── px-brain.service           (pi)     — resident Claude session supervisor (spark-brain; KillMode=process)
  ├── px-api-server.service      (pi)     — REST API + SPARK web dashboard on port 8420
  ├── px-post.service            (pi)     — social posting daemon; watches thoughts, QA-gates via the hosted cognition tier, posts to Bluesky + local feed
  ├── px-frigate-stream.service  (pi)     — local go2rtc RTSP server for Frigate camera integration (stops px-alive to claim libcamera)
@@ -149,7 +149,7 @@ px-spark
 
 After step 6, `px-spark` is replaced by `codex-voice-loop` via `exec` (no fork). The voice loop process inherits all environment variables and owns the terminal.
 
-`PX_VOICE_BACKEND=brain` is the key to persona routing: instead of piping the prompt to `codex exec`, the voice loop sends a `voice_turn` request to the **resident `spark-brain` session** and gets an action object back. There is no per-turn Claude process — see the resident-only invariant in CLAUDE.md.
+`PX_VOICE_BACKEND=tier` is the key to persona routing: instead of piping the prompt to `codex exec`, the voice loop makes **one direct API call** to the cognition tier (`pxh.m5`) and gets an action object back. No process is spawned per turn, and no session holds a login — see the no-resident-Claude invariant in CLAUDE.md.
 
 ### 3. Wake Word Path
 
@@ -191,20 +191,20 @@ build_model_prompt()
  └── user_transcript  = session.transcript (the STT text)
 ```
 
-This prompt becomes the payload of a `voice_turn` request to the resident session:
+This prompt is the body of one direct API call:
 
 ```
 voice_loop.run_voice_turn(prompt)
- 1. brain.ask_brain("voice_turn", {prompt, respond_with})   # 45s deadline
- 2. the resident spark-brain session answers by RETURNING an action object
- 3. reply lands in state/brain/spark-brain/outbox/<id>.json
- 4. voice_loop validates it through policy, then dispatches the tool itself
+ 1. m5.ask_m5("voice_turn", prompt + respond_with, VOICE_TURN_SYSTEM)  # 45s
+ 2. the model returns the action object as the HTTP response body
+ 3. voice_loop validates it through policy, then dispatches the tool itself
 ```
 
-If the session cannot be reached, one cheap retry on a *delivery* failure, then
-a deterministic local line ("I heard you. Give me a second.") through the same
-audio policy gate — never another model. There is no cold `claude -p` fallback
-(see the resident-only invariant in CLAUDE.md).
+If the tier cannot be reached, one cheap retry on a *transport* failure
+(`offline`/`bad_response` — the two a retry actually fixes), then a
+deterministic local line ("I heard you. Give me a second.") through the same
+audio policy gate — never another model. There is no cold `claude -p` fallback,
+no session, and no mailbox (see the no-resident-Claude invariant in CLAUDE.md).
 
 The voice loop captures the response and scans it for a JSON action object. It uses `JSONDecoder.raw_decode()` with a multi-line fallback scan — so Claude can reason in plain text above the action, and the final JSON is extracted cleanly:
 
@@ -453,8 +453,8 @@ For a typical SPARK voice interaction:
 [t=7.5s]  session.transcript saved; session.listening = true
 [t=8s]    voice_loop detects listening=true
 [t=8s]    build_model_prompt() → 4KB prompt (system + session + thoughts + transcript)
-[t=8s]    voice_loop sends a voice_turn request to the resident brain
-[t=11s]   Claude responds → {"tool": "tool_routine", "params": {"action": "load", "name": "morning"}}
+[t=8s]    voice_loop calls the cognition tier (voice_turn)
+[t=11s]   the model returns → {"tool": "tool_routine", "params": {"action": "load", "name": "morning"}}
 [t=11s]   validate_action() sanitises params → env vars
 [t=11s]   execute_tool() injects SPARK voice env
 [t=11.1s] bin/tool-routine runs, loads morning routine, updates session
@@ -507,7 +507,6 @@ sudo systemctl status px-alive             # Idle gaze drift daemon
 sudo systemctl status px-wake-listen       # Wake word listener
 sudo systemctl status px-battery-poll      # Battery voltage poller (writes state/battery.json)
 sudo systemctl status px-mind              # Cognitive loop daemon (awareness → reflection → expression)
-sudo systemctl status px-brain             # Resident Claude session supervisor (spark-brain)
 sudo systemctl status px-api-server        # REST API + web dashboard (:8420)
 sudo systemctl status px-post              # Social posting daemon (Bluesky)
 sudo systemctl status px-frigate-stream    # Frigate camera RTSP stream
@@ -795,8 +794,8 @@ The trust boundary is fixed: semantic intelligence (Claude, Ollama) proposes act
 | `PX_VOICE_DEVICE` | ALSA output device | `robothat` |
 | `PX_API_TOKEN` | REST API bearer token | from `.env` |
 | `PX_WAKE_WORD` | Wake phrase | `hey robot` |
-| `CODEX_CHAT_CMD` | Override non-Claude LLM CLI (codex/ollama) | set by launcher |
-| `PX_VOICE_BACKEND` | `brain` routes voice turns to the resident session | set by launcher |
+| `CODEX_CHAT_CMD` | Override the external LLM CLI (codex/ollama) | set by launcher |
+| `PX_VOICE_BACKEND` | `tier` routes voice turns to the cognition tier | set by launcher |
 | `PX_WATCHDOG_STALE_SECONDS` | Watchdog timeout | `30` |
 | `PX_PERSONA` | Active persona (`spark` / `vixen` / `gremlin`) | from session |
 | `OLLAMA_API_KEY` | Ollama Cloud bearer token (cognition tier + persona chat) | from `.env` |
@@ -822,7 +821,7 @@ picar-x-hacking/
 │   ├── px-statusline             # Claude Code statusbar script
 │   ├── px-{circle,drive,look,…}  # Hardware control scripts
 │   ├── tool-{voice,look,drive,…} # Voice loop tool wrappers (42 tools)
-│   ├── run-voice-loop{,-claude,-ollama}  # Voice backend launchers
+│   ├── run-voice-loop{,-tier,-ollama}   # Voice backend launchers
 ├── src/pxh/                      # Python library (10 modules)
 │   ├── state.py                  # FileLock session, atomic_write, rotate_log
 │   ├── mind.py                   # Cognitive loop daemon (3,300+ lines)
@@ -840,7 +839,7 @@ picar-x-hacking/
 ├── tests/                        # 1652 tests (26 require live hardware)
 ├── docs/prompts/
 │   ├── spark-voice-system.md     # SPARK persona (child companion)
-│   ├── claude-voice-system.md    # Default Claude voice loop
+│   ├── voice-system.md           # Default voice loop prompt
 │   ├── codex-voice-system.md     # Codex voice loop
 │   ├── persona-gremlin.md        # GREMLIN (adult, Ollama)
 │   └── persona-vixen.md          # VIXEN (adult, Ollama)
@@ -851,7 +850,6 @@ picar-x-hacking/
 │   ├── px-wake-listen.service
 │   ├── px-battery-poll.service
 │   ├── px-mind.service
-│   ├── px-brain.service
 │   ├── px-api-server.service
 │   ├── px-post.service
 │   ├── px-frigate-stream.service

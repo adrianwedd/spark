@@ -690,7 +690,7 @@ def _qa_gate(text: str) -> str | None:
 
     if result is None or result.status != "available":
         # Defer. An unpublished post is not a failure; it is next cycle's post.
-        log("qa gate: brain did not answer — deferring this post")
+        log("qa gate: the cognition tier did not answer — deferring this post")
         _qa_breaker["failures"] += 1
         if _qa_breaker["failures"] >= _qa_breaker["threshold"]:
             _qa_breaker["open_until"] = time.monotonic() + _qa_breaker["cooldown"]

@@ -19,8 +19,13 @@ SYSTEMD_DIR = ROOT / "systemd"
 # Every unit this PR contains. A unit not in this set is intentionally out of
 # scope (documented in docs/operations/resource-containment.md), not an
 # oversight — this list is what "contained" means for these tests.
+#
+# `px-brain` left this list with the unit itself (#317 Phase 3). It was the
+# largest single consumer here — 852M of stale two-session state, and the
+# reason the containment work existed at all — so its removal is the largest
+# single change to the sum below, and the sum is asserted against the design
+# doc for exactly that reason.
 CONTAINED_UNITS = [
-    "px-brain",
     "px-wake-listen",
     "px-tts-glados",
     "px-frigate-stream",
@@ -126,7 +131,6 @@ def test_memory_high_headroom_over_measured_baseline():
     """
     # (unit, steady-state MemoryCurrent observed 2026-08-20T19:33 AEST, bytes)
     baseline = {
-        "px-brain": 852 * 1024**2,  # stale two-session state at measurement time
         "px-wake-listen": 522 * 1024**2,
         "px-tts-glados": 501 * 1024**2,
         "px-frigate-stream": 122 * 1024**2,

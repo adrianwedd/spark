@@ -31,7 +31,7 @@ SPARK uses two LLM-driven prompts (both via Claude Haiku) and eleven hardcoded t
 ## 1. Voice System Prompt
 
 **File:** `docs/prompts/spark-voice-system.md`
-**Used by:** `bin/px-spark` → `run-voice-loop-claude`
+**Used by:** `bin/px-spark` → `run-voice-loop-tier`
 **Backend:** Claude Haiku
 
 This is the primary behavioral guide for all SPARK voice interactions. It defines:

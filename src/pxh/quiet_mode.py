@@ -180,7 +180,7 @@ def migration_record(data: Dict[str, Any]) -> Dict[str, Any]:
     legacy shape had no TTL, and inventing one would auto-clear a latch
     whose origin — possibly a real Three S's meltdown protocol — is exactly
     what we don't know). `reason="legacy_migration"` is what makes the
-    record operator-legible: a `px-brain-status`-style reader can say "still
+    record operator-legible: a `px-motd`-style reader can say "still
     quiet, origin unknown, imported from the pre-#285 bool" instead of
     showing a naked True.
     """

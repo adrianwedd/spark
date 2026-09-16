@@ -90,7 +90,7 @@ def main() -> int:
     # speech producer in the tree funnels through this file — tool-chat,
     # tool-chat-vixen, tool-voice-persona, px-cron-say, px-battery-poll — and
     # so does anything holding a shell, which now includes the resident
-    # spark-brain session. Before this gate, prose in a system prompt was the
+    # resident session. Before this gate, prose in a system prompt was the
     # only thing standing between that session and the speaker at 3am.
     #
     # Placed ahead of the persona reroute deliberately. tool-voice-persona

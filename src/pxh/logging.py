@@ -57,7 +57,7 @@ LOG_DIR = _resolve_log_dir()
 
 _LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per log file
 
-# Sticky + world-writable, like state/health/ and state/brain/. Motion tools
+# Sticky + world-writable, like state/health/. Motion tools
 # (tool-drive, tool-circle, tool-look, ...) sudo-elevate to root for GPIO and
 # are the ones most likely to log first; everything else, including the same
 # tool name reached a different way, runs as pi. A root-created 0755 logs/

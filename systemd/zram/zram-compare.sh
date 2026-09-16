@@ -43,8 +43,11 @@ grep overrun logs/px-wake-listen.log | tail -20 \
   | grep -o 'swap_free_kb_at=[0-9.]*' | cut -d= -f2 \
   | sort -n | awk '{a[NR]=$1} END{if(NR)printf "n=%d min=%s median=%s max=%s\n",NR,a[1],a[int(NR/2)+1],a[NR]; else print "none"}'
 
-echo "-- px-brain / px-wake-listen memory.current vs MemoryHigh (#270 axis)"
-for s in px-brain px-wake-listen; do
+echo "-- px-wake-listen memory.current vs MemoryHigh (#270 axis)"
+# `px-brain` was the second unit here until #317 Phase 3 retired it. Dropped
+# rather than left in: `systemctl show` on a unit that no longer exists prints
+# nothing and the loop silently reports a blank line as if it were a reading.
+for s in px-wake-listen; do
   systemctl show "$s" -p MemoryCurrent,MemoryHigh 2>/dev/null \
     | paste -sd' ' | sed "s/^/$s /"
 done

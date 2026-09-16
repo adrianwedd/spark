@@ -414,12 +414,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("brain", "command"),
+        choices=("tier", "command"),
         default=os.environ.get("PX_VOICE_BACKEND", "command"),
         help=(
-            "brain: run the turn on the resident spark-brain session (the only "
-            "permitted way to reach Claude). command: pipe the prompt to an "
-            "external non-Claude CLI such as codex or ollama."
+            "tier: run the turn on the cognition tier (one direct API call — "
+            "what the wake listener uses). command: pipe the prompt to an "
+            "external CLI such as codex or ollama. This was spelled `brain` "
+            "while a resident session served it; that session is gone (#317 "
+            "Phase 3), and a name for a deleted thing is a name that lies."
         ),
     )
     parser.add_argument(
@@ -670,10 +672,15 @@ def run_codex(command_spec: str, prompt: str, timeout: Optional[float] = None) -
         return 1, "", f"run_codex timed out after {timeout}s"
 
 
-# Sentinel return code meaning "the resident brain could not be reached".
+# Sentinel return code meaning "the tier could not be reached".
 # Distinct from a non-zero model exit so the caller can tell "SPARK has nothing
 # to say" from "SPARK could not be asked", and answer the second one.
-VOICE_BRAIN_UNAVAILABLE = 2
+VOICE_TIER_UNAVAILABLE = 2
+
+# Old spelling, kept as an alias for the in-tree callers and tests that still
+# read it by name. Both go in the same change as the module names; see #317
+# Phase 3.
+VOICE_BRAIN_UNAVAILABLE = VOICE_TIER_UNAVAILABLE
 
 VOICE_TURN_KIND = "voice_turn"
 
@@ -687,14 +694,11 @@ VOICE_UNAVAILABLE_ACK = "I heard you. Give me a second."
 
 # The interactive deadline, in seconds. 45s stays: a child is standing there.
 #
-# This duplicates `brain._DEADLINE_S["voice_turn"]` while both exist, and the
-# duplication is deliberate rather than an oversight. The number now belongs to
-# the caller — the kind is served by the cognition tier, and importing
-# `brain.py` (and through it tmux_claude) to read a constant is the dependency
-# this migration exists to remove. The two are pinned equal by
-# `tests/test_voice_turn_cognition.py::test_the_deadline_still_matches_the_brain_table`,
-# so drift fails a test instead of changing a child's wait in silence; the
-# brain-side entry and its pin are deleted together with the mailbox.
+# The number belongs to *this caller*, and #317 Phase 3 is what made that
+# literal rather than aspirational: it used to be declared once in
+# `brain._DEADLINE_S["voice_turn"]` and duplicated here with a test pinning the
+# two together. The table is gone, the pin is gone with it, and this is now the
+# only place the wait of a person standing in front of the robot is decided.
 VOICE_TURN_DEADLINE_S = float(os.environ.get("PX_VOICE_TURN_DEADLINE_S", "45"))
 
 # Interactive callers do not *enqueue* behind a background workload — that is
@@ -706,9 +710,9 @@ VOICE_TURN_DEADLINE_S = float(os.environ.get("PX_VOICE_TURN_DEADLINE_S", "45"))
 VOICE_TURN_LOCK_WAIT_S = float(os.environ.get("PX_VOICE_TURN_LOCK_WAIT_S", "5"))
 
 # The frame the resident session used to supply. `build_model_prompt` carries
-# the *voice* (the launcher's system prompt, or a persona's), and the brain
+# the *voice* (the launcher's system prompt, or a persona's), and the resident
 # session added this on top: answer by doing, not by narrating. A direct call
-# has no session, so without this the model is free to narrate instead.
+# has no session to add it, so it is stated here.
 #
 # Measured, not guessed (#317 Phase 3). The same GREMLIN prompt and utterance,
 # both paths, on the robot:
@@ -751,14 +755,14 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
     """One conversation turn on the cognition tier.
 
     Returns run_codex's (rc, stdout, stderr) shape so the turn loop below is
-    unchanged, with VOICE_BRAIN_UNAVAILABLE for "could not be asked".
+    unchanged, with VOICE_TIER_UNAVAILABLE for "could not be asked".
 
     **Retry is bounded by attempt count and by how the attempt failed, never by
     sleeping — and now that failure has a name.** This used to be a heuristic
-    over elapsed time, because `ask_brain` collapsed delivery timeout, absent
-    session, unvalidated session, lock contention and a real request timeout
-    into one `None`. The tier reports which one it was, so the rule is stated
-    directly:
+    over elapsed time, because the old mailbox call collapsed delivery
+    timeout, absent session, unvalidated session, lock contention and a real
+    request timeout into one `None`. The tier reports which one it was, so the
+    rule is stated directly:
 
       * `offline` / `bad_response` — a transport fault, and the one kind of
         failure a cheap immediate retry actually fixes;
@@ -774,7 +778,7 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
     (`VOICE_UNAVAILABLE_ACK`) is what tells a child he was heard. This is the
     same policy as before, now enforced without guessing at the cause.
 
-    `trace_id` used to travel in the payload so brain.py could log the
+    `trace_id` used to travel in the payload so the mailbox could log the
     wake-grant correlation id. The tier records kind, status and latency
     instead; the correlation id's remaining job is in px-wake-listen, which
     still exports it.
@@ -792,7 +796,7 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
                 lock_wait_s=VOICE_TURN_LOCK_WAIT_S,
             )
         except Exception as exc:  # noqa: BLE001 - the loop must survive the tier
-            return VOICE_BRAIN_UNAVAILABLE, "", f"cognition call raised: {exc}"
+            return VOICE_TIER_UNAVAILABLE, "", f"cognition call raised: {exc}"
 
         if result.status == "available":
             return 0, result.response, ""
@@ -802,7 +806,7 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
             break
         print(f"[voice-loop] cognition {result.status}; one retry", file=sys.stderr)
 
-    return VOICE_BRAIN_UNAVAILABLE, "", last
+    return VOICE_TIER_UNAVAILABLE, "", last
 
 
 def acknowledge_unavailable(dry_run: bool = False) -> bool:
@@ -818,7 +822,7 @@ def acknowledge_unavailable(dry_run: bool = False) -> bool:
     only reaches this path after a voice turn was actually dispatched, so a
     summons already happened. Re-checking wake_grant_active() here would ask
     whether a *window* is still open after the very delay that can close it —
-    the brain is slowest exactly when it is saturated, which is also when the
+    the tier is slowest exactly when it is saturated, which is also when the
     grant is most likely to have aged out. This line is gated the same way any
     other interactive reply is: quiet mode, night silence and on-call still
     apply, and a live grant still overrides them when one is present.
@@ -1330,7 +1334,7 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             # Extend heartbeat well past expected LLM call duration so the
             # watchdog doesn't fire during a legitimately long subprocess.
             heartbeat_val[0] = time.monotonic() + 300.0
-        if args.backend == "brain":
+        if args.backend == "tier":
             rc, stdout, stderr = run_voice_turn(prompt)
         else:
             rc, stdout, stderr = run_codex(args.codex_cmd, prompt)
@@ -1354,16 +1358,16 @@ def supervisor_loop(args: argparse.Namespace) -> None:
                 },
             )
 
-        if rc == VOICE_BRAIN_UNAVAILABLE:
+        if rc == VOICE_TIER_UNAVAILABLE:
             # Acknowledge and stop. Not `continue`: another lap would re-ask a
-            # brain we just established cannot answer, which is the escalation
+            # tier we just established cannot answer, which is the escalation
             # this whole change exists to remove.
             #
             # No wake-grant precondition here: this turn only exists because
-            # something already dispatched a prompt to the brain, so a live
+            # something already dispatched a prompt to the model, so a live
             # summons is not in question. Gating on a *fresh* wake_grant_active()
             # read at this point would fail exactly when it matters most — a
-            # slow, saturated brain is the same delay that ages a grant out —
+            # slow, saturated tier is the same delay that ages a grant out —
             # turning the one timeout this line exists to answer into silence.
             # acknowledge_unavailable() still goes through validate_action(), so
             # quiet mode, night silence and on-call bind this line exactly as

@@ -33,24 +33,12 @@ def _isolate_health_writes(tmp_path, monkeypatch):
     health._last_success_write.clear()
 
 
-@pytest.fixture(autouse=True)
-def _isolate_brain_mailbox(tmp_path, monkeypatch):
-    """Keep brain requests out of the live state/brain/ mailbox.
-
-    Same hazard as _isolate_health_writes, and worse in one respect: an
-    unisolated test that reaches run_claude_session for a brain-routed type
-    drops a real request into the running robot's inbox, where the resident
-    Claude session will pick it up and answer it. A test would spend budget
-    and make SPARK act on a prompt nobody meant to send.
-
-    Redirects only the mailbox root, so tests that deliberately set
-    PX_STATE_DIR keep working.
-    """
-    try:
-        from pxh import brain
-    except ImportError:
-        return
-    monkeypatch.setattr(brain, "brain_root", lambda: tmp_path / "brain")
+# `_isolate_brain_mailbox` lived here. It redirected the resident mailbox root
+# so an unisolated test could not drop a real request into the running robot's
+# inbox and have a Claude session answer it. #317 Phase 3 deleted the mailbox
+# and the session, so there is no root to redirect and no reader to answer —
+# the fixture was removed rather than left returning early, because an autouse
+# fixture that silently does nothing is a fixture nobody can tell is dead.
 
 
 @pytest.fixture(autouse=True)
@@ -144,7 +132,7 @@ def _isolate_session(tmp_path, monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _isolate_observability(tmp_path, monkeypatch, request):
-    """Keep test logs out of logs/ and test supervisors off the live socket.
+    """Keep test logs out of logs/ and test work off the live state tree.
 
     The fifth instance of the hazard, and the one #221 turned up. The 43
     duplicated `start` records in logs/tool-brain-daemon.log were not two
@@ -152,13 +140,14 @@ def _isolate_observability(tmp_path, monkeypatch, request):
     production log. Logs are state: a test that writes production-shaped logs
     can falsify later forensics even if it never touches production state.
 
-    Sets LOG_DIR *and* PX_BRAIN_TMUX_SOCKET, and the pairing is the point. The
-    supervisor guard is keyed to the socket
-    (brain_daemon.supervisor_lock_path), so a synthetic socket implies a
-    synthetic guard by construction: a test cannot acquire a namespace without
-    also acquiring the guard that belongs to it. Under the old checkout-
-    relative key the reverse held — relocating the mailbox silently disabled
-    the guard — which is how the defect stayed invisible.
+    Sets LOG_DIR *and* PX_BRAIN_TMUX_SOCKET. The second was the pairing that
+    mattered while a resident supervisor existed: its guard was keyed to the
+    socket (brain_daemon.supervisor_lock_path), so a synthetic socket implied a
+    synthetic guard by construction, and a test could not acquire a namespace
+    without also acquiring the guard that belonged to it. That supervisor is
+    deleted (#317 Phase 3); the variable is still set because it is the seam
+    every remaining tmux-touching caller reads, and because a test that sets
+    its own value still has to win over this one.
 
     Bypassing the production guard is now explicit: a test that wants the real
     socket must be marked `live`.
@@ -177,8 +166,7 @@ def _isolate_observability(tmp_path, monkeypatch, request):
     # every other fixture in the test, and `isolated_project` mkdir()s
     # tmp_path/"logs" with the default exist_ok=False — creating it here made
     # 360 tests die in setup with FileExistsError. log_event already does
-    # parent.mkdir(parents=True, exist_ok=True), and acquire_supervisor_lock
-    # _ensure_dir()s the socket's parent, so setting the variables is enough.
+    # parent.mkdir(parents=True, exist_ok=True).
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("PX_BRAIN_TMUX_SOCKET", str(tmp_path / "tmux" / "px-mind"))
 

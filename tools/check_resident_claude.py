@@ -1,21 +1,39 @@
 #!/usr/bin/env python3
 """Resident-only Claude invariant — the audit guard.
 
-    No production code may invoke Claude non-residently.
+    No production code may invoke Claude at all.
 
     No `claude -p`. No helper whose implementation is `claude -p`. No fallback
-    to `call_claude_haiku`. No unclassified "cold Claude" kinds.
+    to `call_claude_haiku`. No unclassified "cold Claude" kinds. No resident
+    mailbox. No tmux-injected session.
 
-The resident `spark-brain` session is SPARK's sole Claude execution
-substrate. A cold `claude -p` throws away context on every call,
-cannot use SPARK's tools, is unmetered, and — the reason this guard exists
-rather than a docs paragraph — is *more* expensive to run than the resident
-session it claims to be rescuing. A resident-brain failure that responds by
-spawning a fresh Claude on the same Pi does not degrade gracefully; it
-amplifies the contention that caused the failure. That cascade is observed
-behaviour, not theory (2026-08-19: a 5s tmux delivery timeout under load
-escalated to two concurrent `claude -p` processes, a 120s timeout, and a
-151-second wait for a child who had said "Hey Spark").
+The rule has been through two stages and the current one is the stricter:
+
+  **before #317**  the resident `spark-brain` session was SPARK's sole
+                   permitted Claude substrate, and everything else had to
+                   reach it. A cold `claude -p` throws away context on every
+                   call, cannot use SPARK's tools, is unmetered, and — the
+                   reason this guard exists rather than a docs paragraph — is
+                   *more* expensive to run than the session it claims to be
+                   rescuing. A resident-brain failure that responded by
+                   spawning a fresh Claude on the same Pi did not degrade
+                   gracefully; it amplified the contention that caused the
+                   failure. That cascade is observed behaviour, not theory
+                   (2026-08-19: a 5s tmux delivery timeout under load escalated
+                   to two concurrent `claude -p` processes, a 120s timeout, and
+                   a 151-second wait for a child who had said "Hey Spark").
+
+  **since #317 Phase 3**  there is no Claude substrate. Every kind runs on the
+                   cognition tier as one direct API call, and the resident
+                   session, its supervisor, its mailbox and its reply tool are
+                   deleted. So this guard now also forbids the *existence* of
+                   those paths: an `if` that is currently false can be flipped,
+                   a service that is stopped can be started, and a maildir that
+                   still exists is a maildir someone will use again at 3am.
+
+Both stages share one shape, which is why this file survived the change rather
+than being replaced: the failure it guards against is always *a second way to
+reach a language model that nobody is measuring*.
 
 This guard is deliberately not a single grep for one exact string. It matches
 the *forms* the violation actually takes in this repo:
@@ -46,13 +64,30 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # canary allowlist below; `docs/` and `*.md` are prose and never scanned.
 SCAN_DIRS = ("src/pxh", "bin")
 
-# The one legitimate way to start Claude. `bin/px-claude-session` launches the
-# *resident* interactive session — no `-p`, and the process is meant to outlive
-# the request. It is named here rather than relying on it not matching today's
-# patterns, so that a future edit which adds `-p` to it is a deliberate act
-# against an explicit exemption instead of a silent pass.
-ALLOWLIST = {
-    "bin/px-claude-session": "the resident session launcher — starts the substrate, is not a cold start",
+# Empty, and that is the current invariant rather than an oversight. The one
+# entry this held was `bin/px-claude-session`, the resident session launcher;
+# #317 Phase 3 deleted the file, so the exemption went with it. An empty
+# allowlist is the goal state — the list is an attack surface, and every entry
+# on it is a file this guard no longer reads.
+ALLOWLIST: dict[str, str] = {}
+
+# Deleted, not deprecated — and kept deleted by name. These are the pieces of
+# the retired resident transport; a file that reappears at one of these paths
+# is the mailbox (or the session, or the supervisor) turning back into
+# architecture, which is the exact regression this guard exists to catch.
+#
+# Checked by *path* rather than by basename, deliberately: `brain.py` as a
+# basename would fire on any honest prose that mentions it (and there is a lot,
+# because the retirement is worth explaining to whoever reads this next).
+FORBIDDEN_PATHS: dict[str, str] = {
+    "src/pxh/brain.py": "the resident mailbox — requests, replies and the handshake",
+    "src/pxh/brain_daemon.py": "the resident session supervisor",
+    "src/pxh/tmux_claude.py": "tmux delivery into a resident session",
+    "bin/px-claude-session": "the resident session launcher",
+    "bin/tool-brain-reply": "how a resident session answered a caller",
+    "bin/px-brain": "the supervisor entry point",
+    "bin/px-brain-status": "the resident session's health reader",
+    "systemd/px-brain.service": "the unit that ran the resident session",
 }
 
 # Helpers whose entire implementation is a cold start. Named so that *calling*
@@ -214,6 +249,16 @@ def scan(repo_root: Path | None = None) -> list[Violation]:
     """
     repo_root = (repo_root or REPO_ROOT).resolve()
     found: list[Violation] = []
+
+    # Before anything else, and outside `_candidate_files`: the retired
+    # transport must not be back, and a resurrected file is a finding whether
+    # or not it contains forbidden syntax. A clean-looking `brain.py` is still
+    # the mailbox.
+    for rel, why in FORBIDDEN_PATHS.items():
+        if (repo_root / rel).exists():
+            found.append(Violation(rel, 1, "retired_transport",
+                                   f"{rel} is back: {why}"))
+
     for path in _candidate_files(repo_root):
         rel = str(path.relative_to(repo_root))
         if rel in ALLOWLIST:
@@ -263,8 +308,9 @@ def main(argv: list[str] | None = None) -> int:
         for v in items:
             print(f"    :{v.line}  [{v.kind}] {v.detail}")
         print()
-    print("Every one of these cold-starts Claude. The resident spark-brain")
-    print("session is the only permitted Claude substrate.")
+    print("Every one of these reaches Claude from production code, or brings")
+    print("back a path that used to. There is no permitted way to do either: the")
+    print("cognition tier is the whole transport (#317 Phase 3).")
     return 0 if args.list else 1
 
 

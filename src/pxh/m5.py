@@ -14,15 +14,17 @@ deliberate, and this docstring is the record of it.
 
 What survives the move, and is more load-bearing than the host:
 
-- **No tools, no filesystem.** ``brain.py``'s ``_M5_KINDS`` boundary is "the
-  privileged session never sees untrusted text" (public chat, Obi chat, post
-  and blog QA). A cloud model has no tools and cannot read this repository
-  either — but that text now leaves the LAN. That is a change in *exposure*
-  even though it is not a change in privilege, and it is the one real cost of
-  this arrangement.
+- **No tools, no filesystem.** The old boundary was ``brain.py``'s
+  ``_M5_KINDS``: "the privileged session never sees untrusted text" (public
+  chat, Obi chat, post and blog QA). That session is gone (#317 Phase 3), and
+  the boundary survives it — a cloud model has no tools and cannot read this
+  repository either, but that text leaves the LAN. That is a change in
+  *exposure* even though it is not a change in privilege, and it remains the
+  one real cost of this arrangement.
 - **Defer, never escalate.** A failure here is terminal for the caller
-  (``mind.py::call_llm``). It never falls through to the resident Claude
-  session and never reaches a Pi-local model.
+  (``mind.py::call_llm``). It never falls through to a second provider and
+  never reaches a Pi-local model. Since #317 Phase 3 there is no second
+  provider to fall through *to*, which is the point.
 - **No waiting in line.** The process-shared gate has a zero timeout: a second
   concurrent request defers rather than queueing behind the first.
 """
@@ -67,10 +69,11 @@ _API_KEY_VARS = ("PX_M5_SPARK_API_KEY", "OLLAMA_API_KEY", "OLLAMA_CLOUD_API_KEY"
 
 
 def _read_boot_id() -> str:
-    """The kernel's boot id — see brain_daemon._read_boot_id for why this host
-    needs it: no RTC, so a monotonic deadline written before a reboot reads as
-    still-open for a full CIRCUIT_OPEN_S (or worse, whatever uptime the prior
-    boot had reached) against the new boot's near-zero clock."""
+    """The kernel's boot id — the same idiom as `memory` and `wake_grant`, for
+    why this host needs it: no RTC, so a monotonic deadline written before a
+    reboot reads as still-open for a full CIRCUIT_OPEN_S (or worse, whatever
+    uptime the prior boot had reached) against the new boot's near-zero
+    clock."""
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text(
             encoding="utf-8"

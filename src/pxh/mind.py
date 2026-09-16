@@ -2295,127 +2295,23 @@ def _reset_state():
 
 
 
-def _extract_thought_json(text: str) -> str | None:
-    """Return the first JSON object carrying a 'thought' key, re-serialised.
+# `_reflection_via_brain_enabled()` lived here, then `call_brain_reflection()`,
+# then `call_claude()`. All three were the same thing at three stages of
+# removal: a dial, then a rung, then the last reference to the resident
+# `spark-brain` session. #317 Phase 3 deleted the session itself, so there is
+# nothing left for a rung to reach — `call_llm()` below is the whole of
+# reflection's model access, and it defers on failure.
+#
+# This is recorded rather than silently removed because the ladder grew back
+# once already (see tests/test_dead_tier_functions.py): each rung looked
+# reasonable on its own, and the sum was optional work responding to
+# contention by adding load.
 
-    Models preface, apologise and wrap in fences, so the object is found by
-    scanning rather than by parsing the whole string. Shared by the subprocess
-    and resident-session paths so they cannot drift in what they accept.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict) and "thought" in obj:
-            return json.dumps(obj)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    decoder = json.JSONDecoder()
-    idx = text.find("{")
-    while idx != -1 and idx < len(text):
-        try:
-            obj, end = decoder.raw_decode(text, idx)
-            if isinstance(obj, dict) and "thought" in obj:
-                return json.dumps(obj)
-            idx = end
-        except (json.JSONDecodeError, ValueError):
-            idx += 1
-        idx = text.find("{", idx)
-    return None
-
-
-# `_reflection_via_brain_enabled()` lived here. It was a rollout dial whose off
-# position routed reflection back to `claude -p`. That destination is gone, so
-# the dial's only remaining function would be to silently disable reflection
-# while looking like a routing choice — a lever that does something other than
-# what its name says. PX_BRAIN_KINDS still gates the kinds that genuinely have
-# a second path; reflection is not one of them any more.
-
-
-def call_brain_reflection(prompt: str, system: str) -> dict:
-    """Ask the resident Claude session for a thought.
-
-    Returns the same {"response": ...} / {"error": ...} shape as
-    call_brain_reflection, so it drops into the tier chain unchanged.
-
-    `ask_brain` never raises and returns None for every failure — no session,
-    an unvalidated one, a busy lock, a missed deadline. All of those mean the
-    same thing here: use the subprocess. The broad `except` is the same
-    contract one level up, because this runs under a daemon whose reflection
-    loop must survive anything the brain does.
-    """
-    try:
-        from pxh import brain
-        reply = brain.ask_brain("reflection", {
-            "system": system,
-            "prompt": prompt,
-            # Named explicitly because the resident session's own prompt tells
-            # it to answer by *acting* (speak, look, remember). Reflection is
-            # the opposite: the caller wants the thought handed back so it can
-            # decide what to dispatch. Without this the session tends to go
-            # ahead and say the thing.
-            "respond_with": (
-                "a single JSON object with the keys the prompt asks for "
-                "(thought, mood, action, ...). Do not speak, move or remember "
-                "anything for this request — return the object and nothing else."
-            ),
-        })
-    except Exception as exc:
-        return {"error": f"brain call failed: {exc}"}
-
-    if reply is None:
-        return {"error": "brain unavailable"}
-
-    answer = reply.get("reply")
-    if isinstance(answer, dict) and "thought" in answer:
-        return {"response": json.dumps(answer)}
-    # A reply that came off disk is always JSON-serialisable, but this path
-    # must hold for whatever a future writer puts in the outbox: re-serialising
-    # is the one step here that can raise, and this function's contract with
-    # the reflection loop is that it never does.
-    try:
-        text = answer if isinstance(answer, str) else json.dumps(answer)
-    except (TypeError, ValueError):
-        return {"error": "brain reply is not serialisable"}
-    found = _extract_thought_json(text)
-    if found is not None:
-        return {"response": found}
-    return {"error": "no thought JSON in brain reply"}
-
-
-# Marker on a reflection result meaning "the resident brain could not be
-# reached". Callers must treat it as a full stop, not as a cue to try the next
-# tier: a reflection is optional work, and the failure mode this replaces was
-# optional work responding to contention by adding load.
+# Marker on a reflection result meaning "the model could not be reached".
+# Callers must treat it as a full stop, not as a cue to try the next tier: a
+# reflection is optional work, and the failure mode this replaces was optional
+# work responding to contention by adding load.
 BRAIN_DEFER = "brain_defer"
-
-
-def call_claude(prompt: str, system: str) -> dict:
-    """Reflection's Claude tier. Resident session, and nothing behind it.
-
-    There used to be a `claude -p` subprocess under this, justified in a comment
-    that read: "Both are Claude and both are billed, so this is not a cost
-    decision — it is a latency and context one." That sentence was false. The
-    resident sessions run under the Max subscription; a spawned `claude -p` is
-    metered API usage, so the fallback billed money to make SPARK slower.
-
-    It was also the wrong shape. On 2026-08-19 a 5-second tmux *delivery*
-    timeout under load was reported as "brain unavailable"; this function
-    spawned a second Claude on a 4-core Pi already oversubscribed by the voice
-    turn's own Claude; the two starved each other; the 120s timeout tripped;
-    and the ladder continued into M5 and Ollama Cloud. The brain was healthy and
-    idle throughout. A rescue path that costs more than the thing it rescues
-    does not degrade — it amplifies.
-
-    So: resident brain, or defer. Reflection is the most skippable work SPARK
-    does. Failing to have a thought costs nothing.
-    """
-    result = call_brain_reflection(prompt, system)
-    if "error" not in result:
-        return result
-    return {"error": result["error"], BRAIN_DEFER: True}
 
 
 def call_llm(prompt: str, system: str, persona: str = "") -> dict:
@@ -3673,10 +3569,11 @@ def _consolidation_worker_main(dry: bool) -> None:
     """The background consolidation run. Never raises, always clears the marker.
 
     This is the body that used to run inline on the awareness tick. A single
-    attempt is allowed `brain._DEADLINE_S["consolidate"]` = 600s, which is twice
-    px-mind's own 300s staleness window — inline, honouring that budget would
-    mean ten minutes with no awareness snapshot, no reflection and no battery
-    check, which is why #291's one-line deadline fix was not safe on its own.
+    attempt is allowed `spark_memory.CONSOLIDATE_DEADLINE_S`, which is longer
+    than px-mind's own 300s staleness window — inline, honouring that budget
+    would mean five minutes with no awareness snapshot, no reflection and no
+    battery check, which is why #291's one-line deadline fix was not safe on
+    its own.
     """
     try:
         _record_consolidation_outcome(spark_memory.maybe_consolidate(dry=dry))

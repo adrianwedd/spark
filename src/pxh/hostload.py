@@ -1,11 +1,12 @@
 """Best-effort host load snapshot, shared by anything diagnosing a deadline
 blown on this Pi rather than by its own caller.
 
-#270 (resident `voice_turn` sometimes burning its full 45s budget) and #283
-(arecord ALSA-level overruns during live capture, up to 56.8s) both showed
-the same shape: the code doing the timing out has no bug ask_brain's own
-lock_wait_s/validating_wait_s couldn't already rule out, but the timeouts
-cluster in windows of heavy concurrent host activity. This lives in its own
+#270 (voice_turn sometimes burning its full 45s budget) and #283 (arecord
+ALSA-level overruns during live capture, up to 56.8s) both showed the same
+shape: the code doing the timing out has no bug of its own, and the delivery
+timings the old mailbox logged (lock_wait_s, validating_wait_s) could not rule
+one in either — but the timeouts cluster in windows of heavy concurrent host
+activity. This lives in its own
 module, not duplicated per caller, because two independent subsystems now
 need the same signal to check the same hypothesis against real production
 events rather than a synthetic-load assay.
@@ -22,13 +23,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# The two services the 2026-08-23 episode found chronically pressed against
-# their own cgroup ceiling. Deliberately a small fixed set, not every unit
+# `px-brain` was the second entry until #317 Phase 3 retired the service; it
+# is removed rather than left pointing at a cgroup that no longer exists,
+# because a permanently-absent unit would read as continuous pressure.
+#
+# What the 2026-08-23 episode found chronically pressed against its own cgroup
+# ceiling. Deliberately a small fixed set, not every unit
 # under system.slice — an unknown name is a caller bug (see
 # cgroup_pressure_fields), not a runtime condition to shrug off.
 _MONITORED_UNITS = {
     "px-wake-listen": Path("/sys/fs/cgroup/system.slice/px-wake-listen.service"),
-    "px-brain": Path("/sys/fs/cgroup/system.slice/px-brain.service"),
 }
 
 # In-process only. A rate needs a prior sample; each daemon importing this

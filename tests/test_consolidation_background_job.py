@@ -4,7 +4,7 @@ Three defects made success structurally impossible, and each gets its own
 section here:
 
 1. **The pass ran inline on px-mind's ~60s awareness tick.** Its declared
-   budget is 600s — twice px-mind's own 300s health-staleness window — so
+   budget then was 600s, twice px-mind's own 300s health-staleness window, so
    honouring the budget and keeping the mind loop alive were mutually
    exclusive. Now it runs on a daemon thread with a pid-keyed job marker.
 2. **An ad-hoc `timeout=180` overrode the declared 600s deadline.** The tighter
@@ -13,10 +13,13 @@ section here:
    a night while the `consolidate` quota was 1 and its type cooldown 20 hours.
 
 Section 4 is #310, where three more defects kept the pass failing for nine
-nights — attempt 1 landed inside the brain's own nightly recycle, the retry
-spacing was measured against the wrong end of attempt 1, and a `research`
-failure that spent nothing armed the global cooldown against everyone — plus
-the attempt number, which logged one too high all along.
+nights — attempt 1 landed inside the resident session supervisor's nightly
+recycle, the retry spacing was measured against the wrong end of attempt 1, and
+a `research` failure that spent nothing armed the global cooldown against
+everyone — plus the attempt number, which logged one too high all along. The
+recycle is gone (#317 Phase 3 retired the supervisor), so the window's start no
+longer has anything to clear; the arithmetic that made it necessary is kept as
+the record of why it is 03:00.
 
 Inert by construction: no service is touched, no tmux session is reached, no
 Claude call is made, and every duration in here is synthetic — a "600s"
@@ -34,7 +37,14 @@ import time
 import pytest
 
 import pxh.mind as mind
-from pxh import brain, claude_session, memory
+from pxh import claude_session, m5, memory
+
+# The deadline a consolidation attempt actually gets, now that the resident
+# session's per-kind table is gone (#317 Phase 3). It is the tier's own
+# configured timeout — `PX_M5_SPARK_TIMEOUT_S`, 120 on the deployed Pi — and it
+# is the number every duration below has to be measured against.
+def _attempt_deadline_s() -> float:
+    return float(os.environ.get("PX_M5_SPARK_TIMEOUT_S", m5.M5_TIMEOUT_S))
 
 SPARK = {"persona": "spark"}
 UTC = dt.timezone.utc
@@ -370,65 +380,30 @@ def test_consolidate_passes_no_ad_hoc_timeout(monkeypatch, tmp_path):
         f"consolidate() still overrides the declared deadline: {seen['kw']}")
 
 
-def test_run_claude_session_defaults_to_the_declared_deadline(monkeypatch):
-    """`timeout=None` is the default and reaches ask_brain as None.
+def test_consolidate_passes_no_timeout_and_the_tier_decides(monkeypatch):
+    """`timeout=None` is the default and reaches the tier as None.
 
-    None is what makes brain.py's per-kind table authoritative — ask_brain
-    substitutes `deadline_for_kind(kind)` only when the caller passed nothing.
-
-    Driven through `_run_via_brain` directly: no kind is served residently
-    through the dispatcher any more (#317 Phase 2), and this is the same
-    plumbing the interactive kinds' mailbox goes through.
+    None is what makes the tier's own configured deadline authoritative. The
+    per-kind table this used to defer to (`brain._DEADLINE_S`) went with the
+    session; what replaces it is not a second table but the one number the
+    provider client already reads, which is why the previous test in this file
+    asserts the kwarg is absent rather than equal.
     """
     seen = {}
 
-    def _fake_ask(kind, payload, timeout_s=None, model=None):
+    def _fake_ask(kind, prompt, system, *, timeout_s=None, model=None, **kw):
         seen["kind"] = kind
         seen["timeout_s"] = timeout_s
-        return {"reply": "ok"}
+        return m5.M5Result(status="available", response="[]")
 
-    monkeypatch.setattr(brain, "ask_brain", _fake_ask)
+    monkeypatch.setattr(m5, "ask_m5", _fake_ask)
     monkeypatch.setattr(claude_session, "BUDGET_DISABLED", True)
     monkeypatch.setattr(claude_session, "SESSION_LOG",
                         claude_session.PROJECT_ROOT / "state" / "nonexistent.jsonl")
-    monkeypatch.setattr(claude_session, "_log_session", lambda *a, **kw: None)
-    claude_session._run_via_brain("self_debug", "prompt", None, "claude-sonnet-4-6")
-    assert seen["kind"] == "self_debug"
-    assert seen["timeout_s"] is None
-    assert brain.deadline_for_kind("self_debug") == 900
-
-
-def test_the_declared_600s_is_what_reaches_the_request(monkeypatch):
-    """End of the plumbing: the request the brain would answer carries 600s.
-
-    Fully inert — the mailbox is conftest's tmp dir, the session state is
-    stubbed validated, and `inject` is stubbed to fail so ask_brain returns
-    immediately after writing the request. Nothing waits; the assertion is on
-    the number in the file.
-    """
-    session = brain.session_for_kind("consolidate")
-    captured = []
-
-    def _capture_then_fail(*a, **kw):
-        # ask_brain cleans the inbox up in its `finally`, so read the request
-        # here — at the one moment it exists — and then refuse the injection so
-        # the call returns without waiting for any reply.
-        for f in brain.inbox_dir(session).glob("*.json"):
-            captured.append(json.loads(f.read_text()))
-        return False
-
-    monkeypatch.setattr(brain, "session_state", lambda *a, **kw: brain.VALIDATED)
-    monkeypatch.setattr(brain.tmux_claude, "inject", _capture_then_fail)
-    before = time.time()
-    assert brain.ask_brain("consolidate", {"prompt": "x"}) is None
-
-    assert len(captured) == 1
-    request = captured[0]
-    assert request["kind"] == "consolidate"
-    budget = request["deadline"] - before
-    # A window, not an equality: ask_brain deducts the time already spent
-    # waiting for validation and the lock from the caller's budget.
-    assert 580 <= budget <= 601, f"deadline carried {budget:.0f}s, expected ~600"
+    result = claude_session.run_claude_session("consolidate", "prompt")
+    assert result.returncode == 0
+    assert seen == {"kind": "consolidate", "timeout_s": None}
+    assert _attempt_deadline_s() > 0
 
 
 # ---------------------------------------------------------------------------
@@ -531,33 +506,38 @@ def test_the_window_and_meta_shape_are_what_the_operator_reads():
 
 
 # ---------------------------------------------------------------------------
-# 4. The retry survives a night the brain is having (#310)
+# 4. The retry survives a night the model is having (#310)
 #
 # Nine nights of memory were lost to three defects that all lived in the gap
-# between two gates: consolidation's window and the brain's nightly recycle,
-# the retry spacing's clock and the type cooldown's clock, and the global
-# cooldown's reading of an entry that spent nothing. None of these tests calls
-# Claude: every duration is a number the code declares, and the session log is
-# written by hand.
+# between two gates: consolidation's window and the session supervisor's
+# nightly recycle, the retry spacing's clock and the type cooldown's clock, and
+# the global cooldown's reading of an entry that spent nothing. None of these
+# tests calls a model: every duration is a number the code declares, and the
+# session log is written by hand.
 # ---------------------------------------------------------------------------
 
-def test_the_window_opens_after_the_brains_nightly_recycle():
-    """#310.1: the first attempt raced the brain's own 02:00 recycle.
+def test_the_window_still_admits_both_spaced_attempts():
+    """#310.1: the first attempt raced the supervisor's own 02:00 recycle.
 
-    A recycle clears the session's validation marker on purpose — that is what
-    makes a caller fall back instead of typing into a session that has just
-    forgotten its identity prompt — so everyone who arrives during the boot
-    that follows is refused *immediately* (`brain_unavailable`, dur=0.0s)
-    rather than timing out. The first attempt landed in that boot on every one
-    of the nine nights measured, and failed on arrival on every one of them.
+    A recycle cleared the session's validation marker on purpose — that is what
+    made a caller fall back instead of typing into a session that had just
+    forgotten its identity prompt — so everyone arriving during the boot that
+    followed was refused *immediately* (`brain_unavailable`, dur=0.0s) rather
+    than timing out. The first attempt landed in that boot on every one of the
+    nine nights measured, and failed on arrival on every one of them.
 
-    Pinned against `NIGHTLY_RECYCLE_HOUR` rather than against "3", so moving
-    the recycle without moving the window fails here instead of on the robot.
+    The supervisor and its recycle are gone (#317 Phase 3), so there is no
+    longer a `NIGHTLY_RECYCLE_HOUR` to pin against — the coupling that test
+    guarded cannot drift because one of its terms no longer exists. What
+    survives, and is what the window's start actually has to satisfy, is the
+    arithmetic: both attempts, spaced, inside the window.
     """
-    from pxh import brain_daemon
-
-    assert memory.CONSOLIDATION_WINDOW[0] * 3600 >= (
-        brain_daemon.NIGHTLY_RECYCLE_HOUR * 3600 + brain.VALIDATION_CEILING_S)
+    start_h, end_h = memory.CONSOLIDATION_WINDOW
+    span_s = (end_h - start_h) * 3600
+    assert memory.RETRY_SPACING_S * (memory.MAX_ATTEMPTS_PER_DAY - 1) + \
+        _attempt_deadline_s() <= span_s, (
+            "two spaced attempts no longer fit between "
+            f"{start_h:02d}:00 and {end_h:02d}:00")
 
 
 def test_retry_spacing_covers_the_cooldown_and_the_attempt_before_it():
@@ -569,20 +549,19 @@ def test_retry_spacing_covers_the_cooldown_and_the_attempt_before_it():
     with ten minutes of margin" assumed attempt 1 ended when it started.
     """
     assert memory.RETRY_SPACING_S >= (
-        claude_session._TYPE_COOLDOWNS["consolidate"]
-        + brain._DEADLINE_S["consolidate"])
+        claude_session._TYPE_COOLDOWNS["consolidate"] + _attempt_deadline_s())
 
 
 def test_a_slow_first_attempt_still_leaves_the_retry_admissible(monkeypatch, tmp_path):
     """#310.2, end to end: attempt 1 fails *after* using its whole deadline.
 
     The entry is built the way the real attempt leaves the log — written at
-    start + 600s, which is exactly the disagreement between the two clocks —
-    and then asked of claude_session's own gate rather than of a restatement of
-    it. Put RETRY_SPACING_S back to 2400 and this returns "consolidate cooldown
+    start + the deadline, which is exactly the disagreement between the two
+    clocks — and then asked of claude_session's own gate rather than of a
+    restatement of it. Put RETRY_SPACING_S back to 2400 and this returns "consolidate cooldown
     (1800s / 2400s)", which is the refusal that cost the nine nights.
     """
-    deadline = brain._DEADLINE_S["consolidate"]
+    deadline = _attempt_deadline_s()
     started = dt.datetime.now(UTC) - dt.timedelta(seconds=memory.RETRY_SPACING_S)
     finished = started + dt.timedelta(seconds=deadline)
     log = tmp_path / "claude_sessions.jsonl"
@@ -600,7 +579,8 @@ def test_a_slow_first_attempt_still_leaves_the_retry_admissible(monkeypatch, tmp
 def test_a_failure_that_spent_nothing_does_not_lock_out_the_retry(monkeypatch, tmp_path):
     """#310.3, the defect that cost 09-15 on its own.
 
-    At 02:32:10 `research` logged rc=1 — the brain was down for every caller —
+    At 02:32:10 `research` logged rc=1 — the model was unreachable for every
+    caller —
     and that entry, which spent nothing, was read as spend and refused
     `consolidate` the 02:41 retry it had finally been spaced correctly for:
     "global cooldown (554s / 1800s)".

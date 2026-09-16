@@ -39,16 +39,16 @@ RuntimeDirectory=spark/wake
 Environment=HOME=/home/pi
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
-# Wake-triggered conversation runs on the resident spark-brain session, which
-# this unit reaches through tmux — not by starting Claude. The PATH below is
-# retained rather than trimmed: it was banked from the running unit in #229 and
-# still supplies tmux/script, and narrowing it is a separate change with its own
-# blast radius. What it no longer needs to supply is ~/.local/bin/claude.
-# bin/px-env exports PYTHONPATH but never PATH, so this line is the only thing
-# that puts the binary in reach of the unit, and claude lives solely in
-# ~/.local/bin (a symlink into ~/.local/share/claude/versions/). Drop the entry
-# and the bridge fails its own guard with {"error": "claude not found on PATH"}
-# on every summons — deterministically, not intermittently.
+# Wake-triggered conversation runs on the cognition tier via
+# bin/run-voice-loop-tier — one direct API call, no session and no tmux.
+#
+# The PATH below is retained rather than trimmed: it was banked from the running
+# unit in #229, and narrowing it is a separate change with its own blast radius.
+# `~/.local/bin` is now legacy in this line — it held the `claude` binary the
+# retired session needed — but it is left in place deliberately. Removing it is
+# a change to a live unit's environment with no observable benefit, and the
+# entry costs nothing while the migration is being verified on the robot.
+Environment=PATH=/home/pi/.local/bin:/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PATH=/home/pi/.local/bin:/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
 # Ensure PulseAudio is running (idempotent) and audio hardware is ready
 ExecStartPre=/usr/bin/pulseaudio --start

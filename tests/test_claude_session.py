@@ -286,88 +286,6 @@ class TestRunSession:
                 cs.run_claude_session("evolve", "test prompt", timeout=10)
 
 
-class TestRunViaBrain:
-    """The resident door, driven directly (#317 Phase 2).
-
-    No production kind routes through `_run_via_brain` any more — `self_debug`
-    was the last, and it moved to the cognition tier. These drive the function
-    itself rather than a kind, because the contract it implements did not stop
-    mattering when its last caller left: it is still the door the interactive
-    kinds' mailbox goes through (`brain.ask_brain` for `voice_turn`,
-    `cron_say`, `describe_scene`), and Phase 3 is where the mailbox goes.
-    """
-
-    def _run(self, monkeypatch, cs, ask_brain, tmp_path, timeout=10):
-        monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
-        monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
-        import pxh.brain
-        monkeypatch.setattr(pxh.brain, "ask_brain", ask_brain)
-        return cs._run_via_brain("evolve", "test prompt", timeout, "claude-opus-4-6")
-
-    def test_a_structured_reply_is_handed_back_as_text(self, tmp_path, monkeypatch):
-        """Every caller of this contract reads stdout as text."""
-        import pxh.claude_session as cs
-        result = self._run(monkeypatch, cs,
-                           lambda kind, payload, timeout_s=None, model=None:
-                           {"reply": {"verdict": "yes"}}, tmp_path)
-        assert json.loads(result.stdout) == {"verdict": "yes"}
-
-    def test_an_unavailable_brain_looks_like_a_failed_run_not_an_exception(
-            self, tmp_path, monkeypatch):
-        """Callers already handle a non-zero returncode. Reusing that contract
-        is what lets the brain fail without touching any of them."""
-        import pxh.claude_session as cs
-        result = self._run(monkeypatch, cs,
-                           lambda kind, payload, timeout_s=None, model=None: None,
-                           tmp_path)
-        assert result.returncode != 0
-        assert "brain unavailable" in result.stderr
-        assert result.stdout == ""
-
-    def test_the_prompt_reaches_the_brain_intact(self, tmp_path, monkeypatch):
-        import pxh.claude_session as cs
-        seen = {}
-
-        def _capture(kind, payload, timeout_s=None, model=None):
-            seen.update(kind=kind, payload=payload, timeout_s=timeout_s, model=model)
-            return {"reply": "ok"}
-
-        self._run(monkeypatch, cs, _capture, tmp_path, timeout=42)
-        assert seen["kind"] == "evolve"
-        assert seen["payload"]["prompt"] == "test prompt"
-        assert seen["timeout_s"] == 42
-        assert seen["model"] == "claude-opus-4-6"
-
-    def test_no_subprocess_is_ever_spawned(self, tmp_path, monkeypatch):
-        import pxh.claude_session as cs
-
-        def _boom(*a, **k):
-            raise AssertionError(f"run_claude_session spawned a subprocess: {a}")
-
-        monkeypatch.setattr(cs.subprocess, "run", _boom)
-        assert self._run(monkeypatch, cs,
-                         lambda kind, payload, timeout_s=None, model=None:
-                         {"reply": "the answer"}, tmp_path).stdout == "the answer"
-
-    def test_the_resident_path_is_still_logged_and_names_its_provider(
-            self, tmp_path, monkeypatch):
-        """state/claude_sessions.jsonl is how spend is reconstructed after the
-        fact, and `provider` is what says which tier spent it."""
-        import pxh.claude_session as cs
-        result = self._run(monkeypatch, cs,
-                           lambda kind, payload, timeout_s=None, model=None:
-                           {"reply": "test output"}, tmp_path)
-
-        assert result.stdout == "test output"
-        assert result.provider == cs.RESIDENT_PROVIDER
-        entry = json.loads((tmp_path / "claude_sessions.jsonl").read_text().strip())
-        assert entry["type"] == "evolve"
-        assert entry["outcome"] == "success"
-        assert entry["provider"] == "claude-resident"
-        assert "tokens" not in entry
-
-
-
 class TestWhitelist:
     def test_spark_config_allowed(self):
         from pxh.claude_session import file_in_whitelist
@@ -646,68 +564,65 @@ def test_consolidate_second_attempt_is_admitted(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Routing to the resident Claude session (the `claude -p` retirement)
+# The resident transport is gone (#317 Phase 3)
 # ---------------------------------------------------------------------------
 
-def test_default_routed_types_are_the_ones_watched_in_production():
-    """Nothing is routed here any more, and that is the state #317 aimed at.
+def test_every_kind_has_one_backend_or_none():
+    """Nothing is routed to a CLI any more, and that is the state #317 aimed at.
 
-    The dial's original failure mode was a kind *missing* from it — disabled
-    by accident. With every tool-free kind migrated and `self_debug` last, the
-    honest reading is inverted again: the set is empty because no kind needs
-    the resident session, and `tests/test_resident_routing.py` is what now
-    keeps a new kind from landing in a gap.
+    The dial's original failure mode was a kind *missing* from it — disabled by
+    accident. With every kind migrated and `self_debug` last, the honest
+    reading inverts: a kind is either on the cognition tier or deliberately has
+    no backend, and `tests/test_resident_routing.py` is what keeps a new kind
+    from landing in a gap.
     """
     from pxh import claude_session as cs
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("PX_BRAIN_KINDS", None)
-        kinds = cs.brain_kinds()
-    assert kinds == frozenset()
-    # evolve is absent on purpose: it needs a git worktree, and a resident
-    # session's tool envelope is fixed at launch. Absent now means *disabled*,
-    # not "takes the old path" — there is no old path.
-    assert "evolve" not in kinds
     assert cs._COGNITION_KINDS == {"consolidate", "research", "compose",
                                   "blog", "self_debug"}
+    # `evolve` is absent on purpose: it needs a git worktree, and a tool-free
+    # API call cannot provide one. Absent means *disabled*, not "takes the old
+    # path" — there is no old path.
+    assert "evolve" not in cs._COGNITION_KINDS
 
+
+def test_the_routing_dial_is_gone_rather_than_empty():
+    """An empty dial is a route that is one environment variable from working.
+
+    `PX_BRAIN_KINDS` and both spellings of the accessor are deleted in the same
+    change as the session they routed to, so "rolled back into the mailbox"
+    stops being a shape anyone can reach for.
+    """
+    from pxh import claude_session as cs
+    for name in ("brain_kinds", "_brain_kinds", "_DEFAULT_BRAIN_KINDS",
+                 "RESIDENT_PROVIDER"):
+        assert not hasattr(cs, name), f"{name} outlived the transport it named"
 
 
 def test_reflection_has_no_cold_rollback_dial():
     """The dial's off position used to mean `claude -p`. It has no meaning now.
 
     `mind._reflection_via_brain_enabled()` was removed with the cold path it
-    selected. Had it stayed, narrowing PX_BRAIN_KINDS would silently disable
-    reflection while still reading like a routing choice — a lever that does
-    something other than what its name says.
+    selected. Had it stayed, narrowing PX_BRAIN_KINDS would have silently
+    disabled reflection while still reading like a routing choice — a lever
+    that does something other than what its name says.
     """
     from pxh import mind
     assert not hasattr(mind, "_reflection_via_brain_enabled")
 
 
-def test_brain_kinds_is_read_at_call_time_not_import_time():
-    """Read at call time, so routing can be widened without a restart.\n\n    Narrowing it now *disables* a kind rather than rolling it back to a cold\n    path, so an empty dial means no backend at all — see\n    test_no_session_type_spawns_a_process."""
-    from pxh import claude_session as cs
-    with patch.dict(os.environ, {"PX_BRAIN_KINDS": "research,compose,blog"}):
-        assert "blog" in cs._brain_kinds()
-    with patch.dict(os.environ, {"PX_BRAIN_KINDS": ""}):
-        assert cs._brain_kinds() == frozenset()
-
-
-def test_budget_is_still_checked_before_the_brain_is_asked(tmp_path, monkeypatch):
+def test_budget_is_still_checked_before_the_provider_is_asked(tmp_path, monkeypatch):
     """Routing must not become a way around the quota.
 
-    Driven with a kind that would go resident if the dial still routed one, so
-    the assertion is about the *order* rather than about a kind that no longer
-    reaches this door at all.
+    Driven through the cognition path, since that is now the only door — the
+    assertion is about the *order* of the check, not about which provider.
     """
-    from pxh import brain
-    from pxh import claude_session as cs
+    from pxh import claude_session as cs, m5
 
     asked = []
-    monkeypatch.setattr(brain, "ask_brain",
-                        lambda *a, **k: asked.append(1) or {"reply": "x"})
+    monkeypatch.setattr(m5, "ask_m5", lambda *a, **k: asked.append(1) or
+                        m5.M5Result(status="available", response="x"))
     monkeypatch.setattr(cs, "check_budget", lambda t: "daily cap reached")
 
     with pytest.raises(cs.SessionBudgetExhausted):
-        cs.run_claude_session("evolve", "anything")
+        cs.run_claude_session("research", "anything")
     assert asked == [], "budget check must run before the request"

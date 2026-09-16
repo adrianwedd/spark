@@ -10,7 +10,7 @@ Observation period (steps 5-6) is now running against natural load.
 ## Post-install verification (2026-08-26T19:35 AEST)
 
 zram0 live at prio 100 above /var/swap (−2); comp_algorithm `zstd`; swap total
-1.5 GiB. All services active (px-brain `validated`, px-wake-listen, px-mind,
+1.5 GiB. All services active (px-wake-listen, px-mind,
 px-api-server, px-alive, px-frigate-stream); `/api/v1/health` = ok; cgroup
 MemoryCurrent and `/proc/pressure` both still read. No swap storm — zram used
 0 B immediately post-activation (kernel migrates only on new pressure; the
@@ -42,6 +42,7 @@ removes the SD card from the swap path.
 | swap_free_kb at overrun (n=110) | median 10 212 KB free of 524 284 — **swap effectively exhausted at overrun time**, min 0 |
 | px-wake-listen | memory.current 657 MiB, MemoryHigh 896 MiB, MemoryMax 1280 MiB |
 | px-brain | memory.current 612 MiB, MemoryHigh 960 MiB, MemoryMax 1536 MiB |
+| *(this unit was retired in #317 Phase 3; the row is kept as the measurement it was)* |
 | IOAccounting / IOWeight | `no` / unset on every px-* service |
 | Frigate pipeline disk IO | ffmpeg `write_bytes: 0` (pure restream) — **no evidence camera pipeline competes for disk writes** |
 
@@ -72,7 +73,7 @@ still shows IO PSI clustering at overruns.
 ## Post-install verification checklist
 
 1. `swapon --show` → zram0 prio 100 above /var/swap prio −2.
-2. `bin/px-brain-status`, `systemctl status px-wake-listen px-mind px-api-server`,
+2. `systemctl status px-wake-listen px-mind px-api-server`,
    one `bin/px-mic-check` when the mic is free.
 3. `cat /sys/block/zram0/mm_stat` (compression ratio sanity),
    `/proc/pressure/io` trend.
@@ -82,7 +83,8 @@ still shows IO PSI clustering at overruns.
 
 ## #270 note
 
-The #270 separator is px-brain `mem_ratio` near MemoryHigh, not IO PSI. zram
+The #270 separator was px-brain `mem_ratio` near MemoryHigh, not IO PSI
+(that unit is retired as of #317 Phase 3; the method is unchanged). zram
 changes the *cost* of reclaim, not the cgroup accounting — do not claim #270
 fixed without post-change evidence; use the cleaner regime to re-test the
 correlation.

@@ -13,7 +13,7 @@ def test_homepage_leads_with_persistence_and_three_boundaries():
     page = _read("index.html")
 
     assert "A robot that stays around." in page
-    assert "One persistent brain." in page
+    assert "One continuous someone." in page
     assert "PERSISTS" in page
     assert "KNOWS HOW IT KNOWS" in page
     assert "CANNOT GRANT ITSELF POWER" in page
@@ -25,12 +25,15 @@ def test_homepage_explains_current_cognition_routes():
     assert "Local perception" in page
     assert "Hosted cognition" in page
     assert "Ollama Cloud" in page
-    assert "Resident Claude" in page
     assert "Deterministic policy" in page
     assert "public chat" in page
     assert "Obi chat" in page
     assert "post QA" in page
     assert "blog QA" in page
+    # Direct voice and semantic vision are on the same hosted tier now, so the
+    # route diagram must name them there rather than on a step of their own.
+    assert "direct voice" in page
+    assert "semantic vision" in page
 
 
 def test_homepage_names_durable_provenance_types():
@@ -51,6 +54,13 @@ def test_public_html_rejects_retired_architecture_story():
     assert "Claude CLI (px-spark)" not in public_html
     assert "Four-Tier LLM Fallback" not in public_html
     assert "Tier 1: Ollama on M5" not in public_html
+    # #317 Phase 3: the site may not describe a resident model session, a
+    # handshake, or a kept-alive brain. The claim that SPARK is persistent is
+    # still true — it is carried by memory and the loop, not by a process.
+    assert "spark-brain" not in public_html
+    assert "resident brain" not in public_html
+    assert "resident Claude" not in public_html
+    assert "handshake" not in public_html.lower()
 
 
 def test_supporting_pages_place_content_in_continuous_life():

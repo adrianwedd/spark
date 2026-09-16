@@ -88,22 +88,22 @@ def test_cgroup_pressure_fields_reads_mem_ratio(tmp_path, monkeypatch):
 
 
 def test_cgroup_pressure_fields_computes_rate_on_second_call(tmp_path, monkeypatch):
-    unit_dir = tmp_path / "px-brain.service"
+    unit_dir = tmp_path / "px-wake-listen.service"
     unit_dir.mkdir()
     (unit_dir / "memory.current").write_text("100\n")
     (unit_dir / "memory.high").write_text("200\n")
     events_file = unit_dir / "memory.events"
     events_file.write_text("low 0\nhigh 10\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n")
-    monkeypatch.setitem(hostload._MONITORED_UNITS, "px-brain", unit_dir)
-    hostload._last_events_high.pop("px-brain", None)
+    monkeypatch.setitem(hostload._MONITORED_UNITS, "px-wake-listen", unit_dir)
+    hostload._last_events_high.pop("px-wake-listen", None)
 
-    first = hostload.cgroup_pressure_fields("px-brain", "start")
-    assert first["events_high_rate_px-brain_start"] == 0.0
+    first = hostload.cgroup_pressure_fields("px-wake-listen", "start")
+    assert first["events_high_rate_px-wake-listen_start"] == 0.0
 
     events_file.write_text("low 0\nhigh 25\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n")
-    second = hostload.cgroup_pressure_fields("px-brain", "end")
-    assert second["events_high_px-brain_end"] == 25.0
-    assert second["events_high_rate_px-brain_end"] == 15.0
+    second = hostload.cgroup_pressure_fields("px-wake-listen", "end")
+    assert second["events_high_px-wake-listen_end"] == 25.0
+    assert second["events_high_rate_px-wake-listen_end"] == 15.0
 
 
 def test_cgroup_pressure_fields_omits_mem_ratio_when_high_is_max(tmp_path, monkeypatch):
@@ -121,7 +121,7 @@ def test_cgroup_pressure_fields_omits_mem_ratio_when_high_is_max(tmp_path, monke
 
 def test_cgroup_pressure_fields_never_raises_when_dir_missing(monkeypatch, tmp_path):
     monkeypatch.setitem(
-        hostload._MONITORED_UNITS, "px-brain", tmp_path / "does-not-exist.service"
+        hostload._MONITORED_UNITS, "px-wake-listen", tmp_path / "does-not-exist.service"
     )
-    hostload._last_events_high.pop("px-brain", None)
-    assert hostload.cgroup_pressure_fields("px-brain", "x") == {}
+    hostload._last_events_high.pop("px-wake-listen", None)
+    assert hostload.cgroup_pressure_fields("px-wake-listen", "x") == {}
