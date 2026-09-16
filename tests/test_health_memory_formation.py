@@ -63,9 +63,9 @@ def test_fresh_success_reads_ok():
 
 
 def test_a_healthy_nightly_run_is_not_stale_at_28_hours():
-    # The pass fires anywhere in 02:00-06:00 Hobart, so two good nights can sit
-    # ~28h apart. px-blog's daily 86400 would call that stale every afternoon,
-    # and an alarm that cries wolf daily is one nobody reads.
+    # The pass fires anywhere in 03:00-06:00 Hobart (#310), so two good nights
+    # can sit ~27h apart. px-blog's daily 86400 would call that stale every
+    # afternoon, and an alarm that cries wolf daily is one nobody reads.
     health.record_success(CONS)
     _shift_updated(28 * 3600)
     assert health.read_health()["components"][CONS]["status"] == "ok"

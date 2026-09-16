@@ -108,6 +108,50 @@ class TestRateLimiting:
              patch.object(cs, "COOLDOWN_S", 1800):
             assert cs.check_budget("self_debug") is None
 
+    def test_a_session_that_was_never_answered_does_not_arm_the_cooldown(self, tmp_path):
+        """#310: rc=1/`brain_unavailable` is a record that nothing was spent.
+
+        On 2026-09-15 a `research` attempt that never reached the model was the
+        only thing that refused `consolidate` its own retry for half an hour.
+        """
+        sd = _make_state_dir(tmp_path)
+        _write_session_log(sd, [{
+            "ts": _ts_ago(60), "type": "research", "model": "haiku",
+            "duration_s": 0.0, "returncode": 1, "outcome": "brain_unavailable",
+        }])
+        import pxh.claude_session as cs
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
+             patch.object(cs, "BUDGET_DISABLED", False), \
+             patch.object(cs, "COOLDOWN_S", 1800):
+            assert cs.check_budget("compose") is None
+
+    def test_an_answered_session_still_arms_the_cooldown(self, tmp_path):
+        """The gate is narrowed to spend, not removed."""
+        sd = _make_state_dir(tmp_path)
+        _write_session_log(sd, [{
+            "ts": _ts_ago(60), "type": "research", "model": "haiku",
+            "duration_s": 12.0, "returncode": 0, "outcome": "success",
+        }])
+        import pxh.claude_session as cs
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
+             patch.object(cs, "BUDGET_DISABLED", False), \
+             patch.object(cs, "COOLDOWN_S", 1800):
+            assert "global cooldown" in cs.check_budget("compose")
+
+    def test_an_entry_with_no_returncode_counts_as_spend(self, tmp_path):
+        """An unknown shape keeps the gate that already applied.
+
+        Entries predate the field only in theory, and the safe direction on a
+        parse failure is the narrower cooldown, not a widened one.
+        """
+        sd = _make_state_dir(tmp_path)
+        _write_session_log(sd, [{"ts": _ts_ago(60), "type": "research"}])
+        import pxh.claude_session as cs
+        with patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
+             patch.object(cs, "BUDGET_DISABLED", False), \
+             patch.object(cs, "COOLDOWN_S", 1800):
+            assert "global cooldown" in cs.check_budget("compose")
+
     def test_daily_cap_blocks(self, tmp_path):
         sd = _make_state_dir(tmp_path)
         # Write 8 sessions within the last hour (definitely today in any TZ)
@@ -504,11 +548,17 @@ def test_consolidate_session_type_registered():
     from pxh import claude_session as cs
     from pxh import memory
     assert cs._model_for_type("consolidate").startswith("claude-haiku")
-    # Two per night, 40 min apart (#291). Was 1/72000, which made the second of
+    # Two per night (#291). Was 1/72000, which made the second of
     # memory.MAX_ATTEMPTS_PER_DAY's two attempts structurally unspendable —
     # attempt 1 consumed the only slot attempt 2 could ever have used.
     assert cs._TYPE_QUOTAS["consolidate"] == memory.MAX_ATTEMPTS_PER_DAY == 2
-    assert cs._TYPE_COOLDOWNS["consolidate"] == memory.RETRY_SPACING_S == 2400
+    # The cooldown is *not* the retry gap, and must not be made equal to it
+    # again (#310): this clock starts when an attempt finished, that one when it
+    # started, so an attempt that spends its whole 600s deadline puts the retry
+    # 1800s into a 2400s cooldown and it is refused. The gap has to be wider
+    # than the cooldown, not the same as it.
+    assert cs._TYPE_COOLDOWNS["consolidate"] == 2400
+    assert memory.RETRY_SPACING_S > cs._TYPE_COOLDOWNS["consolidate"]
     assert cs._PRIORITY["consolidate"] == 2
     assert cs._ENV_OVERRIDES["consolidate"] == "PX_CLAUDE_MODEL_CONSOLIDATE"
 

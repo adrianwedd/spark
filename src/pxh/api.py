@@ -753,7 +753,7 @@ async def health():
         # be *visible* — being reported nowhere at all is the bug this
         # component exists to fix — so it moves to checks["memory"] rather than
         # being dropped. Newly deployed, it reads "missing" until the first
-        # 02:00 pass, which would otherwise 503 the API for a whole day.
+        # 03:00 pass (#310), which would otherwise 503 the API for a whole day.
         effective_statuses.pop(_health.CONSOLIDATION_COMPONENT, None)
         status_rank = {
             "ok": 0,

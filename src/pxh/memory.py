@@ -41,26 +41,58 @@ LOCK_TIMEOUT_S = 10
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 DEDUPE_SIMILARITY = 0.85
 DEDUPE_WINDOW_DAYS = 14
-CONSOLIDATION_WINDOW = (2, 6)     # Hobart hours [start, end)
+# Hobart hours [start, end) for the nightly pass. The start is not the hour the
+# night begins, it is the first hour the brain is usable again.
+#
+# `brain_daemon.NIGHTLY_RECYCLE_HOUR` is 02:00, and a recycle deliberately
+# clears the session's validation marker — that is what makes a caller fall
+# back instead of typing into a session that has just forgotten its identity
+# prompt. So for the whole boot that follows, every caller is refused with
+# `brain_unavailable` at dur=0.0s: an immediate refusal, not a timeout.
+#
+# #310: the first attempt landed at 02:00:0x-02:03 on every one of the nine
+# nights it was measured and failed on arrival on every one of them, for this
+# structural reason and no other. `brain.VALIDATION_CEILING_S` (180s) is the
+# ceiling on that blackout, so 03:00 clears it by most of an hour and still
+# leaves both spaced attempts inside the window.
+#
+# tests/test_consolidation_background_job.py pins the coupling to
+# `NIGHTLY_RECYCLE_HOUR` rather than to this number, so moving the recycle
+# without moving the window fails a test instead of costing nine more nights.
+CONSOLIDATION_WINDOW = (3, 6)     # Hobart hours [start, end)
 MAX_ATTEMPTS_PER_DAY = 2
 MIN_THOUGHTS = 5
 MAX_MEMORIES_PER_DAY = 8
 
-# Minimum gap between the two nightly attempts (#291).
+# Minimum gap between the two nightly attempts, measured from the *start* of
+# the first (#291, corrected by #310).
 #
 # Both attempts used to land ~60s apart, which made the retry decorative twice
 # over: `claude_session.COOLDOWN_S` (the 30-minute global session cooldown)
 # rejected it outright, and even without that a second Haiku turn started one
-# minute after the first failed is a retry of the same load conditions. 40
-# minutes clears the global cooldown with ten minutes of margin and still fits
-# twice inside the four-hour 02:00-06:00 window.
+# minute after the first failed is a retry of the same load conditions.
+#
+# The gap is measured against the attempt it is spacing, and the two clocks are
+# not the same instant. This gate reads `meta["last_attempt_ts"]`, stamped when
+# attempt 1 *started*; the `consolidate` type cooldown reads the session log,
+# written when attempt 1 *finished*. An attempt that spends its declared
+# `brain._DEADLINE_S` of 600s therefore reaches attempt 2 with 2400s elapsed
+# here and only 1800s elapsed there, and is refused. That is the whole of
+# #310's second defect. The history matches it exactly: attempt 2 was admitted
+# on 09-04..09-07, which are precisely the nights attempt 1 failed instantly,
+# and refused on 09-08 and 09-10, which are the nights it ran to its deadline.
+#
+# So the spacing has to cover the attempt's own worst case, not a nominal one:
+# `_TYPE_COOLDOWNS["consolidate"]` (2400) + `_DEADLINE_S["consolidate"]` (600)
+# = 3000s, plus margin for prompt assembly. 3300s clears that with five minutes
+# to spare, and two spaced attempts still fit inside 03:00-06:00.
 #
 # Spacing past the cooldown is deliberate, rather than adding `consolidate` to
 # `_GLOBAL_COOLDOWN_EXEMPT`. The cooldown exists because two Claude sessions
 # close together contend on a 4-core Pi, and that reason applies to
 # consolidation exactly as written — the attempt is 600s of resident-session
 # time. An exemption would buy the retry by denying the premise.
-RETRY_SPACING_S = 2400
+RETRY_SPACING_S = 3300
 
 # A consolidation worker that has held the job marker this long has overrun its
 # own budget (brain._DEADLINE_S["consolidate"] is 600s, plus prompt assembly and
@@ -423,6 +455,18 @@ def _parse_ts(value: object) -> dt.datetime | None:
     return parsed
 
 
+def _hobart_date(local: dt.datetime) -> str:
+    """The Hobart calendar date a (tz-aware) instant falls on.
+
+    Every date-keyed decision in this module — "first attempt of the night",
+    "already done for this date", the meta reset, and now the attempt number
+    reported to the operator — has to be made against Hobart's calendar. Two of
+    them used to spell the format out locally; this is here so the third does
+    not have to.
+    """
+    return local.astimezone(HOBART_TZ).strftime("%Y-%m-%d")
+
+
 def consolidation_due(now: dt.datetime | None = None) -> str | None:
     """The read-only half of `maybe_consolidate`'s gate.
 
@@ -437,9 +481,13 @@ def consolidation_due(now: dt.datetime | None = None) -> str | None:
     """
     local = (now or dt.datetime.now(HOBART_TZ)).astimezone(HOBART_TZ)
     if not (CONSOLIDATION_WINDOW[0] <= local.hour < CONSOLIDATION_WINDOW[1]):
-        return "outside the 02:00-06:00 window"
+        # Rendered from the constant rather than typed twice: this string is
+        # what an operator reads out of `budget_summary`, and a literal here
+        # would keep describing 02:00-06:00 after the gate moved on.
+        return (f"outside the {CONSOLIDATION_WINDOW[0]:02d}:00-"
+                f"{CONSOLIDATION_WINDOW[1]:02d}:00 window")
     meta = _read_consolidation_meta()
-    if meta.get("last_date") != local.strftime("%Y-%m-%d"):
+    if meta.get("last_date") != _hobart_date(local):
         return None                      # a fresh Hobart date: first attempt
     if meta.get("done"):
         return "already done for this date"
@@ -455,13 +503,25 @@ def consolidation_due(now: dt.datetime | None = None) -> str | None:
     return None
 
 
-def next_consolidation_attempt() -> int:
+def next_consolidation_attempt(now: dt.datetime | None = None) -> int:
     """1 or 2 — which attempt `maybe_consolidate` would spend next.
 
     Recorded on the job marker so an operator looking at a stuck run can tell
     "tonight's first try" from "the last chance before morning".
+
+    Read through the date, not around it (#310). `meta["attempts"]` is reset
+    for a new Hobart date inside `maybe_consolidate`, and this runs before
+    that, so a bare `attempts + 1` reported the *previous* night's second
+    attempt as tonight's third: every night logged "attempt 3/2" on the first
+    run and "2/2" on the second. `now` is injectable for the same reason the
+    other gates take it — the caller's clock is what decides which date the
+    attempts belong to.
     """
-    return _read_consolidation_meta().get("attempts", 0) + 1
+    local = (now or dt.datetime.now(HOBART_TZ)).astimezone(HOBART_TZ)
+    meta = _read_consolidation_meta()
+    if meta.get("last_date") != _hobart_date(local):
+        return 1
+    return meta.get("attempts", 0) + 1
 
 
 def maybe_consolidate(dry: bool = False, persona: str = "spark",
@@ -477,7 +537,7 @@ def maybe_consolidate(dry: bool = False, persona: str = "spark",
     local = (now or dt.datetime.now(HOBART_TZ)).astimezone(HOBART_TZ)
     if consolidation_due(now=local) is not None:
         return None
-    today = local.strftime("%Y-%m-%d")
+    today = _hobart_date(local)
     meta_f = consolidation_meta_file()
     meta = _read_consolidation_meta()
     if meta.get("last_date") != today:

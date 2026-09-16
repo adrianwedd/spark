@@ -3758,7 +3758,7 @@ def mind_loop(args) -> None:
         prev_awareness = awareness
         health_mod.record_success("px-mind", detail={"transitions": transitions})
 
-        # Nightly memory consolidation (02:00–06:00 Hobart, once per date, SPARK only)
+        # Nightly memory consolidation (03:00–06:00 Hobart, once per date, SPARK only)
         _consolidation_tick(session, args.dry_run)
 
         # Any transition resets the backoff (something is happening)
