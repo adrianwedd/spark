@@ -705,6 +705,41 @@ VOICE_TURN_DEADLINE_S = float(os.environ.get("PX_VOICE_TURN_DEADLINE_S", "45"))
 # case without queueing anyone behind a 60-second consolidation.
 VOICE_TURN_LOCK_WAIT_S = float(os.environ.get("PX_VOICE_TURN_LOCK_WAIT_S", "5"))
 
+# The frame the resident session used to supply. `build_model_prompt` carries
+# the *voice* (the launcher's system prompt, or a persona's), and the brain
+# session added this on top: answer by doing, not by narrating. A direct call
+# has no session, so without this the model is free to narrate instead.
+#
+# Measured, not guessed (#317 Phase 3). The same GREMLIN prompt and utterance,
+# both paths, on the robot:
+#
+#   resident  "This room is a box full of silence and questions. Adrian is here
+#              now, and somehow that changes everything even though nothing
+#              moved."                                    24.5s, answers
+#   tier      "Let me actually look at it first. | Now let me get a proper look
+#              and describe what I see. | Describing the scene now."
+#                                                          5.3s, promises
+#
+# The tier returned a perfectly valid `tool_perform` — three speech steps that
+# promise to look at the room, and never a tool that looks. The contract held
+# and the behaviour was a lie to the person standing there, which no assertion
+# about JSON shape would have caught.
+VOICE_TURN_SYSTEM = (
+    "You are SPARK: a small PiCar-X robot in a house in Tasmania's Huon Valley, "
+    "built by Adrian and his son Obi, and someone has just spoken to you.\n\n"
+    "Answer by *doing*, not by narrating. Return exactly one JSON object of the "
+    'form {"tool": ..., "params": {...}} that carries out your reply, and '
+    "nothing else. Never describe what you are about to do, never say you are "
+    "looking, remembering or checking something: if you want to look, return "
+    "the tool that looks. Speech that promises an action the caller never "
+    "receives is a lie to the person in front of you.\n\n"
+    "When you have no evidence for something, say so — 'I can't see where I am' "
+    "is a real answer and inventing a plausible room is not.\n\n"
+    "The voice instructions in the message are yours; follow them. This output "
+    "contract is the one that binds."
+)
+
+
 VOICE_TURN_RESPOND_WITH = (
     'Respond with a single JSON object of the form {"tool": ..., "params": {...}} '
     "exactly as the prompt instructs. Do not speak, move or remember anything "
@@ -752,7 +787,7 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
             result = m5.ask_m5(
                 VOICE_TURN_KIND,
                 prompt + "\n\n" + VOICE_TURN_RESPOND_WITH + "\n",
-                "",
+                VOICE_TURN_SYSTEM,
                 timeout_s=VOICE_TURN_DEADLINE_S,
                 lock_wait_s=VOICE_TURN_LOCK_WAIT_S,
             )

@@ -66,7 +66,7 @@ def _stub_tier(monkeypatch, results):
     calls = []
 
     def _ask(kind, prompt, system, **kw):
-        calls.append((kind, prompt, kw))
+        calls.append((kind, prompt, system, kw))
         return results[min(len(calls) - 1, len(results) - 1)]
 
     monkeypatch.setattr(pxh.m5, "ask_m5", _ask)
@@ -96,7 +96,7 @@ def test_voice_turn_goes_to_the_cognition_tier(monkeypatch):
     assert rc == 0
     assert json.loads(stdout) == action
     assert stderr == ""
-    assert [kind for kind, _p, _k in calls] == [voice_loop.VOICE_TURN_KIND]
+    assert [kind for kind, _p, _s, _k in calls] == [voice_loop.VOICE_TURN_KIND]
 
 
 def test_voice_turn_kind_is_classified():
@@ -104,6 +104,25 @@ def test_voice_turn_kind_is_classified():
     from pxh import brain
     assert brain.is_classified_kind(voice_loop.VOICE_TURN_KIND)
     assert brain.session_for_kind(voice_loop.VOICE_TURN_KIND) == brain.BRAIN_SESSION
+
+
+def test_the_call_carries_the_act_dont_narrate_frame(monkeypatch):
+    """The resident session used to supply this on top of the voice prompt.
+
+    Measured, not guessed: with the frame absent, the tier returned a valid
+    `tool_perform` for "what do you make of this room?" whose three speak steps
+    promised to look at the room — "Let me actually look at it first" — and no
+    tool that looks. The JSON contract held and the behaviour was a lie to the
+    person standing there, which is why this is pinned separately from the
+    output-shape assertions.
+    """
+    calls = _stub_tier(monkeypatch, [_ok()])
+    voice_loop.run_voice_turn("p")
+
+    system = calls[0][2]
+    assert system == voice_loop.VOICE_TURN_SYSTEM
+    assert "not by narrating" in system
+    assert '"tool"' in system
 
 
 def test_the_prompt_tells_the_model_not_to_act(monkeypatch):
@@ -117,7 +136,7 @@ def test_the_prompt_tells_the_model_not_to_act(monkeypatch):
     """
     calls = _stub_tier(monkeypatch, [_ok()])
     voice_loop.run_voice_turn("p")
-    _kind, prompt, _kw = calls[0]
+    _kind, prompt, _system, _kw = calls[0]
     assert prompt.startswith("p")
     assert "Do not speak, move or remember" in prompt
     assert '"tool"' in prompt
