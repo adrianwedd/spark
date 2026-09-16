@@ -254,6 +254,18 @@ class SessionBudgetExhausted(Exception):
 
 
 
+class CognitionTierToolsForbidden(ValueError):
+    """A cognition-tier kind was asked for tools it cannot have (#317).
+
+    The tier is one direct API call: there is no tool envelope to widen and no
+    session to widen it on. The tempting failure mode is to *ignore* the
+    request and answer without the tools — a silently degraded answer that
+    looks like a working one. Refusing is the honest outcome, and it is
+    cheap to fix: collect what the model needs in Python and pass it in the
+    prompt, which is what `self_debug` does.
+    """
+
+
 class ColdStartForbidden(RuntimeError):
     """Raised when a session type has no resident route.
 
@@ -388,7 +400,8 @@ def budget_summary() -> str:
 COGNITION_PROVIDER = "ollama-cloud"
 RESIDENT_PROVIDER = "claude-resident"
 
-_COGNITION_KINDS = frozenset({"consolidate", "research", "compose", "blog"})
+_COGNITION_KINDS = frozenset({"consolidate", "research", "compose", "blog",
+                               "self_debug"})
 
 # Provider-neutral per-kind model override. The Claude-era names
 # (`PX_CLAUDE_MODEL_RESEARCH` and friends) deliberately do not apply here: the
@@ -400,14 +413,23 @@ _COGNITION_MODEL_ENV = {
     "research": "PX_MODEL_RESEARCH",
     "compose": "PX_MODEL_COMPOSE",
     "blog": "PX_MODEL_BLOG",
+    "self_debug": "PX_MODEL_SELF_DEBUG",
 }
 
-# Only `self_debug` is left here. `research`, `compose`, `blog` and
-# `consolidate` moved to the cognition tier (#317); `post_qa` and `reflection`
-# were listed but never served from the resident session — `brain.py`
-# classifies both as M5 kinds and refuses them at the mailbox. `evolve` stays
+# Empty, and that is the state the migration was for: no kind is served
+# through this dispatcher by the resident session any more. `research`,
+# `compose`, `blog`, `consolidate` moved in #317 Phase 1 and `self_debug` in
+# Phase 2 — the last one, and the only one that ever needed tools. `post_qa`
+# and `reflection` were listed here but never served residently (`brain.py`
+# classifies both as M5 kinds and refuses them at the mailbox). `evolve` stays
 # absent and disabled on purpose (see the note above).
-_DEFAULT_BRAIN_KINDS = "self_debug"
+#
+# The dial itself is kept rather than deleted because `bin/px-post` consults
+# it, and because `_run_via_brain` is still the one door to the mailbox that
+# `ask_brain` itself uses for the interactive kinds (`voice_turn`, `cron_say`,
+# `describe_scene`). Removing the mechanism is Phase 3, where the mailbox goes
+# with it.
+_DEFAULT_BRAIN_KINDS = ""
 
 
 def brain_kinds() -> frozenset[str]:
@@ -580,6 +602,15 @@ def run_claude_session(
         # Ordered before the brain dial on purpose (#317): a migrated kind must
         # not be able to reach the resident session, including via a
         # `PX_BRAIN_KINDS` that still lists it.
+        if allowed_tools or skip_permissions:
+            # Not ignored, and not silently answered without them: a caller
+            # that asked for tools and got a tool-less answer would have no
+            # way to tell that from a working one.
+            raise CognitionTierToolsForbidden(
+                f"{session_type!r} runs on the cognition tier, which has no "
+                f"tools (asked for {allowed_tools!r}). Collect what it needs "
+                f"in Python and pass it in the prompt instead."
+            )
         return _run_via_cognition(session_type, prompt, timeout, model_override)
 
     model = model_override or _model_for_type(session_type)
