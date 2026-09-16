@@ -39,9 +39,9 @@ TURN_S         = 0.7
 PROBE_S        = 0.4
 
 EXPLORE_STEP_TIMEOUT   = 30
-# Budget for one tool-describe-scene call: Claude vision (vision.CLAUDE_TIMEOUT,
+# Budget for one tool-describe-scene call: vision on the cognition tier (vision.DESCRIBE_TIMEOUT_S,
 # 60s) + bounded speech (60s) + ~20s photo/stream headroom = 140s worst case,
-# plus 25s slack. Moves WITH vision.CLAUDE_TIMEOUT — the pin in
+# plus 25s slack. Moves WITH vision.DESCRIBE_TIMEOUT_S — the pin in
 # test_describe_scene_timeout_has_margin_over_claude checks the surplus, not
 # just the sign, so raising one without the other fails the suite by name.
 DESCRIBE_SCENE_TIMEOUT = 165

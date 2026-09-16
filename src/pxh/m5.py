@@ -260,12 +260,18 @@ def circuit_summary() -> dict:
 
 def ask_m5(kind: str, prompt: str, system: str, *,
            timeout_s: float | None = None, model: str | None = None,
-           lock_wait_s: float = 0.0) -> M5Result:
+           lock_wait_s: float = 0.0, images: list[str] | None = None) -> M5Result:
     """Run one no-tools turn on the pinned cognition model, without queueing.
 
     `model` overrides the tier's configured model for this one call — the seam
     a provider-neutral per-kind override needs (#317) — and the resolved model
     comes back on the result either way.
+
+    `images` is a list of base64-encoded images to attach to the request —
+    Ollama's `images` field, which needs a model that reports the `vision`
+    capability (`pxh.vision` checks that once, and refuses to guess). It is the
+    one parameter that makes a call *larger* rather than different, so the
+    size bound lives with the caller that owns the file, not here.
 
     `lock_wait_s` is how long to wait for the tier's single-flight lock before
     reporting `busy`. It defaults to 0 — *do not enqueue* — because a
@@ -324,7 +330,7 @@ def ask_m5(kind: str, prompt: str, system: str, *,
             return _result("offline", kind=kind, started=started, error=str(exc))
         if model is None:
             return _result("busy", kind=kind, started=started, error="no resident M5 model")
-        payload = json.dumps({
+        request_body = {
             "model": model,
             "prompt": prompt,
             "system": system,
@@ -332,7 +338,10 @@ def ask_m5(kind: str, prompt: str, system: str, *,
             # Reasoning chains re-enable refusal in small models and burn the
             # whole budget on a  thinking block that never emits an answer.
             "think": False,
-        }).encode()
+        }
+        if images:
+            request_body["images"] = list(images)
+        payload = json.dumps(request_body).encode()
         headers = {"Content-Type": "application/json"}
         key = _api_key()
         if key:
