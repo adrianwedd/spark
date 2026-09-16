@@ -62,6 +62,10 @@ state/race_track.json
 state/race_log.jsonl
 state/race_live.json
 state/pin_lockout.json
+# The model-call log. `claude_sessions.jsonl` is the same log under its
+# historical name — #317 Phase 3 renamed the writer, not the file, and the
+# old name is kept here so the record it holds stays out of the repository.
+state/model_sessions.jsonl
 state/claude_sessions.jsonl
 state/debug_reports.jsonl
 state/compositions-spark.jsonl
