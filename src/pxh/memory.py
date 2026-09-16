@@ -275,17 +275,32 @@ Output ONLY a JSON array:
 
 def _thoughts_last_24h(persona: str = "spark",
                        now: dt.datetime | None = None) -> list[dict]:
+    """The thoughts in `[now - 24h, now]`, oldest first.
+
+    `now` is the *end* of the window as well as the origin of its start
+    (#310). The pass is named for a 24-hour window and `consolidate(now=...)`
+    is the seam that makes any particular window addressable, but the selection
+    was bounded below only: every instant selected "everything since
+    `now - 24h`", running on to the present. Nothing visible in production
+    depends on that — with `now` omitted the present is the only possible end —
+    but it is what makes a historical replay a fiction instead of a
+    reconstruction. Ten candidate nights measured on the robot all selected the
+    *same* 200 thoughts, 09-15 13:48 onward, because the prompt carries
+    `thoughts[-200:]`: nine catch-up turns on nine different nights would each
+    have distilled tonight.
+    """
     f = _state_dir() / f"thoughts-{persona or 'spark'}.jsonl"
     if not f.exists():
         return []
-    cutoff = (now or dt.datetime.now(dt.timezone.utc)) - dt.timedelta(hours=24)
+    end = now or dt.datetime.now(dt.timezone.utc)
+    cutoff = end - dt.timedelta(hours=24)
     out: list[dict] = []
     try:
         for line in f.read_text(encoding="utf-8").strip().splitlines():
             try:
                 rec = json.loads(line)
                 ts = dt.datetime.fromisoformat(str(rec.get("ts", "")).replace("Z", "+00:00"))
-                if ts >= cutoff:
+                if cutoff <= ts <= end:
                     out.append(rec)
             except (json.JSONDecodeError, ValueError, TypeError):
                 continue
