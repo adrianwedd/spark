@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# px-cron-say — Claude-driven scheduled robot announcement.
+# px-cron-say — SPARK's scheduled announcement, on the cognition tier.
 #
 # Usage:
 #   bin/px-cron-say --scene morning      (morning greeting + weather)
@@ -8,7 +8,7 @@
 #   bin/px-cron-say --scene random       (random observation)
 #   bin/px-cron-say --prompt "Say something funny about being a robot."
 #
-# Claude is asked to return a tool_perform JSON so speech and motion are
+# The model is asked to return a tool_perform JSON so speech and motion are
 # choreographed together.  Falls back to tool_voice if tool_perform not found.
 set -euo pipefail
 
@@ -101,50 +101,48 @@ def build_prompt(scene: str | None, custom_prompt: str | None) -> str:
     )
 
 
-def call_claude(prompt: str) -> str:
-    """Ask the resident spark-brain for the scheduled line.
+# Was `brain._DEADLINE_S["cron_say"]` while the resident session answered this
+# kind. 90s stays: nobody is waiting on a cron line, and four more slots follow.
+CRON_SAY_DEADLINE_S = 90.0
 
-    This ran five times a day as a cold `claude -p` — a fresh Claude process,
-    metered API usage rather than Max, spawned on a Pi that might be in the
-    middle of a conversation, to produce one sentence.
+RESPOND_WITH = (
+    "a single tool_perform JSON object as the prompt instructs. "
+    "Do not speak or move for this request — return the object "
+    "and nothing else; the caller dispatches it."
+)
+
+
+def call_model(prompt: str) -> str:
+    """Ask the cognition tier for the scheduled line.
+
+    This ran five times a day as a cold `claude -p`, then on the resident
+    spark-brain session, and now on the cognition tier (#317 Phase 3): one
+    direct API call, no session, no mailbox, no request id.
 
     On unavailability it returns "" and the caller skips this slot. Nobody is
     waiting on a cron line; there are four more today. Deferring is the whole
-    point — a scheduled announcement must never be the reason the Pi is busy.
+    point — a scheduled announcement must never be the reason the Pi is busy,
+    and nothing here escalates to a second backend to avoid saying so.
     """
     try:
-        from pxh.brain import ask_brain
+        from pxh.m5 import ask_m5
     except Exception as exc:  # noqa: BLE001 - cron must never traceback
-        print(f"cron-say: brain import failed: {exc}", file=sys.stderr)
+        print(f"cron-say: cognition tier import failed: {exc}", file=sys.stderr)
         return ""
 
     try:
-        reply = ask_brain("cron_say", {
-            "system": SYSTEM_PROMPT,
-            "prompt": prompt,
-            "respond_with": (
-                "a single tool_perform JSON object as the prompt instructs. "
-                "Do not speak or move for this request — return the object "
-                "and nothing else; the caller dispatches it."
-            ),
-        })
+        result = ask_m5("cron_say", prompt + "\n\n" + RESPOND_WITH, SYSTEM_PROMPT,
+                        timeout_s=CRON_SAY_DEADLINE_S)
     except Exception as exc:  # noqa: BLE001
-        print(f"cron-say: brain call failed: {exc}", file=sys.stderr)
+        print(f"cron-say: cognition call failed: {exc}", file=sys.stderr)
         return ""
 
-    if reply is None:
-        print("cron-say: resident brain unavailable — skipping this slot",
+    if result.status != "available":
+        print(f"cron-say: cognition tier {result.status} — skipping this slot",
               file=sys.stderr)
         return ""
 
-    answer = reply.get("reply")
-    if isinstance(answer, str):
-        return answer.strip()
-    try:
-        import json as _j
-        return _j.dumps(answer)
-    except (TypeError, ValueError):
-        return ""
+    return result.response.strip()
 
 
 def extract_json(text: str) -> dict | None:
@@ -191,11 +189,11 @@ def main(argv) -> int:
     prompt = build_prompt(args.scene, args.prompt)
     log_event("cron-say", {"scene": args.scene, "dry": args.dry_run})
 
-    print(f"[cron-say] Asking Claude for scene='{args.scene}'…", file=sys.stderr)
-    response = call_claude(prompt)
+    print(f"[cron-say] asking the cognition tier for scene='{args.scene}'…", file=sys.stderr)
+    response = call_model(prompt)
 
     if not response:
-        print("[cron-say] Claude returned empty response", file=sys.stderr)
+        print("[cron-say] empty response — skipping this slot", file=sys.stderr)
         return 1
 
     action = extract_json(response)

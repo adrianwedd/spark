@@ -241,3 +241,26 @@ def test_bridge_is_deleted_not_deprecated():
     from pathlib import Path
     repo = Path(__file__).resolve().parent.parent
     assert not (repo / "bin" / "claude-voice-bridge").exists()
+
+
+# ── The same rule, for the scheduled line ──────────────────────────────────
+
+def test_cron_say_answers_from_the_cognition_tier_too():
+    """`bin/px-cron-say` is a bash+python script with no importable surface, so
+    this is a source invariant rather than a behavioural one — the shape the
+    repo already uses for `bin/claude-voice-bridge` being deleted and for the
+    describe-scene timeout pin.
+
+    It speaks, so it is the same voice question as `voice_turn`, and it fails
+    the same way if it drifts back: a resident session that is logged out or
+    mid-recycle takes the slot with it.
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "bin" / "px-cron-say").read_text(encoding="utf-8")
+
+    assert "ask_m5" in src, "cron-say no longer asks the cognition tier"
+    assert "ask_brain" not in src, "cron-say went back to the resident mailbox"
+    # Deliberately not asserting on the *phrase* "claude -p": this file's
+    # docstring has to be able to say what it replaced, and prose is not a call
+    # path. The two assertions above are about calls.
+    assert "call_claude" not in src
