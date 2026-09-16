@@ -21,6 +21,41 @@ All `bin/` scripts source `bin/px-env` automatically, which sets `PROJECT_ROOT`,
 
 **First use:** `cp state/session.template.json state/session.json`
 
+### Deploying to the robot
+
+This checkout is a dev copy. The robot runs `/home/pi/picar-x-hacking` and is
+**downstream of `master`** — a merge here changes nothing there until it is
+deployed.
+
+```bash
+ssh pi@picar
+cd /home/pi/picar-x-hacking && git status --short    # must be empty
+git fetch origin master && git merge --ff-only origin/master
+```
+
+**A change that deletes or renames a file a unit names must be ordered *around*
+that unit, not after it.** systemd resolves `ExecStart` when the unit starts, so
+a deleted entry point does not fail the deploy — it leaves the unit
+crash-looping against a missing file. That is #315's shape: loud, pointless, and
+it needs a human. Check before deploying:
+
+```bash
+for u in $(systemctl list-units --type=service --all --no-legend --plain | awk '{print $1}'); do
+  es=$(systemctl show "$u" -p ExecStart --value | grep -o '/home/pi/picar-x-hacking/[^ ;"]*' | head -1)
+  [ -n "$es" ] && [ ! -e "$es" ] && echo "$u -> MISSING $es"
+done
+```
+
+Repoint or disable those units **first**. #317 Phase 3 is the worked example: it
+deletes `bin/px-brain`, so `sudo systemctl disable --now px-brain` precedes the
+merge rather than following it.
+
+**Then restart the units whose *in-memory* state points at something that
+moved.** A daemon that resolved a path at startup keeps the old one until it
+restarts, and the symptom appears hours later rather than at deploy time:
+`px-wake-listen` resolves its voice launcher once, so a launcher rename needs
+`systemctl restart px-wake-listen` as well as `px-mind`.
+
 ## Running Tests
 
 ```bash

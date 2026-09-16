@@ -408,3 +408,90 @@ def test_an_unreadable_error_body_does_not_replace_the_status(_isolated_m5):
         result = _isolated_m5.ask_m5("reflection", "prompt", "system")
     assert result.status == "bad_response"
     assert "400" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Secret hygiene (#317 lists "never log OLLAMA_API_KEY" as an acceptance item)
+# ---------------------------------------------------------------------------
+#
+# Nothing pinned this. The key is only ever interpolated into an Authorization
+# header, which reads as obviously safe — but #324 made the provider's *error
+# body* part of the reported error, and an error string travels into logs, into
+# `state/claude_sessions.jsonl`'s neighbours and into whatever a caller prints.
+# "It only builds a header" is exactly the kind of reasoning that stops being
+# true one edit later, so the property is asserted rather than argued.
+
+def _walk_text(root):
+    """Every text blob under a directory, concatenated. Binary files skipped."""
+    import pathlib
+    out = []
+    for path in sorted(pathlib.Path(root).rglob("*")):
+        if path.is_file():
+            try:
+                out.append(path.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, OSError):
+                continue
+    return "\n".join(out)
+
+
+def test_the_api_key_appears_nowhere_after_every_failure_mode(
+        _isolated_m5, monkeypatch, tmp_path):
+    """Not in the meter, not in the circuit, not in an error, not on disk.
+
+    Every outcome that produces a message is exercised, because the leak — if
+    one ever exists — will be in whichever one nobody checked.
+    """
+    secret = "super-secret-token-8f3a1c"
+    monkeypatch.setenv("OLLAMA_API_KEY", secret)
+    monkeypatch.delenv("PX_M5_SPARK_API_KEY", raising=False)
+
+    def _http(code, body=b""):
+        raise urllib.error.HTTPError(
+            "https://ollama.com/api/generate", code, f"HTTP {code}",
+            MagicMock(), io.BytesIO(body))
+
+    errors = []
+
+    # available
+    with patch("urllib.request.urlopen", return_value=_response("hello")):
+        errors.append(_isolated_m5.ask_m5("reflection", "p", "s").error)
+    # offline (transport)
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+        errors.append(_isolated_m5.ask_m5("reflection", "p", "s").error)
+    # circuit open, which is the path that *replaces* the real error
+    errors.append(_isolated_m5.ask_m5("reflection", "p", "s").error)
+    # timeout
+    _isolated_m5.reset_for_tests()
+    with patch("urllib.request.urlopen", side_effect=TimeoutError("slow")):
+        errors.append(_isolated_m5.ask_m5("reflection", "p", "s").error)
+    # HTTP status with a body — #324's path, and the one that could echo it
+    _isolated_m5.reset_for_tests()
+    with patch("urllib.request.urlopen",
+               side_effect=lambda *a, **k: _http(401, b'{"error":"bad token"}')):
+        errors.append(_isolated_m5.ask_m5("reflection", "p", "s").error)
+    # unusable payload
+    _isolated_m5.reset_for_tests()
+    with patch("urllib.request.urlopen", return_value=_response("   ")):
+        errors.append(_isolated_m5.ask_m5("reflection", "p", "s").error)
+
+    assert any(e for e in errors), "no failure produced a message to check"
+    for err in errors:
+        assert secret not in (err or ""), f"the key surfaced in an error: {err!r}"
+
+    on_disk = _walk_text(tmp_path)
+    assert secret not in on_disk, "the API key was written under the state dir"
+    assert secret not in str(_isolated_m5.meter_summary())
+    assert secret not in str(_isolated_m5.circuit_summary())
+
+
+def test_the_missing_key_message_names_the_variable_not_the_value(_isolated_m5, monkeypatch):
+    """The failure an operator actually hits must be actionable without being a
+    disclosure: it names which variable to set, never what it held."""
+    monkeypatch.delenv("PX_M5_SPARK_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_API_KEY", raising=False)
+    monkeypatch.delenv("OLLAMA_CLOUD_API_KEY", raising=False)
+
+    result = _isolated_m5.ask_m5("reflection", "p", "s")
+
+    assert result.status == "bad_response"
+    assert "OLLAMA_API_KEY" in result.error
