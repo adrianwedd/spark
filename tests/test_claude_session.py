@@ -282,15 +282,17 @@ class TestRunSession:
                           return_value={"reply": "test output"}), \
              patch.object(cs, "SESSION_LOG", sd / "claude_sessions.jsonl"), \
              patch.object(cs, "STATE_DIR", sd):
-            result = cs.run_claude_session("research", "test prompt", timeout=10)
+            result = cs.run_claude_session("self_debug", "test prompt", timeout=10)
             assert result.stdout == "test output"
             assert result.returncode == 0
+            assert result.provider == "claude-resident"
 
             log_file = sd / "claude_sessions.jsonl"
             assert log_file.exists()
             entry = json.loads(log_file.read_text().strip())
-            assert entry["type"] == "research"
+            assert entry["type"] == "self_debug"
             assert entry["outcome"] == "success"
+            assert entry["provider"] == "claude-resident"
 
     def test_no_session_type_spawns_a_process(self, tmp_path):
         """Replaces test_claude_env_vars_stripped.
@@ -313,7 +315,7 @@ class TestRunSession:
              patch.object(cs, "STATE_DIR", sd), \
              patch.dict(os.environ, {"CLAUDECODE": "1", "PX_BRAIN_KINDS": ""}):
             with pytest.raises(cs.ColdStartForbidden):
-                cs.run_claude_session("research", "test prompt", timeout=10)
+                cs.run_claude_session("self_debug", "test prompt", timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -614,12 +616,16 @@ def test_default_routed_types_are_the_ones_watched_in_production():
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("PX_BRAIN_KINDS", None)
         kinds = cs.brain_kinds()
-    assert kinds == {"research", "compose", "post_qa", "reflection",
-                     "blog", "consolidate", "self_debug"}
+    assert kinds == {"self_debug"}
     # evolve is absent on purpose: it needs a git worktree, and a resident
     # session's tool envelope is fixed at launch. Absent now means *disabled*,
     # not "takes the old path" — there is no old path.
     assert "evolve" not in kinds
+    # The tool-free kinds left this dial for the cognition tier (#317), and
+    # `post_qa`/`reflection` were only ever listed here by mistake — brain.py
+    # classifies both as M5 kinds and refuses them at the mailbox.
+    assert kinds.isdisjoint(cs._COGNITION_KINDS)
+    assert cs._COGNITION_KINDS == {"consolidate", "research", "compose", "blog"}
 
 
 def test_reflection_has_no_cold_rollback_dial():
@@ -658,7 +664,7 @@ def test_a_routed_type_never_spawns_a_subprocess(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
     monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
 
-    result = cs.run_claude_session("research", "what is a wombat", timeout=5)
+    result = cs.run_claude_session("self_debug", "what is a wombat", timeout=5)
     assert result.returncode == 0
     assert result.stdout == "the answer"
 
@@ -676,11 +682,11 @@ def test_the_prompt_reaches_the_brain_intact(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
     monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
 
-    cs.run_claude_session("compose", "write a haiku", timeout=42)
-    assert seen["kind"] == "compose"
+    cs.run_claude_session("self_debug", "write a haiku", timeout=42)
+    assert seen["kind"] == "self_debug"
     assert seen["payload"]["prompt"] == "write a haiku"
     assert seen["timeout_s"] == 42
-    assert seen["model"].startswith("claude-haiku")
+    assert seen["model"] == cs._model_for_type("self_debug")
 
 
 def test_an_unavailable_brain_looks_like_a_failed_run_not_an_exception(
@@ -695,7 +701,7 @@ def test_an_unavailable_brain_looks_like_a_failed_run_not_an_exception(
     monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
     monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
 
-    result = cs.run_claude_session("research", "anything", timeout=5)
+    result = cs.run_claude_session("self_debug", "anything", timeout=5)
     assert result.returncode != 0
     assert "brain unavailable" in result.stderr
     assert result.stdout == ""
@@ -712,7 +718,7 @@ def test_a_structured_reply_is_handed_back_as_text(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "SESSION_LOG", tmp_path / "claude_sessions.jsonl")
     monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
 
-    result = cs.run_claude_session("research", "anything", timeout=5)
+    result = cs.run_claude_session("self_debug", "anything", timeout=5)
     assert json.loads(result.stdout) == {"verdict": "yes"}
 
 
@@ -727,7 +733,7 @@ def test_budget_is_still_checked_before_the_brain_is_asked(tmp_path, monkeypatch
     monkeypatch.setattr(cs, "check_budget", lambda t: "daily cap reached")
 
     with pytest.raises(cs.SessionBudgetExhausted):
-        cs.run_claude_session("research", "anything")
+        cs.run_claude_session("self_debug", "anything")
     assert asked == [], "budget check must run before the request"
 
 
@@ -744,6 +750,6 @@ def test_a_routed_session_is_still_logged(tmp_path, monkeypatch):
     monkeypatch.setattr(cs, "SESSION_LOG", log)
     monkeypatch.setattr(cs, "BUDGET_DISABLED", True)
 
-    cs.run_claude_session("research", "anything", timeout=5)
+    cs.run_claude_session("self_debug", "anything", timeout=5)
     entries = [json.loads(line) for line in log.read_text().splitlines() if line]
-    assert entries and entries[-1]["type"] == "research"
+    assert entries and entries[-1]["type"] == "self_debug"

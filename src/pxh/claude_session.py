@@ -1,7 +1,10 @@
-"""Claude session manager — model routing, rate limiting, execution, logging.
+"""Session dispatcher — provider routing, rate limiting, execution, logging.
 
-Central dispatcher for all SPARK-initiated Claude Code interactions.
-Used by px-evolve, tool-research, tool-compose, and mind.py self-debug.
+Central entry point for every SPARK-initiated model call that is not ordinary
+reflection. The name is historical: since #317 the tool-free kinds are served
+by the cognition tier (a direct Ollama Cloud API call, `pxh.m5`) and only the
+kinds that genuinely need Claude Code's tool envelope still reach the resident
+`spark-brain` session.
 """
 from __future__ import annotations
 
@@ -269,6 +272,10 @@ class RunResult:
     returncode: int
     duration_s: float
     model_used: str
+    # What actually served the call (#317). Callers that report "model_used"
+    # to an operator should be able to say which provider it came from —
+    # before this, every caller here was implicitly Claude.
+    provider: str = ""
 
 
 def _log_session(
@@ -277,19 +284,31 @@ def _log_session(
     duration_s: float,
     returncode: int,
     outcome: str,
+    *,
+    provider: str = "",
+    tokens: dict | None = None,
 ) -> str:
-    """Log a session to the session log.  Returns session_id."""
+    """Log a session to the session log.  Returns session_id.
+
+    `provider` is recorded rather than inferred (#317): the entry names the
+    tier that actually served the call, so a reader never has to know which
+    code path ran to interpret `model`. `tokens` carries Ollama's counters
+    when the provider supplied them; the resident path has none to give.
+    """
     now = dt.datetime.now(dt.timezone.utc)
     session_id = f"sess-{now.strftime('%Y%m%d-%H%M%S')}-{int(now.microsecond / 1000):03d}"
     entry = {
         "ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "type": session_type,
         "model": model,
+        "provider": provider,
         "duration_s": round(duration_s, 1),
         "returncode": returncode,
         "outcome": outcome,
         "session_id": session_id,
     }
+    if tokens:
+        entry["tokens"] = tokens
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     _append_session_entry(entry)
@@ -352,11 +371,51 @@ def budget_summary() -> str:
 # the alternative was a "legacy cold Claude" bucket, which is what this whole
 # change exists to abolish. px-evolve will raise until the brain can hold a
 # worktree; that is a known, deliberate outage, not a regression.
-_DEFAULT_BRAIN_KINDS = "research,compose,post_qa,reflection,blog,consolidate,self_debug"
+# ---------------------------------------------------------------------------
+# Provider routing (#317)
+# ---------------------------------------------------------------------------
+# Kinds served by the cognition tier — a direct Ollama Cloud API call — instead
+# of the resident Claude session. All four are tool-free (`allowed_tools=""`)
+# and every caller's prompt is self-contained: each opens with "You are SPARK
+# ..." and states its own output format, so nothing depends on the resident
+# session's system prompt or on Claude Code's tool envelope.
+#
+# This set is checked *before* the brain dial, and deliberately so. #317's
+# requirement is that no migrated kind silently falls back to Claude; a
+# rollback dial that could still route `consolidate` back into the mailbox
+# would be exactly that fallback, and the mailbox is the thing that cost nine
+# nights (#310, #314).
+COGNITION_PROVIDER = "ollama-cloud"
+RESIDENT_PROVIDER = "claude-resident"
+
+_COGNITION_KINDS = frozenset({"consolidate", "research", "compose", "blog"})
+
+# Provider-neutral per-kind model override. The Claude-era names
+# (`PX_CLAUDE_MODEL_RESEARCH` and friends) deliberately do not apply here: the
+# value they hold is a Claude model id, and handing that to Ollama would be a
+# different mistake than ignoring it. Set these only to override the tier's
+# configured model (`PX_M5_SPARK_MODEL`) for one kind.
+_COGNITION_MODEL_ENV = {
+    "consolidate": "PX_MODEL_CONSOLIDATE",
+    "research": "PX_MODEL_RESEARCH",
+    "compose": "PX_MODEL_COMPOSE",
+    "blog": "PX_MODEL_BLOG",
+}
+
+# Only `self_debug` is left here. `research`, `compose`, `blog` and
+# `consolidate` moved to the cognition tier (#317); `post_qa` and `reflection`
+# were listed but never served from the resident session — `brain.py`
+# classifies both as M5 kinds and refuses them at the mailbox. `evolve` stays
+# absent and disabled on purpose (see the note above).
+_DEFAULT_BRAIN_KINDS = "self_debug"
 
 
 def brain_kinds() -> frozenset[str]:
-    """Read at call time so the rollout can be widened or rolled back live."""
+    """Read at call time so the rollout can be widened or rolled back live.
+
+    Kinds in `_COGNITION_KINDS` are not served residently no matter what this
+    returns — see `run_claude_session`.
+    """
     raw = os.environ.get("PX_BRAIN_KINDS", _DEFAULT_BRAIN_KINDS)
     return frozenset(part.strip() for part in raw.split(",") if part.strip())
 
@@ -399,7 +458,8 @@ def _run_via_brain(
     duration = time.monotonic() - start
 
     if reply is None:
-        _log_session(session_type, model, duration, 1, "brain_unavailable")
+        _log_session(session_type, model, duration, 1, "brain_unavailable",
+                     provider=RESIDENT_PROVIDER)
         return RunResult(
             stdout="",
             stderr="brain unavailable — the resident Claude session did not answer",
@@ -414,13 +474,78 @@ def _run_via_brain(
         # all read stdout as text, so hand it back the way a subprocess would.
         answer = json.dumps(answer)
 
-    _log_session(session_type, model, duration, 0, "success")
+    _log_session(session_type, model, duration, 0, "success",
+                 provider=RESIDENT_PROVIDER)
     return RunResult(
         stdout=answer,
         stderr="",
         returncode=0,
         duration_s=duration,
         model_used=model,
+        provider=RESIDENT_PROVIDER,
+    )
+
+
+def cognition_model(session_type: str, override: str | None = None) -> str | None:
+    """The model the cognition tier should ask for, or None to use the tier's own.
+
+    Precedence: an explicit caller override, then the provider-neutral
+    per-kind name (`PX_MODEL_RESEARCH`), then `PX_M5_SPARK_MODEL` — resolved
+    inside `m5`, so the tier keeps one configured default.
+    """
+    if override:
+        return override
+    var = _COGNITION_MODEL_ENV.get(session_type)
+    if var:
+        value = os.environ.get(var, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _run_via_cognition(session_type: str, prompt: str, timeout: int | None,
+                       model_override: str | None = None) -> RunResult:
+    """Serve a tool-free session from the cognition tier: one direct API call.
+
+    The answer *is* the HTTP response body, which is the whole point of the
+    migration (#317, #314). There is no session to be logged out of, no inbox
+    file to be addressed by request id, no reply command to be shell-quoted,
+    and no permission dialog to sit in front of it — a language-model answer
+    cannot be produced and then lost in transit here, because nothing carries
+    it but the socket.
+
+    Failure is reported, never escalated to another provider: `status` is
+    mapped to a distinct outcome (`cognition_timeout`, `cognition_offline`,
+    `cognition_bad_response`, `cognition_busy`) so an operator can tell a slow
+    tier from a missing credential from a concurrent call, and the caller's
+    existing `returncode != 0` path does the rest.
+    """
+    from . import m5  # local import keeps the HTTP client off the import path
+
+    start = time.monotonic()
+    result = m5.ask_m5(session_type, prompt, "",
+                       timeout_s=timeout,
+                       model=cognition_model(session_type, model_override))
+    duration = time.monotonic() - start
+    model = result.model or m5.configured_model() or ""
+    tokens = {"prompt": result.prompt_eval_count, "eval": result.eval_count}
+
+    if result.status == "available":
+        _log_session(session_type, model, duration, 0, "success",
+                     provider=COGNITION_PROVIDER, tokens=tokens)
+        return RunResult(stdout=result.response, stderr="", returncode=0,
+                         duration_s=duration, model_used=model,
+                         provider=COGNITION_PROVIDER)
+
+    _log_session(session_type, model, duration, 1, f"cognition_{result.status}",
+                 provider=COGNITION_PROVIDER, tokens=tokens)
+    return RunResult(
+        stdout="",
+        stderr=f"cognition tier {result.status}: {result.error}",
+        returncode=1,
+        duration_s=duration,
+        model_used=model,
+        provider=COGNITION_PROVIDER,
     )
 
 
@@ -449,8 +574,15 @@ def run_claude_session(
         if reason:
             raise SessionBudgetExhausted(reason)
 
-    model = model_override or _model_for_type(session_type)
     work_dir = str(cwd) if cwd else str(PROJECT_ROOT)
+
+    if session_type in _COGNITION_KINDS:
+        # Ordered before the brain dial on purpose (#317): a migrated kind must
+        # not be able to reach the resident session, including via a
+        # `PX_BRAIN_KINDS` that still lists it.
+        return _run_via_cognition(session_type, prompt, timeout, model_override)
+
+    model = model_override or _model_for_type(session_type)
 
     if session_type in _brain_kinds():
         return _run_via_brain(session_type, prompt, timeout, model)

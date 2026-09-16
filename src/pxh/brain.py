@@ -153,6 +153,12 @@ _DEADLINE_S: dict[str, int] = {
     # warm and >45s cold — so this is headroom, not a target.
     "describe_scene": 60,
     "reflection": 120,
+    # These four are no longer consulted: `research`, `compose`, `blog` and
+    # `consolidate` were served from the cognition tier in #317 and never
+    # reach `ask_brain`, so their deadlines are now the tier's
+    # (`PX_M5_SPARK_TIMEOUT_S`). Left in place rather than deleted so the
+    # numbers remain legible in the history of this table; remove them with
+    # the rest of the resident mailbox.
     "research": 300,
     "compose": 300,
     "blog": 300,
