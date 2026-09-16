@@ -50,6 +50,21 @@ Repoint or disable those units **first**. #317 Phase 3 is the worked example: it
 deletes `bin/px-brain`, so `sudo systemctl disable --now px-brain` precedes the
 merge rather than following it.
 
+**Retiring a service leaves residue, and the residue lies.** Stopping a unit
+does not remove what it owned, and none of it is visible to the code that reads
+that kind of file. #317 Phase 3 left three, and each was found by listing a
+directory by hand rather than by anything failing:
+
+| residue | why it lied |
+|---|---|
+| an orphaned `claude` process and its tmux server, ~594 MB | `KillMode=process` is deliberate — a supervisor restart must not kill the sessions it supervises — so `systemctl stop` leaves them running, unreachable, forever |
+| `/tmp/tmux-1000/px-mind{.supervisor.lock}` | a socket file with no server reads as "there is a server here" |
+| `state/health/px-brain.json` | `read_health()` deliberately reports any component that has *ever* written a file, so a retired service reports `stale` forever — a permanent false alarm on the operator board |
+
+So the deploy checklist for a retirement is: stop the unit, kill what it owned
+(check `ps` for the process *and* the tmux socket), remove its health record,
+then watch the board until the name is gone.
+
 **Then restart the units whose *in-memory* state points at something that
 moved.** A daemon that resolved a path at startup keeps the old one until it
 restarts, and the symptom appears hours later rather than at deploy time:
@@ -500,6 +515,30 @@ glyph to misread, and no four-state session marker. `ask_m5` returns a
 classified `M5Result`; `probe()` answers "is the tier reachable and serving the
 configured model" once at px-mind startup. Run
 `python tools/check_resident_claude.py --list` for the live debt map.
+
+**Cognition tier availability — the blast radius if the key or the provider lapses.**
+The tier is a hosted service (`https://ollama.com`) reached with a bearer token
+from `.env`, and there is no local model anywhere beneath it. This is the
+question an operator asks at 3am when reflection stops answering, so it is
+written down rather than worked out under pressure:
+
+- **Unaffected.** All motion, safety, GPIO, wake-word, TTS and policy layers are
+  local Python with no model in the path. A dead tier cannot move the robot,
+  cannot speak for it, and cannot talk its way past `validate_action()`.
+- **Degraded, never broken.** `reflection` defers and backs off; `post_qa` and
+  `blog_qa` skip the item and retry next cycle; `cron_say` drops the slot (five
+  more follow today); `voice_turn` retries once on a transport fault and then
+  speaks the deterministic acknowledgement; `describe_scene` returns "I couldn't
+  see anything right now."; `research`/`compose`/`blog`/`consolidate`/`self_debug`
+  log and skip. **SPARK goes quiet and blind on demand; he does not brick.**
+- **Nothing escalates.** Every one of those is a deferral, and there is no
+  second destination to defer *to* — no resident session, no local model, no CLI
+  (#308, #317). A failure reduces work; it does not search wider.
+- **Two failure shapes worth telling apart.** A *missing* credential fails
+  closed and says so every time; a *rejected* one is reported with the provider's
+  own words (#324). And an `offline` that lasts exactly five minutes is the
+  shared circuit, not the network — check `state/m5/circuit.json` and
+  `state/m5/meter.json` before believing anything else.
 
 **Historical detail is in git, not here.** The mailbox layout
 (`state/brain/<session>/{inbox,outbox,dead}`, `current.json`,
