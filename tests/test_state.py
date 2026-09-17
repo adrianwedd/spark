@@ -655,3 +655,46 @@ def test_sweep_stale_temps_missing_directory_is_not_an_error(tmp_path):
         "skipped": 0,
         "failed": 0,
     }
+
+# --- atomic_write durability is a choice, not a default (#283) -------------
+#
+# The health store is rewritten by every daemon on its next tick, so its fsync
+# bought no crash durability and forced an ext4 journal commit per tick — the
+# wait 19 of 20 instrumented D-state IO stalls sat in (jbd2_log_wait_commit,
+# px-wake-listen 14, px-mind 4). Durability stays the default so nothing else
+# loses it by accident.
+
+
+def test_atomic_write_without_durability_still_lands_the_content(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(state.os, "fsync", lambda fd: calls.append(fd))
+    target = tmp_path / "record.json"
+    state.atomic_write(target, '{"a": 1}', durable=False)
+    assert target.read_text() == '{"a": 1}'
+    assert calls == [], "durable=False must not force a journal commit"
+    # No temp left behind, and the file is readable by the other uid.
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_atomic_write_is_durable_by_default(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(state.os, "fsync", lambda fd: calls.append(fd))
+    state.atomic_write(tmp_path / "ledger.json", "{}")
+    assert len(calls) == 1, "the default must keep the fsync"
+
+
+def test_health_records_are_written_without_a_journal_commit(monkeypatch):
+    """The capture loop writes one of these per AMBIENT_WRITE_S.
+
+    `tests/conftest.py` already points the health dir at a tmp path, so this
+    exercises the real `_write_record` path without touching `state/`.
+    """
+    import pxh.health as health
+
+    calls = []
+    monkeypatch.setattr(state.os, "fsync", lambda fd: calls.append(fd))
+    health.record_success("px-wake-listen", detail={"rms": 120, "level": "quiet"})
+    assert calls == [], "a liveness record must not force a journal commit"
+    body = health._component_path("px-wake-listen").read_text()
+    assert "px-wake-listen" in body and '"rms": 120' in body
