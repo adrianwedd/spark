@@ -13,8 +13,6 @@ import types
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 from pxh.gpio_lease import GpioLeaseStore
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -230,6 +228,84 @@ def _drain(sock):
             received.append(sock.recv(256))
         except socket.timeout:
             return received
+
+
+# Reaching the park and then observing it are *conditions*, not durations.
+# px-alive's own documented acquisition band is ~6 s typical and can exceed 15 s
+# under I2C contention (CLAUDE.md), so a 15 s bound for reaching the park was
+# under the documented worst case, and the 2 s sleep after it was a guess about
+# how long "several re-check passes" takes on whatever machine the suite landed
+# on (#211: a fixed wait calibrated to a machine state rather than to the thing
+# being tested turns harness bugs into flakes).
+_PARK_CONDITION_TIMEOUT_S = 60.0
+#: Park iterations to observe, counted by distinct heartbeat `ts` values.
+_PARK_PASSES = 3
+
+
+def _lease_recheck_s() -> float:
+    """The real `LEASE_RECHECK_S` from bin/px-alive, not a copy of it."""
+    try:
+        return float(load_alive_module({}).get("LEASE_RECHECK_S", 2.0))
+    except Exception:  # pragma: no cover — the constant's own test covers it
+        return 2.0
+
+
+def _read_beat(beat):
+    try:
+        record = json.loads(beat.read_text())
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _wait_for_park(proc, beat, timeout_s=_PARK_CONDITION_TIMEOUT_S):
+    """Wait until px-alive's heartbeat says `lease_wait`; return that record.
+
+    Deadline on the *condition*, so a loaded host waits longer instead of
+    failing. Returns as soon as the condition holds, which also makes the happy
+    path faster than the fixed sleep it replaces.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"px-alive exited (rc={proc.returncode}) before parking"
+            )
+        record = _read_beat(beat)
+        if record.get("mode") == "lease_wait":
+            return record
+        time.sleep(0.05)
+    raise AssertionError(f"px-alive never reported lease_wait within {timeout_s:.0f}s")
+
+
+def _wait_for_park_passes(proc, beat, *, after_ts=None, passes=_PARK_PASSES, timeout_s=None):
+    """Wait for `passes` further park iterations, counted by heartbeat writes.
+
+    Each park iteration writes one beat (`LEASE_RECHECK_S` apart), so distinct
+    `ts` values *measure* the re-check passes the old `time.sleep(2)` was
+    assuming — including after a signal, where the property the test needs is
+    "the loop kept iterating", not "two seconds elapsed".
+    """
+    if timeout_s is None:
+        timeout_s = passes * _lease_recheck_s() * 3 + 10.0
+    deadline = time.monotonic() + timeout_s
+    seen = set()
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"px-alive exited (rc={proc.returncode}) during the park"
+            )
+        record = _read_beat(beat)
+        ts = record.get("ts")
+        if record.get("mode") == "lease_wait" and isinstance(ts, (int, float)):
+            if after_ts is None or ts > after_ts:
+                seen.add(ts)
+                if len(seen) >= passes:
+                    return record
+        time.sleep(0.05)
+    raise AssertionError(
+        f"saw {len(seen)} of {passes} park re-check passes within {timeout_s:.0f}s"
+    )
 
 
 def _alive_env(isolated_project, heartbeat_dir=None):
@@ -561,24 +637,8 @@ def test_foreign_lease_keeps_daemon_alive_in_lease_wait(isolated_project, tmp_pa
     )
     try:
         beat = runtime_dir / "alive_heartbeat.json"
-        deadline = time.time() + 15
-        mode = None
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                pytest.fail(
-                    f"px-alive exited (rc={proc.returncode}) instead of waiting "
-                    f"for the lease to clear"
-                )
-            if beat.exists():
-                try:
-                    mode = json.loads(beat.read_text())["mode"]
-                except (json.JSONDecodeError, KeyError):
-                    mode = None
-                if mode == "lease_wait":
-                    break
-            time.sleep(0.2)
-
-        assert mode == "lease_wait", f"expected lease_wait heartbeat, got {mode!r}"
+        record = _wait_for_park(proc, beat)
+        assert record["mode"] == "lease_wait"
         assert proc.poll() is None, "daemon must stay alive while parked"
 
         # Releasing the lease lets it resume a normal loop on its own.
@@ -616,15 +676,14 @@ def test_sigusr1_while_parked_is_a_noop(isolated_project, tmp_path):
     )
     try:
         beat = runtime_dir / "alive_heartbeat.json"
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if beat.exists() and json.loads(beat.read_text()).get("mode") == "lease_wait":
-                break
-            time.sleep(0.2)
+        parked = _wait_for_park(proc, beat)
         assert proc.poll() is None, "daemon died before we could park it"
 
         proc.send_signal(signal.SIGUSR1)
-        time.sleep(2)  # several park re-check passes
+        # Several *passes*, counted rather than slept through: each iteration
+        # writes a beat, so this asserts the loop kept iterating after the
+        # signal instead of assuming 2 s is enough time for that.
+        _wait_for_park_passes(proc, beat, after_ts=parked.get("ts"))
 
         assert proc.poll() is None, (
             f"SIGUSR1 killed the parked daemon (rc={proc.returncode}) — a yield "
@@ -664,12 +723,11 @@ def test_lease_wait_does_not_touch_foreign_lease(isolated_project, tmp_path):
     )
     try:
         beat = runtime_dir / "alive_heartbeat.json"
-        deadline = time.time() + 15
-        while time.time() < deadline:
-            if beat.exists() and json.loads(beat.read_text()).get("mode") == "lease_wait":
-                break
-            time.sleep(0.2)
-        time.sleep(2)  # let it take several passive re-check passes
+        parked = _wait_for_park(proc, beat)
+        # Several passive re-check passes, counted from the heartbeat: the lease
+        # must survive the iterations the loop actually ran, not the ones a
+        # fixed sleep hoped had happened.
+        _wait_for_park_passes(proc, beat, after_ts=parked.get("ts"))
 
         assert proc.poll() is None, "daemon must still be parked for this to mean anything"
         after = json.loads(lease_file.read_text())
