@@ -1285,3 +1285,291 @@ def test_cli_loop_starts_and_exits_cleanly(tmp_path):
     assert proc.returncode == 0
     # It publishes its own pid while running and clears it on a clean exit.
     assert not (log_dir / "px-io-attrib.pid").exists()
+
+
+# --- the window channel, and the privilege boundary it exists to cross -----
+
+
+def _field_line(pid: int, comm: str, state: str = "S", *, delayacct: int = 0) -> str:
+    """A synthetic /proc/<pid>/stat line with a *correctly placed* field 42.
+
+    Built by index rather than by counting words, because this field sits 39
+    places past `comm` and an off-by-one here measures a different counter while
+    looking entirely plausible. The alignment was verified against the robot's
+    own `/proc/1/stat` on 2026-09-18: index 36 (`processor`) read 3, 37
+    (`rt_priority`) 0, 38 (`policy`) 0, 39 (`delayacct_blkio_ticks`) 0.
+    """
+    fields = ["0"] * 40
+    fields[0] = state
+    fields[36] = "3"
+    fields[39] = str(delayacct)
+    return f"{pid} ({comm}) " + " ".join(fields) + "\n"
+
+
+def _bare_paths(tmp_path, procs: dict[int, dict]) -> io_attrib.Paths:
+    """A `Paths` over a hand-built /proc tree: only what a test actually reads."""
+    proc = tmp_path / "proc"
+    proc.mkdir()
+    for pid, spec in procs.items():
+        pid_dir = proc / str(pid)
+        pid_dir.mkdir()
+        (pid_dir / "stat").write_text(spec["stat"])
+        (pid_dir / "io").write_text(spec.get("io", "write_bytes: 0\n"))
+        (pid_dir / "wchan").write_text(spec.get("wchan", "0"))
+        (pid_dir / "cgroup").write_text(spec.get("cgroup", "0::/system.slice/px-alive.service\n"))
+        for tid, thread in (spec.get("threads") or {}).items():
+            task = pid_dir / "task" / str(tid)
+            task.mkdir(parents=True)
+            (task / "stat").write_text(thread["stat"])
+            (task / "wchan").write_text(thread.get("wchan", "0"))
+    return io_attrib.Paths(
+        proc=proc,
+        pressure_io=tmp_path / "pressure_io",
+        diskstats=tmp_path / "diskstats",
+        vmstat=tmp_path / "vmstat",
+        uptime=tmp_path / "uptime",
+        sys_block=tmp_path / "sys_block",
+        ext4_sysfs=tmp_path / "sys_fs_ext4",
+    )
+
+
+def test_parse_proc_stat_reads_delayacct_from_field_42():
+    parsed = io_attrib.parse_proc_stat(_field_line(7, "python3", "D", delayacct=4242))
+    assert parsed["comm"] == "python3"
+    assert parsed["state"] == "D"
+    assert parsed["delayacct_blkio_ticks"] == 4242
+
+
+def test_parse_proc_stat_omits_delayacct_rather_than_defaulting_to_zero():
+    """A short line is another kernel, not a process that never waited on IO."""
+    parsed = io_attrib.parse_proc_stat("7 (python3) S 1 1 1\n")
+    assert "delayacct_blkio_ticks" not in parsed
+
+
+def test_delayacct_enabled_reads_the_sysctl(tmp_path):
+    proc = tmp_path / "proc"
+    (proc / "sys" / "kernel").mkdir(parents=True)
+    paths = io_attrib.Paths(proc=proc)
+    assert io_attrib.delayacct_enabled(paths) is None  # not there: not measured
+    (proc / "sys" / "kernel" / "task_delayacct").write_text("0\n")
+    assert io_attrib.delayacct_enabled(paths) is False
+    (proc / "sys" / "kernel" / "task_delayacct").write_text("1\n")
+    assert io_attrib.delayacct_enabled(paths) is True
+
+
+def test_delayacct_note_never_lets_a_missing_reading_read_as_zero():
+    off = io_attrib.delayacct_note(False)
+    assert "absent" in off and "not zero" in off
+    assert "blkio_wait_ms" in io_attrib.delayacct_note(True)
+    assert "unreadable" in io_attrib.delayacct_note(None)
+
+
+def test_sample_window_counts_d_state_across_the_window(tmp_path):
+    """The burst that ends before t1 is the entire reason this exists."""
+    paths = _bare_paths(tmp_path, {7: {"stat": _field_line(7, "px-alive", "S")}})
+    stat = paths.proc / "7" / "stat"
+    states = iter(["D", "D", "S", "S"])
+
+    def step(_seconds):
+        stat.write_text(_field_line(7, "px-alive", next(states, "S")))
+
+    window = io_attrib.sample_window(
+        paths, [7], samples=4, interval_s=0.5, sleep=step
+    )
+    entry = window["pids"][7]
+    assert window["samples"] == 4
+    assert window["span_s"] > 0
+    assert entry["samples"] == 4
+    assert entry["d_samples"] == 2  # samples 2 and 3, invisible to both ends
+    assert entry["comm"] == "px-alive"
+
+
+def test_sample_window_records_a_symbol_only_where_the_kernel_gives_one(tmp_path):
+    paths = _bare_paths(
+        tmp_path,
+        {
+            7: {
+                "stat": _field_line(7, "python3", "D"),
+                "wchan": "jbd2_log_wait_commit",
+            }
+        },
+    )
+    window = io_attrib.sample_window(paths, [7], samples=2, interval_s=0.5)
+    assert window["pids"][7]["wchan"] == {"jbd2_log_wait_commit": 2}
+
+
+def test_sample_window_thread_walk_is_rotating_and_bounded(tmp_path, monkeypatch):
+    """A full per-thread walk every sample would be the observer as the writer."""
+    pids = list(range(1, 9))
+    paths = _bare_paths(
+        tmp_path, {pid: {"stat": _field_line(pid, "worker")} for pid in pids}
+    )
+    seen: list[int] = []
+    monkeypatch.setattr(
+        io_attrib, "blocked_threads", lambda pid, pid_dir: seen.append(pid) or []
+    )
+    window = io_attrib.sample_window(
+        paths, pids, samples=2, interval_s=0.5, sleep=lambda _s: None
+    )
+    # 8 pids over 4 buckets, in order: [1,5] on the first sample, [2,6] on the second.
+    assert seen == [1, 5, 2, 6]
+    assert window["thread_coverage_s"] == 2.0  # a full rotation takes 4 samples
+
+
+def test_sample_window_watches_a_known_blocked_thread_every_sample(tmp_path):
+    """#287's shape: leader S, health thread D — the pid is carried, not rotated."""
+    pids = list(range(1, 9))
+    procs = {pid: {"stat": _field_line(pid, "worker")} for pid in pids}
+    procs[8] = {
+        "stat": _field_line(8, "px-alive", "S"),
+        "threads": {9: {"stat": _field_line(9, "px-alive", "D")}},
+    }
+    paths = _bare_paths(tmp_path, procs)
+    window = io_attrib.sample_window(
+        paths, pids, samples=2, interval_s=0.5, thread_pids=[8], sleep=lambda _s: None
+    )
+    entry = window["pids"][8]
+    assert entry["d_samples"] == 0  # the leader never enters D
+    assert entry["thread_d_samples"] == 2  # the thread is stuck throughout
+
+
+def test_rank_blocked_in_window_marks_a_withheld_wchan(tmp_path):
+    """`None` means two different things, and the record must not blur them."""
+    window = {
+        "samples": 4,
+        "pids": {
+            42: {"comm": "px-alive", "samples": 4, "d_samples": 4,
+                 "thread_d_samples": 0, "wchan": {}, "thread_wchan": {}},
+            7: {"comm": "python3", "samples": 4, "d_samples": 2, "thread_d_samples": 0,
+                "wchan": {"jbd2_log_wait_commit": 2}, "thread_wchan": {}},
+            9: {"comm": "arecord", "samples": 4, "d_samples": 1,
+                "thread_d_samples": 0, "wchan": {}, "thread_wchan": {}},
+        },
+    }
+    rows, count = io_attrib.rank_blocked_in_window(
+        window, {42: {"comm": "px-alive"}}, {42}, top=8
+    )
+    assert count == 3
+    assert [row["pid"] for row in rows] == [42, 7, 9]
+    assert rows[0]["comm"] == "px-alive"
+    assert rows[0]["d_share"] == 1.0
+    assert rows[0]["wchan"] is None and rows[0]["wchan_withheld"] is True
+    assert rows[1]["wchan"] == "jbd2_log_wait_commit"
+    assert rows[1]["wchan_withheld"] is False
+    # Blocked, no symbol, and *not* hidden from us: the kernel has no name for it.
+    assert rows[2]["wchan"] is None and rows[2]["wchan_withheld"] is False
+
+
+def test_rank_blocked_in_window_prefers_a_wedged_thread_over_a_flicker():
+    window = {
+        "samples": 4,
+        "pids": {
+            1: {"comm": "flicker", "samples": 4, "d_samples": 1,
+                "thread_d_samples": 0, "wchan": {}, "thread_wchan": {}},
+            2: {"comm": "px-alive", "samples": 4, "d_samples": 0,
+                "thread_d_samples": 4, "wchan": {}, "thread_wchan": {}},
+        },
+    }
+    rows, _ = io_attrib.rank_blocked_in_window(window, {})
+    assert [row["pid"] for row in rows] == [2, 1]
+    assert rows[0]["wchan_withheld"] is False  # nothing was measured as denied
+
+
+def test_rank_blocked_in_window_reports_delayacct_wait_only_when_present():
+    base = {"comm": "px-alive", "samples": 2, "d_samples": 2, "thread_d_samples": 0,
+            "wchan": {}, "thread_wchan": {}}
+    ticks = {"samples": 2, "pids": {7: {**base, "blkio_ticks_first": 100,
+                                        "blkio_ticks_last": 250}}}
+    rows, _ = io_attrib.rank_blocked_in_window(
+        ticks, {7: {"comm": "px-alive"}}, delayacct_on=True
+    )
+    assert rows[0]["blkio_wait_ms"] == round(150 * io_attrib._tick_ms(), 1)
+    # Present-and-zero in /proc/<pid>/stat on a kernel that is not accounting
+    # for it: a delta emitted anyway would read as a measured "waited 0 ms".
+    zeroed, _ = io_attrib.rank_blocked_in_window(
+        {"samples": 2, "pids": {7: {**base, "blkio_ticks_first": 0,
+                                    "blkio_ticks_last": 0}}},
+        {7: {"comm": "px-alive"}},
+        delayacct_on=False,
+    )
+    assert "blkio_wait_ms" not in zeroed[0]
+    absent, _ = io_attrib.rank_blocked_in_window(
+        {"samples": 2, "pids": {7: {**base, "blkio_ticks_first": None,
+                                    "blkio_ticks_last": None}}},
+        {7: {"comm": "px-alive"}},
+        delayacct_on=True,
+    )
+    assert "blkio_wait_ms" not in absent[0]
+
+
+def test_wchan_withheld_pids_counts_past_the_reporting_limit():
+    """A count that silently inherits the `top` limit is worse than no count."""
+    window = {
+        "samples": 1,
+        "pids": {pid: {"comm": "x", "samples": 1, "d_samples": 1,
+                       "thread_d_samples": 0, "wchan": {}, "thread_wchan": {}}
+                 for pid in range(1, 13)},
+    }
+    procs_post = {pid: {"comm": "x", "state": "D", "io_denied": True}
+                  for pid in range(1, 13)}
+    rows, count = io_attrib.rank_blocked_in_window(
+        window, procs_post, set(procs_post), top=3
+    )
+    assert len(rows) == 3 and count == 12
+    withheld = io_attrib.wchan_withheld_pids(procs_post, set(procs_post), window)
+    assert len(withheld) == 12
+    assert "withheld" in io_attrib.wchan_unavailable_reason(len(withheld))
+    assert io_attrib.wchan_unavailable_reason(0) is None
+
+
+def test_capture_records_a_root_owned_writer_through_the_window_channel(
+    tmp_path, monkeypatch
+):
+    """The headline claim: an unreadable writer is still a *named* writer here."""
+    procs = {
+        42: {
+            "comm": "px-alive",
+            "state": "S",
+            "io_denied": True,  # what /proc/<pid>/io did, measured
+            "cgroup": "0::/system.slice/px-alive.service\n",
+            "threads": {43: {"comm": "px-alive", "state": "D", "wchan": "0"}},
+        },
+        7: {"comm": "python3", "state": "S", "io": {"write_bytes": 0}},
+    }
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    record = io_attrib.capture(
+        {"reason": "heartbeat_age"},
+        paths=paths,
+        window_s=3.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["window_samples"] == 6
+    assert record["window_sample_interval_s"] == 0.5
+    assert record["blocked_in_window_count"] == 1
+    row = record["blocked_in_window"][0]
+    assert row["pid"] == 42 and row["comm"] == "px-alive"
+    assert row["d_samples"] == 0  # the leader never enters D ...
+    assert row["thread_d_samples"] >= 1  # ... the health thread is what is stuck
+    assert row["unit"] == "px-alive.service"
+    assert row["wchan"] is None and row["wchan_withheld"] is True
+    assert record["wchan_withheld_count"] == 1
+    assert "withheld" in record["wchan_unavailable_reason"]
+    assert "the kernel answers" in record["wchan_unavailable_reason"]
+    assert record["delayacct"]["enabled"] is None
+    assert "unreadable" in record["delayacct"]["note"]
+
+
+def test_capture_says_nothing_about_withheld_wchan_when_none_were(tmp_path, monkeypatch):
+    procs = {7: {"comm": "python3", "state": "D", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["wchan_withheld_count"] == 0
+    assert record["wchan_unavailable_reason"] is None
+    assert record["blocked_in_window"][0]["wchan_withheld"] is False
