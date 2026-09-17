@@ -209,7 +209,16 @@ def _resident_model(mode: str) -> str | None:
 
 
 def _record_request(kind: str, status: M5Status, duration_ms: int) -> None:
-    """Best-effort request evidence, keyed by workload kind and session."""
+    """Best-effort request evidence, keyed by workload kind and session.
+
+    Written on every cognition request (~12k accumulated on `picar` as of
+    2026-09-18: reflection 6373, post_qa 5781, voice_turn 109) and non-durable:
+    it is a **gauge** for the dashboard, not a ledger — the durable accounting
+    is the token ledger and the session log. Losing the last increment to a
+    power cut costs nothing, while the `fsync` forced an ext4 journal commit
+    per request on the card shared with the microphone ring (#247, the same
+    class as #367/#370/#373/#376).
+    """
     if not _ensure_dir():
         return
     try:
@@ -231,7 +240,7 @@ def _record_request(kind: str, status: M5Status, duration_ms: int) -> None:
     data["total"] = sum(by_kind.values())
     data["updated_ts"] = utc_timestamp()
     try:
-        atomic_write(_meter_path(), json.dumps(data, indent=2))
+        atomic_write(_meter_path(), json.dumps(data, indent=2), durable=False)
     except OSError:
         pass
 
