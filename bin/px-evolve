@@ -41,6 +41,15 @@ from pathlib import Path
 
 from pxh.evolve_queue import build_pr_body, reset_building_to_pending
 
+try:
+    from pxh import health as _health
+except ImportError:                                   # pxh not on PYTHONPATH
+    class _health:                                    # no-op shim
+        record_success = staticmethod(lambda *a, **k: None)
+        record_failure = staticmethod(lambda *a, **k: None)
+        record_capability_failure = staticmethod(lambda *a, **k: None)
+        record_capability_success = staticmethod(lambda *a, **k: None)
+
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", Path(__file__).parent.parent))
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 STATE_DIR = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
@@ -334,9 +343,20 @@ def _run_in_worktree(
 
     try:
         from pxh.model_session import run_model_session, SessionBudgetExhausted, file_in_whitelist
-    except ImportError:
+    except ImportError as exc:
         log(f"[{entry_id}] model_session not importable, using direct subprocess")
+        # A real evolution was requested and none of it can run. The
+        # deliberately-unavailable states are excluded on purpose: --dry-run
+        # returns above, and an idle daemon with an empty queue never gets here,
+        # so "the feature is switched off" cannot poison the board. Only a
+        # request that unexpectedly lost its implementation dependency does.
+        _health.record_capability_failure(
+            "px-evolve", "evolution",
+            f"evolution requested but pxh.model_session is not importable: {exc!r}",
+            detail={"entry_id": entry_id},
+        )
         return _run_claude_direct(entry_id, intent, build_implement_prompt(intent, {}), workdir)
+    _health.record_capability_success("px-evolve", "evolution")
 
     # ── Phase 1: Plan (Opus, budget-checked, read-only) ──────────────────────
     log(f"[{entry_id}] phase 1/4: planning with {PLAN_MODEL}")

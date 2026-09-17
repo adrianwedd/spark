@@ -1332,6 +1332,60 @@ class TestPublicBudget:
         r = api_client.get("/api/v1/public/budget")
         assert r.status_code == 200
 
+    def test_public_budget_reports_unavailable_rather_than_zeros(
+        self, api_client, block_module_import
+    ):
+        """#332's shape at the API boundary: the dependency that computes the
+        budget is gone, so the capability is unavailable.
+
+        The old behaviour answered `used_today: 0, remaining: 8` from an
+        `except` clause — a broken capability rendered as a quiet, fresh day,
+        which no reader or dashboard can tell from the real thing.
+        """
+        block_module_import.block("pxh.model_session")
+
+        r = api_client.get("/api/v1/public/budget")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["available"] is False
+        assert data["used_today"] is None
+        assert data["remaining"] is None
+        assert data["daily_cap"] is None
+
+        # ...and the health board says which daemon lost which capability,
+        # rather than leaving it in a log line.
+        from pxh import health
+
+        entry = health.read_health(components=("px-api-server",))["components"]["px-api-server"]
+        assert entry["status"] == "degraded"
+        assert "model-budget" in entry["capabilities"]
+
+    def test_budget_recovers_when_the_dependency_returns(
+        self, api_client, block_module_import
+    ):
+        """The block clears on the capability succeeding, not on a restart."""
+        from pxh import health
+
+        block_module_import.block("pxh.model_session")
+        assert api_client.get("/api/v1/public/budget").json()["available"] is False
+        assert health.read_health(components=("px-api-server",))["components"]["px-api-server"]["status"] == "degraded"
+
+        block_module_import.unblock("pxh.model_session")
+
+        data = api_client.get("/api/v1/public/budget").json()
+        assert data["available"] is True
+        assert isinstance(data["used_today"], int)
+        assert isinstance(data["remaining"], int)
+        assert health.read_health(components=("px-api-server",))["components"]["px-api-server"]["status"] == "ok"
+
+    def test_authenticated_budget_reports_unavailable_too(self, api_client, auth_headers, block_module_import):
+        block_module_import.block("pxh.model_session")
+        r = api_client.get("/api/v1/budget", headers=auth_headers)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["available"] is False
+        assert data["sessions"] is None
+
     def test_authenticated_budget_includes_sessions(self, api_client, auth_headers):
         """GET /api/v1/budget (authenticated) includes per-session detail."""
         r = api_client.get("/api/v1/budget", headers=auth_headers)

@@ -8,7 +8,18 @@ Store: ``state/health/<component>.json``, one file per component::
 
     {"component", "last_success_ts", "last_success_detail",
      "last_error", "last_error_ts", "consecutive_failures",
-     "success_count", "failure_count", "updated_ts"}
+     "success_count", "failure_count", "updated_ts",
+     "capabilities": {"<capability>": {"error", "ts", "failures"}}}
+
+**Two axes, deliberately separate.** `consecutive_failures` describes the
+*process* — is this daemon doing its job? `capabilities` describes a single
+*boundary* — can this daemon still perform one named thing it advertises? The
+second exists because a daemon can be perfectly alive, keep proving it, and
+still have lost a dependency: #332's three stale units each failed one
+capability (a blog post, an evolution, a budget read) while their loops ticked
+on. `record_success` clears the process axis; only `record_capability_success`
+for the same capability clears the capability axis, and a restart clears
+neither — the record is on disk.
 
 **One file per component, deliberately.** A single shared ``health.json`` would
 need a ``FileLock`` for its read-modify-write, and this system has cross-user
@@ -141,6 +152,75 @@ def _write_record(component: str, record: dict[str, Any]) -> None:
         pass
 
 
+def blocked_capabilities(rec: dict[str, Any] | None) -> dict[str, Any]:
+    """The capability blocks recorded on a health record, if any."""
+    if not rec:
+        return {}
+    caps = rec.get("capabilities")
+    return caps if isinstance(caps, dict) else {}
+
+
+def record_capability_failure(
+    component: str, capability: str, error: str, detail: Any = None
+) -> None:
+    """Note that `component` cannot perform `capability` at all.
+
+    Use this at a capability boundary where the daemon *was asked to work* and
+    could not, because a dependency it needs is gone — the canonical case is an
+    `ImportError` for a module a deploy renamed or deleted (#332). The daemon is
+    still alive, so this is not `record_failure`: it stays off the process axis
+    and does not advance the failure streak that means "this daemon is dying".
+
+    The block is sticky until the same capability succeeds. A daemon-level
+    `record_success` does not clear it (the loop that keeps proving the process
+    alive is exactly what hid this class of failure), and a restart does not
+    clear it either, because the record is on disk.
+
+    Never raises — health reporting must not take down the daemon it reports on.
+    """
+    try:
+        rec = _read_record(component)
+        caps = dict(blocked_capabilities(rec))
+        entry = dict(caps.get(capability) or {})
+        entry["error"] = str(error)[:500]
+        entry["ts"] = utc_timestamp()
+        entry["failures"] = int(entry.get("failures", 0)) + 1
+        if detail is not None:
+            entry["detail"] = detail
+        caps[capability] = entry
+        rec["capabilities"] = caps
+        _write_record(component, rec)
+    except Exception:
+        pass
+
+
+def record_capability_success(component: str, capability: str) -> None:
+    """Clear `capability`'s block — the only thing that does.
+
+    A no-op when nothing was blocked, so a healthy fast path does not write a
+    record per call. When the record has never carried a success, this stamps
+    one: a capability that has just demonstrably run is evidence about the
+    component, and without the stamp a component whose only record was written
+    by a block would read `degraded` forever after the block cleared.
+    """
+    try:
+        rec = _read_record(component)
+        caps = dict(blocked_capabilities(rec))
+        if capability not in caps:
+            return
+        caps.pop(capability)
+        if caps:
+            rec["capabilities"] = caps
+        else:
+            rec.pop("capabilities", None)
+        if not rec.get("last_success_ts"):
+            rec["last_success_ts"] = utc_timestamp()
+            rec["success_count"] = int(rec.get("success_count", 0)) + 1
+        _write_record(component, rec)
+    except Exception:
+        pass
+
+
 def record_success(component: str, detail: Any = None, min_interval_s: float = 0.0) -> None:
     """Note that `component` completed its work. Resets the failure streak.
 
@@ -203,6 +283,20 @@ def _age_s(ts: str | None, now: dt.datetime) -> float | None:
 
 
 def _derive_status(rec: dict[str, Any], component: str, now: dt.datetime) -> tuple[str, float | None]:
+    """The process axis, promoted by any blocked capability on the same record.
+
+    A blocked capability is the daemon's own fault and a silent one, so it takes
+    a healthy process reading to `degraded` rather than letting `ok` stand. It
+    deliberately does not outrank a genuinely worse process state: `failing`
+    and `stale` still win, because "this daemon is dying" is the bigger news.
+    """
+    status, age = _base_status(rec, component, now)
+    if status == "ok" and blocked_capabilities(rec):
+        return "degraded", age
+    return status, age
+
+
+def _base_status(rec: dict[str, Any], component: str, now: dt.datetime) -> tuple[str, float | None]:
     if not rec:
         return "missing", None
     age = _age_s(rec.get("updated_ts"), now)
@@ -353,6 +447,9 @@ def read_health(components: tuple[str, ...] | None = None) -> dict[str, Any]:
                     "consecutive_failures", "success_count", "failure_count"):
             if key in rec:
                 entry[key] = rec[key]
+        caps = blocked_capabilities(rec)
+        if caps:
+            entry["capabilities"] = caps
         if name == "px-alive":
             # A daemon can be stalling to within 70ms of a watchdog kill while
             # every field above reads clean — that is the exact blind spot this
@@ -412,6 +509,17 @@ def summarize(health: dict[str, Any] | None = None) -> str:
             mins = round((entry.get("age_s") or 0) / 60)
             bits.append(f"{name}: silent for {mins} min")
         else:
+            caps = entry.get("capabilities") or {}
+            if caps:
+                # The process is fine; a named capability is not. Saying
+                # "degraded after 0 failures" would describe the wrong axis.
+                for cap, info in sorted(caps.items()):
+                    reason = (info.get("error") or "").strip()
+                    bits.append(
+                        f"{name}: capability {cap} unavailable"
+                        + (f" ({reason[:80]})" if reason else "")
+                    )
+                continue
             err = (entry.get("last_error") or "").strip()
             fails = entry.get("consecutive_failures", 0)
             detail = f" ({err[:80]})" if err else ""

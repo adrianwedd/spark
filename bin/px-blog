@@ -56,6 +56,8 @@ except ImportError:                                   # pxh not on PYTHONPATH
     class _health:                                    # no-op shim
         record_success = staticmethod(lambda *a, **k: None)
         record_failure = staticmethod(lambda *a, **k: None)
+        record_capability_failure = staticmethod(lambda *a, **k: None)
+        record_capability_success = staticmethod(lambda *a, **k: None)
 
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 BLOG_FILE = STATE_DIR / "blog.json"
@@ -744,8 +746,17 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         )
         raw_text = result.stdout.strip()
         model_used = result.model_used
-    except ImportError:
+    except ImportError as exc:
         log(f"model_session not available, cannot generate {post_type}")
+        # The capability boundary, not the process: this daemon is alive and its
+        # poll loop will keep proving it, which is exactly why the failure has
+        # to be recorded here or not at all (#332). Cleared only by a post that
+        # actually generates.
+        _health.record_capability_failure(
+            "px-blog", "generation",
+            f"cannot generate {post_type}: {exc!r}",
+            detail={"post_type": post_type, "post_id": pid},
+        )
         return None
     except SessionBudgetExhausted as exc:
         log(f"budget exhausted for {post_type}: {exc}")
@@ -824,6 +835,7 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         post["mood"] = max(child_moods, key=child_moods.get) if child_moods else "content"
 
     clear_generation_failure(pid)
+    _health.record_capability_success("px-blog", "generation")
     return post
 
 
