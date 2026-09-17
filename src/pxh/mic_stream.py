@@ -184,7 +184,27 @@ class ArecordStream:
         # is actually asked.
         self.reader_gap_last_ms = 0.0
         self.reader_gap_max_ms = 0.0
+        #: The same measurement over a *caller-owned* window. The capture window
+        #: above only has evidence when something overruns; a healthy capture
+        #: path reports nothing at all, which is indistinguishable from an
+        #: unwatched one. This one is drained by whoever polls it (the wake
+        #: listener does, every `AMBIENT_WRITE_S`), so the worst reader gap of
+        #: the last ten seconds is a number the health store carries even when
+        #: no conversation happens (#283).
+        self.reader_gap_window_max_ms = 0.0
         self._last_chunk_mono: float | None = None
+
+    def take_gap_window_ms(self) -> float:
+        """Worst reader gap since the last call, in ms, and reset the window.
+
+        The complement of the overrun report: it answers "how long did the
+        drain thread go without reading arecord" *before* anything overruns,
+        which is the quantity the 12 s ALSA ring is sized against.
+        """
+        with self._cond:
+            worst = self.reader_gap_window_max_ms
+            self.reader_gap_window_max_ms = 0.0
+        return worst
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -248,6 +268,8 @@ class ArecordStream:
                     self.reader_gap_last_ms = gap_ms
                     if gap_ms > self.reader_gap_max_ms:
                         self.reader_gap_max_ms = gap_ms
+                    if gap_ms > self.reader_gap_window_max_ms:
+                        self.reader_gap_window_max_ms = gap_ms
                 self._last_chunk_mono = now
                 dropped = False
                 with self._cond:

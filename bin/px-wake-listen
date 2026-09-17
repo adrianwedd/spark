@@ -94,6 +94,12 @@ SILENCE_S        = 3.0    # silence after speech → end of utterance (patient �
 MAX_RECORD_S     = 20.0   # hard cap on recording length
 RMS_SILENCE      = 300    # RMS below this → silence
 AMBIENT_WRITE_S  = 10     # write ambient sound level every N seconds
+#: Log a warning when a single reader gap exceeds this. Well inside the 12 s
+#: ALSA ring (nothing is lost yet), and low enough that a *pattern* of these is
+#: visible before the ring is at risk. The value is reported to the health store
+#: on every ambient tick regardless — an alarm only when it matters, evidence
+#: always (#283).
+READER_GAP_WARN_S = 2.0
 SPEECH_ONSET_RMS = 800    # RMS above this → speech started (follow-up detection)
 FOLLOWUP_SILENCE_S  = 3.5  # silence threshold ending a follow-up utterance
 FOLLOWUP_MAX_S      = 20.0  # hard cap for follow-up recording
@@ -1271,8 +1277,15 @@ def listen_loop(model, args, stt=None, whisper=None, sensevoice=None) -> None:
                         # Reaching here proves the audio stream is being read
                         # AND state is writable — the two ways this daemon dies
                         # quietly while its process stays up.
-                        _health.record_success("px-wake-listen",
-                                               detail={"rms": avg_rms, "level": level})
+                        _reader_gap_ms = stream.take_gap_window_ms()
+                        if _reader_gap_ms >= READER_GAP_WARN_S * 1000.0:
+                            log(f"capture reader gap {_reader_gap_ms:.0f} ms "
+                                f"(ALSA ring holds {stream.alsa_buffer_s:.0f} s)")
+                        _health.record_success(
+                            "px-wake-listen",
+                            detail={"rms": avg_rms, "level": level,
+                                    "reader_gap_ms": round(_reader_gap_ms, 1),
+                                    "alsa_buffer_s": stream.alsa_buffer_s})
                     except (OSError, TypeError) as exc:
                         log(f"ambient file write failed: {exc}")
                         _health.record_failure("px-wake-listen", f"ambient write: {exc}")
