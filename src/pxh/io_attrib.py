@@ -1560,6 +1560,60 @@ def sample_ext4(paths: Paths = DEFAULT_PATHS) -> dict[str, Any]:
     return out
 
 
+def card_baseline(
+    records: Sequence[Mapping[str, Any]], *, tail: int = 40
+) -> dict[str, Any]:
+    """Summary of a card's measured service time, for an A/B comparison (#405).
+
+    SD media exposes no lifetime telemetry (`PRE_EOL_INFO` and
+    `DEVICE_LIFE_TIME_*` are eMMC EXT_CSD registers), so a replacement decision
+    rests on measured latency and errors instead — and "measured" has to mean
+    *the same measurement on both cards*. This is that measurement, computed from
+    records the observer already wrote:
+
+    * `ms_per_write` median / p90 / max — queue time per write, read time
+      subtracted, i.e. the number that turns "a few megabytes" into 1-8 s of
+      occupancy on a slow card;
+    * `ms_per_read` median, for the asymmetry (a healthy card is within a small
+      factor, not 50x);
+    * `ext4_errors` (last reading) and the window's record count, so a comparison
+      cannot quietly use three records of a quiet hour against forty of a busy one.
+    """
+    per_write: list[float] = []
+    per_read: list[float] = []
+    errors = 0
+    for record in list(records)[-tail:]:
+        devices = record.get("devices") or {}
+        device = devices.get("mmcblk0") or {}
+        writes = device.get("writes_completed") or 0
+        reads = device.get("reads_completed") or 0
+        busy = max(0, (device.get("ms_io") or 0) - (device.get("ms_reading") or 0))
+        if writes > 0 and busy:
+            per_write.append(busy / writes)
+        if reads > 0:
+            per_read.append((device.get("ms_reading") or 0) / reads)
+        ext4 = record.get("ext4") or {}
+        if isinstance(ext4.get("errors_count"), int):
+            errors = ext4["errors_count"]
+
+    def _pct(values: list[float], fraction: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, int(len(ordered) * fraction))
+        return round(ordered[index], 1)
+
+    return {
+        "records": len(list(records)[-tail:]),
+        "writes_measured": len(per_write),
+        "ms_per_write_median": _pct(per_write, 0.5),
+        "ms_per_write_p90": _pct(per_write, 0.9),
+        "ms_per_write_max": round(max(per_write), 1) if per_write else None,
+        "ms_per_read_median": _pct(per_read, 0.5),
+        "ext4_errors": errors,
+    }
+
+
 def unattributed_write_share(
     devices: Mapping[str, Mapping[str, int]], write_bytes_total: int
 ) -> tuple[int, int, float | None]:

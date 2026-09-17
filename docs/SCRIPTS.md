@@ -15,6 +15,7 @@ Comprehensive documentation for every script in `bin/` and every module in `src/
    - [bin/px-status](#binpx-status)
    - [bin/px-io-attrib](#binpx-io-attrib)
    - [bin/px-io-attrib-ensure](#binpx-io-attrib-ensure)
+   - [bin/px-card-baseline](#binpx-card-baseline)
 3. [Motion — Direct Actuators](#motion--direct-actuators)
    - [bin/px-circle](#binpx-circle)
    - [bin/px-figure8](#binpx-figure8)
@@ -280,6 +281,25 @@ PX_IO_ATTRIB_IO_THRESHOLD=10 bin/px-io-attrib-ensure
 ```
 
 Remove that line when the root unit is installed — a `pi`-run observer cannot read other users' `/proc/<pid>/io`. The liveness check still recognises a root-owned observer, so the two cannot both be started by accident.
+
+---
+
+### bin/px-card-baseline
+
+**Purpose:** Summarise a card's measured write service time, for the A/B replacement decision in #405. SD media exposes no lifetime telemetry (`PRE_EOL_INFO` / `DEVICE_LIFE_TIME_*` are eMMC EXT_CSD registers), so the replacement question is answered by measuring the same workload on both cards.
+
+**Usage:**
+```bash
+bin/px-card-baseline            # one human line
+bin/px-card-baseline --json     # the same numbers, for a diff between two cards
+bin/px-card-baseline --tail 100
+```
+
+**What it prints:** `ms_per_write` median / p90 / max (queue time per write, read time subtracted), `ms_per_read` median, `ext4.errors_count`, and how many records the answer came from — so a comparison cannot quietly use three quiet records against forty busy ones.
+
+**Source:** `logs/tool-io-attrib.log`; no new instrumentation and no root. Runbook: [docs/operations/io-attribution.md](operations/io-attribution.md).
+
+**Dependencies:** `/usr/bin/python3`.
 
 ---
 

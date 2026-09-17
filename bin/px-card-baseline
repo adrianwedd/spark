@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# px-card-baseline — one line of numbers to decide a card replacement on (#405).
+#
+# SD media exposes no lifetime telemetry (`PRE_EOL_INFO` / `DEVICE_LIFE_TIME_*`
+# are eMMC EXT_CSD registers), so an A/B replacement test compares *measured*
+# numbers instead. Run this on the current card, then on the replacement, under
+# the same workload, and compare:
+#
+#   bin/px-card-baseline            # human line
+#   bin/px-card-baseline --json     # same numbers, for a diff
+#
+# The workload matters: the apt timers (#402) and deploy restarts dominate IO
+# variance, so compare like with like (same time of day, no apt run in between).
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/px-env"
+
+exec /usr/bin/python3 - "$@" <<'PY'
+"""Summarise the card's measured service time from the observer's records."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+
+from pxh import io_attrib  # noqa: E402 — px-env exports PYTHONPATH
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--records", default=str(LOG_DIR / "tool-io-attrib.log"),
+                    help="the observer's record log")
+    ap.add_argument("--tail", type=int, default=40,
+                    help="how many records to summarise (default 40)")
+    ap.add_argument("--json", action="store_true", help="machine-readable, for a diff")
+    args = ap.parse_args(argv)
+
+    path = Path(args.records)
+    try:
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except FileNotFoundError:
+        print(f"px-card-baseline: no records at {path}", file=sys.stderr)
+        return 1
+
+    summary = io_attrib.card_baseline(records, tail=max(1, args.tail))
+    if args.json:
+        print(json.dumps(summary, sort_keys=True))
+        return 0
+
+    if not summary["writes_measured"]:
+        print(f"px-card-baseline: {summary['records']} record(s), none with writes to measure")
+        return 1
+    print(
+        "card: ms_per_write median {median} p90 {p90} max {maxv} | "
+        "ms_per_read median {read} | ext4 errors {errors} | from {n} record(s)".format(
+            median=summary["ms_per_write_median"], p90=summary["ms_per_write_p90"],
+            maxv=summary["ms_per_write_max"], read=summary["ms_per_read_median"],
+            errors=summary["ext4_errors"], n=summary["records"],
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+PY

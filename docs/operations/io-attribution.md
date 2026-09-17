@@ -865,16 +865,23 @@ positive evidence of health either, because the hardware does not report it.
 
 ### The replacement decision is an A/B test, not a reading
 
-1. **Image the current card** — it is the known-slow baseline.
+1. **Image the current card** — it is the known-slow baseline. Run
+   `bin/px-card-baseline --json` on it and keep that output: it is the "before"
+   half, computed from records already on disk.
 2. **Boot a known-good replacement SD card** with that same image.
 3. **Run the same baseline on both, under the same workload.** The apt timers
    dominate workload variance, so compare like with like (`ms_per_write` median
    and p90 from the record history, io PSI over the same window shape, and
    `state/health/px-alive.json` → `watchdog.margin_min_ms`).
-4. **Keep the replacement only if the write latency collapses.** If ~86 ms becomes
+4. **Run the same command on the replacement** and compare the two JSON lines —
+   `ms_per_write_median`, `ms_per_write_p90`, `ms_per_read_median`, `ext4_errors`.
+5. **Keep the replacement only if the write latency collapses.** If ~86 ms becomes
    ~5 ms, #405 is answered empirically; if it does not, the card was never the
    variable and the small-write-pressure work (#367/#376/#377/#381/#382/#384) is
    the whole answer.
+
+`bin/px-card-baseline [--tail N] [--json]` is that comparison, computed from
+records the observer already wrote — no new instrumentation, no root.
 
 ## Deliberately not done
 
