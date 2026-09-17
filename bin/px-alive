@@ -583,7 +583,19 @@ def spark_greet(dry: bool) -> None:
     if dry:
         env["PX_DRY"] = "1"
     try:
-        _subprocess.run([str(tool_voice)], env=env, capture_output=True, check=False, timeout=8)
+        # Beaten, because this is a blocking subprocess with an 8 s timeout on
+        # the main loop's path — the same shape as make_px() and the camera
+        # teardown that `_with_heartbeat` already covers. Measured 2026-09-18
+        # from the daemon's own buckets: a 9017 ms heartbeat gap attributed to
+        # `ease_proximity`, which is the mode of the beat *before* the gap — the
+        # proximity branch eases, then greets, and the greeting went silent.
+        # Minimum watchdog margin fell to 5.98 s of 15 s because of it.
+        _with_heartbeat(
+            lambda: _subprocess.run(
+                [str(tool_voice)], env=env, capture_output=True, check=False, timeout=8
+            ),
+            mode="greeting",
+        )
     except Exception:
         pass  # voice busy or timed out — greet silently skipped, px-alive keeps running
 
@@ -629,9 +641,12 @@ def release_px(px) -> None:
     # process exits; the MCU keeps driving servos in the meantime.
 
 
-def _with_heartbeat(fn):
+def _with_heartbeat(fn, mode: str = "acquiring_picarx"):
     """Run fn() while beating every HEARTBEAT_EVERY_S, for any blocking call
     that must never silently outlast the watchdog.
+
+    `mode` is published into the heartbeat record, so the telemetry names the
+    phase that blocked rather than the phase before it.
 
     Originally added for make_px(), which blocks synchronously inside
     Picarx.__init__ (I2C): the first acquisition after ANY park (a
@@ -658,7 +673,7 @@ def _with_heartbeat(fn):
 
     def _beat() -> None:
         while not stop_beat.wait(HEARTBEAT_EVERY_S):
-            write_alive_heartbeat("acquiring_picarx")
+            write_alive_heartbeat(mode)
 
     beat_thread = threading.Thread(
         target=_beat, daemon=True, name="px-alive-acquire-heartbeat"
