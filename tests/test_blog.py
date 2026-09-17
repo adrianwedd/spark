@@ -450,6 +450,26 @@ class TestBlogHelpers:
         assert "SPARK" in prompt
 
 
+def test_log_rotates_rather_than_growing_without_bound(blog_mod):
+    """px-blog.log had no rotation at all and had reached 5.2 MB (#247's audit).
+
+    Keep-last-half above 5 MB, matching px-post and px-alive: a log that grows
+    without bound on the card the rest of this arc is about.
+    """
+    ns, _state_dir, log_dir = blog_mod
+    target = log_dir / "px-blog.log"
+    target.write_text("".join("filler %d\n" % i for i in range(400_000)))
+    before = target.stat().st_size
+    assert before > 5_000_000
+
+    ns["log"]("probe: rotation must fire")
+
+    after = target.stat().st_size
+    assert after < before, "the log should have been trimmed, not grown"
+    assert after < 3_100_000, "keep the last half"
+    assert "probe: rotation must fire" in target.read_text()
+
+
 def test_skip_backoff_is_reasonable():
     """SKIP_BACKOFF_S should be <= 600s (10 min) not 3600s."""
     blog_path = Path(__file__).parent.parent / "bin" / "px-blog"
