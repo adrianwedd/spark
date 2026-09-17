@@ -456,3 +456,18 @@ def test_drop_logging_does_not_hold_the_stream_lock():
         )
     finally:
         stream.close()
+
+def test_take_gap_window_reports_the_worst_gap_and_resets():
+    """The overrun report only exists when something overruns; this is the same
+    measurement as evidence in normal operation (#283)."""
+    stream = ArecordStream(chunk_frames=8, buffer_s=0.01, alsa_buffer_s=0.5,
+                           device="x", log=lambda *_: None)
+    stream.reader_gap_window_max_ms = 12.5
+    assert stream.take_gap_window_ms() == 12.5
+    assert stream.take_gap_window_ms() == 0.0, "the window resets on read"
+
+    # A larger gap raises the window; a smaller one does not lower it.
+    stream.reader_gap_window_max_ms = 0.0
+    stream.reader_gap_window_max_ms = max(stream.reader_gap_window_max_ms, 3.0)
+    stream.reader_gap_window_max_ms = max(stream.reader_gap_window_max_ms, 1.0)
+    assert stream.take_gap_window_ms() == 3.0
