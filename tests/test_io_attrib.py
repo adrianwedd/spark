@@ -2179,7 +2179,7 @@ def test_card_baseline_reports_service_time_and_the_read_asymmetry():
     assert summary["writes_measured"] == 3
     assert summary["ms_per_write_median"] == 200.0
     assert summary["ms_per_write_max"] == 298.5
-    assert summary["ms_per_read_median"] == 1.5
+    assert summary["ms_per_read_median_in_stall_windows"] == 1.5
     assert summary["ext4_errors"] == 0
     assert summary["records"] == 3
 
@@ -2193,7 +2193,7 @@ def test_card_baseline_subtracts_read_time_and_ignores_idle_records():
     summary = io_attrib.card_baseline(records)
     assert summary["writes_measured"] == 1
     assert summary["ms_per_write_median"] == 100.0
-    assert summary["ms_per_read_median"] == 40.0
+    assert summary["ms_per_read_median_in_stall_windows"] == 40.0
 
 
 def test_card_baseline_honours_the_tail_so_a_comparison_is_like_for_like():
@@ -2202,3 +2202,21 @@ def test_card_baseline_honours_the_tail_so_a_comparison_is_like_for_like():
     summary = io_attrib.card_baseline(quiet + busy, tail=40)
     assert summary["records"] == 40
     assert summary["ms_per_write_median"] == 50.0, "the quiet records were left out by --tail"
+
+
+def test_card_baseline_labels_its_sample_as_stall_triggered():
+    """These records exist because something stalled; the read figure is not idle.
+
+    Measured on `picar`: the same card reads at ~1.5 ms per read in a quiet
+    bulk-read interval, and at ~933 ms per read inside stall windows — where reads
+    queue behind write-back. Presenting one as the other is how a comparison goes
+    wrong.
+    """
+    summary = io_attrib.card_baseline(
+        [_card_record(writes=4, reads=4, ms_io=400, ms_reading=8)]
+    )
+    assert summary["sampled"] == "stall-triggered records"
+    assert "ms_per_read_median_in_stall_windows" in summary
+    assert "ms_per_read_median" not in summary, (
+        "an unqualified read figure would be read as the quiet-interval one"
+    )
