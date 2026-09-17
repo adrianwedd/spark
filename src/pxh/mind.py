@@ -980,8 +980,16 @@ def _latch_detail(curr: dict, reason: str) -> str:
     and "this fix is too coarse to be about the radius it was tested against"
     are different facts, and an evidence log that blurs them cannot settle
     whether the tracker is flapping."""
+    # Coordinates and age, not just distance and accuracy (#305, reopened
+    # 2026-09-18). A tracker flapping between 0.01 km and 4.44 km all evening
+    # cannot be diagnosed from a distance: the two candidate mechanisms --
+    # a *stale* far fix being treated as current, and a fetch being mislabeled
+    # onto the wrong tracker -- look identical in a distance, and different in a
+    # coordinate. `age_s` is already computed per tracker by `_enrich_tracker`
+    # and carried in this dict; printing it costs nothing.
     numbers = (
-        f"{curr.get('distance_km')}km, ±{curr.get('accuracy_m')}m, "
+        f"{curr.get('distance_km')}km @{curr.get('lat')},{curr.get('lon')} "
+        f"±{curr.get('accuracy_m')}m age={curr.get('age_s')}s, "
         f"{ENTER_RADIUS_KM:.2f}km enter / {EXIT_RADIUS_KM:.2f}km exit"
     )
     if reason == "hold-band":
