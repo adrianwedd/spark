@@ -29,7 +29,11 @@ real shapes in this tree were invisible to it until #336:
 
 Beyond the closure: `restart_list` compares the *symbols* a changed module
 changed against the names a unit actually references from it, and treats
-"cannot tell" as "flag". A false restart costs seconds; the failures this module
+"cannot tell" as "flag". One case needs more than that comparison: a changed
+name the module's *own* code reads — a constant used as a function's default
+argument reaches every importer without any of them naming it, which is how a
+4 s→12 s ALSA ring in `pxh.mic_stream` could have been deployed without
+restarting the capture daemon (replayed on `picar`, 2026-09-17). A false restart costs seconds; the failures this module
 exists for (a renamed module reached hours later inside a lazy import) cost a
 silent 22:00 job.
 
@@ -45,7 +49,7 @@ import ast
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Sequence
 
 #: Directories whose contents count as "code a process executes".
@@ -191,6 +195,59 @@ class ModuleChange:
     #: module *provides* may have moved rather than changed in place. This is
     #: #332's shape: a renamed import inside a module only fails at call time.
     module_level: bool
+    #: Changed top-level name -> the top-level definitions that *read* it. A
+    #: constant used as a default argument (`alsa_buffer_s: float =
+    #: DEFAULT_ALSA_BUFFER_S`) reaches every unit that references the class,
+    #: without any of them naming the constant — so "the unit references none
+    #: of the changed names" is not evidence of being unaffected. Attribution
+    #: is per definition on purpose: a module that merely reads a changed
+    #: constant somewhere in its own body is not a reason to restart units that
+    #: call none of the readers.
+    internal_readers: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: A changed name read *outside* any definition — the module's own
+    #: import-time state moved, so every importer is affected, like
+    #: `module_level`.
+    read_at_module_level: bool = False
+
+
+def _internal_flows(source: str) -> tuple[dict[str, set[str]], set[str]]:
+    """`({name: definitions that read it}, names read at module level)`.
+
+    `DEFAULT_ALSA_BUFFER_S` is read exactly once in `pxh/mic_stream.py` — as the
+    default value of `ArecordStream.__init__`'s `alsa_buffer_s` parameter — so
+    every importer of `ArecordStream` is affected by the constant's value while
+    naming only the class. The deploy gate called that "references none of the
+    changed names", which would have left `px-wake-listen` on the old 4 s ring
+    (replayed on `picar`, 2026-09-17).
+
+    A `Load` occurrence is the whole test, and the *enclosing definition* is the
+    attribution: a unit that references `ArecordStream` is affected by what
+    `ArecordStream` reads, and a unit that references nothing in the module is
+    not. Reads outside any definition are reported separately because those are
+    import-time state, which every importer sees.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}, set()  # callers treat an unparsable change as undetermined
+    readers: dict[str, set[str]] = {}
+    top_level: set[str] = set()
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    definition_ids = {id(node) for node in definitions}
+    for node in definitions:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                readers.setdefault(sub.id, set()).add(node.name)
+    for node in tree.body:
+        if id(node) in definition_ids:
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                top_level.add(sub.id)
+    return readers, top_level
 
 
 def _module_symbols(source: str) -> tuple[dict[str, str], str]:
@@ -251,7 +308,15 @@ def changed_symbols(prev: str, head: str, path: str, root: str = ".") -> ModuleC
         name for name in set(before) | set(after)
         if before.get(name) != after.get(name)
     )
-    return ModuleChange(symbols=symbols, module_level=before_other != after_other)
+    readers, top_level = _internal_flows(after_src)
+    return ModuleChange(
+        symbols=symbols,
+        module_level=before_other != after_other,
+        internal_readers={
+            name: frozenset(readers[name]) for name in symbols if name in readers
+        },
+        read_at_module_level=bool(top_level & symbols),
+    )
 
 
 def _dotted(node: ast.AST) -> str | None:
@@ -457,6 +522,9 @@ def _change_hits(
         if change.module_level:
             hits.append((path, "module-level change (imports or top-level logic)"))
             continue
+        if change.read_at_module_level:
+            hits.append((path, "a changed name is read at module level (import-time state)"))
+            continue
         names, resolvable = unit_module_references(unit.entry, root, module)
         if not resolvable:
             hits.append((path, "references it in a way static analysis cannot resolve"))
@@ -465,6 +533,20 @@ def _change_hits(
         if touched:
             shown = ", ".join(sorted(touched)[:3])
             hits.append((path, f"references removed or changed {shown}"))
+            continue
+        # The other way a changed name reaches this unit: through code the unit
+        # *does* reference. `px-wake-listen` names `ArecordStream`, and
+        # `ArecordStream.__init__`'s default is the constant that moved — the
+        # reference comparison above answers "not referenced" and would be
+        # wrong. Attributed per definition so that a module reading a changed
+        # constant in its own private helper does not flag every importer.
+        flowed = sorted(
+            name for name, containers in change.internal_readers.items()
+            if containers & names
+        )
+        if flowed:
+            shown = ", ".join(flowed[:3])
+            hits.append((path, f"changes {shown}, which code this unit calls reads"))
     return hits
 
 
