@@ -530,3 +530,26 @@ def test_results_carry_the_serving_backend(monkeypatch):
     result = m5._result("bad_response", kind="voice_turn", started=time.monotonic(),
                         error="no")
     assert result.backend == "ollama-m5"
+
+def test_the_request_meter_is_a_gauge_not_a_ledger(tmp_path, monkeypatch):
+    """Written on every cognition request (~12k on picar), so the fsync forced a
+    journal commit per request for a number nobody needs across a power cut
+    (#247)."""
+    import pxh.m5 as m5
+    import pxh.state as state
+
+    monkeypatch.setattr(m5, "_m5_dir", lambda: tmp_path)
+    monkeypatch.setattr(m5, "_ensure_dir", lambda: tmp_path)
+    calls = []
+    real = state.atomic_write
+
+    def spy(path, content, **kwargs):
+        calls.append(kwargs.get("durable", True))
+        return real(path, content, **kwargs)
+
+    monkeypatch.setattr(m5, "atomic_write", spy)
+    m5._record_request("voice_turn", "available", 42)
+
+    assert calls == [False], "the gauge must not force a journal commit"
+    body = (tmp_path / "meter.json").read_text()
+    assert "voice_turn" in body

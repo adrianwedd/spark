@@ -345,7 +345,15 @@ def record_conversation_turn(
     max_turns: int = CONVERSATION_MAX_TURNS,
 ) -> None:
     """Append a turn and trim the buffer to the last max_turns, atomically.
-    max_turns <= 0 disables the buffer (writes an empty file)."""
+    max_turns <= 0 disables the buffer (writes an empty file).
+
+    Atomic, not durable: this is a rolling window of prompt context rewritten
+    from scratch every turn, and the durable record of the same conversation is
+    the person-memory append (and the transcript log event). The `fsync` bought
+    nothing a crash could not afford — losing the last turn's context — while
+    costing a forced ext4 journal commit per voice turn on the card shared with
+    the microphone ring (#247, same class as #367).
+    """
     # Person-memory writer: the user's own words only, and only under the SPARK
     # persona (refused inside record_person_facts, so GREMLIN/VIXEN cannot
     # acquire a store by any route). Ahead of the early return, because turning
@@ -353,13 +361,13 @@ def record_conversation_turn(
     people.record_person_facts(role="user", text=user_text, persona=persona,
                                channel="voice")
     if max_turns <= 0:
-        atomic_write(conversation_path(persona), "")
+        atomic_write(conversation_path(persona), "", durable=False)
         return
     turns = recent_conversation(persona, n=max_turns + 1)
     turns.append({"user": user_text, "spark": spark_text})
     turns = turns[-max_turns:]
     body = "".join(json.dumps(t, ensure_ascii=False) + "\n" for t in turns)
-    atomic_write(conversation_path(persona), body)
+    atomic_write(conversation_path(persona), body, durable=False)
 
 
 class VoiceLoopError(Exception):
