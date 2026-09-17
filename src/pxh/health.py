@@ -183,12 +183,28 @@ def _ensure_health_dir() -> Path | None:
 
 
 def _write_record(component: str, record: dict[str, Any]) -> None:
+    """Write one component's health record, atomically but not durably.
+
+    `durable=False`, deliberately. A health record is a *liveness* signal that
+    every daemon rewrites on its next tick, so crash durability buys nothing
+    that the next tick does not restore — while the `fsync` forced an ext4
+    journal commit on every tick, and the commit wait is what the instrumented
+    stalls were made of: `jbd2_log_wait_commit` in 19 of 20 D-state samples on
+    `picar` (2026-09-17), `px-wake-listen` 14 and `px-mind` 4 of them. For
+    `px-wake-listen` that write happens **in the microphone capture loop**
+    (once per `AMBIENT_WRITE_S`), so blocking there is what stops the ALSA ring
+    being drained (#283).
+
+    Atomicity is unchanged: `os.replace` is still what publishes the record.
+    """
     if _ensure_health_dir() is None:
         return
     record["component"] = component
     record["updated_ts"] = utc_timestamp()
     try:
-        atomic_write(_component_path(component), json.dumps(record, indent=2))
+        atomic_write(
+            _component_path(component), json.dumps(record, indent=2), durable=False
+        )
     except OSError:
         pass
 

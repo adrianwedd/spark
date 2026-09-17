@@ -34,12 +34,23 @@ def _trim_corrupt_backups(path: Path, keep: int = 3) -> None:
             pass
 
 
-def atomic_write(path: Path, content: str) -> None:
+def atomic_write(path: Path, content: str, *, durable: bool = True) -> None:
     """Write content to path atomically via temp file + os.replace.
 
     Attempts to preserve original file's ownership (skipped silently if caller
     lacks privileges) and sets mode 0o644 so that cross-user writers
     (root px-alive, pi px-mind) don't lock each other out.
+
+    `durable=False` skips the `fsync`, keeping only the atomicity that
+    `os.replace` gives. Use it for state that is **rewritten continuously and
+    meaningless after a power cut**: the fsync buys no crash durability there,
+    and it forces an ext4 journal commit, which is the wait 19 of the 20
+    D-state IO stalls instrumented on `picar` were sitting in
+    (`jbd2_log_wait_commit`, 2026-09-17 — `px-wake-listen` 14, `px-mind` 4).
+    A commit also *serialises*: two daemons fsyncing in the same second each
+    wait for the other's commit on a card whose small writes cost ~43 KB of
+    write amplification (#247). Anything a reader must see after a crash —
+    session, ledger, queue — keeps the default.
     """
     # Capture original ownership before replacing
     try:
@@ -53,7 +64,8 @@ def atomic_write(path: Path, content: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
             f.flush()
-            os.fsync(f.fileno())
+            if durable:
+                os.fsync(f.fileno())
         os.chmod(tmp, 0o644)
         if orig_uid is not None:
             try:
