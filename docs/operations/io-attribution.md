@@ -865,23 +865,41 @@ positive evidence of health either, because the hardware does not report it.
 
 ### The replacement decision is an A/B test, not a reading
 
-1. **Image the current card** — it is the known-slow baseline. Run
-   `bin/px-card-baseline --json` on it and keep that output: it is the "before"
-   half, computed from records already on disk.
-2. **Boot a known-good replacement SD card** with that same image.
-3. **Run the same baseline on both, under the same workload.** The apt timers
-   dominate workload variance, so compare like with like (`ms_per_write` median
-   and p90 from the record history, io PSI over the same window shape, and
-   `state/health/px-alive.json` → `watchdog.margin_min_ms`).
-4. **Run the same command on the replacement** and compare the two JSON lines —
-   `ms_per_write_median`, `ms_per_write_p90`, `ms_per_read_median`, `ext4_errors`.
-5. **Keep the replacement only if the write latency collapses.** If ~86 ms becomes
-   ~5 ms, #405 is answered empirically; if it does not, the card was never the
-   variable and the small-write-pressure work (#367/#376/#377/#381/#382/#384) is
-   the whole answer.
+**The replacement must be a known-good card of documented model and capacity** —
+not "another card". A worse spare produces a technically complete experiment that
+answers nothing, and there is no way afterwards to tell which happened.
 
-`bin/px-card-baseline [--tail N] [--json]` is that comparison, computed from
-records the observer already wrote — no new instrumentation, no root.
+Everything but the card is held constant: **the same image and software revision,
+the same observer, the same workload window, and the same command.** The apt timers
+(#402) dominate workload variance, so do not compare across an apt run.
+
+1. **Image the current card** — it is the known-slow baseline. Run
+   `bin/px-card-baseline --json` on it and keep the output: it is the "before" half,
+   and it names the card it measured (from `/sys/block/mmcblk0/device/`).
+2. **Boot the documented replacement** from that same image.
+3. **Run the same command on it**, same time of day, and diff the two JSON lines.
+4. Compare exactly these, and nothing else:
+
+   | field | what it answers |
+   |---|---|
+   | `card` | *which* cards were compared (type, name, manfid, date, serial, capacity) |
+   | `ms_per_write_median` / `_p90` | the write path — the quantity this whole file is about |
+   | `ms_per_read_median_in_stall_windows` | reads under contention (not a quiet-interval figure) |
+   | `ext4_errors` | whether either card has produced a filesystem error |
+   | `io_psi_incidence` | how often io PSI reached 20 % at trigger in the sample |
+   | `watchdog_margin_min_ms` | the margin the robot actually had against its 15 s deadline |
+
+5. **Replace only if the replacement materially improves those under comparable
+   conditions.** ~86 ms → ~5 ms answers #405 empirically. **No improvement is also
+   an answer**: it means the constraint is this storage *class* — a single SD card
+   as the only block device — rather than the individual card, and the effort
+   belongs in the small-write-pressure work (#367/#376/#377/#381/#382/#384) and in
+   moving what can be moved off the card (#402).
+
+`bin/px-card-baseline [--tail N] [--json] [--device mmcblk0]` is that comparison,
+computed from records the observer already wrote — no new instrumentation, no root.
+Its output names the card, so an A/B result is attributable rather than two
+unlabelled JSON blobs.
 
 ## Deliberately not done
 

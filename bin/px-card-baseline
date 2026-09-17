@@ -28,7 +28,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
 
-from pxh import io_attrib  # noqa: E402 — px-env exports PYTHONPATH
+from pxh import health as _health  # noqa: E402 — px-env exports PYTHONPATH
+from pxh import io_attrib  # noqa: E402
 
 
 def main(argv: list[str]) -> int:
@@ -38,6 +39,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--tail", type=int, default=40,
                     help="how many records to summarise (default 40)")
     ap.add_argument("--json", action="store_true", help="machine-readable, for a diff")
+    ap.add_argument("--device", default="mmcblk0",
+                    help="block device whose identity travels with the numbers")
+    ap.add_argument("--state-dir", default=str(PROJECT_ROOT / "state"),
+                    help="where px-alive's health record lives (watchdog margin)")
     args = ap.parse_args(argv)
 
     path = Path(args.records)
@@ -47,7 +52,17 @@ def main(argv: list[str]) -> int:
         print(f"px-card-baseline: no records at {path}", file=sys.stderr)
         return 1
 
-    summary = io_attrib.card_baseline(records, tail=max(1, args.tail))
+    paths = io_attrib.Paths()
+    identity = io_attrib.card_identity(paths.sys_block / args.device / "device")
+    try:
+        margin = _health.read_watchdog_margin(args.state_dir).get("watchdog_margin_min_ms")
+    except Exception:  # a missing board must not stop a card comparison
+        margin = None
+
+    summary = io_attrib.card_baseline(
+        records, tail=max(1, args.tail), identity=identity,
+        watchdog_margin_min_ms=margin,
+    )
     if args.json:
         print(json.dumps(summary, sort_keys=True))
         return 0
@@ -55,6 +70,15 @@ def main(argv: list[str]) -> int:
     if not summary["writes_measured"]:
         print(f"px-card-baseline: {summary['records']} record(s), none with writes to measure")
         return 1
+    card = summary.get("card") or {}
+    if card:
+        print(
+            "card: {type} {name} manfid {manfid} {date} serial {serial} | {cap} GB".format(
+                type=card.get("type", "?"), name=card.get("name", "?"),
+                manfid=card.get("manfid", "?"), date=card.get("date", "?"),
+                serial=card.get("serial", "?"), cap=card.get("capacity_gb", "?"),
+            )
+        )
     print(
         "card: ms_per_write median {median} p90 {p90} max {maxv} | "
         "ms_per_read {read} (stall windows) | ext4 errors {errors} | "
@@ -63,6 +87,16 @@ def main(argv: list[str]) -> int:
             maxv=summary["ms_per_write_max"],
             read=summary["ms_per_read_median_in_stall_windows"],
             errors=summary["ext4_errors"], n=summary["records"],
+        )
+    )
+    print(
+        "      io PSI >=20% at trigger in {inc} of records (median {psi}%) | "
+        "watchdog margin {margin} ms".format(
+            inc="?" if summary["io_psi_incidence"] is None
+            else "{:.0%}".format(summary["io_psi_incidence"]),
+            psi=summary["io_psi_median_at_trigger"],
+            margin="n/a" if summary["watchdog_margin_min_ms"] is None
+            else summary["watchdog_margin_min_ms"],
         )
     )
     return 0

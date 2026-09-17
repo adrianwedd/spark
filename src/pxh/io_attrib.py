@@ -1560,8 +1560,37 @@ def sample_ext4(paths: Paths = DEFAULT_PATHS) -> dict[str, Any]:
     return out
 
 
+def card_identity(device_dir: Path | str) -> dict[str, Any]:
+    """The card's own identification, from `/sys/block/mmcblk0/device/`.
+
+    An A/B replacement must name *which* cards were compared; otherwise two JSON
+    blobs of measurements belong to nobody in particular, and a technically
+    complete experiment can be worthless because the replacement was an
+    undocumented spare. Everything here is world-readable; `type` is included
+    because it is the field that settles SD vs eMMC (and therefore which wear
+    registers exist at all).
+    """
+    out: dict[str, Any] = {}
+    root = Path(device_dir)
+    for field in ("type", "name", "manfid", "date", "fwrev", "serial"):
+        value = _read_text(root / field)
+        if value is not None:
+            out[field] = value.strip()
+    size = _read_text(root.parent / "size")
+    if size is not None:
+        try:
+            out["capacity_gb"] = round(int(size.strip()) * 512 / 1_000_000_000, 1)
+        except ValueError:
+            pass
+    return out
+
+
 def card_baseline(
-    records: Sequence[Mapping[str, Any]], *, tail: int = 40
+    records: Sequence[Mapping[str, Any]],
+    *,
+    tail: int = 40,
+    identity: Mapping[str, Any] | None = None,
+    watchdog_margin_min_ms: float | None = None,
 ) -> dict[str, Any]:
     """Summary of a card's measured service time, for an A/B comparison (#405).
 
@@ -1607,10 +1636,31 @@ def card_baseline(
         index = min(len(ordered) - 1, int(len(ordered) * fraction))
         return round(ordered[index], 1)
 
+    psi = [
+        value
+        for value in (
+            ((record.get("psi_pre") or {}).get("psi_io_some_avg10_pre"))
+            for record in list(records)[-tail:]
+        )
+        if isinstance(value, (int, float))
+    ]
     return {
         # Named because every record here was triggered by a stall: a figure from
         # this sample is "under contention", never "idle".
         "sampled": "stall-triggered records",
+        # Which card this is. An A/B result that does not name both cards is an
+        # experiment nobody can repeat.
+        "card": dict(identity) if identity else None,
+        # Live, from px-alive's own heartbeat record — the margin the replacement
+        # also has to improve or preserve.
+        "watchdog_margin_min_ms": watchdog_margin_min_ms,
+        # Incidence, not a level: what fraction of the sampled records the
+        # observer triggered with io PSI at or above 20 %, and the median of
+        # those trigger readings. Both are window figures by construction.
+        "io_psi_incidence": (
+            round(sum(1 for value in psi if value >= 20.0) / len(psi), 3) if psi else None
+        ),
+        "io_psi_median_at_trigger": _pct(psi, 0.5),
         "records": len(list(records)[-tail:]),
         "writes_measured": len(per_write),
         "ms_per_write_median": _pct(per_write, 0.5),
