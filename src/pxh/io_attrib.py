@@ -131,6 +131,10 @@ class Paths:
     #: the interesting question is per device, and because the answer "0/0"
     #: has to be reportable — see ``sample_inflight``.
     sys_block: Path = Path("/sys/block")
+    #: Per-filesystem ext4 counters (world-readable). The filesystem's own view
+    #: of how many bytes it wrote, which is the only way to tell the device's
+    #: 500 KB per stall from *file data* — see ``sample_ext4``.
+    ext4_sysfs: Path = Path("/sys/fs/ext4")
 
 
 DEFAULT_PATHS = Paths()
@@ -360,6 +364,27 @@ def sample_file_sizes(patterns: Sequence[str], *, limit: int = 400) -> dict[str,
         path: entry["size"]
         for path, entry in sample_file_meta(patterns, limit=limit).items()
     }
+
+
+def _ext4_window(
+    pre: Mapping[str, Any], post: Mapping[str, Any]
+) -> dict[str, Any]:
+    """`{fs, write_kbytes_delta, ...}` across the window; `{}` if unwatched."""
+    if not post:
+        return {}
+    out: dict[str, Any] = {"fs": post.get("fs")}
+    before = pre.get("session_write_kbytes")
+    after = post.get("session_write_kbytes")
+    # No pre-sample (filesystem mounted mid-window) means no delta, not a zero.
+    if isinstance(before, int) and isinstance(after, int):
+        out["write_kbytes_delta"] = after - before
+    for field in ("session_write_kbytes", "lifetime_write_kbytes",
+                  "delayed_allocation_blocks", "errors_count"):
+        if field in post:
+            out[field] = post[field]
+    if "journal_task" in post:
+        out["journal_task"] = post["journal_task"]
+    return out
 
 
 def rank_file_touches(
@@ -728,6 +753,60 @@ def sample_inflight(paths: Paths = DEFAULT_PATHS) -> dict[str, dict[str, int]]:
     return out
 
 
+#: ext4 counters worth reading. `session_write_kbytes` is the discriminator:
+#: it counts bytes written *to this filesystem*, so a stall where the device
+#: moves 500 KB and this moves 4 KB is metadata/journal work with no file to
+#: attribute it to — which is why every file channel comes back empty and why
+#: "nobody wrote" is the wrong reading. `lifetime_write_kbytes` is the card-wear
+#: figure (1.03 TB on `picar` as of 2026-09-17).
+EXT4_FIELDS = (
+    "session_write_kbytes",
+    "lifetime_write_kbytes",
+    "delayed_allocation_blocks",
+    "errors_count",
+)
+
+#: Counters to difference across the window; the rest are point readings.
+EXT4_COUNTERS = ("session_write_kbytes",)
+
+
+def sample_ext4(paths: Paths = DEFAULT_PATHS) -> dict[str, Any]:
+    """`{fs, session_write_kbytes, ...}` for the first ext4 filesystem found.
+
+    World-readable, and the complement of every other channel here: `/proc/*/io`
+    and the file watchlist both answer "which file grew", and neither can see
+    journal/metadata writes, which have no file. This answers "did the
+    filesystem write anything at all", so a record can say *the device moved
+    500 KB and the filesystem wrote nothing* instead of leaving an empty writer
+    list to be misread.
+
+    Never raises; `{}` means "not watched", never "nothing was written".
+    """
+    out: dict[str, Any] = {}
+    try:
+        candidates = sorted(paths.ext4_sysfs.glob("*"))
+    except (OSError, ValueError):
+        return out
+    for entry in candidates:
+        try:
+            if not (entry / "session_write_kbytes").is_file():
+                continue
+        except OSError:
+            continue
+        out["fs"] = entry.name
+        for field in EXT4_FIELDS:
+            try:
+                out[field] = int((entry / field).read_text().strip())
+            except (OSError, ValueError):
+                continue
+        try:
+            out["journal_task"] = (entry / "journal_task").read_text().strip()
+        except OSError:
+            pass
+        break
+    return out
+
+
 def _device_deltas(
     pre: Mapping[str, Mapping[str, int]],
     post: Mapping[str, Mapping[str, int]],
@@ -840,6 +919,7 @@ def capture(
         except (ValueError, IndexError):
             uptime_s = None
     inflight_pre = sample_inflight(paths)
+    ext4_pre = sample_ext4(paths)
     procs_pre = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
     files_pre = sample_file_meta(growth_patterns) if growth_patterns else {}
     observer_pre = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
@@ -851,6 +931,7 @@ def capture(
     disk_post = parse_diskstats(_read_text(paths.diskstats) or "")
     vmstat_post = parse_vmstat(_read_text(paths.vmstat) or "")
     inflight_post = sample_inflight(paths)
+    ext4_post = sample_ext4(paths)
     observer_post = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
     psi_post = host_load_fields("post")
 
@@ -911,6 +992,12 @@ def capture(
         # in it to find.
         "device_inflight_pre": inflight_pre,
         "device_inflight_post": inflight_post,
+        # The filesystem's own view, and the only field here that separates
+        # "file data" from "metadata/journal": `write_kbytes_delta` is bytes
+        # written *to the filesystem* across the window. A record where the
+        # device moved 500 KB and this moved 4 KB is a record of journal work —
+        # which has no file, so no file channel can ever name it.
+        "ext4": _ext4_window(ext4_pre, ext4_post),
         "vmstat": {
             key: _delta(vmstat_pre, vmstat_post, key) for key in VMSTAT_COUNTERS
         },
