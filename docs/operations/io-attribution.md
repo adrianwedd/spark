@@ -160,6 +160,22 @@ in D state, and **no readable process accounts for the 152 KB that reached the
 disk**. That last line is the whole reason the root channel is the next step:
 "invisible to this uid" is a different statement from "nobody wrote".
 
+**Caveat (added 2026-09-17 20:20) — `ms_writing` on this host does not mean what
+it looks like it means.** That worked example quotes "`ms_writing` 21-419 s
+inside 3.2 s windows — per-request service times in the seconds" as the device
+grinding. Direct measurement contradicts it: a 169-byte `fsync`+`replace` costs
+p50 7 ms (max 25 ms over 15 samples), a 512 KiB sequential `fsync` write runs at
+~575 KB/s, and a quiet record taken 2026-09-17T20:11 shows
+`writes_completed 81, sectors_written 720 (360 KB), ms_writing 6286, ms_io 432`
+— which asks the device to have ~100 4 KB writes in flight at once, on an
+`mmc` queue that is one or two deep. The two counters are irreconcilable;
+`ms_io` (queue-occupied time, 19 % here) agrees with the direct measurements and
+`ms_writing` does not. **Do not read `ms_writing` as device service time on this
+kernel (6.12)** — in the 2026-08-16 fsync investigation it was the corroborating
+evidence for a real defect that `/proc/<pid>/wchan: jbd2_log_wait_commit`
+already proved on its own, so the conclusion stands on that, not on this field.
+`device_inflight_pre` and `ms_io` are the fields to reason from.
+
 That record predates the file channel, so a current run also carries
 `file_growth` / `file_growth_total_bytes` / `file_growth_groups` /
 `file_growth_watched` (see the field table below).
@@ -253,7 +269,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `writers_with_activity` / `write_bytes_total` | how many processes moved anything at all, and how much of it reached the disk |
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
 | `d_state_count` / `blocked_thread_count` | stalled processes, and how many of the blocked tasks are non-leader threads |
-| `devices` | per-device deltas: `ms_writing` (time with writes in flight) and `ms_io` (queue time) separate "busy device" from "many small writes" |
+| `devices` | per-device deltas. `ms_io` (queue-occupied time) is the trustworthy one; `ms_writing` is reported but over-counts on this kernel — see the caveat above |
 | `device_inflight_pre` / `device_inflight_post` | `/sys/block/<dev>/inflight` at each end of the window — requests *currently* dispatched. Zero is reported, not dropped: `0/0` during a stall is the finding, not a missing sample. `pre` is inside the stall (the caller triggered because PSI is high now), `post` shows recovery |
 | `vmstat` / `vmstat_end` | swap-in/out and direct-reclaim deltas; `nr_dirty`/`nr_writeback` gauges |
 | `psi_pre` / `psi_post` | `psi_io_some_avg10_*`, `psi_io_full_avg10_*`, memory PSI, `load1`, `swap_free_kb` on both ends |
