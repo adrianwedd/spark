@@ -1551,6 +1551,19 @@ def _device_deltas(
                 "ms_reading",
             )
         }
+        # Derived, because "the card is slow" needs a number and the counters for
+        # it are already here. `ms_io` is queue-occupied *time*, so dividing by
+        # the writes it served gives average queue time per write — ~10-20 ms on
+        # a healthy card, and measured 2026-09-18 at **~18 s across 89 writes
+        # moving 446 KB** during the post-burst phase (#247), where the queue was
+        # only 16 % occupied and every daemon was still blocked. Reported as
+        # `None` rather than 0 when nothing was written: 0/0 is not "fast".
+        writes = deltas.get("writes_completed", 0)
+        if writes > 0:
+            deltas["ms_per_write"] = round(deltas.get("ms_io", 0) / writes, 1)
+            deltas["kb_per_write"] = round(
+                deltas.get("sectors_written", 0) * 512 / 1024 / writes, 1
+            )
         if deltas["writes_completed"] or deltas["reads_completed"] or deltas["ms_io"]:
             out[name] = deltas
     return dict(list(out.items())[:_MAX_DEVICES])
