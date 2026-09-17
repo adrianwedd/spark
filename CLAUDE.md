@@ -69,7 +69,28 @@ then watch the board until the name is gone.
 moved.** A daemon that resolved a path at startup keeps the old one until it
 restarts, and the symptom appears hours later rather than at deploy time:
 `px-wake-listen` resolves its voice launcher once, so a launcher rename needs
-`systemctl restart px-wake-listen` as well as `px-mind`.
+`systemctl restart px-wake-listen` as well as `px-mind`. A *lazy* import does
+not save a daemon either — the compiled statement keeps the old module name, so
+a rename fails inside the daemon's next call, hours after a deploy that looked
+clean (#332: the 20:51 deploy restarted 3 of 10 units and left three executing
+code that still named the deleted `pxh.claude_session`; the first symptom was a
+22:00 blog line nobody was watching for).
+
+Source state and process state are separate realities, and only the second one
+is running, so do not derive that list from memory:
+
+```bash
+bin/px-deploy-check     # on the robot, immediately after the ff-merge
+```
+
+It reads the deploy's changed files from git (`HEAD@{1}..HEAD`), reads every
+`px-*` unit's `ExecStart` and start time from systemd, and flags any unit whose
+entry point — or any `pxh` module reachable from it, including shell wrappers
+that run `python -m pxh.x` — this deploy changed while the process was already
+running. Replayed against the 2026-09-16 20:51 deploy it names six units: the
+four #332 had to restart by hand, plus `px-mind` and `px-wake-listen`, and none
+of the other four. **A deploy is not complete until it exits 0** — the source
+tree being correct is not the property; the processes executing it is.
 
 ## Running Tests
 

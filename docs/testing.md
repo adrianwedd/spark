@@ -90,3 +90,28 @@ effect is observed — see `_mock_popen` / `_await_spawn` in `tests/test_api.py`
 4. Mark it `live` only if it genuinely requires hardware. `live` is a deselect,
    not a place to hide flakes.
 5. Let CI tell you whether it works. That is the entire point.
+
+## Acceptance for a migration is absence, not a mock
+
+A unit test asserts your *model* of a transport. When the thing being changed
+*is* the transport, the stronger acceptance is that the old one no longer exists
+and the outcome still happens. #310/#317's criterion was one line: **new
+memories appear while the old architecture literally does not exist** —
+`px-brain` disabled and inactive, its code deleted, no tmux server, no `claude`
+process, and the log the retired path used to write (`logs/tool-brain.log`)
+unchanged in size across the run. A mock cannot fail that measurement. A real
+host can, which is the whole point.
+
+Two artefacts from that work deliberately disagreed, and the disagreement was
+the instrument:
+
+- the **replay** wrote the nine missing nights of memories — a human running the
+  pass by hand, on deployed code, one night at a time;
+- the **health record** was left reading `failing`, untouched, so the first
+  *unattended* pass was the only thing that could turn it green.
+
+"Fix the health record to match the replay" would have destroyed the only
+measurement that separates "the supervised path works" from "we once ran it by
+hand". Keep the record that *reports* health separate from the artefact that
+*proves* the path.
+
