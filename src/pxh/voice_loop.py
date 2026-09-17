@@ -764,6 +764,12 @@ VOICE_TURN_RESPOND_WITH = (
 )
 
 
+#: `bin/codex-ollama`'s own default endpoint. Named here so the label and the
+#: adapter cannot drift apart silently; `test_command_backend_label_matches_the_adapter_default`
+#: reads the adapter's source and fails if this stops matching it.
+CODEX_OLLAMA_DEFAULT_HOST = "https://ollama.com"
+
+
 def command_backend_label(codex_cmd: str) -> str:
     """The token-log bucket for a `--backend command` turn (#306).
 
@@ -780,11 +786,13 @@ def command_backend_label(codex_cmd: str) -> str:
     if "codex-ollama" in name:
         from pxh import m5
 
-        host = (
-            os.environ.get("OLLAMA_HOST")
-            or os.environ.get("PX_OLLAMA_HOST")
-            or "http://localhost:11434"
-        )
+        # Mirror the adapter's own resolution (`bin/codex-ollama`: OLLAMA_HOST,
+        # defaulting to Ollama Cloud), not an invented one: defaulting to a
+        # localhost daemon when the adapter actually calls the cloud is exactly
+        # the misattribution this label exists to prevent, and reading
+        # PX_OLLAMA_HOST here would name a variable that does not move the call.
+        # Divergence is pinned by a test that reads the adapter's source.
+        host = os.environ.get("OLLAMA_HOST", CODEX_OLLAMA_DEFAULT_HOST)
         return m5.backend_label(host)
     if name.startswith("codex"):
         return "codex"
