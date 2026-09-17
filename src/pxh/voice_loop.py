@@ -997,6 +997,20 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         })
         tool = substitute_tool
         params = substitute_params
+    elif verdict.unevaluated:
+        # Fail-open, made visible (#191). The rule above did not fire and could
+        # not have: HA carried no on-call signal, so "nothing needed
+        # suppressing" is not a claim this turn is entitled to. Recording it is
+        # what separates the two readings afterwards.
+        rules = ",".join(verdict.unevaluated)
+        print(f"[voice-loop] requested={requested_tool} verdict=allowed "
+              f"unevaluated={rules}", file=sys.stderr)
+        log_event("policy_fail_open", {
+            "requested": requested_tool,
+            "unevaluated": list(verdict.unevaluated),
+            "origin": "interactive",
+            "ts": utc_timestamp(),
+        })
 
     sanitized: Dict[str, Any] = {}
 

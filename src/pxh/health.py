@@ -74,6 +74,10 @@ STALE_AFTER_S: dict[str, int] = {
     "px-mind-consolidation": 108000,
     "px-api-server": 300,
     "px-frigate-stream": 300,
+    # Perception, not a daemon: HA is the evidence source for presence, calls
+    # and hot-mic state, and a whole modality vanishing used to leave the board
+    # green (#191). Polled every HA_INTERVAL_S (300 s) by px-mind, so 3x that.
+    "ha": 900,
 }
 DEFAULT_STALE_AFTER_S = 900
 

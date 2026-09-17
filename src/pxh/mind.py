@@ -1332,6 +1332,68 @@ def _fetch_ha_context(dry: bool = False) -> dict | None:
         return None
 
 
+# Why HA perception is currently unavailable, or None while it is working.
+# Read into awareness so the modality's absence is a stated fact rather than a
+# missing key (#191): an absent `ha_presence` and "HA could not be reached" look
+# identical to every consumer otherwise.
+_ha_unavailable_reason: str | None = None
+
+
+# Log-once-per-transition for the autonomous fail-open: this runs on every
+# expression evaluation (every couple of minutes), and a line per tick while HA
+# is down would bury the fact it is meant to surface.
+_on_call_unevaluated_logged = False
+
+
+def _note_on_call_unevaluated() -> None:
+    """Name the autonomous fail-open once per episode — log *and* health.
+
+    Both effects are behind the same flag on purpose: `record_failure` has no
+    throttle by design (failures never throttle), so calling it on every
+    expression evaluation while HA is down would fsync a health record every
+    couple of minutes onto the card this system is already bottlenecked on
+    (#247). The per-fetch failures are recorded by `_note_ha_outcome`; this is
+    the supplementary fact that the *rule* could not be evaluated.
+    """
+    global _on_call_unevaluated_logged
+    if _on_call_unevaluated_logged:
+        return
+    _on_call_unevaluated_logged = True
+    log("expression: on-call rule unevaluated — HA carried no call/mic signal (fail-open)")
+    try:
+        health_mod.record_failure(
+            "ha", "on-call rule unevaluated at expression time"
+        )
+    except Exception:  # pragma: no cover — reporting is never load-bearing
+        pass
+
+
+def _note_ha_outcome(ok: bool, detail: str = "") -> None:
+    """Record one HA fetch outcome: health, and why perception is missing.
+
+    HA is the evidence source for presence, on-call and hot-mic state. When it
+    is down the policy layer correctly fails *open*, so the operationally
+    important fact is that something stopped being observable while everything
+    still looked fine — which is a health record plus an awareness flag, not a
+    timeout in a log (#191).
+    """
+    global _ha_unavailable_reason
+    global _on_call_unevaluated_logged
+    if ok:
+        _ha_unavailable_reason = None
+        _on_call_unevaluated_logged = False
+        try:
+            health_mod.record_success("ha", min_interval_s=HA_INTERVAL_S)
+        except Exception:  # pragma: no cover — reporting is never load-bearing
+            pass
+        return
+    _ha_unavailable_reason = detail or "unavailable"
+    try:
+        health_mod.record_failure("ha", _ha_unavailable_reason)
+    except Exception:  # pragma: no cover — reporting is never load-bearing
+        pass
+
+
 def _format_ha_context(ctx: dict | None) -> str:
     """Format HA context signals for the reflection prompt."""
     if not ctx:
@@ -1982,17 +2044,26 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
             ha = _fetch_ha_presence(dry)
             if ha is not None:
                 _cached_ha = ha
+                _note_ha_outcome(True)
             else:
                 log("ha_presence: returned None, keeping previous cache")
+                _note_ha_outcome(False, "presence fetch returned nothing usable")
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):
                 _cached_ha = None   # auth failure — don't serve stale data
                 log(f"ha_presence: auth failure ({exc.code}), cache cleared")
+                _note_ha_outcome(False, f"auth failure ({exc.code})")
             else:
                 log(f"ha_presence: HTTP {exc.code}, keeping cache")
+                _note_ha_outcome(False, f"HTTP {exc.code}")
         except Exception as exc:
             _mark_ha_offline(exc)
+            _note_ha_outcome(False, f"{type(exc).__name__}: {exc}")
         _last_ha_fetch = now_mono
+    elif not _ha_online and _ha_unavailable_reason is None:
+        # Inside the backoff window: the modality is down and this tick is not
+        # even trying, which is worth stating once rather than per tick.
+        _note_ha_outcome(False, "host unreachable (backoff)")
 
     # Refresh HA calendar periodically
     if _ha_online and (now_mono - _last_ha_calendar_fetch) > HA_CALENDAR_INTERVAL_S:
@@ -2140,6 +2211,9 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     # Enrich with HA presence (who's home)
     if _cached_ha:
         awareness["ha_presence"] = _cached_ha
+    if _ha_unavailable_reason:
+        # An explicit statement, not an absent key (#191).
+        awareness["ha_perception_unavailable"] = _ha_unavailable_reason
 
     # Enrich with HA calendar (upcoming events)
     if _cached_ha_calendar:
@@ -2391,6 +2465,7 @@ def _reset_state():
     global _time_period_start_mono, _last_image_cleanup
     global _last_known_findmyhub
     global _ha_offline_until
+    global _ha_unavailable_reason
     global _ha_sleep_entity_missing
 
     _battery_history = []
@@ -2426,6 +2501,7 @@ def _reset_state():
     _latch_suppressed = {}
     _latch_far_streak = {}
     _ha_offline_until = 0.0
+    _ha_unavailable_reason = None
 
 
 
@@ -3205,13 +3281,17 @@ def expression(thought: dict, dry: bool, awareness: dict | None = None) -> bool:
         log(f"expression: suppressed {action} — bedtime routine (calm mode)")
         return False
 
-    # Suppress speech when Adrian is on a call or mic is active
-    ha_ctx = _aw.get("ha_context") or {}
-    if ha_ctx.get("adrian_on_call") or ha_ctx.get("adrian_mic_active"):
+    # Suppress speech when Adrian is on a call or mic is active. The rule and
+    # the "could not be evaluated" case come from one place (policy), so the
+    # autonomous loop and the interactive sink gate cannot drift (#191).
+    on_call, on_call_evaluable = policy.on_call_suppression(_aw)
+    if on_call:
         if action in ("greet", "greet_arrival", "comment", "weather_comment", "play_sound",
                        "time_check", "calendar_check", "photograph"):
             log(f"expression: suppressed {action} — Adrian on call/mic active")
             return False
+    elif not on_call_evaluable:
+        _note_on_call_unevaluated()
 
     # Behavioural policy (#174). For the autonomous path this adds quiet mode;
     # night silence and on-call suppression are already enforced above and stay

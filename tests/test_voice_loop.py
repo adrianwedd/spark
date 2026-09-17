@@ -244,3 +244,36 @@ def test_validate_action_leaves_presence_tools_alone_in_quiet_mode(monkeypatch):
     _no_policy_blockers(monkeypatch, spark_quiet_mode=True)
     tool, env = voice_loop.validate_action({"tool": "tool_look", "params": {}})
     assert tool == "tool_look"
+
+
+def test_validate_action_records_a_policy_fail_open(monkeypatch):
+    """#191: when HA carried no on-call signal, the rule did not fire *and could
+    not have* — record it, or 'nothing needed suppressing' is indistinguishable
+    from 'suppression was never evaluated'."""
+    events = []
+    monkeypatch.setattr(voice_loop, "log_event",
+                        lambda name, payload: events.append((name, payload)))
+    monkeypatch.setattr(voice_loop, "_load_awareness_for_policy", lambda: {})
+
+    tool, _env = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+
+    assert tool == "tool_voice"                     # still fails open
+    assert [name for name, _payload in events] == ["policy_fail_open"]
+    payload = events[0][1]
+    assert payload["unevaluated"] == ["on_call"]
+    assert payload["requested"] == "tool_voice"
+
+
+def test_validate_action_does_not_cry_fail_open_when_ha_answered(monkeypatch):
+    events = []
+    monkeypatch.setattr(voice_loop, "log_event",
+                        lambda name, payload: events.append(name))
+    monkeypatch.setattr(
+        voice_loop, "_load_awareness_for_policy",
+        lambda: {"ha_context": {"adrian_on_call": False, "adrian_mic_active": False}},
+    )
+
+    tool, _env = voice_loop.validate_action({"tool": "tool_voice", "params": {"text": "hi"}})
+
+    assert tool == "tool_voice"
+    assert events == []

@@ -400,3 +400,23 @@ def test_a_failing_sweep_never_breaks_the_health_write(monkeypatch):
     health.record_success("px-mind")
     rec = json.loads(health._component_path("px-mind").read_text())
     assert rec["success_count"] == 1
+
+
+# --- HA perception is a component, not an absence (#191) --------------------
+
+
+def test_ha_is_a_known_component_with_a_window_from_its_poll():
+    """A whole evidence modality vanishing used to leave the board green. The
+    window is 3x px-mind's HA_INTERVAL_S (300 s), matching the file's convention
+    for every other component."""
+    from pxh import mind
+
+    assert "ha" in health.KNOWN_COMPONENTS
+    assert health.STALE_AFTER_S["ha"] == 3 * mind.HA_INTERVAL_S
+
+
+def test_ha_reads_stale_only_after_its_window():
+    health.record_success("ha")
+    assert health.read_health(("ha",))["components"]["ha"]["status"] == "ok"
+    _shift("ha", health.STALE_AFTER_S["ha"] + 60)
+    assert health.read_health(("ha",))["components"]["ha"]["status"] == "stale"

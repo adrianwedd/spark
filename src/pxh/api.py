@@ -755,6 +755,12 @@ async def health():
         # being dropped. Newly deployed, it reads "missing" until the first
         # 03:00 pass (#310), which would otherwise 503 the API for a whole day.
         effective_statuses.pop(_health.CONSOLIDATION_COMPONENT, None)
+        # Same reasoning for HA perception (#191): it is reported as its own
+        # check but kept out of the liveness rollup. "The device is serving" is
+        # not a claim about the home-automation network, and HA being down — or
+        # simply having no token configured on this host — must not 503 the API
+        # and take the tunnel health check with it.
+        effective_statuses.pop("ha", None)
         status_rank = {
             "ok": 0,
             "degraded": 1,
@@ -773,6 +779,14 @@ async def health():
         }
         # When SPARK last actually formed a long-term memory. No error text:
         # this endpoint is unauthenticated and last_error can carry paths.
+        # Perception, visible but not liveness: the modality's own status and
+        # why it is missing, without last_error text (this endpoint is
+        # unauthenticated and errors can carry hostnames and paths).
+        _ha = component_statuses.get("ha", "missing")
+        checks["perception"] = {
+            "status": _ha if isinstance(_ha, str) else "unknown",
+            "ha_available": isinstance(_ha, str) and _ha == "ok",
+        }
         _mem = daemons.get("memory_formation") or {}
         checks["memory"] = {
             "status": _mem.get("status", "unknown"),
