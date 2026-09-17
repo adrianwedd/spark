@@ -884,7 +884,7 @@ the same observer, the same workload window, and the same command.** The apt tim
    |---|---|
    | `card` | *which* cards were compared (type, name, manfid, date, serial, capacity) |
    | `ms_per_write_median` / `_p90` | the write path — the quantity this whole file is about |
-   | `ms_per_read_median_in_stall_windows` | reads under contention (not a quiet-interval figure) |
+   | `ms_per_read_median_in_stall_windows` | reads under contention (not a quiet-interval figure). **Read `reads_measured` beside it**: a stall window often holds only a handful of reads, and two samples of the same card gave 933 ms and 1.0 ms. A difference smaller than that noise is not a finding |
    | `ext4_errors` | whether either card has produced a filesystem error |
    | `io_psi_incidence` | how often io PSI reached 20 % at trigger in the sample |
    | `watchdog_margin_min_ms` | the margin the robot actually had against its 15 s deadline |

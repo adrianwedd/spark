@@ -2255,3 +2255,21 @@ def test_card_baseline_carries_identity_psi_incidence_and_the_watchdog_margin():
     bare = io_attrib.card_baseline(records)
     assert bare["card"] is None and bare["watchdog_margin_min_ms"] is None
     assert bare["io_psi_incidence"] == 0.5
+
+
+def test_card_baseline_reports_the_read_sample_size():
+    """Two samples of the same card gave 933 ms and 1.0 ms per read.
+
+    The read figure is noisy because a stall window often contains a handful of
+    reads; the count is what lets a reader judge whether a difference between two
+    cards is real or is the sample.
+    """
+    records = [
+        _card_record(writes=4, reads=1, ms_io=400, ms_reading=900),
+        _card_record(writes=4, reads=0, ms_io=400),
+        _card_record(writes=4, reads=6, ms_io=400, ms_reading=6),
+    ]
+    summary = io_attrib.card_baseline(records)
+    assert summary["reads_measured"] == 2, "only records with reads contribute"
+    # Nearest-rank (upper of two), the same helper p90 uses: 900 and 1.0 -> 900.
+    assert summary["ms_per_read_median_in_stall_windows"] == 900.0
