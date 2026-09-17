@@ -62,9 +62,22 @@ transient storage stall. That is why the heavy part is bounded and rare, why the
 unit runs `Nice=10` + `IOSchedulingClass=idle`, and why every record carries
 `observer_write_bytes` — the instrument accounting for itself.
 
-The heartbeat trigger is gated on aliveness (the pid in `logs/px-alive.pid`
-exists) so a *stopped* daemon's stale heartbeat file cannot trigger forever and
-bury the real stalls.
+The heartbeat trigger is gated on aliveness (the pid in `--px-alive-pid-file`,
+default `LOG_DIR/px-alive.pid`, exists) so a *stopped* daemon's stale heartbeat
+file cannot trigger forever and bury the real stalls.
+
+That default is derived from `LOG_DIR`, which makes the gate **silently
+disarmable** — measured 2026-09-18: a bounded verify instance run with
+`LOG_DIR=/tmp/...` had the heartbeat ageing 0.26-0.32 s at **20 of 20** samples
+and fired **zero** `heartbeat_age` captures, because it was looking for
+`px-alive.pid` under the scratch log dir. Nothing in its output said the trigger
+could not fire; the only symptom would have been records that never carry
+`heartbeat_age`, which reads as "the heartbeat was healthy" rather than "nobody
+was watching it". So the observer states it three ways: `heartbeat_gate=armed|
+disarmed` plus `px_alive_pid_file=<path>` on the startup line, an explicit
+`heartbeat trigger DISARMED: ...` line when it starts with no live pid (re-checked
+every poll, so a later px-alive start arms it), and `trigger.px_alive_gate` in
+**every** record.
 
 ## Two channels, and the privilege asymmetry between them
 
@@ -630,6 +643,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | field | meaning |
 |---|---|
 | `reason` | `io_psi`, `heartbeat_age`, both (`io_psi+heartbeat_age`), or `manual` |
+| `trigger.px_alive_gate` | `armed` / `disarmed` — whether the watchdog half of the trigger was actually watching. `disarmed` means this record could only have come from io PSI, and that a late heartbeat would not have been captured at all. `trigger.px_alive_pid_file` names the path it looked in |
 | `writer_channel_attempted` | whether the writer channel was tried at all (false only under `--no-proc-io`) |
 | `privileged` | the probe's answer: can this uid read *other users'* `/proc/<pid>/io`? (It asks about pid 1 — reading our own io always succeeds and would prove nothing.) |
 | `writers_unreadable_count` / `writers_unavailable_reason` | the measurement: how many processes actually refused `/proc/<pid>/io` in this snapshot, and one sentence saying which of the three gaps applies — not attempted, unprivileged, or refused-despite-privilege (a non-dumpable process) |
@@ -669,6 +683,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `ext4.lifetime_write_kbytes` is in the hundreds of GB to TB (1.03 TB on `picar`, 2026-09-17) | the card has been written a great deal; a wear-related latency tail is a live hypothesis, not a theory | treat card health as a candidate alongside the kernel/host path, and say so when reporting |
 | both file channels empty with the device saturated | metadata/journal work with no file-level signature at all (ext4 `-rsv-conversion`, `kblockd`, `jbd2` in the D-state roster) | the root channel is the only way in; do not read the empty channels as "nobody wrote" |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
+| a log with `io_psi` records but **no** `heartbeat_age` record ever, on a host whose px-alive has been parked | check `trigger.px_alive_gate` before concluding the heartbeat is healthy | pass `--px-alive-pid-file` explicitly, or stop overriding `LOG_DIR`; the gate is /proc-based and a missing pid file disarms it |
 | `blocked_in_window[0]` is a root-owned daemon or a kernel thread with `wchan_withheld: true`, `writers_unreadable_count` high | the unprivileged reading of "the writer is one of the processes we cannot measure". A `jbd2/mmcblk0p2-8` row is ext4 journal work; the journal thread *is* the writer, and it has no file and no unit | the unit-level fix is journal-side tuning (`SyncIntervalSec`, `Storage=`, rates) or taking fsyncs out of the suspect daemon — not process weighting; install as root for the symbol and the bytes |
 | `blocked_in_window` names a *user-space* daemon with `thread_d_samples` at or near `samples` while `d_samples` is 0 | a thread of that daemon is wedged behind a healthy leader (#287) — the shape a leader-only view reports as "fine" | that daemon's write path, not its park logic |
 | `co_blocked_samples` > 0, especially with `brcmf_wq/mmc1:*` and `jbd2/mmcblk0p2-8` in the same instant | the block is **shared**, not a writer: the `mmc` bus carries the card and the SDIO WiFi, and nothing here is competing for it | stop looking for a writer; this is #217/#247's "wedge, not writer" territory — kernel/driver/power, and `mmc1` has no `/sys/block` entry to consult |

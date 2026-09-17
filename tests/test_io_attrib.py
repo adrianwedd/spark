@@ -1630,3 +1630,93 @@ def test_capture_says_nothing_about_withheld_wchan_when_none_were(tmp_path, monk
     assert record["wchan_withheld_count"] == 0
     assert record["wchan_unavailable_reason"] is None
     assert record["blocked_in_window"][0]["wchan_withheld"] is False
+
+
+# --- the heartbeat trigger's own visibility --------------------------------
+# The watchdog half of the trigger is gated on px-alive's pid file, whose
+# default path is derived from LOG_DIR. A disarmed gate is invisible unless it
+# is stated: records then never carry `heartbeat_age`, which reads as "the
+# heartbeat was healthy" rather than "nobody was watching it" (#247).
+
+
+def _cli(tmp_path, *args, env_extra=None, timeout=60):
+    import subprocess
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(exist_ok=True)
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.run(
+        [str(root / "bin" / "px-io-attrib"), *args],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={
+            **os.environ,
+            "LOG_DIR": str(log_dir),
+            "PX_BYPASS_SUDO": "1",
+            "PX_STATE_DIR": str(tmp_path / "state"),
+            "PATH": os.environ.get("PATH", ""),
+            **(env_extra or {}),
+        },
+    )
+
+
+def test_a_dry_run_states_that_the_heartbeat_trigger_is_disarmed(tmp_path):
+    """Found by running a bounded verify instance under a scratch LOG_DIR:
+    the heartbeat aged 0.26-0.32 s at 20 of 20 samples and nothing fired."""
+    import json
+
+    proc = _cli(
+        tmp_path,
+        "--dry-run", "--window", "1",
+        "--heartbeat-file", str(tmp_path / "no-heartbeat.json"),
+        "--px-alive-pid-file", str(tmp_path / "absent.pid"),
+        "--no-file-growth",
+    )
+    assert proc.returncode == 0, proc.stderr
+    record = json.loads(proc.stdout)
+    assert record["trigger"]["px_alive_gate"] == "disarmed"
+    assert record["trigger"]["px_alive_pid_file"].endswith("absent.pid")
+    assert record["trigger"]["px_alive_pid"] is None
+
+
+def test_a_dry_run_reports_the_trigger_armed_when_px_alive_publishes_a_pid(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    pid_file = tmp_path / "px-alive.pid"
+    pid_file.write_text(f"{live.pid}\n", encoding="utf-8")
+    try:
+        proc = _cli(
+            tmp_path,
+            "--dry-run", "--window", "1",
+            "--heartbeat-file", str(tmp_path / "no-heartbeat.json"),
+            "--px-alive-pid-file", str(pid_file),
+            "--no-file-growth",
+        )
+        assert proc.returncode == 0, proc.stderr
+        record = json.loads(proc.stdout)
+        assert record["trigger"]["px_alive_gate"] == "armed"
+        assert record["trigger"]["px_alive_pid"] == live.pid
+    finally:
+        live.terminate()
+        live.wait(timeout=10)
+
+
+def test_a_disarmed_trigger_is_announced_at_startup_not_left_implicit(tmp_path):
+    proc = _cli(
+        tmp_path,
+        "--duration-h", "0.0006",
+        "--io-threshold", "200",
+        "--heartbeat-file", str(tmp_path / "no-heartbeat.json"),
+        "--px-alive-pid-file", str(tmp_path / "absent.pid"),
+        "--poll", "0.5",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "heartbeat_gate=disarmed" in proc.stdout
+    assert "px_alive_pid_file=" in proc.stdout
+    assert "heartbeat trigger DISARMED" in proc.stdout
+    assert "only the io-PSI trigger is armed" in proc.stdout
