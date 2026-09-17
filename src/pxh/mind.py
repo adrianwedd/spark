@@ -924,6 +924,40 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
         return None
 
 
+def _note_findmyhub_feed(reason: str | None, *, record: bool = True) -> None:
+    """Record the tracker feed's own health, because a frozen feed is silent.
+
+    Modelled on `_note_ha_outcome` (#191): the operationally important fact is
+    that a *modality stopped being observable while everything still looked
+    fine*. Arrival detection fails in the least visible way available — the
+    fetcher keeps publishing a current file, the fix inside is frozen, the
+    staleness gate correctly declines to decide, and the outcome is no arrivals
+    rather than an error anywhere. A health record is the only thing that turns
+    that into a signal.
+
+    `record=False` is for the *absent* feed: a host with no M5 fetcher is not
+    broken, and recording success there would claim a capability that does not
+    exist. The component is deliberately **not** in `health.KNOWN_COMPONENTS`
+    for the same reason — "expected to exist" would report `missing` on every
+    host without the fetcher, which is the false alarm the io-attrib observer
+    refused as well.
+    """
+    global _findmyhub_feed_reason
+    _findmyhub_feed_reason = reason
+    if not record:
+        return
+    try:
+        if reason is None:
+            # `min_interval_s` because this runs every awareness cycle (~60 s)
+            # and the health record is an fsync'd state write — see #367's
+            # lesson about paying that on a timer.
+            health_mod.record_success("findmyhub", min_interval_s=FINDMYHUB_STALE_S)
+        else:
+            health_mod.record_failure("findmyhub", reason)
+    except Exception:  # pragma: no cover — reporting is never load-bearing
+        pass
+
+
 def _read_findmyhub() -> dict:
     """Read state/findmyhub.json (written by M5.local cron via GoogleFindMyTools).
 
@@ -933,20 +967,51 @@ def _read_findmyhub() -> dict:
     """
     try:
         if not FINDMYHUB_FILE.exists():
+            # Not configured, not broken: say nothing rather than claim a
+            # capability this host does not have.
+            _note_findmyhub_feed(None, record=False)
             return {}
         data = json.loads(FINDMYHUB_FILE.read_text(encoding="utf-8"))
         file_age_s = time.time() - data.get("ts", 0)
         if file_age_s > FINDMYHUB_STALE_S:
             log(f"findmyhub: file stale ({file_age_s:.0f}s old), ignoring")
+            _note_findmyhub_feed(
+                f"the fetch file itself is stale ({file_age_s / 3600.0:.1f} h old) "
+                "— the fetcher has stopped, so no tracker can be seen at all"
+            )
             return {}
-        result = {}
+        result: dict = {}
+        stale_fixes: list[tuple[str, float]] = []
+        errored: list[str] = []
         for name, raw in data.get("trackers", {}).items():
             enriched = _enrich_tracker(raw, name)
-            if enriched:
-                result[name] = enriched
+            if not enriched:
+                errored.append(name)
+                continue
+            age_s = enriched.get("age_s")
+            if isinstance(age_s, (int, float)) and age_s > FINDMYHUB_FIX_STALE_S:
+                stale_fixes.append((name, float(age_s)))
+            result[name] = enriched
+        # The distinction the file-level gate cannot make, and the one that
+        # decides whether "0 arrivals" means fixed or dead (#305).
+        if len(result) - len(stale_fixes) > 0:
+            _note_findmyhub_feed(None)
+        elif stale_fixes:
+            detail = ", ".join(f"{name} {age / 3600.0:.1f} h" for name, age in stale_fixes)
+            _note_findmyhub_feed(
+                f"every tracked fix is stale ({detail}; limit "
+                f"{FINDMYHUB_FIX_STALE_S / 3600.0:.0f} h) — arrival detection is "
+                "holding, not working"
+            )
+        else:
+            _note_findmyhub_feed(
+                "no tracker returned a usable fix"
+                + (f" ({', '.join(errored)})" if errored else "")
+            )
         return result
     except Exception as exc:
         log(f"findmyhub: read error: {exc}")
+        _note_findmyhub_feed(f"read error: {exc}")
         return {}
 
 
@@ -1061,7 +1126,10 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
             if prev_home is not None:
                 curr["at_home"] = prev_home
             _latch_stale[name] = _latch_stale.get(name, 0) + 1
-            if _latch_stale[name] == 1 or _latch_stale[name] % 100 == 0:
+            # Every 12th stale fix, not every 100th: the latch advances once per
+            # *new* sample (~5 min cron), so 100 was ~8 h of silence on the one
+            # line that says arrival detection is disabled (#305).
+            if _latch_stale[name] == 1 or _latch_stale[name] % 12 == 0:
                 log(
                     f"findmyhub: {name} fix is stale ({age_s / 3600.0:.1f} h old, "
                     f"limit {FINDMYHUB_FIX_STALE_S / 3600.0:.0f} h) — holding "
@@ -2026,6 +2094,15 @@ _latch_stale: dict = {}
 # 2026-09-17 — the tracker never left. Arrivals are not confirmed this way,
 # because waiting on the side that greets trades a false greeting for a late one.
 _latch_far_streak: dict = {}
+
+#: Why the tracker feed cannot currently support arrival detection (#305).
+#: `state/findmyhub.json` is rewritten by an external cron every ~5 min, so the
+#: *file* always looks current while the *fixes* inside it can be days old —
+#: measured on the robot 2026-09-18: file age 47 s, adrian's fix 15.6 h,
+#: obi_chipolo's 4.4 days, laura erroring. The stale gate then correctly refuses
+#: to decide anything, which means arrival detection is not "quiet", it is
+#: *off*, and nothing said so: 0 arrivals and a green board look identical.
+_findmyhub_feed_reason: str | None = None
 _consecutive_reflection_failures: int = 0
 # HA host offline flag: when set, awareness_tick skips all HA fetches until expired.
 # Set by the first HA network error in the tick; cleared automatically on expiry.
@@ -2319,6 +2396,12 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     # Enrich with Find Hub tracker locations (already read above for arrival detection)
     if findmyhub:
         awareness["findmyhub"] = findmyhub
+    if _findmyhub_feed_reason:
+        # An explicit statement, not an absent key (#191's lesson). Without it a
+        # voice consumer reads a 15-hour-old 4.4 km fix and answers "dad is
+        # away" while the arrival logic is holding because that fix is not
+        # evidence about now — the two-readers-disagreeing shape #305 is about.
+        awareness["findmyhub_unavailable"] = _findmyhub_feed_reason
 
     # Enrich with HA sleep data
     if _cached_ha_sleep:
