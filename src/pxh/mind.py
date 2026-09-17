@@ -1013,6 +1013,21 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
         prev_home = prev.get("at_home") if isinstance(prev, dict) else None
         sample_is_new = not isinstance(prev, dict) or prev.get("ts") != curr.get("ts")
 
+        if not sample_is_new:
+            # Re-reading one fix is not a second opinion. The awareness loop
+            # ticks every 60 s while the cron rewrites the file every ~5 min, so
+            # counting re-reads let a *single* far sample confirm its own
+            # departure inside a minute — and because a re-read is deliberately
+            # not logged, that also latched `away` with no line in the evidence
+            # (seen on the robot at 18:06: the departure was real, the record of
+            # it was missing). Only distinct fixes count toward the confirmation.
+            #
+            # The latched state is copied onto the fresh dict first: the cache
+            # ends up holding *this* dict, so returning early without it would
+            # drop `at_home` for every consumer until the next cron push.
+            if prev_home is not None:
+                curr["at_home"] = prev_home
+            continue
         streak = _latch_far_streak.get(name, 0)
         state, reason = latch_at_home(
             curr["distance_km"], curr.get("accuracy_m"), prev_home, streak
@@ -1027,8 +1042,6 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
             state = prev_home
         if state is not None:
             curr["at_home"] = state
-        if not sample_is_new:
-            continue
 
         # "Would the old bare threshold have flipped here?" — the honest measure
         # of what the latch absorbed, as opposed to every in-band fix.
