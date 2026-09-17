@@ -43,6 +43,33 @@ class PolicyVerdict:
     allowed: bool
     reason: str
     suggest_presence_substitute: bool = False
+    #: Rules that would have been consulted but had no evidence to consult —
+    #: fail-open, named (#191). "No suppression fired" and "suppression could
+    #: not be evaluated" are different claims about the world, and only one of
+    #: them is safe to read as "nothing needed suppressing".
+    unevaluated: tuple[str, ...] = ()
+
+
+#: The HA signals the on-call rule reads. Both dispatchers — this module for the
+#: interactive sink gate, mind's expression loop for autonomous speech — consult
+#: them through `on_call_suppression()`, because a second opinion about what "no
+#: evidence" means is how the two would drift apart.
+ON_CALL_KEYS = ("adrian_on_call", "adrian_mic_active")
+
+
+def on_call_suppression(awareness: dict) -> tuple[bool, bool]:
+    """`(suppressed, evaluable)` for the on-call rule.
+
+    `evaluable=False` means HA carried neither signal, so the rule did not fire
+    *and could not have*. The posture is unchanged — awareness still fails open,
+    because a missing signal is not evidence of a call and the alternative
+    (suppressing speech whenever HA is down) would silence SPARK for a network
+    fault. What changes is that the caller can now say so.
+    """
+    ctx = awareness.get("ha_context") or {}
+    if not any(key in ctx for key in ON_CALL_KEYS):
+        return False, False
+    return bool(ctx.get("adrian_on_call") or ctx.get("adrian_mic_active")), True
 
 
 def is_night_hour(hour: int) -> bool:
@@ -103,6 +130,9 @@ def evaluate(
     """
     if effect != "audio":
         return PolicyVerdict(allowed=True, reason="effect_not_audio")
+
+    # Rules that could not be evaluated, carried on an allowed verdict.
+    unevaluated: tuple[str, ...] = ()
 
     def _block(reason: str) -> PolicyVerdict:
         if _depth >= 1:
@@ -175,8 +205,10 @@ def evaluate(
         if is_night_hour(hour):
             return _block("night_silence")
 
-        ha_ctx = awareness.get("ha_context") or {}
-        if ha_ctx.get("adrian_on_call") or ha_ctx.get("adrian_mic_active"):
+        on_call, evaluable = on_call_suppression(awareness)
+        if on_call:
             return _block("on_call")
+        if not evaluable:
+            unevaluated = ("on_call",)
 
-    return PolicyVerdict(allowed=True, reason="ok")
+    return PolicyVerdict(allowed=True, reason="ok", unevaluated=unevaluated)

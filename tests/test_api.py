@@ -1929,3 +1929,33 @@ def test_obi_chat_prompt_includes_projects_summary(monkeypatch, isolated_project
     # Obi's chat goes to the io session's own kind, not the public one: the
     # two carry different system prompts and different deadlines.
     assert captured["kind"] == "obi_chat"
+
+
+class TestHealthPerception:
+    """HA being down is a perception fact, not a serving failure (#191)."""
+
+    def test_ha_failure_is_visible_without_503ing_liveness(self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        TestHealth._write_fresh_core_state(state_dir)
+        from pxh import health
+        health.record_failure("ha", "host unreachable (backoff)")
+        TestHealth._write_heartbeat(state_dir, mode="running")
+        TestHealth._write_sonar(state_dir)
+
+        response = api_client.get("/api/v1/health")
+        body = response.json()
+
+        assert response.status_code == 200, "an HA outage must not take the tunnel health check down"
+        assert body["checks"]["daemons"]["components"]["ha"] != "ok"
+        assert body["checks"]["perception"]["status"] != "ok"
+        assert body["checks"]["perception"]["ha_available"] is False
+
+    def test_healthy_ha_reports_available(self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        TestHealth._write_fresh_core_state(state_dir)
+        TestHealth._write_heartbeat(state_dir, mode="running")
+        TestHealth._write_sonar(state_dir)
+
+        body = api_client.get("/api/v1/health").json()
+
+        assert body["checks"]["perception"] == {"status": "ok", "ha_available": True}

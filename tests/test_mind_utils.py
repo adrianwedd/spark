@@ -1961,3 +1961,67 @@ def test_spark_prompt_offers_goal_actions_and_explore_injection_still_works():
     assert '- "set_goal"' in _SPARK_REFLECTION_SUFFIX
     patched = _inject_explore(_SPARK_REFLECTION_SUFFIX)
     assert ", explore" in patched  # regex injection survives the longer enum
+
+
+# ---------------------------------------------------------------------------
+# HA perception health and the visible fail-open (issue #191)
+# ---------------------------------------------------------------------------
+
+
+def test_ha_outcome_records_health_and_names_the_missing_modality(monkeypatch):
+    """HA is an evidence source, so its absence is a stated fact on the board
+    and in awareness — not an absent key and a timeout in a log."""
+    from pxh import mind as mind_mod
+
+    recorded = []
+    # monkeypatch, not assignment: `health` is shared module state, and a test
+    # that swapped `record_success` for a lambda permanently would make every
+    # later health write in the suite silently vanish (#210's shape).
+    monkeypatch.setattr(
+        mind_mod.health_mod, "record_failure",
+        lambda comp, err, detail=None: recorded.append(("failure", comp, err)),
+    )
+    monkeypatch.setattr(
+        mind_mod.health_mod, "record_success",
+        lambda comp, **kw: recorded.append(("success", comp)),
+    )
+
+    mind_mod._note_ha_outcome(False, "host unreachable (backoff)")
+    assert mind_mod._ha_unavailable_reason == "host unreachable (backoff)"
+    assert recorded[-1] == ("failure", "ha", "host unreachable (backoff)")
+
+    mind_mod._note_ha_outcome(True)
+    assert mind_mod._ha_unavailable_reason is None
+    assert recorded[-1] == ("success", "ha")
+
+
+def test_on_call_unevaluated_is_logged_once_and_reported(monkeypatch):
+    """The autonomous dispatcher's fail-open, named once per episode: this runs
+    every couple of minutes and a line per tick would bury the fact."""
+    from pxh import mind as mind_mod
+
+    lines = []
+    failures = []
+    monkeypatch.setattr(mind_mod, "log", lines.append)
+    monkeypatch.setattr(
+        mind_mod.health_mod, "record_failure",
+        lambda comp, err, detail=None: failures.append((comp, err)),
+    )
+    mind_mod._on_call_unevaluated_logged = False
+
+    mind_mod._note_on_call_unevaluated()
+    mind_mod._note_on_call_unevaluated()
+
+    assert len(lines) == 1
+    assert "on-call rule unevaluated" in lines[0]
+    assert failures == [("ha", "on-call rule unevaluated at expression time")]
+
+
+def test_a_working_ha_clears_the_once_per_episode_flag(monkeypatch):
+    from pxh import mind as mind_mod
+
+    monkeypatch.setattr(mind_mod.health_mod, "record_success", lambda comp, **kw: None)
+    monkeypatch.setattr(mind_mod.health_mod, "record_failure", lambda *a, **kw: None)
+    mind_mod._on_call_unevaluated_logged = True
+    mind_mod._note_ha_outcome(True)
+    assert mind_mod._on_call_unevaluated_logged is False

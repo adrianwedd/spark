@@ -256,3 +256,63 @@ def test_no_non_audio_tool_can_reach_an_audio_sink():
     assert offenders == [], (
         f"tools reach a known audio sink but are not classified 'audio': {offenders}"
     )
+
+
+# --- fail-open is a claim, so it gets reported (#191) -----------------------
+#
+# Awareness still fails open — a missing on-call signal is not evidence of a
+# call, and suppressing speech on every HA outage would be worse. What changed
+# is that "the rule could not be evaluated" no longer looks like "nothing
+# needed suppressing".
+
+
+def test_on_call_suppression_names_the_two_dispatchers_one_rule():
+    assert policy.on_call_suppression({}) == (False, False)
+    assert policy.on_call_suppression({"ha_context": None}) == (False, False)
+    # Present and false: the rule ran and found nothing — a different fact.
+    assert policy.on_call_suppression(
+        {"ha_context": {"adrian_on_call": False, "adrian_mic_active": False}}
+    ) == (False, True)
+    assert policy.on_call_suppression({"ha_context": {"adrian_on_call": True}}) == (True, True)
+    assert policy.on_call_suppression({"ha_context": {"adrian_mic_active": True}}) == (True, True)
+
+
+def test_verdict_names_the_rule_it_could_not_evaluate():
+    verdict = policy.evaluate(
+        "tool_voice", {"text": "hi"}, effect="audio", origin="interactive",
+        session={"spark_quiet_mode": False}, awareness={}, now=DAY_TS,
+    )
+    assert verdict.allowed is True
+    assert verdict.unevaluated == ("on_call",)
+
+
+def test_verdict_marks_nothing_unevaluated_when_ha_answered():
+    verdict = policy.evaluate(
+        "tool_voice", {"text": "hi"}, effect="audio", origin="interactive",
+        session={"spark_quiet_mode": False},
+        awareness={"ha_context": {"adrian_on_call": False, "adrian_mic_active": False}},
+        now=DAY_TS,
+    )
+    assert verdict.allowed is True
+    assert verdict.unevaluated == ()
+
+
+def test_a_non_audio_action_evaluates_no_rules_so_names_none():
+    verdict = policy.evaluate(
+        "tool_look", {}, effect="presence", origin="interactive",
+        session={}, awareness={}, now=DAY_TS,
+    )
+    assert verdict.allowed is True
+    assert verdict.unevaluated == ()
+
+
+def test_a_blocked_on_call_verdict_is_not_a_fail_open():
+    """Blocked means the rule ran. The two must not be readable as each other."""
+    verdict = policy.evaluate(
+        "tool_voice", {"text": "hi"}, effect="audio", origin="interactive",
+        session={"spark_quiet_mode": False},
+        awareness={"ha_context": {"adrian_on_call": True}}, now=DAY_TS,
+    )
+    assert verdict.allowed is False
+    assert verdict.reason == "on_call"
+    assert verdict.unevaluated == ()
