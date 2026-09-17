@@ -1074,3 +1074,70 @@ def test_park_keeps_beating_while_the_lease_read_is_stalled(isolated_project, tm
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+
+# --- a daemon that is idle for a good reason is working, not stale ---------
+#
+# Both idle-for-good-reason branches (`charging`, I2C backoff) `continue` before
+# the loop's health write, so `state/health/px-alive.json` stops moving while the
+# daemon is behaving exactly as designed. Live evidence on 2026-09-17: the record
+# was last written at 17:39 local, 87 minutes before it was read, while px-alive
+# was parked on the charger at 71% battery with a fresh heartbeat and a 13 s
+# watchdog margin. The operator board read `stale` — a false alarm of the same
+# family as a retired service reporting stale forever.
+
+
+def test_report_health_success_writes_and_throttles(tmp_path):
+    """The mechanism both idle branches now use: write once, then throttle."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    ns = load_alive_module({"PX_STATE_DIR": str(state_dir)})
+    # conftest's autouse fixture redirects health_dir() per test, so ask the
+    # module where it actually writes rather than assuming PX_STATE_DIR.
+    from pxh import health as _health_mod
+
+    health_path = _health_mod.health_dir() / "px-alive.json"
+    _health_mod._last_success_write.clear()
+
+    ns["_report_health_success"](time.time())
+    deadline = time.monotonic() + 10
+    while not health_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert health_path.exists()
+    first = json.loads(health_path.read_text())["success_count"]
+
+    # Inside HEALTH_INTERVAL_S the call is a no-op — that throttle is what makes
+    # it safe to call from a branch that runs every two seconds.
+    ns["_report_health_success"](time.time() + 5.0)
+    time.sleep(0.3)
+    assert json.loads(health_path.read_text())["success_count"] == first
+
+
+def test_both_idle_branches_report_health_before_continuing():
+    """`charging` and I2C backoff `continue` past the loop's health write.
+
+    They are working states — the code says so for backoff — so leaving the
+    report behind made the operator board read `stale` for a daemon that was
+    doing exactly what it should. Measured live: the record was last written at
+    17:39 local and read 87 minutes later, while px-alive was parked on the
+    charger at 71% battery with a fresh heartbeat and a 13 s watchdog margin.
+
+    Asserted against the source because the branch only runs outside `--dry-run`,
+    and the loop cannot be driven without hardware. This pins the *wiring*;
+    `test_report_health_success_writes_and_throttles` pins the behaviour it calls.
+    """
+    import re
+
+    body = (PROJECT_ROOT / "bin" / "px-alive").read_text()
+    for mode in ("i2c_backoff", "charging"):
+        # The statement, not the word: the comment above the call talks about
+        # what the branch does, so a plain `index("continue")` matches prose.
+        branch = re.search(
+            rf'write_alive_heartbeat\("{mode}"\)(?P<body>.*?)\n\s*continue',
+            body, re.S,
+        )
+        assert branch is not None, f"no {mode} branch found"
+        assert "_report_health_success(now)" in branch.group("body"), (
+            f"the {mode} branch skips the loop's health write, so the board "
+            f"reads stale for a working daemon"
+        )

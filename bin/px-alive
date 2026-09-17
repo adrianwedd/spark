@@ -871,6 +871,14 @@ def idle_loop(args) -> None:
                 # forever, waiting for an acquisition it is deliberately skipping.
                 notify_ready("I2C backoff")
                 write_alive_heartbeat("i2c_backoff")
+                # A working state still has to *report*. Both idle-for-good-reason
+                # branches below `continue` past the loop's health write, which
+                # left the operator board reading `stale` (STALE_AFTER_S=300) for
+                # a daemon that was doing exactly what it should — measured live
+                # for 87 minutes while parked on the charger at 71% battery.
+                # `_report_health_success` is throttled to once a minute and
+                # writes on its own thread, so this costs the loop nothing.
+                _report_health_success(now)
                 time.sleep(0.5)
                 continue
 
@@ -886,6 +894,7 @@ def idle_loop(args) -> None:
                     # so readiness cannot wait on the handle here either.
                     notify_ready("on charger — servo motion frozen")
                     write_alive_heartbeat("charging")
+                    _report_health_success(now)
                     time.sleep(2)
                     continue
 
