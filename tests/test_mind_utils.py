@@ -5,6 +5,7 @@ import datetime as _dt
 import json as _json
 import time as _time
 import urllib.error
+import itertools
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1315,13 +1316,22 @@ def _tracker(distance_km, ts, accuracy_m=34.0):
     return {"distance_km": distance_km, "accuracy_m": accuracy_m, "ts": ts}
 
 
+_TS = itertools.count(1)
+
+
 def _series(mind_mod, distances, *, accuracy_m=34.0, name="adrian"):
-    """Feed a distance series through the latch + edge detector."""
+    """Feed a distance series through the latch + edge detector.
+
+    `ts` comes from a shared counter rather than restarting per call: the latch
+    treats an unchanged `ts` as the *same* fix re-read (which the awareness loop
+    does four or five times per cron push), so two series reusing `ts=1` would
+    silently be one sample.
+    """
     transitions = []
-    for ts, distance in enumerate(distances, start=1):
+    for distance in distances:
         transitions.extend(
             mind_mod._findmyhub_transitions(
-                {name: _tracker(distance, ts=ts, accuracy_m=accuracy_m)}
+                {name: _tracker(distance, ts=next(_TS), accuracy_m=accuracy_m)}
             )
         )
     return transitions
@@ -2025,3 +2035,24 @@ def test_a_working_ha_clears_the_once_per_episode_flag(monkeypatch):
     mind_mod._on_call_unevaluated_logged = True
     mind_mod._note_ha_outcome(True)
     assert mind_mod._on_call_unevaluated_logged is False
+
+
+def test_findmyhub_a_re_read_is_not_a_second_opinion():
+    """The awareness loop ticks every 60 s while the cron rewrites the file every
+    ~5 min, so one far fix is read four or five times before the next one
+    arrives. Counting those reads as confirmations let a single sample retire a
+    home latch inside a minute — and, because a re-read is deliberately not
+    logged, it did so with no line in the evidence (seen on the robot at 18:06;
+    that departure was real, the record of it was missing).
+    """
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.02]) == []
+    same_sample_ts = next(_TS) - 1
+    for _ in range(5):
+        mind_mod._findmyhub_transitions({"adrian": _tracker(0.6, ts=same_sample_ts)})
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._latch_far_streak.get("adrian", 0) == 0
+
+    # Two genuinely distinct far fixes still confirm the departure.
+    assert _series(mind_mod, [0.6, 0.62]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
