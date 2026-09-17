@@ -469,9 +469,11 @@ def test_changed_symbols_attributes_a_read_to_the_definition_that_reads_it(tmp_p
     path = "src/pxh/mic_stream.py"
     change = changed_symbols(first, "HEAD", path, str(tmp_path))
     assert change.symbols == frozenset({"DEFAULT_ALSA_BUFFER_S"})
-    assert change.internal_readers == {
-        "DEFAULT_ALSA_BUFFER_S": frozenset({"ArecordStream"})
-    }
+    # Edges point the way the flow goes: definition -> top-level names it reads.
+    # Only top-level names are edges — a parameter or a builtin inside the
+    # definition is not something this module can change under a caller.
+    assert "DEFAULT_ALSA_BUFFER_S" in change.local_reads["ArecordStream"]
+    assert "self" not in change.local_reads["ArecordStream"]
     assert change.read_at_module_level is False
 
 
@@ -498,10 +500,92 @@ def test_a_constant_behind_a_default_argument_flags_the_unit_that_calls_the_clas
     }
     assert verdicts["px-wake-listen.service"].needs_restart is True
     assert "DEFAULT_ALSA_BUFFER_S" in verdicts["px-wake-listen.service"].reason
-    assert "reads" in verdicts["px-wake-listen.service"].reason
+    assert "reaches" in verdicts["px-wake-listen.service"].reason
     # Precision: the flow is attributed to the definition the unit calls, so a
     # unit that calls something else in the same module is not dragged in.
     assert verdicts["px-other.service"].needs_restart is False
+
+
+def test_a_change_two_hops_in_flags_the_unit_that_runs_the_loop(tmp_path):
+    """The `#370` shape: `awareness_tick` changed, `bin/px-mind` names only
+    `main`, and `main` reaches the tick through the loop. One hop was not
+    enough — the gate said "references none of the changed names" and would
+    have left px-mind running the old tick."""
+    _tree(
+        tmp_path,
+        entries={"px-mind": "#!/usr/bin/env python3\nfrom pxh.mind import main\nmain()\n"},
+        modules={
+            "mind": (
+                "def awareness_tick():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "def mind_loop():\n"
+                "    return awareness_tick()\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    return mind_loop()\n"
+            )
+        },
+    )
+    first = _git(
+        tmp_path,
+        {"src/pxh/mind.py": (
+            "def awareness_tick():\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def mind_loop():\n"
+            "    return awareness_tick()\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    return mind_loop()\n"
+        )},
+    )
+    path = "src/pxh/mind.py"
+    change = changed_symbols(first, "HEAD", path, str(tmp_path))
+    assert change.symbols == frozenset({"awareness_tick"})
+    units = [_unit("px-mind.service", tmp_path / "bin" / "px-mind", 0.0)]
+    verdicts = restart_list([path], units, root=str(tmp_path), changes={path: change})
+    assert verdicts[0].needs_restart is True
+    assert "awareness_tick" in verdicts[0].reason
+
+
+def test_reachability_does_not_flag_a_unit_that_calls_elsewhere(tmp_path):
+    """Precision, at the same time as the closure: a unit whose names cannot
+    reach the changed definition is not dragged in."""
+    _tree(
+        tmp_path,
+        entries={"px-other": "#!/usr/bin/env python3\nfrom pxh.mind import other\nother()\n"},
+        modules={
+            "mind": (
+                "def awareness_tick():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "def other():\n"
+                "    return 0\n"
+            )
+        },
+    )
+    first = _git(
+        tmp_path,
+        {"src/pxh/mind.py": (
+            "def awareness_tick():\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def other():\n"
+            "    return 0\n"
+        )},
+    )
+    path = "src/pxh/mind.py"
+    changes = {path: changed_symbols(first, "HEAD", path, str(tmp_path))}
+    units = [_unit("px-other.service", tmp_path / "bin" / "px-other", 0.0)]
+    verdicts = restart_list([path], units, root=str(tmp_path), changes=changes)
+    assert verdicts[0].needs_restart is False
 
 
 def test_a_changed_name_read_at_module_level_flags_every_importer(tmp_path):

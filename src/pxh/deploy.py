@@ -195,59 +195,91 @@ class ModuleChange:
     #: module *provides* may have moved rather than changed in place. This is
     #: #332's shape: a renamed import inside a module only fails at call time.
     module_level: bool
-    #: Changed top-level name -> the top-level definitions that *read* it. A
-    #: constant used as a default argument (`alsa_buffer_s: float =
-    #: DEFAULT_ALSA_BUFFER_S`) reaches every unit that references the class,
-    #: without any of them naming the constant — so "the unit references none
-    #: of the changed names" is not evidence of being unaffected. Attribution
-    #: is per definition on purpose: a module that merely reads a changed
-    #: constant somewhere in its own body is not a reason to restart units that
-    #: call none of the readers.
-    internal_readers: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    #: The module's own call graph at top level: definition -> every top-level
+    #: name that definition reads. Changed names are matched against the
+    #: *reachable* set from the names a unit references, because a change
+    #: reaches a unit through code it calls whether the unit names the changed
+    #: thing or not, and through more than one hop:
+    #:
+    #: - one hop: `ArecordStream.__init__`'s default is the constant that moved,
+    #:   so a unit naming only `ArecordStream` is affected (#365);
+    #: - two and more: `awareness_tick` changed, `bin/px-mind` names only
+    #:   `main`, and `main` reaches `awareness_tick` through the loop (#370).
+    #:
+    #: Over-approximating this (it is a static graph, so no dynamic dispatch) is
+    #: the right direction: a false restart costs seconds, a missed one costs
+    #: hours of a daemon running code that no longer exists on disk.
+    local_reads: Mapping[str, frozenset[str]] = field(default_factory=dict)
     #: A changed name read *outside* any definition — the module's own
     #: import-time state moved, so every importer is affected, like
     #: `module_level`.
     read_at_module_level: bool = False
 
 
+def _reachable(seeds: Iterable[str], edges: Mapping[str, frozenset[str]]) -> set[str]:
+    """Everything reachable from `seeds` in the module's own top-level graph."""
+    seen: set[str] = set()
+    stack = list(seeds)
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        stack.extend(edges.get(name, ()))
+    return seen
+
+
 def _internal_flows(source: str) -> tuple[dict[str, set[str]], set[str]]:
-    """`({name: definitions that read it}, names read at module level)`.
+    """`({definition: top-level names it reads}, names read at module level)`.
 
     `DEFAULT_ALSA_BUFFER_S` is read exactly once in `pxh/mic_stream.py` — as the
     default value of `ArecordStream.__init__`'s `alsa_buffer_s` parameter — so
-    every importer of `ArecordStream` is affected by the constant's value while
-    naming only the class. The deploy gate called that "references none of the
-    changed names", which would have left `px-wake-listen` on the old 4 s ring
-    (replayed on `picar`, 2026-09-17).
+    every unit that reaches `ArecordStream` is affected by the constant's value
+    while naming only the class. The deploy gate called that "references none of
+    the changed names", which would have left `px-wake-listen` on the old 4 s
+    ring (replayed on `picar`, 2026-09-17). The same shape appears two hops
+    deeper in `pxh/mind.py`: `awareness_tick` changed, `bin/px-mind` names only
+    `main`, and `main` reaches the tick through the loop (#370).
 
     A `Load` occurrence is the whole test, and the *enclosing definition* is the
-    attribution: a unit that references `ArecordStream` is affected by what
-    `ArecordStream` reads, and a unit that references nothing in the module is
-    not. Reads outside any definition are reported separately because those are
-    import-time state, which every importer sees.
+    edge, so a unit's reachable set can be walked. Only names bound at top level
+    count as edges: a parameter or a builtin is not something this module can
+    change under a caller. Reads outside any definition are reported separately
+    because those are import-time state, which every importer sees.
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return {}, set()  # callers treat an unparsable change as undetermined
-    readers: dict[str, set[str]] = {}
+        return {}, {}  # callers treat an unparsable change as undetermined
     top_level: set[str] = set()
+    edges: dict[str, set[str]] = {}
     definitions = [
         node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     ]
     definition_ids = {id(node) for node in definitions}
+    top_names = {node.name for node in definitions}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            top_names.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            top_names.add(node.target.id)
     for node in definitions:
+        reads = edges.setdefault(node.name, set())
         for sub in ast.walk(node):
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                readers.setdefault(sub.id, set()).add(node.name)
+                if sub.id in top_names:
+                    reads.add(sub.id)
     for node in tree.body:
         if id(node) in definition_ids:
             continue
         for sub in ast.walk(node):
             if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
-                top_level.add(sub.id)
-    return readers, top_level
+                if sub.id in top_names:
+                    top_level.add(sub.id)
+    return edges, top_level
 
 
 def _module_symbols(source: str) -> tuple[dict[str, str], str]:
@@ -308,13 +340,11 @@ def changed_symbols(prev: str, head: str, path: str, root: str = ".") -> ModuleC
         name for name in set(before) | set(after)
         if before.get(name) != after.get(name)
     )
-    readers, top_level = _internal_flows(after_src)
+    edges, top_level = _internal_flows(after_src)
     return ModuleChange(
         symbols=symbols,
         module_level=before_other != after_other,
-        internal_readers={
-            name: frozenset(readers[name]) for name in symbols if name in readers
-        },
+        local_reads={name: frozenset(reads) for name, reads in edges.items()},
         read_at_module_level=bool(top_level & symbols),
     )
 
@@ -535,18 +565,16 @@ def _change_hits(
             hits.append((path, f"references removed or changed {shown}"))
             continue
         # The other way a changed name reaches this unit: through code the unit
-        # *does* reference. `px-wake-listen` names `ArecordStream`, and
-        # `ArecordStream.__init__`'s default is the constant that moved — the
-        # reference comparison above answers "not referenced" and would be
-        # wrong. Attributed per definition so that a module reading a changed
-        # constant in its own private helper does not flag every importer.
-        flowed = sorted(
-            name for name, containers in change.internal_readers.items()
-            if containers & names
-        )
+        # *does* reference, possibly several hops in. `px-wake-listen` names
+        # `ArecordStream` whose default argument is the constant that moved;
+        # `bin/px-mind` names `main`, and `main` reaches the tick that changed.
+        # The reference comparison above answers "not referenced" and would be
+        # wrong in both cases. Reachability from the unit's own names keeps this
+        # from degenerating into "any importer of the module".
+        flowed = sorted(_reachable(names, change.local_reads) & change.symbols)
         if flowed:
             shown = ", ".join(flowed[:3])
-            hits.append((path, f"changes {shown}, which code this unit calls reads"))
+            hits.append((path, f"changes {shown}, which code this unit reaches"))
     return hits
 
 
