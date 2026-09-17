@@ -1393,11 +1393,15 @@ def test_sample_window_counts_d_state_across_the_window(tmp_path):
         stat.write_text(_field_line(7, "px-alive", next(states, "S")))
 
     window = io_attrib.sample_window(
-        paths, [7], samples=4, interval_s=0.5, sleep=step
+        paths, [7], samples=4, interval_s=0.5, sleep=step, monotonic=_monotonic()
     )
     entry = window["pids"][7]
     assert window["samples"] == 4
-    assert window["span_s"] > 0
+    # The clock is injected: this assertion used to read the wall clock, and on
+    # a fast filesystem four samples finish inside half a millisecond, so
+    # `round(span_s, 3)` came out 0.0 and the test failed in CI while passing
+    # locally. Found in the master run for ab6eac3e.
+    assert window["span_s"] == 3.0
     assert entry["samples"] == 4
     assert entry["d_samples"] == 2  # samples 2 and 3, invisible to both ends
     assert entry["comm"] == "px-alive"
