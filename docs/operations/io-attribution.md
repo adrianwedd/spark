@@ -4,7 +4,9 @@
 **Status 2026-09-17:** merged and deployed (`#337`, `#338`); **the root unit is
 not installed yet** — that needs a sudo password (command below). In the
 meantime an **unprivileged** instance runs by hand on the robot:
-`nohup bin/px-io-attrib`, pid in `logs/px-io-attrib.pid`, stdout in
+`nohup bin/px-io-attrib` (which publishes its own pid — no operator has to match
+`/usr/bin/python3 -`, since four daemons on this host share that argv, including
+root's `px-battery-poll`), pid in `logs/px-io-attrib.pid`, stdout in
 `logs/px-io-attrib.out`. It records the stall channel plus the writer list it is
 allowed to read, and it is *not* supervised and will not survive a reboot — the
 unit replaces it.
@@ -63,6 +65,13 @@ bury the real stalls.
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
 | **file** | size deltas of a bounded *watchlist*: the system journal (`/var/log/journal/*/*.journal`), `logs/*.log`, `state/*.json`, `state/health/*.json` | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal growing is journald by another name |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI | no — world-readable, including for root-owned processes |
+
+**Pid files, two different roles until 2026-09-17:** `--pid-file` (default
+`logs/px-io-attrib.pid`) is where the observer publishes *its own* pid while
+running; `--px-alive-pid-file` (default `logs/px-alive.pid`) is the one it
+*reads* to gate the heartbeat trigger. They were a single flag, and the runbook's
+discovery step wrote root's `px-battery-poll` pid into the observer's file —
+`kill $(cat …)` would have killed a daemon that was doing its job.
 
 The file channel is a **watchlist, not a filesystem scan**: a bounded set of stat calls, opt-in per run (`--growth-pattern`, repeatable; `--no-file-growth` to skip). `file_growth_watched` records how many paths it covered, because growth *outside* the watchlist is invisible and silence there is not evidence of not writing.
 

@@ -114,8 +114,10 @@ def main(argv: list[str]) -> int:
                     help="ranked writers / stalled processes to keep")
     ap.add_argument("--heartbeat-file", default=None,
                     help="default: /run/spark/alive_heartbeat.json or state/")
-    ap.add_argument("--pid-file", default=str(LOG_DIR / "px-alive.pid"),
+    ap.add_argument("--px-alive-pid-file", default=str(LOG_DIR / "px-alive.pid"),
                     help="px-alive's pid file, used to gate the heartbeat trigger")
+    ap.add_argument("--pid-file", default=str(LOG_DIR / "px-io-attrib.pid"),
+                    help="where to publish this observer's own pid while it runs")
     ap.add_argument("--no-proc-io", action="store_true",
                     help="do not attempt the per-process writer channel")
     ap.add_argument("--growth-pattern", action="append", default=None,
@@ -153,6 +155,7 @@ def main(argv: list[str]) -> int:
         if args.heartbeat_file
         else resolve_runtime_read_path(state_dir, HEARTBEAT_FILENAME)
     )
+    px_alive_pid_file = Path(args.px_alive_pid_file)
     pid_file = Path(args.pid_file)
     paths = io_attrib.Paths()
     # Attempt the writer channel either way and record what it could actually
@@ -202,16 +205,22 @@ def main(argv: list[str]) -> int:
         f"observer start io_threshold={args.io_threshold} "
         f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
         f"cooldown_s={args.cooldown} poll_s={args.poll} "
-        f"heartbeat_file={heartbeat_file} growth_patterns={len(growth_patterns)} "
+        f"heartbeat_file={heartbeat_file} pid_file={pid_file if pid_published else 'unavailable'} "
+        f"growth_patterns={len(growth_patterns)} "
         f"privileged={privileged}"
         + ("" if privileged else " (writer list will be partial; root sees the rest)")
     )
+
+    # Publish our own pid: `/usr/bin/python3 -` matches several daemons here, so
+    # an operator (or a future runbook) must not have to guess which one is us.
+    pid_published = io_attrib.write_pid_file(pid_file)
 
     started = time.monotonic()
     cooldown_until = 0.0
     captures = 0
     while not _stop:
         if args.duration_h and (time.monotonic() - started) >= args.duration_h * 3600:
+            io_attrib.remove_pid_file(pid_file)
             log(f"observer stop after {args.duration_h}h, captures={captures}")
             return 0
         now = time.monotonic()
@@ -221,7 +230,7 @@ def main(argv: list[str]) -> int:
 
         io_now = psi_io_avg10(paths.pressure_io).get("some")
         age, mode = io_attrib.read_heartbeat_age(heartbeat_file)
-        pid = io_attrib.read_pid_file(pid_file)
+        pid = io_attrib.read_pid_file(px_alive_pid_file)
         alive = pid is not None and io_attrib.process_alive(pid, paths.proc)
         reason = io_attrib.trigger_reason(
             io_some_avg10=io_now,
@@ -247,6 +256,7 @@ def main(argv: list[str]) -> int:
         log(_summary(record))
         cooldown_until = time.monotonic() + max(0.0, args.cooldown)
 
+    io_attrib.remove_pid_file(pid_file)
     log(f"observer stop after signal, captures={captures}")
     return 0
 
