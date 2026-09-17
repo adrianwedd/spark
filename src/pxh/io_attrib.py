@@ -1560,7 +1560,13 @@ def _device_deltas(
         # `None` rather than 0 when nothing was written: 0/0 is not "fast".
         writes = deltas.get("writes_completed", 0)
         if writes > 0:
-            deltas["ms_per_write"] = round(deltas.get("ms_io", 0) / writes, 1)
+            # `ms_io` is queue-occupied time for *all* I/O, so the read time is
+            # subtracted out first: measured on `picar` 2026-09-18, this card
+            # reads at ~1.5 ms per read and writes at ~86 ms per write (median
+            # over 150 records), and a metric that mixed the two would move with
+            # the read mix instead of with the write path.
+            busy_ms = max(0, deltas.get("ms_io", 0) - deltas.get("ms_reading", 0))
+            deltas["ms_per_write"] = round(busy_ms / writes, 1)
             deltas["kb_per_write"] = round(
                 deltas.get("sectors_written", 0) * 512 / 1024 / writes, 1
             )
