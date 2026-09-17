@@ -462,6 +462,38 @@ Every record therefore carries `procs_running_*` and `procs_blocked_*`: without
 them a 40 % reading invites the wrong story, and this issue's own history shows
 where that goes.
 
+## 2026-09-18 04:00 — the card itself, measured (identity, wear, TRIM)
+
+When the question becomes "is it the card?", these are the facts, so the next
+reader does not have to re-derive them:
+
+```
+name EB1QT   serial 0xfb8c6775   manfid 0x1b   date 08/2019   29.8 GiB SDHC
+ext4 lifetime_write_kbytes  1,105,803,377  (1.03 TB = 35 full-card writes)
+ext4 session  (since mount)     2,451.8 MB  (10.5 h boot -> ~5.6 GB/day)
+ext4 errors_count               0
+queue/discard_max_bytes         170 GB, granularity 4 MB
+fstrim.timer                    enabled, weekly (last 2026-09-14, next 09-21)
+mount                           rw,noatime   (no `discard` — TRIM is the timer's job)
+```
+
+Two readings from that, and one of them closes a hypothesis:
+
+1. **Wear-out is not indicated.** 35 full-card writes is modest against microSD
+   endurance (hundreds to thousands of P/E cycles). The card is *old* — made
+   08/2019 — but SD keeps no life-time register to read actual wear (that is an
+   eMMC feature), so age alone is not evidence about the residual. A card swap
+   would be an experiment, not a remedy with a rationale behind it.
+2. **The traffic is still real after every fix in this arc**: ~5.6 GB/day, against
+   the 96.5 % of it that is journal/metadata with no process name (see the
+   decomposition above). That is the residual, and it is intrinsic to a
+   filesystem doing small durable writes on a card whose per-write tail reaches
+   seconds.
+
+The mount options are already tuned in the direction this investigation would
+recommend (`noatime`, TRIM left to the weekly timer rather than `discard`), so
+there is nothing to change there.
+
 ## Reading a record
 
 ```bash
