@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+# px-io-attrib — record what was writing when an IO stall was visible (#247).
+#
+# A trigger-on-demand observer, not a poller. Between triggers it reads one
+# small /proc file (io PSI) and px-alive's heartbeat, once a second. When either
+# crosses its threshold it takes ONE bounded snapshot — /proc/<pid>/io deltas,
+# who is in uninterruptible sleep, mmcblk0 write-queue time, vmstat, PSI before
+# and after — writes one record, then stays quiet for the cooldown.
+#
+# That discipline is the whole design: an observer that sampled /proc/*/io for
+# all ~150 processes all day would be a candidate for the very list it produces,
+# on a host whose remaining defect is a transient storage stall.
+#
+# Per-process /proc/<pid>/io is EACCES for other users' processes unless this
+# runs as root. Unprivileged it still records the stall channel (who was
+# blocked, device queue time, PSI) and says so in
+# `writers_unavailable_reason` — an unprivileged record is not a record that
+# found no writer.
+#
+# Usage:
+#   sudo bin/px-io-attrib                  # observe until stopped
+#   bin/px-io-attrib --once                # one snapshot now, print it, log it
+#   bin/px-io-attrib --dry-run             # one snapshot now, print only
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/px-env"
+
+# Use system python3, matching every other systemd-run px-* daemon; px-env has
+# already exported PYTHONPATH with $PROJECT_ROOT/src.
+exec /usr/bin/python3 - "$@" <<'PY'
+"""Sample the writer behind a transient IO stall, on trigger, and stop."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", "/home/pi/picar-x-hacking"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", PROJECT_ROOT / "logs"))
+
+try:
+    from pxh import io_attrib
+    from pxh.hostload import psi_io_avg10
+    from pxh.logging import log_event
+    from pxh.runtime_paths import HEARTBEAT_FILENAME, resolve_runtime_read_path
+except ImportError as exc:  # pragma: no cover — px-env exports PYTHONPATH
+    print(f"px-io-attrib: cannot import pxh ({exc})", file=sys.stderr)
+    raise SystemExit(1)
+
+LOG_NAME = "io-attrib"
+_stop = False
+
+
+def _on_signal(signum, _frame):
+    global _stop
+    _stop = True
+
+
+def log(msg: str) -> None:
+    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}", flush=True)
+
+
+def _proc_io_readable(proc_root: Path) -> bool:
+    """Whether this process may read /proc/<pid>/io for other users' processes.
+
+    Probed rather than inferred from euid: a uid-0 process in a container
+    without CAP_SYS_PTRACE is exactly the case where guessing wrong would turn
+    "not permitted" into "nothing wrote" in the record.
+    """
+    for candidate in (1, os.getpid()):
+        try:
+            (proc_root / str(candidate) / "io").read_text()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _summary(record: dict) -> str:
+    writers = record.get("writers") or []
+    top = writers[0] if writers else None
+    top_str = (
+        f"{top['comm']}({top['pid']}) write_bytes={top['write_bytes']}"
+        if top
+        else "none-readable" if not record.get("privileged") else "none"
+    )
+    devices = record.get("devices") or {}
+    parts = [
+        f"stall captured reason={record.get('reason')}",
+        f"window_s={record.get('window_s')}",
+        f"top_writer={top_str}",
+        f"writers={record.get('writers_with_activity')}",
+        f"write_bytes_total={record.get('write_bytes_total')}",
+        f"d_state={record.get('d_state_count')}",
+        f"blocked_threads={record.get('blocked_thread_count')}",
+    ]
+    parts.extend(
+        f"{name}_ms_io={deltas.get('ms_io', 0)}" for name, deltas in devices.items()
+    )
+    parts.append(f"privileged={record.get('privileged')}")
+    return " ".join(parts)
+
+
+def main(argv: list[str]) -> int:
+    state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--io-threshold", type=float, default=40.0,
+                    help="io PSI some avg10 (%%) that counts as a stall")
+    ap.add_argument("--heartbeat-threshold", type=float, default=7.0,
+                    help="px-alive heartbeat age (s) that counts as approaching "
+                         "its 15s watchdog deadline")
+    ap.add_argument("--window", type=float, default=io_attrib.DEFAULT_WINDOW_S,
+                    help="seconds to sample across once triggered (1-10)")
+    ap.add_argument("--poll", type=float, default=1.0,
+                    help="seconds between the cheap trigger reads")
+    ap.add_argument("--cooldown", type=float, default=60.0,
+                    help="seconds of quiet after a snapshot")
+    ap.add_argument("--top", type=int, default=8,
+                    help="ranked writers / stalled processes to keep")
+    ap.add_argument("--heartbeat-file", default=None,
+                    help="default: /run/spark/alive_heartbeat.json or state/")
+    ap.add_argument("--pid-file", default=str(LOG_DIR / "px-alive.pid"),
+                    help="px-alive's pid file, used to gate the heartbeat trigger")
+    ap.add_argument("--no-proc-io", action="store_true",
+                    help="force unprivileged mode (stall channel only)")
+    ap.add_argument("--once", action="store_true",
+                    help="take one snapshot now, print it, log it, exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="take one snapshot now, print it, do not log")
+    ap.add_argument("--duration-h", type=float, default=0.0,
+                    help="stop after this many hours (0 = until signalled)")
+    args = ap.parse_args(argv)
+
+    window_s = min(10.0, max(1.0, args.window))
+    heartbeat_file = (
+        Path(args.heartbeat_file)
+        if args.heartbeat_file
+        else resolve_runtime_read_path(state_dir, HEARTBEAT_FILENAME)
+    )
+    pid_file = Path(args.pid_file)
+    paths = io_attrib.Paths()
+    allow_proc_io = (not args.no_proc_io) and _proc_io_readable(paths.proc)
+
+    def snapshot(reason: str, trigger_extra: dict) -> dict:
+        trigger = {"reason": reason, **trigger_extra}
+        record = io_attrib.capture(
+            trigger,
+            paths=paths,
+            window_s=window_s,
+            allow_proc_io=allow_proc_io,
+            top=max(1, args.top),
+        )
+        if not args.dry_run:
+            log_event(LOG_NAME, record)
+        return record
+
+    if args.once or args.dry_run:
+        age, mode = io_attrib.read_heartbeat_age(heartbeat_file)
+        io_now = psi_io_avg10(paths.pressure_io).get("some")
+        record = snapshot(
+            "manual",
+            {
+                "io_psi_some_avg10": io_now,
+                "heartbeat_age_s": None if age is None else round(age, 2),
+                "heartbeat_mode": mode,
+            },
+        )
+        print(json.dumps(record, indent=2, sort_keys=True))
+        if args.dry_run:
+            return 0
+        log(_summary(record))
+        return 0
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+    log(
+        f"observer start io_threshold={args.io_threshold} "
+        f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
+        f"cooldown_s={args.cooldown} poll_s={args.poll} "
+        f"heartbeat_file={heartbeat_file} privileged={allow_proc_io}"
+        + ("" if allow_proc_io else " (writer channel unavailable without root)")
+    )
+
+    started = time.monotonic()
+    cooldown_until = 0.0
+    captures = 0
+    while not _stop:
+        if args.duration_h and (time.monotonic() - started) >= args.duration_h * 3600:
+            log(f"observer stop after {args.duration_h}h, captures={captures}")
+            return 0
+        now = time.monotonic()
+        if now < cooldown_until:
+            time.sleep(min(args.poll, cooldown_until - now))
+            continue
+
+        io_now = psi_io_avg10(paths.pressure_io).get("some")
+        age, mode = io_attrib.read_heartbeat_age(heartbeat_file)
+        pid = io_attrib.read_pid_file(pid_file)
+        alive = pid is not None and io_attrib.process_alive(pid, paths.proc)
+        reason = io_attrib.trigger_reason(
+            io_some_avg10=io_now,
+            heartbeat_age_s=age,
+            alive=alive,
+            io_threshold=args.io_threshold,
+            heartbeat_threshold_s=args.heartbeat_threshold,
+        )
+        if reason is None:
+            time.sleep(args.poll)
+            continue
+
+        record = snapshot(
+            reason,
+            {
+                "io_psi_some_avg10": io_now,
+                "heartbeat_age_s": None if age is None else round(age, 2),
+                "heartbeat_mode": mode,
+                "px_alive_pid": pid if alive else None,
+            },
+        )
+        captures += 1
+        log(_summary(record))
+        cooldown_until = time.monotonic() + max(0.0, args.cooldown)
+
+    log(f"observer stop after signal, captures={captures}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+PY

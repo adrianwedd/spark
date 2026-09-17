@@ -694,7 +694,19 @@ See `src/pxh/api.py` for full endpoint list.
 | `px-evolve` | `bin/px-evolve` | pi | on-failure, 30s |
 | `px-blog` | `bin/px-blog` | pi | on-failure, 30s |
 | `px-tts-glados` | GLaDOS TTS :7861 | pi | always, 10s |
+| `px-io-attrib` | `bin/px-io-attrib` | root | always, 30s |
 | `cloudflared` | Tunnel → spark-api.wedd.au | pi | always, 10s |
+
+**`px-io-attrib` is root on purpose**, and it is an instrument rather than a
+control loop: it samples nothing until io PSI crosses 40 % or `px-alive`'s
+heartbeat passes 7 s of its 15 s watchdog, then takes one bounded `/proc`
+snapshot and stops for 60 s (`docs/operations/io-attribution.md`). Root is what
+lets it read `/proc/<pid>/io` for px-alive and journald; run unprivileged it
+still records who was *stalled* (D state, `wchan`, run delay) but says so in
+`writers_unavailable_reason` instead of reporting a writer list that looks
+empty. It exists because #247/#283/#287 are one transient storage stall with
+three faces, and no fix — weighting, journal tuning, or the heartbeat write
+path — is choosable until a writer is named.
 
 ## Safety Model
 

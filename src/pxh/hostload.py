@@ -59,6 +59,17 @@ def _psi_avg10(path: Path) -> dict[str, float]:
     return out
 
 
+def psi_io_avg10(path: Path | None = None) -> dict[str, float]:
+    """`{"some": ..., "full": ...}` io PSI alone, or `{}` when unreadable.
+
+    `host_load_fields` is the right call when a *record* needs the whole load
+    picture. This is for the caller that only needs the number — the stall
+    trigger in `bin/px-io-attrib` reads this once a second and would otherwise
+    open five /proc files a second to answer one question.
+    """
+    return _psi_avg10(path or Path("/proc/pressure/io"))
+
+
 def host_load_fields(prefix: str) -> dict[str, float]:
     """`{"load1_<prefix>": ..., "psi_cpu_avg10_<prefix>": ..., ...}`, never raising.
 

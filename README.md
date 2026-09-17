@@ -108,7 +108,7 @@ This section traces the complete data flow from power-on to a robot response, an
 
 ### 1. Boot Sequence
 
-Twelve systemd services start automatically:
+Thirteen systemd services start automatically:
 
 ```
 Boot
@@ -122,6 +122,7 @@ Boot
  ├── px-evolve.service          (pi)     — self-evolution daemon (on-failure restart; proposes PRs, never auto-merges)
  ├── px-blog.service            (pi)     — scheduled blog writer (daily/weekly/monthly/essay)
  ├── px-tts-glados.service      (pi)     — GLaDOS TTS server on :7861 for GREMLIN persona
+ ├── px-io-attrib.service       (root)   — transient IO-stall attribution: bounded /proc snapshot on io PSI or a late px-alive heartbeat, then cooldown (#247, #283, #287)
  └── cloudflared.service        (pi)     — Cloudflare Tunnel (spark-api.wedd.au → localhost:8420)
 ```
 
@@ -816,6 +817,7 @@ picar-x-hacking/
 │   ├── px-mind                   # Cognitive loop daemon
 │   ├── px-wake-listen            # Wake word listener (systemd)
 │   ├── px-battery-poll           # Battery voltage poller (systemd)
+│   ├── px-io-attrib              # Transient IO-stall attribution observer (systemd)
 │   ├── px-api-server             # REST API launcher
 │   ├── px-post                   # Social posting daemon (Bluesky + local feed)
 │   ├── px-statusline             # Claude Code statusbar script
@@ -856,6 +858,7 @@ picar-x-hacking/
 │   ├── px-evolve.service
 │   ├── px-blog.service
 │   ├── px-tts-glados.service
+│   ├── px-io-attrib.service
 │   └── cloudflared.service
 ├── sounds/                       # Bundled audio
 ├── models/                       # STT models (gitignored, ~500MB)

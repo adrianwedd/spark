@@ -3,6 +3,7 @@ import pxh.hostload as hostload
 
 # -- host_load_fields --
 
+
 def test_host_load_fields_preserves_existing_key_names():
     """load1_<prefix> and psi_cpu_avg10_<prefix> are consumed by existing
     production log analysis (#270/#283) — renaming either is a breaking
@@ -46,6 +47,7 @@ def test_host_load_fields_values_are_floats():
 
 # -- _psi_avg10 --
 
+
 def test_psi_avg10_parses_real_format(tmp_path):
     p = tmp_path / "cpu"
     p.write_text(
@@ -62,6 +64,7 @@ def test_psi_avg10_missing_file_returns_empty(tmp_path):
 
 # -- cgroup_pressure_fields --
 
+
 def test_cgroup_pressure_fields_unknown_unit_raises():
     try:
         hostload.cgroup_pressure_fields("not-a-real-unit", "x")
@@ -74,7 +77,7 @@ def test_cgroup_pressure_fields_reads_mem_ratio(tmp_path, monkeypatch):
     unit_dir = tmp_path / "px-wake-listen.service"
     unit_dir.mkdir()
     (unit_dir / "memory.current").write_text("671088640\n")  # 640 MiB
-    (unit_dir / "memory.high").write_text("671088640\n")     # 640 MiB -> ratio 1.0
+    (unit_dir / "memory.high").write_text("671088640\n")  # 640 MiB -> ratio 1.0
     (unit_dir / "memory.events").write_text(
         "low 0\nhigh 795123\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
     )
@@ -93,14 +96,18 @@ def test_cgroup_pressure_fields_computes_rate_on_second_call(tmp_path, monkeypat
     (unit_dir / "memory.current").write_text("100\n")
     (unit_dir / "memory.high").write_text("200\n")
     events_file = unit_dir / "memory.events"
-    events_file.write_text("low 0\nhigh 10\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n")
+    events_file.write_text(
+        "low 0\nhigh 10\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    )
     monkeypatch.setitem(hostload._MONITORED_UNITS, "px-wake-listen", unit_dir)
     hostload._last_events_high.pop("px-wake-listen", None)
 
     first = hostload.cgroup_pressure_fields("px-wake-listen", "start")
     assert first["events_high_rate_px-wake-listen_start"] == 0.0
 
-    events_file.write_text("low 0\nhigh 25\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n")
+    events_file.write_text(
+        "low 0\nhigh 25\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    )
     second = hostload.cgroup_pressure_fields("px-wake-listen", "end")
     assert second["events_high_px-wake-listen_end"] == 25.0
     assert second["events_high_rate_px-wake-listen_end"] == 15.0
@@ -111,7 +118,9 @@ def test_cgroup_pressure_fields_omits_mem_ratio_when_high_is_max(tmp_path, monke
     unit_dir.mkdir()
     (unit_dir / "memory.current").write_text("100\n")
     (unit_dir / "memory.high").write_text("max\n")
-    (unit_dir / "memory.events").write_text("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n")
+    (unit_dir / "memory.events").write_text(
+        "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n"
+    )
     monkeypatch.setitem(hostload._MONITORED_UNITS, "px-wake-listen", unit_dir)
     hostload._last_events_high.pop("px-wake-listen", None)
 
@@ -125,3 +134,19 @@ def test_cgroup_pressure_fields_never_raises_when_dir_missing(monkeypatch, tmp_p
     )
     hostload._last_events_high.pop("px-wake-listen", None)
     assert hostload.cgroup_pressure_fields("px-wake-listen", "x") == {}
+
+
+# -- psi_io_avg10 (the stall trigger's one-read form) --
+
+
+def test_psi_io_avg10_reads_the_real_format(tmp_path):
+    path = tmp_path / "io"
+    path.write_text(
+        "some avg10=96.40 avg60=1.00 avg300=0.50 total=1\n"
+        "full avg10=90.00 avg60=0.90 avg300=0.40 total=1\n"
+    )
+    assert hostload.psi_io_avg10(path) == {"some": 96.4, "full": 90.0}
+
+
+def test_psi_io_avg10_missing_file_returns_empty(tmp_path):
+    assert hostload.psi_io_avg10(tmp_path / "nope") == {}

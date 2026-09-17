@@ -67,8 +67,12 @@ modified, so rollback restores the exact prior state.
 pipeline materially compete during audio overruns" — it does not: the ffmpeg
 restream writes nothing to disk (44 MiB read since start, 0 written), and
 IOAccounting is off everywhere so there is no per-service IO signal to act on.
-The disk writers are swap and state/log fsyncs. Revisit only if post-zram data
-still shows IO PSI clustering at overruns.
+The disk writers are swap and state/log fsyncs. Post-zram data *does* still show
+IO PSI clustering at overruns (100 % of the 7 instrumented overruns since the
+current boot; median `psi_io_some_avg10_at` 96 %), so the revisit is now: the
+decision waits on `bin/px-io-attrib`, which names the writer by taking a bounded
+`/proc` snapshot at the stall itself — see
+[io-attribution.md](io-attribution.md).
 
 ## Post-install verification checklist
 
