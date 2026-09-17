@@ -1,8 +1,13 @@
 # Attributing the transient IO stall (#247, #283, #287)
 
 **Instrument:** `bin/px-io-attrib` + `src/pxh/io_attrib.py`
-**Status 2026-09-17:** committed and tested; **not yet installed on the robot** —
-the unit runs as root and installing it needs a sudo password (command below).
+**Status 2026-09-17:** merged and deployed (`#337`, `#338`); **the root unit is
+not installed yet** — that needs a sudo password (command below). In the
+meantime an **unprivileged** instance runs by hand on the robot:
+`nohup bin/px-io-attrib`, pid in `logs/px-io-attrib.pid`, stdout in
+`logs/px-io-attrib.out`. It records the stall channel plus the writer list it is
+allowed to read, and it is *not* supervised and will not survive a reboot — the
+unit replaces it.
 
 ## Why this exists
 
@@ -114,6 +119,32 @@ three are root-owned or kernel-side).
 
 Rollback: `sudo systemctl disable --now px-io-attrib && sudo rm
 /etc/systemd/system/px-io-attrib.service && sudo systemctl daemon-reload`.
+
+## First live catch (2026-09-17T15:44:17+10:00) — a worked example
+
+Triggered 50 seconds after the observer started, `reason=io_psi`:
+
+```
+io_psi_some_avg10_at=41.85   psi_post some avg10=57.21   heartbeat age 0.04s
+privileged=false   writers_unreadable_count=179/202   writers_with_activity=7   write_bytes_total=8192 B
+  python3 px-wake-listen.service  write_bytes 8192   <- the only readable disk writer
+  go2rtc  px-frigate-stream       write_bytes 0, wchar 1.13 MB   <- pipe, not disk
+stalled (7 in D state): python3(px-wake-listen) wchan=jbd2_log_wait_commit;
+  python3(px-battery-poll); systemd-journald; jbd2/mmcblk0p2-8; kworker/2:0H+kblockd; kworker/u17:1-flush
+mmcblk0: 26 writes, 320 sectors (160 KB), ms_io +2212, ms_writing +66545     vmstat: pswpin/pswpout 0, nr_dirty 166
+```
+
+How to read that: the device was pathological (`ms_writing` advanced by 66.5 s
+inside a 3.2 s window — per-request service times in the seconds), memory PSI was
+0.0 and swap was untouched, the ext4 journal thread and journald were themselves
+in D state, and **no readable process accounts for the 152 KB that reached the
+disk**. That last line is the whole reason the root channel is the next step:
+"invisible to this uid" is a different statement from "nobody wrote".
+
+Calibration from the same window: px-alive's normal heartbeat gap max sits at
+~2.2-2.6 s, so the 7 s trigger has ~3× margin and the first record used the io-PSI
+trigger alone (`heartbeat age 0.04s`). Idle io PSI is under 5 %, with bursts past
+40 %; one catch in the first ten minutes is about the expected rate.
 
 ## Reading a record
 
