@@ -793,21 +793,15 @@ The instrument found both without anyone reading a timer table: `unit_log`
 carried the lifecycle lines into the records and `file_recent` named
 `/var/cache/apt/pkgcache.bin` 25-260 s before each one.
 
-**The lever (root, one drop-in, covers both units):**
+**The lever (root, one reviewed drop-in, covers both units).** The file lives in
+the repo so it can be reviewed and diffed: `systemd/host-tuning/apt-daily.service.d/10-io-priority.conf`.
 
 ```bash
-sudo mkdir -p /etc/systemd/system/apt-daily.service.d
-sudo tee /etc/systemd/system/apt-daily.service.d/10-io-priority.conf >/dev/null <<'CONF'
-# Keep apt off the SD card's critical path (#402). apt-daily and apt-daily-upgrade
-# both write tens of megabytes and hold this card's queue for whole windows
-# (measured 2026-09-18: 93.6 % and 70.2 % io PSI), and neither can be rescheduled
-# away from the device -- so lower its priority instead of its volume.
-[Service]
-IOSchedulingClass=idle
-IOWeight=1
-Nice=19
-CONF
-sudo cp -r /etc/systemd/system/apt-daily.service.d /etc/systemd/system/apt-daily-upgrade.service.d
+for u in apt-daily apt-daily-upgrade; do
+  sudo install -d "/etc/systemd/system/$u.service.d"
+  sudo install -m 0644 systemd/host-tuning/apt-daily.service.d/10-io-priority.conf \
+    "/etc/systemd/system/$u.service.d/10-io-priority.conf"
+done
 sudo systemctl daemon-reload
 ```
 
@@ -839,6 +833,48 @@ consequences for operators:
 * A record taken within a minute or two of a deploy may reflect *your* restart
   rather than the defect under investigation. Both examples above are in
   `logs/tool-io-attrib.log` and carry the `unit_log` lines that say so.
+
+## Card health: what is measurable on an *SD* card (#405)
+
+`PRE_EOL_INFO` and `DEVICE_LIFE_TIME_EST_TYP_A/B` are **eMMC EXT_CSD registers**.
+This host's only storage is an **SD card**, verified on the robot 2026-09-18:
+
+```
+/sys/block/mmcblk0/device/type    SD
+name / manfid / date              EB1QT / 0x00001b / 08/2019
+/dev/mmcblk0boot*                 absent          (eMMC boot partitions do not exist)
+mmc-utils                         not installed — and irrelevant: `mmc extcsd read` needs eMMC
+```
+
+So **this hardware exposes no standard lifetime telemetry**, and a reader who goes
+looking for it finds only the absence. That is why it is written down here rather
+than left as a task for the next person.
+
+What *is* measurable, unprivileged, in every record:
+
+| signal | on `picar` | how to read it |
+|---|---|---|
+| `ms_per_write` | median **69-86 ms**, p90 **207 ms** (184 records) | the card's service latency; ~50-100x its read side (~1.5 ms) |
+| `ext4.errors_count` | **0** | no filesystem-level errors, ever, on this card |
+| host writes | ~1.03 TB (~35 full-card writes) | usage context, **not** a failure threshold |
+| stalls | correlate with write-back, never with idleness | the mechanism, not the health |
+
+**Verdict carried 2026-09-18 — slow SD write path demonstrated; wear/failure state
+unknown.** Not end-of-life: no errors, no failed writes, no timeouts. But no
+positive evidence of health either, because the hardware does not report it.
+
+### The replacement decision is an A/B test, not a reading
+
+1. **Image the current card** — it is the known-slow baseline.
+2. **Boot a known-good replacement SD card** with that same image.
+3. **Run the same baseline on both, under the same workload.** The apt timers
+   dominate workload variance, so compare like with like (`ms_per_write` median
+   and p90 from the record history, io PSI over the same window shape, and
+   `state/health/px-alive.json` → `watchdog.margin_min_ms`).
+4. **Keep the replacement only if the write latency collapses.** If ~86 ms becomes
+   ~5 ms, #405 is answered empirically; if it does not, the card was never the
+   variable and the small-write-pressure work (#367/#376/#377/#381/#382/#384) is
+   the whole answer.
 
 ## Deliberately not done
 
