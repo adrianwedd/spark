@@ -11,6 +11,7 @@ import time
 import pytest
 
 from pxh.mic_stream import (
+    DEFAULT_BUFFER_S,
     ArecordStream,
     parse_arecord_devices,
     resolve_arecord_device,
@@ -385,7 +386,13 @@ def test_alsa_buffer_holds_seconds_and_whole_periods():
     cmd = stream.build_command()
     buffer_frames = int(cmd[cmd.index("--buffer-size") + 1])
     assert buffer_frames % chunk_frames == 0, "arecord wants whole periods"
-    assert buffer_frames / 44100 >= 2.0, "less than 2 s of slack is the old defect"
+    # Sized against the *app* ring, not against a round number: if ALSA holds
+    # less than the app ring, a long reader stall overruns the kernel ring
+    # first, and that loss is silent — nothing counts it (#283). The app ring
+    # must be the first thing to give, because it counts and logs its drops.
+    assert buffer_frames / 44100 > DEFAULT_BUFFER_S, (
+        "ALSA ring must exceed the app-side ring so the counted ring overflows first"
+    )
     assert cmd[cmd.index("--period-size") + 1] == str(chunk_frames)
 
 

@@ -52,9 +52,19 @@ DEFAULT_BUFFER_S = 10.0
 #: reader thread is stalled, and it was `chunk_frames * 8` — with a 2048-frame
 #: period at 44.1 kHz that is **0.37 s of slack**, which is why the production
 #: overruns are measured in seconds: the reader was stalled far longer than the
-#: buffer could cover (#283). 4 s of slack does not fix a stall, it stops a
-#: stall from silently deleting audio, and it is free (353 KB of kernel buffer).
-DEFAULT_ALSA_BUFFER_S = 4.0
+#: buffer could cover (#283).
+#:
+#: **Sized to exceed the app-side ring on purpose.** 4 s stopped a stall from
+#: silently deleting audio but did not cover one: the instrumented stalls on
+#: `picar` (2026-09-17) include a single 8.8 s `fsync` and 10-11 s io-PSI
+#: windows, so at 4 s the *kernel* ring was still the binding constraint and its
+#: overflow is silent — nobody counts it. At 12 s the kernel ring can hold more
+#: than the 10 s app ring, so the first thing to give is the ring that counts
+#: and logs its drops (#283's `dropped_chunks` and `reader_gap_*`), which is the
+#: difference between a measured loss and an invisible one. Cost is 1.0 MB of
+#: kernel ring at 44.1 kHz mono S16, and capture latency is set by
+#: `chunk_frames`, not by this.
+DEFAULT_ALSA_BUFFER_S = 12.0
 DEFAULT_READ_TIMEOUT_S = 5.0
 
 # A drop is only audio *loss* if the listener meant to be recording at the
