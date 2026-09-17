@@ -698,3 +698,17 @@ def test_health_records_are_written_without_a_journal_commit(monkeypatch):
     assert calls == [], "a liveness record must not force a journal commit"
     body = health._component_path("px-wake-listen").read_text()
     assert "px-wake-listen" in body and '"rms": 120' in body
+
+def test_log_rotation_is_atomic_but_not_durable(tmp_path, monkeypatch):
+    """Rotation rewrites half of a multi-megabyte file in one atomic_write; it
+    must not also force a journal commit (#247). The append path never fsynced,
+    so rotation was the only diagnostic write that did."""
+    target = tmp_path / "px-mind.log"
+    target.write_text("\n".join(f"line {i}" for i in range(4000)) + "\n")
+    calls = []
+    monkeypatch.setattr(state.os, "fsync", lambda fd: calls.append(fd))
+    state.rotate_log(target, max_bytes=1000)
+    assert calls == []
+    body = target.read_text().splitlines()
+    assert 1000 < len(body) < 4000, "rotation should have dropped the oldest half"
+    assert body[-1] == "line 3999"

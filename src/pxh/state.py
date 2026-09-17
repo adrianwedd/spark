@@ -167,9 +167,22 @@ def rotate_log(
 ) -> None:
     """Rotate log file by keeping the last half of lines when it exceeds max_bytes.
 
-    Uses atomic_write for SD card durability. Callers should hold the .rotlock
-    across the append + rotate to prevent TOCTOU races (issue #149). Pass the
-    held lock via held_lock to skip re-acquisition (FileLock is not reentrant).
+    Atomic, but deliberately **not** durable (`durable=False` below): a log's
+    append path does not fsync either, so rotation was the only place a
+    diagnostic tree forced an ext4 journal commit — and it does it while writing
+    back *half of a multi-megabyte file in one call*. Observed as its own stall
+    shape on `picar` (2026-09-17T12:17:21Z): 2336 KB written in a 3.27 s window
+    at 85 % device occupancy with `px-mind.log` growing and its `.rotlock`
+    touched (#247).
+
+    The volume is a separate question and a real one: rewriting the tail of a
+    5 MB file costs ~2.5 MB per rotation, which is a burst no durability flag
+    removes. Retention policy decides that, so it is left as it is and recorded
+    rather than quietly changed.
+
+    Callers should hold the .rotlock across the append + rotate to prevent TOCTOU
+    races (issue #149). Pass the held lock via held_lock to skip re-acquisition
+    (FileLock is not reentrant).
     """
     # Fast-path size check before any lock acquisition — avoids hitting the
     # filesystem for FileLock on every tiny log append.
@@ -184,7 +197,7 @@ def rotate_log(
             return
         lines = path.read_text(encoding="utf-8").splitlines()
         half = len(lines) // 2
-        atomic_write(path, "\n".join(lines[half:]) + "\n")
+        atomic_write(path, "\n".join(lines[half:]) + "\n", durable=False)
 
     if FileLock is None:
         # Best-effort fallback when filelock isn't available; legacy behavior.
