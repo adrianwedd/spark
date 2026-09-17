@@ -772,6 +772,51 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `co_blocked_samples` > 0, especially with `brcmf_wq/mmc1:*` and `jbd2/mmcblk0p2-8` in the same instant | the block is **shared**, not a writer: the `mmc` bus carries the card and the SDIO WiFi, and nothing here is competing for it | stop looking for a writer; this is #217/#247's "wedge, not writer" territory — kernel/driver/power, and `mmc1` has no `/sys/block` entry to consult |
 | **`device_inflight_pre` is `0/0` while `d_state_count` is high and `devices` shows queue time** | **nothing was in flight: the queue is wedged, not busy — there is no writer in this record to find, and a longer search for one is the wrong search** | take the question to the *waiters*: `stalled[].wchan` and (as root) the kernel threads, and to the other bus users — `mmc1`'s SDIO WiFi shares the `mmc` subsystem and cannot be seen from `/sys/block` |
 
+## Host tuning: the two apt timers, and why the lever is worth pulling (#402)
+
+The largest writers on this host are not SPARK daemons. Measured 2026-09-18, both
+`apt` timers produced a stall within an hour of each other, with *different*
+shapes on the same device:
+
+| run | when | bytes | queue | io PSI peak | shape |
+|---|---|---|---|---|---|
+| `apt-daily.service` (update) | 05:25:38-05:26:14 | **48 MB** in a 36 s window, `pgpgout` 61 MB, 87 MB dirty backlog | 100 % occupied | 93.6 % | **mass** |
+| `apt-daily-upgrade.service` (upgrade + clean) | 06:00:44-06:03:31 (167 s, 38.5 s CPU) | 44 KB - 1.8 MB per window, `pkgcache.bin` 57.2 MB rewritten | 100 % occupied | 70.2 % | **latency** |
+
+The second row is the one that changes the argument. It moves *kilobytes* and
+still saturates the queue for whole windows, because this card's write service
+time is ~86 ms (p90 207 ms — see the hardware issue, #405). A job that cannot be
+reordered away from the device is exactly where weighting has leverage, and both
+rows are *scheduled*, so they will recur at randomised times each day.
+
+The instrument found both without anyone reading a timer table: `unit_log`
+carried the lifecycle lines into the records and `file_recent` named
+`/var/cache/apt/pkgcache.bin` 25-260 s before each one.
+
+**The lever (root, one drop-in, covers both units):**
+
+```bash
+sudo mkdir -p /etc/systemd/system/apt-daily.service.d
+sudo tee /etc/systemd/system/apt-daily.service.d/10-io-priority.conf >/dev/null <<'CONF'
+# Keep apt off the SD card's critical path (#402). apt-daily and apt-daily-upgrade
+# both write tens of megabytes and hold this card's queue for whole windows
+# (measured 2026-09-18: 93.6 % and 70.2 % io PSI), and neither can be rescheduled
+# away from the device -- so lower its priority instead of its volume.
+[Service]
+IOSchedulingClass=idle
+IOWeight=1
+Nice=19
+CONF
+sudo cp -r /etc/systemd/system/apt-daily.service.d /etc/systemd/system/apt-daily-upgrade.service.d
+sudo systemctl daemon-reload
+```
+
+Alternatives, if weighting proves insufficient: move `/var/lib/apt/lists` and
+`/var/cache/apt` onto zram with a persistent overlay (removes ~253 MB of
+recurring churn from the card), or accept it and keep the small-write pressure
+low elsewhere. All three are decisions, not code — the evidence lives in #402,
+and the card question in #405.
+
 ## Deliberately not done
 
 - **No health record.** `health.STALE_AFTER_S` entries are "expected to exist"
