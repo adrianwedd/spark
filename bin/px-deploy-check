@@ -31,7 +31,13 @@ import re
 import subprocess
 import sys
 
-from pxh.deploy import CODE_DIRS, UnitState, needs_restart, restart_list
+from pxh.deploy import (
+    CODE_DIRS,
+    UnitState,
+    changed_symbols,
+    needs_restart,
+    restart_list,
+)
 
 ENTRY_RE = re.compile(r"(/[^\s;\"']*/(?:bin|systemd)/[^\s;\"']*)")
 
@@ -98,7 +104,15 @@ def main():
     if args.deploy_stamp:
         deploy_ts = dt.datetime.fromisoformat(args.deploy_stamp).timestamp()
 
-    verdicts = restart_list(moved, units, root=root, deploy_ts=deploy_ts)
+    # Per-file symbol diffs, so the restart list is about *reachability* rather
+    # than fan-out (#336): a daemon whose only reference to a changed module is a
+    # name that did not change gains nothing from a restart, and a fleet restart
+    # on a one-file observability change is churn that teaches people to ignore
+    # this gate. A file whose change cannot be determined maps to None, which
+    # `restart_list` treats as "flag".
+    changes = {path: changed_symbols(args.prev, args.head, path, root) for path in moved}
+
+    verdicts = restart_list(moved, units, root=root, deploy_ts=deploy_ts, changes=changes)
     stale = needs_restart(verdicts)
 
     print("px-deploy-check: {} changed file(s) in {}..{}".format(len(moved), args.prev, args.head))

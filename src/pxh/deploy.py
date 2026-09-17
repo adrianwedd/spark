@@ -7,11 +7,31 @@ still exists, but whose *imports* were renamed, moved, or deleted, does not
 fail at deploy time. It fails hours later inside a lazy import, and the failure
 follows the old name — `ImportError` naming a module the tree no longer has.
 
-The rule here: **a unit needs a restart if any file it executes was changed by
-this deploy, and the process started before that change.** "File it executes"
-means its entry point, or any `pxh` module in the entry point's static import
-closure — imports at any nesting depth, plus `importlib.import_module("pxh...")`
-calls written as string literals.
+The rule here: **a unit is stale when it can execute a changed code path from its
+current process image** (#336's decision — reachability, not fan-out). A daemon
+that merely *imports* a changed module but references none of the changed names
+gains nothing from a restart, and a fleet restart on a one-file observability
+change is churn that teaches people to ignore this gate.
+
+Two stages, and the first is a prerequisite for the second: the import closure
+must actually have the graph edges before path sensitivity means anything. Three
+real shapes in this tree were invisible to it until #336:
+
+* `from pxh import health as _health` — `node.module == "pxh"` and the submodule
+  is in `node.names`; reading only `node.module` recorded the literal `"pxh"`,
+  a package, and the closure died at `src/pxh/pxh.py`. This is the dominant
+  idiom in the tree, used at module scope by eight units.
+* ASGI app strings — `bin/px-api-server` runs `exec uvicorn pxh.api:app`, which
+  no import-shaped rule can see.
+* Shell entries with an embedded Python heredoc — `bin/px-alive` is bash wrapping
+  `<<'PY' … PY`, so the file is not parseable as Python and the AST walk finds
+  nothing at all.
+
+Beyond the closure: `restart_list` compares the *symbols* a changed module
+changed against the names a unit actually references from it, and treats
+"cannot tell" as "flag". A false restart costs seconds; the failures this module
+exists for (a renamed module reached hours later inside a lazy import) cost a
+silent 22:00 job.
 
 This is deliberately a *file* rule rather than a symbol-level proof. A unit
 that is flagged but does not actually reach the changed module costs seconds of
@@ -24,8 +44,9 @@ from __future__ import annotations
 import ast
 import os
 import re
+import subprocess
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 #: Directories whose contents count as "code a process executes".
 CODE_DIRS = ("bin", "src", "systemd")
@@ -33,8 +54,73 @@ CODE_DIRS = ("bin", "src", "systemd")
 #: Package directory to walk for imports, relative to the repository root.
 PACKAGE_DIR = os.path.join("src", "pxh")
 
+#: ASGI app factories named as a string: `exec uvicorn pxh.api:app`. Invisible
+#: to every import-shaped rule, and how `px-api-server` reaches `pxh.api` — the
+#: unit that was a false negative on the gate's first production run (#336).
+_ASGI_APP_RE = re.compile(r"\b(?:uvicorn|gunicorn|hypercorn)\b[^\n]*?\bpxh\.([A-Za-z0-9_]+)")
+
+#: A shell heredoc opener: `<<'PY'`, `<<PY`, `<<-EOF`.
+_HEREDOC_OPEN_RE = re.compile(r"<<-?\s*'?([A-Za-z_][A-Za-z0-9_]*)'?")
+
 _IMPORT_MODULE_RE = re.compile(r"""import_module\(\s*["'](pxh\.[A-Za-z0-9_.]+)["']""")
 _MODULE_FLAG_RE = re.compile(r"""(?:^|\s)-m\s+pxh\.([A-Za-z0-9_]+)""")
+
+
+def heredoc_bodies(source: str) -> list[str]:
+    """Python payloads embedded in shell heredocs, as text.
+
+    `bin/px-alive` is bash wrapping `<<'PY' … PY`. The file is not parseable as
+    Python, so the AST walk finds *nothing* — the entry point of the most
+    important daemon on this host had no closure at all (#336). Extraction is
+    deliberately dumb (an opener line, then lines until the tag repeats) because
+    the alternative is a shell parser; a body that fails to parse is picked up by
+    the text scans below instead.
+    """
+    bodies: list[str] = []
+    lines = source.splitlines()
+    index = 0
+    while index < len(lines):
+        match = _HEREDOC_OPEN_RE.search(lines[index])
+        if not match:
+            index += 1
+            continue
+        tag = match.group(1)
+        index += 1
+        body: list[str] = []
+        while index < len(lines) and lines[index].strip() != tag:
+            body.append(lines[index])
+            index += 1
+        if body:
+            bodies.append("\n".join(body))
+        index += 1
+    return bodies
+
+
+def _pxh_modules_in_python(source: str) -> set[str]:
+    """Submodule names a *Python* source imports from `pxh`, at any depth."""
+    found: set[str] = set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        tree = None
+    if tree is None:
+        return found
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("pxh"):
+            if "." in node.module:
+                found.add(node.module.split(".", 1)[1])
+            else:
+                # `from pxh import health as _health`: the submodule is in
+                # `names`, not in `module`. Reading only `module` recorded the
+                # literal "pxh" — the package — and the closure died at
+                # src/pxh/pxh.py, which does not exist.
+                for alias in node.names:
+                    found.add(alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("pxh."):
+                    found.add(alias.name.split(".", 1)[1])
+    return found
 
 
 def imported_pxh_modules(path: str) -> set[str]:
@@ -42,6 +128,8 @@ def imported_pxh_modules(path: str) -> set[str]:
 
     A lazy import inside a function still *names* the module in the process's
     compiled code, so it is found here — that is the case this guard exists for.
+    Reads the file as Python *and* any heredoc payload inside it, because the
+    `bin/px-*` entries are shell wrappers around exactly that.
     """
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -49,20 +137,9 @@ def imported_pxh_modules(path: str) -> set[str]:
     except OSError:
         return set()
 
-    found: set[str] = set()
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        tree = None
-
-    if tree is not None:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("pxh"):
-                found.add(node.module.split(".", 1)[1] if "." in node.module else node.module)
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name.startswith("pxh."):
-                        found.add(alias.name.split(".", 1)[1])
+    found = _pxh_modules_in_python(source)
+    for body in heredoc_bodies(source):
+        found |= _pxh_modules_in_python(body)
 
     # `importlib.import_module("pxh.x")` is a string, invisible to the AST walk
     # above unless the name is also written as an import somewhere.
@@ -70,6 +147,8 @@ def imported_pxh_modules(path: str) -> set[str]:
         found.add(match.split(".", 1)[1])
     for name in _MODULE_FLAG_RE.findall(source):
         found.add(name)
+    for match in _ASGI_APP_RE.findall(source):
+        found.add(match)
 
     return found
 
@@ -95,6 +174,223 @@ def executed_paths(entry: str, root: str) -> set[str]:
     for name in import_closure(entry, root):
         paths.add(os.path.join(PACKAGE_DIR, name + ".py"))
     return paths
+
+
+# --- stage 2: which *names* a unit actually reaches (#336) -----------------
+
+
+@dataclass(frozen=True)
+class ModuleChange:
+    """What changed in one module between two revisions."""
+
+    #: Top-level names (functions, classes, assignments) whose source differs.
+    symbols: frozenset[str]
+    #: A top-level statement that is not one of those differs — an import block,
+    #: a decorator, a conditional definition — or the module could not be
+    #: parsed. Every unit that imports the module is stale, because what the
+    #: module *provides* may have moved rather than changed in place. This is
+    #: #332's shape: a renamed import inside a module only fails at call time.
+    module_level: bool
+
+
+def _module_symbols(source: str) -> tuple[dict[str, str], str]:
+    """`({name: ast dump}, dump of everything else at module level)`.
+
+    Assignments are keyed by the name they bind, so a constant changing is a
+    *symbol* change rather than a module-level one. The second element is what
+    the module does at import time — its import block, conditional definitions,
+    decorators — and it only matters by *comparison*: an unchanged import block
+    must not make every importer stale, which is what a presence check would do
+    (every module has imports).
+    """
+    tree = ast.parse(source)
+    symbols: dict[str, str] = {}
+    others: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            symbols[node.name] = ast.dump(node)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    symbols[target.id] = ast.dump(node)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            symbols[node.target.id] = ast.dump(node)
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            continue  # a docstring: prose, not behaviour
+        else:
+            others.append(ast.dump(node))
+    return symbols, "\n".join(others)
+
+
+def changed_symbols(prev: str, head: str, path: str, root: str = ".") -> ModuleChange | None:
+    """What `path` changed between two revisions. None when it cannot be told.
+
+    Reads both revisions through `git show`, so it works before and after the
+    checkout and for deleted files. `None` is not "nothing changed" — the caller
+    must treat it as "flag", which is the direction this whole module errs in.
+    """
+    def _show(rev: str) -> str | None:
+        try:
+            out = subprocess.run(
+                ["git", "show", f"{rev}:{path}"],
+                cwd=root, capture_output=True, text=True, check=False,
+            )
+        except OSError:
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    before_src, after_src = _show(prev), _show(head)
+    if before_src is None or after_src is None:
+        return None
+    try:
+        before, before_other = _module_symbols(before_src)
+        after, after_other = _module_symbols(after_src)
+    except SyntaxError:
+        return None
+    symbols = frozenset(
+        name for name in set(before) | set(after)
+        if before.get(name) != after.get(name)
+    )
+    return ModuleChange(symbols=symbols, module_level=before_other != after_other)
+
+
+def _dotted(node: ast.AST) -> str | None:
+    """`pxh.mind.m5_mod` for a dotted attribute chain, else None."""
+    parts: list[str] = []
+    cursor = node
+    while isinstance(cursor, ast.Attribute):
+        parts.append(cursor.attr)
+        cursor = cursor.value
+    if not isinstance(cursor, ast.Name):
+        return None
+    parts.append(cursor.id)
+    return ".".join(reversed(parts))
+
+
+def _references_in_python(source: str, module: str) -> tuple[set[str], bool]:
+    """`(names, resolvable)` for one Python source's use of `pxh.<module>`."""
+    names: set[str] = set()
+    resolvable = True
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return names, False
+
+    # Bindings that point at the module: `from pxh import health as _health`
+    # binds `_health`; `import pxh.health` binds the dotted path `pxh.health`.
+    bound_names: set[str] = set()
+    dotted = f"pxh.{module}"
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == f"pxh.{module}":
+                for alias in node.names:
+                    if alias.name == "*":
+                        resolvable = False
+                    elif alias.name != "":
+                        names.add(alias.name)
+            elif node.module == "pxh":
+                for alias in node.names:
+                    if alias.name == module:
+                        bound_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == dotted:
+                    if alias.asname:
+                        bound_names.add(alias.asname)
+                    else:
+                        bound_names.add(dotted)
+        elif isinstance(node, ast.Attribute):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id in bound_names:
+                names.add(node.attr)
+            elif dotted in bound_names and _dotted(value) == dotted:
+                names.add(node.attr)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            is_getattr = (isinstance(func, ast.Name) and func.id == "getattr")
+            if is_getattr and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Name) and first.id in bound_names:
+                    # getattr(health_mod, name) — the name is data, not syntax.
+                    resolvable = False
+                elif dotted in bound_names and _dotted(first) == dotted:
+                    resolvable = False
+
+    return names, resolvable
+
+
+def file_module_references(path: str, module: str) -> tuple[set[str], bool]:
+    """Names `path` reaches from `pxh.<module>`, and whether that set is complete.
+
+    Covers the idioms this tree actually uses — `from pxh.mod import a`,
+    `from pxh import mod as alias` + `alias.a`, `import pxh.mod` + `pxh.mod.a`,
+    `import pxh.mod as alias` + `alias.a` — and answers `resolvable=False` for
+    the ones it cannot (`getattr`, `import *`, `importlib.import_module`). The
+    caller turns that into a restart rather than a pass.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+    except OSError:
+        return set(), False
+
+    # A `bin/px-*` entry is a shell wrapper: the whole file is not Python, and
+    # its *bodies* are the code. Treating the unparseable wrapper as
+    # "unresolvable" would flag every unit whose entry is a heredoc, which is
+    # most of them — the opposite of what this stage is for.
+    chunks: list[str] = []
+    try:
+        ast.parse(source)
+        chunks.append(source)
+    except SyntaxError:
+        pass
+    bodies = heredoc_bodies(source)
+    chunks.extend(bodies)
+    if not chunks:
+        # No embedded Python. Two very different cases hide here: a wrapper whose
+        # Python is *named* (`exec python -m pxh.mind`, `exec uvicorn pxh.api:app`)
+        # has no hidden references, while a wrapper with an inline `python -c`
+        # we cannot parse might. The first is resolvable-and-empty, the second is
+        # the fail-safe case.
+        if _MODULE_FLAG_RE.search(source) or _ASGI_APP_RE.search(source):
+            return set(), True
+        return (set(), False) if "python" in source else (set(), True)
+
+    names: set[str] = set()
+    resolvable = True
+    for chunk in chunks:
+        chunk_names, chunk_resolvable = _references_in_python(chunk, module)
+        names |= chunk_names
+        resolvable = resolvable and chunk_resolvable
+
+    # Text-level literals survive even in a shell wrapper.
+    for text in [source, *bodies]:
+        for match in _IMPORT_MODULE_RE.findall(text):
+            if match == f"pxh.{module}":
+                # The module is reached, the names are not: dynamic by
+                # construction, so a change inside it cannot be ruled out.
+                resolvable = False
+    return names, resolvable
+
+
+def unit_module_references(entry: str, root: str, module: str) -> tuple[set[str], bool]:
+    """Union of every executed file's references to `pxh.<module>`."""
+    names: set[str] = set()
+    resolvable = True
+    for path in sorted(executed_paths(entry, root)):
+        file_names, file_resolvable = file_module_references(os.path.join(root, path), module)
+        names |= file_names
+        resolvable = resolvable and file_resolvable
+    return names, resolvable
+
+
+def _module_name_for(path: str) -> str | None:
+    """`src/pxh/health.py` -> `health`; anything else -> None."""
+    prefix = PACKAGE_DIR + os.sep
+    if not path.startswith(prefix) or not path.endswith(".py"):
+        return None
+    return path[len(prefix):-3].replace(os.sep, ".")
 
 
 @dataclass(frozen=True)
@@ -126,13 +422,67 @@ def _changed_at(path: str, root: str, deploy_ts: float | None) -> float:
         return deploy_ts if deploy_ts is not None else float("inf")
 
 
+def _change_hits(
+    unit: UnitState,
+    moved: Sequence[str],
+    root: str,
+    executed: set[str],
+    changes: Mapping[str, ModuleChange | None] | None,
+) -> list[tuple[str, str]]:
+    """`(path, why)` for each moved file this unit can actually *reach*.
+
+    With `changes` supplied this is #336's rule: a changed module counts only if
+    the unit references a name the module changed, and anything undecidable
+    counts. Without it — a caller with no git revisions to hand — every executed
+    path counts, which is this module's earlier, deliberately over-broad rule.
+    """
+    entry_rel = os.path.relpath(unit.entry, root) if unit.entry else None
+    hits: list[tuple[str, str]] = []
+    for path in moved:
+        if path not in executed:
+            continue
+        if path == entry_rel:
+            # The process *is* this file; which of its paths the invocation
+            # reaches is not statically knowable.
+            hits.append((path, "its own entry point"))
+            continue
+        module = _module_name_for(path) if changes is not None else None
+        if module is None:
+            hits.append((path, "executes it"))
+            continue
+        change = changes.get(path)
+        if change is None:
+            hits.append((path, "change could not be determined"))
+            continue
+        if change.module_level:
+            hits.append((path, "module-level change (imports or top-level logic)"))
+            continue
+        names, resolvable = unit_module_references(unit.entry, root, module)
+        if not resolvable:
+            hits.append((path, "references it in a way static analysis cannot resolve"))
+            continue
+        touched = change.symbols & names
+        if touched:
+            shown = ", ".join(sorted(touched)[:3])
+            hits.append((path, f"references removed or changed {shown}"))
+    return hits
+
+
 def restart_list(
     moved: Sequence[str],
     units: Iterable[UnitState],
     root: str = ".",
     deploy_ts: float | None = None,
+    changes: Mapping[str, ModuleChange | None] | None = None,
 ) -> list[Verdict]:
-    """Decide which units are running code older than the deploy that changed it."""
+    """Decide which units are running code older than the deploy that changed it.
+
+    `changes` maps each moved path to what changed inside it (see
+    `changed_symbols`); `None` for a path means "could not be determined" and is
+    treated as a restart. Omitting the mapping entirely falls back to the
+    path-level rule, which flags every unit that merely executes a moved file —
+    the conservative direction, and what callers without git revisions get.
+    """
     moved = [path for path in moved if path]
     verdicts: list[Verdict] = []
     for unit in units:
@@ -140,12 +490,26 @@ def restart_list(
             verdicts.append(Verdict(unit.name, False, "runs nothing under this repo"))
             continue
         executed = executed_paths(unit.entry, root)
-        hits = [path for path in moved if path in executed]
+        hits = _change_hits(unit, moved, root, executed, changes)
         if not hits:
-            verdicts.append(Verdict(unit.name, False, "executes nothing this deploy moved"))
+            # With a change map, "executes nothing" would be misleading: the unit
+            # may well execute the moved file and simply reach none of what
+            # changed inside it — which is the whole point of the second stage.
+            executed_moved = sorted(path for path in moved if path in executed)
+            if changes is not None and executed_moved:
+                verdicts.append(
+                    Verdict(
+                        unit.name,
+                        False,
+                        f"executes {', '.join(executed_moved[:2])} but references none of the "
+                        f"changed names",
+                    )
+                )
+            else:
+                verdicts.append(Verdict(unit.name, False, "executes nothing this deploy moved"))
             continue
-        newest = max(_changed_at(path, root, deploy_ts) for path in hits)
-        changed = ", ".join(sorted(hits)[:3])
+        newest = max(_changed_at(path, root, deploy_ts) for path, _why in hits)
+        changed = ", ".join(f"{path} ({why})" for path, why in sorted(hits)[:2])
         if unit.started_ts is None:
             verdicts.append(
                 Verdict(unit.name, True, f"start time unknown; executes changed {changed}")
