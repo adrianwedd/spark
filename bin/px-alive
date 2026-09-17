@@ -399,17 +399,26 @@ def reset_watchdog_window(now: float | None = None) -> None:
     _hb_window_started_at = time.time() if now is None else now
 
 
-def write_alive_heartbeat(mode: str, now: float | None = None) -> bool:
+def write_alive_heartbeat(mode: str, now: float | None = None,
+                          extra: dict | None = None) -> bool:
     """Atomically publish loop progress, then notify systemd's watchdog.
 
     The notification deliberately follows the durable write: systemd must not
     consider the loop healthy when its authoritative progress record is stale.
+
+    `extra` carries phase-specific observations (the park's lease-read age) so a
+    caller does not have to fork this function to add a field.
     """
     global _heartbeat_err_logged, _hb_last_mode
     ALIVE_HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
     ts = time.time() if now is None else now
     _observe_beat(ts, mode)
     record = {"ts": ts, "mode": mode}
+    if extra:
+        try:
+            record.update(extra)
+        except Exception:  # pragma: no cover — telemetry is never load-bearing
+            pass
     # Reporting must never be able to kill the daemon it reports on, so the
     # observations are attached defensively and the beat goes out regardless.
     try:
@@ -1041,6 +1050,79 @@ def idle_loop(args) -> None:
         _with_heartbeat(lambda: (drop_px(), stop_face_detection() if face_active else None))
 
 
+class _PendingLeaseRead:
+    """One `state/gpio_lease.json` read, kept off the park loop's thread.
+
+    The park loop's product is *liveness*: it writes a heartbeat and an
+    `EXTEND_TIMEOUT_USEC` every `LEASE_RECHECK_S`, which is what stops
+    `TimeoutStartSec` from killing a daemon that is behaving correctly. Reading
+    the lease is SD-card IO on the same card #247 measures stalling for tens of
+    seconds, so doing it on that thread stops the beats exactly when the
+    filesystem stalls — and systemd then kills a park that was never hung (26
+    `start operation timed out` events since 2026-08-26, `NRestarts=39`).
+
+    Reordering the extension ahead of the read is not enough on its own: the
+    observed park ran 82 s against a 30 s extension, so beats must keep landing
+    *during* the block. Hence a daemon thread that owns the read while the loop
+    keeps beating, and `heartbeat_fields()` so the wait is visible in the record
+    instead of only in a systemd timeout.
+    """
+
+    def __init__(self, reader):
+        self._reader = reader
+        self._thread: threading.Thread | None = None
+        self._done = True
+        self._started_at = 0.0
+        self._last_ms = 0.0
+        self._value: dict | None = None
+        self._error: BaseException | None = None
+
+    def start(self) -> None:
+        """Begin a read if one is not already in flight."""
+        if not self._done:
+            return
+        self._done = False
+        self._started_at = time.monotonic()
+        self._error = None
+
+        def _read() -> None:
+            started = time.monotonic()
+            try:
+                self._value = self._reader()
+            except BaseException as exc:  # surfaced to the caller, not swallowed
+                self._error = exc
+            finally:
+                self._last_ms = (time.monotonic() - started) * 1000.0
+                self._done = True
+
+        self._thread = threading.Thread(target=_read, name="px-alive-lease-read",
+                                        daemon=True)
+        self._thread.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    @property
+    def pending_ms(self) -> float:
+        return 0.0 if self._done else (time.monotonic() - self._started_at) * 1000.0
+
+    def result(self) -> tuple[dict | None, BaseException | None]:
+        return self._value, self._error
+
+    def heartbeat_fields(self) -> dict:
+        """What the park publishes while waiting: the age of the in-flight read.
+
+        A park that is waiting on a stalled read looks exactly like a park that
+        is genuinely wedged from the outside; this is the field that separates
+        them, and it costs one float in a record that is rewritten every 2 s.
+        """
+        return {
+            "lease_read_pending_ms": round(self.pending_ms, 1),
+            "lease_read_last_ms": round(self._last_ms, 1),
+        }
+
+
 def main(argv) -> int:
     global GAZE_MIN_S, GAZE_MAX_S, PROX_THRESH
     parser = argparse.ArgumentParser(description="PiCar-X idle alive daemon")
@@ -1117,17 +1199,16 @@ def main(argv) -> int:
         return GpioLeaseStore(STATE_DIR).current()
 
     try:
-        lease = _foreign_lease()
-        if lease is not None:
-            log("GPIO lease active (%s PID %d) — parking in lease_wait" % (
-                lease["owner_kind"], lease["owner_pid"]))
-            # Parked is pre-READY: `systemctl status` would otherwise show a
-            # bare `activating` with no reason. The park is bounded by lease
-            # expiry, and each heartbeat below extends TimeoutStartSec.
-            _sd_notify("STATUS=parked: GPIO lease held by %s PID %d" % (
-                lease["owner_kind"], lease["owner_pid"]))
-        parked = lease is not None
-        while lease is not None:
+        # The *first* read can be the one that stalls, so the park loop beats
+        # from the start and consumes the answer whenever it lands (#287).
+        read = _PendingLeaseRead(_foreign_lease)
+        read.start()
+        parked = False
+        while True:
+            # Beat first, always: the extension is the deadline, and it must not
+            # depend on a filesystem read completing.
+            write_alive_heartbeat("lease_wait" if parked else "starting",
+                                  extra=read.heartbeat_fields())
             # A yield arriving while parked is already satisfied — we hold no
             # handle. Consume it, so it cannot leak into idle_loop and make a
             # freshly-resumed daemon exit on its first iteration.
@@ -1135,9 +1216,24 @@ def main(argv) -> int:
             if _yield_requested:
                 log("SIGUSR1 while parked — no GPIO held, nothing to yield")
                 _yield_requested = False
-            write_alive_heartbeat("lease_wait")
+            if read.done:
+                lease, exc = read.result()
+                if exc is not None:
+                    raise exc
+                if lease is None:
+                    break
+                if not parked:
+                    parked = True
+                    log("GPIO lease active (%s PID %d) — parking in lease_wait" % (
+                        lease["owner_kind"], lease["owner_pid"]))
+                    # Parked is pre-READY: `systemctl status` would otherwise show
+                    # a bare `activating` with no reason. The park is bounded by
+                    # lease expiry, and each heartbeat above extends
+                    # TimeoutStartSec.
+                    _sd_notify("STATUS=parked: GPIO lease held by %s PID %d" % (
+                        lease["owner_kind"], lease["owner_pid"]))
+                read.start()  # poll again, off-thread
             time.sleep(LEASE_RECHECK_S)
-            lease = _foreign_lease()
         if parked:
             log("GPIO lease cleared — resuming")
     except (ImportError, OSError, ValueError) as exc:

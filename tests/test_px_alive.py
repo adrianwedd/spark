@@ -944,3 +944,133 @@ def test_telemetry_absent_when_systemd_sets_no_deadline(tmp_path):
     rec = json.loads((tmp_path / "runtime" / "alive_heartbeat.json").read_text())
     assert "watchdog_margin_min_ms" not in rec
     assert rec["heartbeat_gap_max_ms"] == 9000.0  # gaps still observed
+
+
+# --- #287: a stalled lease read must not stop the park's beats -------------
+#
+# The park loop's product is liveness: a heartbeat plus an EXTEND_TIMEOUT_USEC
+# every LEASE_RECHECK_S. Reading state/gpio_lease.json is SD-card IO on the same
+# card #247 measures stalling for tens of seconds, so when that read was on the
+# loop's own thread the beats stopped exactly when the filesystem stalled — and
+# systemd killed a park that was never hung (26 start-timeout events since
+# 2026-08-26, NRestarts=39).
+
+
+def test_lease_read_runs_off_the_loop_thread():
+    import threading
+
+    ns = load_alive_module({})
+    gate = threading.Event()
+    calls = []
+
+    def reader():
+        calls.append(1)
+        gate.wait(5.0)
+        time.sleep(0.25)  # so the completed-read duration is measurable
+        return {"owner_kind": "voice", "owner_pid": 4321}
+
+    read = ns["_PendingLeaseRead"](reader)
+    read.start()
+
+    deadline = time.monotonic() + 3
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert calls, "the reader should have been called"
+    assert not read.done, "the read is deliberately still blocked"
+    # This is what the park publishes while waiting.
+    fields = read.heartbeat_fields()
+    assert fields["lease_read_pending_ms"] > 0
+    assert fields["lease_read_last_ms"] == 0.0
+
+    gate.set()
+    deadline = time.monotonic() + 5
+    while not read.done and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert read.done
+    value, error = read.result()
+    assert error is None
+    assert value == {"owner_kind": "voice", "owner_pid": 4321}
+    assert read.heartbeat_fields()["lease_read_last_ms"] >= 200.0
+
+
+def test_a_failing_lease_read_is_surfaced_not_swallowed():
+    """The park's existing failure path must still see an OSError/ImportError."""
+    ns = load_alive_module({})
+
+    def boom():
+        raise OSError("card went away")
+
+    read = ns["_PendingLeaseRead"](boom)
+    read.start()
+    deadline = time.monotonic() + 5
+    while not read.done and time.monotonic() < deadline:
+        time.sleep(0.01)
+    value, error = read.result()
+    assert value is None
+    assert isinstance(error, OSError)
+
+
+def test_park_keeps_beating_while_the_lease_read_is_stalled(isolated_project, tmp_path):
+    """The production case: the lease file cannot be read for tens of seconds.
+
+    A FIFO stands in for the stalled card: `read_text()` on it blocks until a
+    writer appears, which is what an SD-card read does under the stalls #247
+    measures. The daemon must keep writing heartbeats (each of which extends
+    TimeoutStartSec) instead of going quiet until systemd kills it.
+    """
+    runtime_dir = tmp_path / "runtime"
+    env = _alive_env(isolated_project, heartbeat_dir=runtime_dir)
+    state_dir = isolated_project["state_dir"]
+    lease_path = state_dir / "gpio_lease.json"
+    os.mkfifo(lease_path)
+
+    proc = subprocess.Popen(
+        [str(PROJECT_ROOT / "bin" / "px-alive"), "--dry-run"],
+        cwd=PROJECT_ROOT, text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        beat = runtime_dir / "alive_heartbeat.json"
+        seen: set = set()
+        deadline = time.monotonic() + 45
+        while len(seen) < 3 and time.monotonic() < deadline:
+            assert proc.poll() is None, "daemon died while the lease read was stalled"
+            record = _read_beat(beat)
+            ts = record.get("ts")
+            if isinstance(ts, (int, float)):
+                seen.add(ts)
+            time.sleep(0.05)
+
+        assert len(seen) >= 3, (
+            "the park must keep beating while the lease read is stalled — that is "
+            "what keeps TimeoutStartSec from expiring"
+        )
+        record = _read_beat(beat)
+        assert record.get("lease_read_pending_ms", 0) > 0, (
+            "the record must name the wait, not just look wedged"
+        )
+
+        # Let the read finish with an *expired* lease, which is how the daemon
+        # learns the foreign owner is gone. (An invalid record is deliberately
+        # fail-closed — `_read()` raises and the daemon refuses to start, which
+        # is correct and is why this writes a well-formed one.)
+        expired = {
+            "active": True,
+            "lease_id": "f" * 32,
+            "owner_kind": "voice",
+            "owner_pid": 1,
+            "acquired_at": time.time() - 60.0,
+            # Positive but in the past: `_read()` rejects a non-positive
+            # `expires_at` outright ("invalid GPIO lease values"), so an
+            # expired-but-well-formed record is what tells the park the foreign
+            # owner is gone.
+            "expires_at": time.time() - 5.0,
+        }
+        with open(lease_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(expired))
+        proc.wait(timeout=30)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
