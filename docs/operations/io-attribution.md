@@ -35,6 +35,13 @@ journal work or journald, process-level weighting may buy little, and if it is
 the daemon heartbeat write path the fix is a design change in `bin/px-alive`,
 not weighting at all.
 
+**Update 2026-09-17 20:05 — it may not be a writer at all.** The residual caught
+live is a *wedge*: io PSI `full` 58 % with `mmcblk0` at 0/0 `inflight`, 2-7 %
+busy, and a durable 169-byte write completing in 7-52 ms *during* the stall. See
+[the 19:35-20:05 section](#2026-09-17-1935-2005--the-residual-stall-is-not-storage-work-device-idle-while-everything-waited).
+Read that before running another writer hunt; `device_inflight_pre` is the field
+that distinguishes the two shapes.
+
 ## What it does, and what it deliberately does not
 
 A **trigger-on-demand** observer, not a poller:
@@ -162,6 +169,69 @@ Calibration from the same window: px-alive's normal heartbeat gap max sits at
 trigger alone (`heartbeat age 0.04s`). Idle io PSI is under 5 %, with bursts past
 40 %; one catch in the first ten minutes is about the expected rate.
 
+## 2026-09-17 19:35-20:05 — the residual stall is not storage *work* (device idle while everything waited)
+
+Measured live on `picar` with a bounded ad-hoc sampler (1 s cadence; no unit, no
+root), chasing the residual that #247/#283/#287 share.
+
+**The deepest stall caught: io PSI `some` 64.3 %, `full` 58.4 % — and the SD card
+idle.**
+
+```
+t= 90.9  some=30.5 full=27.1 inflight=0/2  rd=0 wr=6 72KB  busy=8ms   FSYNC DURING STALL: 8855 33 16 ms
+t= 90.9  some=62.2 full=55.9 inflight=0/0  rd=0 wr=89 760KB busy=9000ms FSYNC DURING STALL: 8 11 8 ms
+t= 92.0  some=64.3 full=58.4 inflight=0/0  rd=0 wr=9  144KB busy=24ms  FSYNC DURING STALL: 11 7 11 ms
+t= 96.1  some=43.3 full=39.3 inflight=0/0  rd=0 wr=12 168KB busy=68ms  FSYNC DURING STALL: 33 12 10 ms
+t=101.1  some=29.2 full=26.4 inflight=0/0  rd=0 wr=13 228KB busy=36ms  FSYNC DURING STALL: 12 8 50 ms
+```
+
+- `full` tracks `some` within a few points: **when it stalls, it stalls
+  everything** — not one slow daemon.
+- `inflight` is **0/0** and the device is **2-7 % busy** for the whole episode,
+  doing 144-228 KB/s of writes: it has essentially nothing to do.
+- A 169-byte `mkstemp`+`fsync`+`os.replace` *during* the stall completed in
+  **7-52 ms**. The 8.8 s fsync in the first line was the tail of the wedge
+  *before* sampling began.
+
+Independent calibration that the storage path itself is healthy when not wedged:
+
+```
+169B fsync+replace x15 (idle): min 5.5 p50 7.1 p90 13.0 max 24.8 ms
+512KiB sequential fsync write: 0.89 s -> ~575 KB/s
+120 s continuous sampling: mmcblk0 read 0 bytes in every sample; every readable
+  process read ~0 and wrote ~180 KB total; io PSI some still reached 38 %
+```
+
+**What this changes.** The residual is not a *writer* problem and not a
+*throughput* problem: it is an episodic **wedge** in which tasks block in
+`io_schedule` for ~10 s while the SD card has nothing in flight and nothing to
+do. Two consequences:
+
+1. `IOWeight`/`IOSchedulingClass=` cannot fix it — there is no competing writer
+   to deprioritise. That lever is now closed, not merely deferred.
+2. The observer's empty writer lists were **correct**: the 2026-08-20 "no
+   offender among SPARK's daemons" sample was right about the daemons and wrong
+   only about the device. `device_inflight_pre` is recorded now so the next
+   record says so directly instead of inviting another writer hunt.
+
+**Where it points instead.** Candidates, in the order the evidence favours:
+the `mmc` host/block path blocking *before* dispatch (`blk_mq_get_tag` waits set
+`in_iowait` and are counted by io PSI while `inflight` stays 0), the SDIO WiFi
+(`mmc1`, same `mmc` subsystem, no `/sys/block` entry, `brcmf_wq/mmc1:0001:1` was
+in D state in two earlier records), and power. On power, the same boot reports
+
+```
+$ vcgencmd get_throttled
+throttled=0x50000          # bit 16 (under-voltage has occurred), bit 18 (throttled)
+$ journalctl -b -k | grep -i undervoltage
+hwmon hwmon1: Undervoltage detected!    # 16:55:55 and 17:30:12
+```
+
+and the previous boot ended with
+`user-1000.journal corrupted or uncleanly shut down`. An under-volting Pi is a
+live explanation for a host controller that stops completing requests without
+logging an error, and it is testable from the privileged side.
+
 ## Reading a record
 
 ```bash
@@ -184,6 +254,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
 | `d_state_count` / `blocked_thread_count` | stalled processes, and how many of the blocked tasks are non-leader threads |
 | `devices` | per-device deltas: `ms_writing` (time with writes in flight) and `ms_io` (queue time) separate "busy device" from "many small writes" |
+| `device_inflight_pre` / `device_inflight_post` | `/sys/block/<dev>/inflight` at each end of the window — requests *currently* dispatched. Zero is reported, not dropped: `0/0` during a stall is the finding, not a missing sample. `pre` is inside the stall (the caller triggered because PSI is high now), `post` shows recovery |
 | `vmstat` / `vmstat_end` | swap-in/out and direct-reclaim deltas; `nr_dirty`/`nr_writeback` gauges |
 | `psi_pre` / `psi_post` | `psi_io_some_avg10_*`, `psi_io_full_avg10_*`, memory PSI, `load1`, `swap_free_kb` on both ends |
 | `observer_write_bytes` | the observer's own disk writes during the window — if it ever tops the list, the observer is the defect |
@@ -202,6 +273,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `file_growth_groups.journal` is most of the bytes | journald is writing through the stall | journal-side tuning (`SyncIntervalSec`, rates, storage), not process weighting |
 | `file_growth` empty while `mmcblk0.ms_writing` is high | the bytes went somewhere outside the watchlist (root-owned state, another tree, or kernel writeback) | widen `--growth-pattern`, or install as root |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
+| **`device_inflight_pre` is `0/0` while `d_state_count` is high and `devices` shows queue time** | **nothing was in flight: the queue is wedged, not busy — there is no writer in this record to find, and a longer search for one is the wrong search** | take the question to the *waiters*: `stalled[].wchan` and (as root) the kernel threads, and to the other bus users — `mmc1`'s SDIO WiFi shares the `mmc` subsystem and cannot be seen from `/sys/block` |
 
 ## Deliberately not done
 
@@ -210,8 +282,10 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
   the unit is a permanent false alarm — the same shape as the retired-service
   residue CLAUDE.md documents. Silence from this observer is visible in
   `logs/tool-io-attrib.log` and in the absence of the unit, not on the board.
-- **No `IOSchedulingClass`/`IOWeight` change on the suspect services yet.** That
-  decision waits on a named writer (this instrument is what names it).
+- **No `IOSchedulingClass`/`IOWeight` change on the suspect services.** That
+  lever is now *closed* rather than deferred: the 2026-09-17 wedge shows the
+  stall happens with the device idle and no competing writer, so there is
+  nothing to deprioritise.
 - **No `task_delayacct`.** `/proc/sys/kernel/task_delayacct=1` would make
   per-task block-IO wait time world-readable (it is currently 0 on this host),
   which would give a second unprivileged stall channel. Reversible one-liner,

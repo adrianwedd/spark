@@ -35,6 +35,7 @@ def _write_proc_tree(
     diskstats: str = "",
     vmstat: str = "",
     uptime: str = "12345.67 9000.00\n",
+    inflight: dict[str, tuple[int, int]] | None = None,
 ):
     proc = tmp_path / "proc"
     proc.mkdir()
@@ -71,12 +72,18 @@ def _write_proc_tree(
     (tmp_path / "vmstat").write_text(vmstat)
     (tmp_path / "uptime").write_text(uptime)
     (tmp_path / "pressure_io").write_text(PRESSURE)
+    sys_block = tmp_path / "sys_block"
+    sys_block.mkdir()
+    for name, (reads, writes) in (inflight or {}).items():
+        (sys_block / name).mkdir()
+        (sys_block / name / "inflight").write_text(f"{reads} {writes}\n")
     return io_attrib.Paths(
         proc=proc,
         pressure_io=tmp_path / "pressure_io",
         diskstats=tmp_path / "diskstats",
         vmstat=tmp_path / "vmstat",
         uptime=tmp_path / "uptime",
+        sys_block=sys_block,
     )
 
 
@@ -937,6 +944,58 @@ def test_pid_file_helpers_never_raise(tmp_path):
 
 # --- the CLI, not just the module (the gap that let a crash ship) ---------
 #
+# --- the inflight channel (#247) ------------------------------------------
+#
+# Every other channel in this module is a delta across the window, and a delta
+# cannot express "nothing was in flight while every task waited". Measured on
+# `picar` 2026-09-17: a 64 % some / 58 % full io-PSI stall with mmcblk0 at 0/0
+# inflight, ~2 % busy, and a 169-byte fsync+replace completing in 7-52 ms.
+# Without this field a record of that stall looks like a record of a busy
+# device, which is the reading that sent the writer hunt to the wrong place.
+
+
+def test_sample_inflight_reports_a_zeroed_device_rather_than_dropping_it(tmp_path):
+    paths = _write_proc_tree(
+        tmp_path, {}, inflight={"mmcblk0": (0, 0), "zram0": (1, 3)}
+    )
+    assert io_attrib.sample_inflight(paths) == {
+        "mmcblk0": {"reads": 0, "writes": 0},
+        "zram0": {"reads": 1, "writes": 3},
+    }
+
+
+def test_sample_inflight_skips_virtual_devices_and_survives_a_missing_tree(tmp_path):
+    paths = _write_proc_tree(
+        tmp_path, {}, inflight={"ram0": (9, 9), "loop3": (4, 4), "mmcblk0": (0, 2)}
+    )
+    assert io_attrib.sample_inflight(paths) == {"mmcblk0": {"reads": 0, "writes": 2}}
+    # /sys/block absent (container, macOS dev box): empty, not an exception.
+    assert io_attrib.sample_inflight(io_attrib.Paths(sys_block=tmp_path / "nope")) == {}
+
+
+def test_capture_records_inflight_at_both_ends(tmp_path, monkeypatch):
+    procs = _stall_procs()
+    paths = _wire_capture(tmp_path, monkeypatch, procs, _stall_post(procs))
+    seen = iter(
+        [
+            {"mmcblk0": {"reads": 0, "writes": 0}},   # inside the stall
+            {"mmcblk0": {"reads": 0, "writes": 2}},   # recovering
+        ]
+    )
+    monkeypatch.setattr(
+        io_attrib, "sample_inflight", lambda _paths=None: next(seen, {})
+    )
+    record = io_attrib.capture(
+        {"reason": "io_psi", "io_some_avg10": 96.4},
+        paths=paths,
+        window_s=3.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["device_inflight_pre"] == {"mmcblk0": {"reads": 0, "writes": 0}}
+    assert record["device_inflight_post"] == {"mmcblk0": {"reads": 0, "writes": 2}}
+
+
 # The unit tests exercise io_attrib's functions; they cannot see the argv
 # plumbing or the order of statements in main(). The first version of the pid
 # file wrote it *after* the startup line that reports it, so the observer died

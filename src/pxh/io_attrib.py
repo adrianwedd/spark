@@ -127,6 +127,10 @@ class Paths:
     diskstats: Path = Path("/proc/diskstats")
     vmstat: Path = Path("/proc/vmstat")
     uptime: Path = Path("/proc/uptime")
+    #: Per-device ``inflight`` gauges. A directory rather than a file because
+    #: the interesting question is per device, and because the answer "0/0"
+    #: has to be reportable — see ``sample_inflight``.
+    sys_block: Path = Path("/sys/block")
 
 
 DEFAULT_PATHS = Paths()
@@ -638,6 +642,40 @@ def rank_stalled(
     return rows[:top], stalled_processes, blocked_thread_count, max_delay
 
 
+def sample_inflight(paths: Paths = DEFAULT_PATHS) -> dict[str, dict[str, int]]:
+    """``{device: {"reads": n, "writes": n}}`` from ``/sys/block/*/inflight``.
+
+    The one gauge the delta channels cannot supply. ``ms_writing`` and
+    ``ms_io`` say how much time the queue *was* occupied; they cannot say
+    whether anything is occupied *now*, and the difference between "the device
+    is saturated" and "nothing is in flight yet every task is waiting on IO"
+    decides which investigation is worth running. Measured on `picar`
+    2026-09-17: a 64 % ``some`` / 58 % ``full`` io-PSI stall with this device
+    at 0/0 inflight and ~2 % busy, i.e. the SD card was idle while the whole
+    task set was blocked — see docs/operations/io-attribution.md.
+
+    Never raises, and never omits a device for reading zero: 0/0 is the
+    finding, not a missing sample.
+    """
+    out: dict[str, dict[str, int]] = {}
+    try:
+        candidates = sorted(paths.sys_block.glob("*/inflight"))
+    except (OSError, ValueError):
+        return out
+    for path in candidates[:_MAX_DEVICES * 4]:
+        name = path.parent.name
+        if name.startswith(_IGNORED_DEVICE_PREFIXES):
+            continue
+        try:
+            fields = path.read_text().split()
+            out[name] = {"reads": int(fields[0]), "writes": int(fields[1])}
+        except (OSError, ValueError, IndexError):
+            continue
+        if len(out) >= _MAX_DEVICES:
+            break
+    return out
+
+
 def _device_deltas(
     pre: Mapping[str, Mapping[str, int]],
     post: Mapping[str, Mapping[str, int]],
@@ -749,6 +787,7 @@ def capture(
             uptime_s = round(float(uptime_text.split()[0]), 1)
         except (ValueError, IndexError):
             uptime_s = None
+    inflight_pre = sample_inflight(paths)
     procs_pre = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
     files_pre = sample_file_sizes(growth_patterns) if growth_patterns else {}
     observer_pre = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
@@ -759,6 +798,7 @@ def capture(
     files_post = sample_file_sizes(growth_patterns) if growth_patterns else {}
     disk_post = parse_diskstats(_read_text(paths.diskstats) or "")
     vmstat_post = parse_vmstat(_read_text(paths.vmstat) or "")
+    inflight_post = sample_inflight(paths)
     observer_post = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
     psi_post = host_load_fields("post")
 
@@ -807,6 +847,14 @@ def capture(
         "psi_pre": psi_pre,
         "psi_post": psi_post,
         "devices": _device_deltas(disk_pre, disk_post),
+        # Pre is the one that matters: the caller triggered *because* PSI was
+        # high, so the walk at t0 is inside the stall. Post shows recovery.
+        # A record whose device shows 0/0 here while `devices` shows a queue
+        # that was busy, and `stalled` shows the whole task set blocked, is a
+        # record of a wedged queue — not of a busy one — and no writer exists
+        # in it to find.
+        "device_inflight_pre": inflight_pre,
+        "device_inflight_post": inflight_post,
         "vmstat": {
             key: _delta(vmstat_pre, vmstat_post, key) for key in VMSTAT_COUNTERS
         },
