@@ -27,6 +27,30 @@ card 4: Device [USB PnP Sound Device], device 0: USB Audio [USB Audio]
 """
 
 
+class _LockProbingStream(ArecordStream):
+    """Records whether the window max is written while the drain lock is held.
+
+    Structural, not a race: a test that tried to *trigger* the interleaving
+    would be a flaky test of the scheduler. This asks the question directly —
+    `_cond._is_owned()` is true only when the writing thread itself holds the
+    lock `take_gap_window_ms()` drains under.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.lock_held_on_write: list[bool] = []
+        super().__init__(*args, **kwargs)
+
+    @property
+    def reader_gap_window_max_ms(self) -> float:
+        return self._gap_window_max
+
+    @reader_gap_window_max_ms.setter
+    def reader_gap_window_max_ms(self, value: float) -> None:
+        cond = getattr(self, "_cond", None)
+        self.lock_held_on_write.append(bool(cond is not None and cond._is_owned()))
+        self._gap_window_max = value
+
+
 def _pcm_command(num_chunks: int, chunk_bytes: int, delay_s: float = 0.0):
     """A subprocess emitting `num_chunks` chunks of a known ramp, then EOF."""
     src = (
@@ -456,6 +480,36 @@ def test_drop_logging_does_not_hold_the_stream_lock():
         )
     finally:
         stream.close()
+
+def test_the_gap_window_is_written_under_the_lock_it_is_drained_with():
+    """A read-then-zero drain plus a lock-free update loses the worst gap.
+
+    `take_gap_window_ms()` reads the max and zeroes it while the reader thread
+    raises it. Made mutual, a gap belongs to exactly one window. Made racy, the
+    compare-and-set can be clobbered by the reset: the window that held the
+    worst gap reports 0 and the *next* window reports it — a misattribution in
+    the metric #283's acceptance rests on, and one that would make an overrun
+    look like it happened in a quiet window (#283).
+    """
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    stream = _LockProbingStream(
+        chunk_frames=chunk_frames,
+        command=_pcm_command(6, chunk_bytes, delay_s=0.05),
+    )
+    stream.lock_held_on_write.clear()  # drop the assignments from __init__
+    try:
+        with stream.capturing():
+            for _ in range(6):
+                stream.read(chunk_frames, exception_on_overflow=False)
+    finally:
+        stream.close()
+    assert stream.lock_held_on_write, "the reader should have recorded a gap"
+    assert all(stream.lock_held_on_write), (
+        "the window max was written without holding _cond, so a concurrent "
+        "take_gap_window_ms() reset can drop that gap into the next window"
+    )
+
 
 def test_take_gap_window_reports_the_worst_gap_and_resets():
     """The overrun report only exists when something overruns; this is the same
