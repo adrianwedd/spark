@@ -83,12 +83,22 @@ def test_guard_keeps_legitimate_owner_live_then_releases(tmp_path):
     proving at least one refresh succeeded.  A generous timeout bounds the
     wait so a broken refresh thread still fails the test deterministically.
     """
+    # ttl_s must leave room for the *scheduler*, not just for the refresh
+    # thread's own work. At 80 ms a loaded runner could starve the thread past
+    # the TTL, the lease expired, and `store.current()` returned None — the
+    # test then failed on a TypeError about a None lease, which reads as a
+    # defect in the guard rather than in the test's timing budget (#323).
+    # What proves the thread works is expires_at *advancing*; the TTL only has
+    # to be wide enough that the observation is about the guard and not about
+    # the runner's load.
     store = GpioLeaseStore(tmp_path, pid_alive=lambda _pid: True)
-    guard = GpioLeaseGuard(store, "voice", ttl_s=0.08, refresh_s=0.02, pid=1060)
+    guard = GpioLeaseGuard(store, "voice", ttl_s=2.0, refresh_s=0.05, pid=1060)
 
     assert guard.acquire() is True
-    lease_id = store.current()["lease_id"]
-    initial_expires = store.current()["expires_at"]
+    current = store.current()
+    assert current is not None, "the lease vanished immediately after acquire()"
+    lease_id = current["lease_id"]
+    initial_expires = current["expires_at"]
 
     # Wait for the refresh thread to extend expires_at — deterministic
     # synchronization instead of a fixed sleep that races the scheduler.
@@ -101,9 +111,11 @@ def test_guard_keeps_legitimate_owner_live_then_releases(tmp_path):
     else:
         pytest.fail("refresh thread did not extend expires_at within 5s")
 
-    assert store.current() is not None
+    assert guard.owns_gpio, "the guard lost its lease while it was alive"
     assert store.release("wrong-token") is False
-    assert store.current()["lease_id"] == lease_id
+    current = store.current()
+    assert current is not None, "the lease was lost after an unrelated release attempt"
+    assert current["lease_id"] == lease_id
     assert guard.release() is True
     assert store.current() is None
 
@@ -170,7 +182,11 @@ def test_guard_notifies_owner_when_refresh_is_lost(tmp_path):
     assert guard.acquire() is True
     store.refresh = lambda *_args, **_kwargs: False
 
-    assert guard.lost.wait(0.2) is True
+    # Bounded generously rather than tightly (#323): the wait has to outlast
+    # the refresh thread being *scheduled*, not just its 0.02s interval, and a
+    # 0.2s bound is ten intervals — enough on an idle machine, not enough on a
+    # loaded runner. A thread that never runs still fails here, deterministically.
+    assert guard.lost.wait(5.0) is True
     assert notified == ["lost"]
     assert guard.owns_gpio is False
 

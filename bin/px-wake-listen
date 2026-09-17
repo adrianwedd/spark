@@ -85,6 +85,25 @@ _LOG_WRITER = StallProofLineWriter(LOG_FILE, echo=lambda line: print(line, flush
 # detection does not leave the gate ajar.
 WAKE_GRANT_TTL_S = 180.0
 
+
+def _refresh_wake_grant(grant_id: str | None) -> None:
+    """Extend the window for one turn of the conversation that owns it.
+
+    `wake_grant.refresh_grant` returns the *policy* verdict — False is a
+    decision (wrong conversation, expired window, past the ceiling). A write
+    that did not land raises instead, because that is a different event with a
+    different consequence: the window closes under a conversation that is still
+    talking (#323). Nothing here may propagate — a listener that dies to a full
+    disk stops hearing the wake word entirely, which is worse than a window
+    closing early — so the failure is logged and the turn proceeds.
+    """
+    if not grant_id:
+        return
+    try:
+        wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
+    except wake_grant.GrantWriteFailed as exc:
+        log(f"wake grant: could not extend the window: {exc}")
+
 # Audio constants
 MIC_RATE    = 44100  # hardware recording rate (USB mic supports 44100/48000 only)
 VOSK_RATE   = 16000  # Vosk model input rate
@@ -1088,8 +1107,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             log(f"persona {persona_name} turn {turn}/{max_turns}: {current_text!r}")
 
             env["PX_TEXT"] = current_text
-            if grant_id:
-                wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
+            _refresh_wake_grant(grant_id)
             result = subprocess.run(
                 [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
             )
@@ -1123,8 +1141,7 @@ def run_persona_conversation(persona_name: str, initial_text: str, dry: bool,
             if _END_PHRASE_RE.search(follow_text.lower()):
                 log("persona conversation: end phrase — final turn")
                 env["PX_TEXT"] = follow_text
-                if grant_id:
-                    wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
+                _refresh_wake_grant(grant_id)
                 subprocess.run(
                     [cfg["chat_tool"]], capture_output=True, text=True, check=False, env=env,
                 )
@@ -1162,8 +1179,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
     try:
         for turn in range(1, max_turns + 1):
             log(f"conversation turn {turn}/{max_turns}: {current_text!r}")
-            if grant_id:
-                wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
+            _refresh_wake_grant(grant_id)
             result = subprocess.run(
                 [voice_cmd, "--max-turns", "3"],
                 input=current_text,
@@ -1207,8 +1223,7 @@ def run_conversation(initial_text: str, voice_cmd: str, dry: bool,
             # Check for end-of-conversation phrases
             if _END_PHRASE_RE.search(follow_text.lower()):
                 log("conversation: end phrase — one final turn")
-                if grant_id:
-                    wake_grant.refresh_grant(grant_id, ttl_s=WAKE_GRANT_TTL_S)
+                _refresh_wake_grant(grant_id)
                 subprocess.run(
                     [voice_cmd, "--max-turns", "3"],
                     input=follow_text,
