@@ -118,7 +118,7 @@ systemd-run --unit=px-research-<uuid> --collect \
    --property=EnvironmentFile=/etc/px-research/tier.env \
    --property=DynamicUser=yes --property=User=spark-research \
    --property=RuntimeDirectory=px-research \
-   --property=PX_STATE_DIR=/run/px-research/state \
+   --property=Environment=PX_STATE_DIR=/run/px-research/state \
    --property=ProtectSystem=strict --property=ProtectHome=yes \
    --property=PrivateDevices=yes --property=PrivateTmp=yes \
    --property=NoNewPrivileges=yes --property=RestrictSUIDSGID=yes \
