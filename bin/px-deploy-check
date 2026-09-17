@@ -71,6 +71,25 @@ def unit_state(name):
     return UnitState(name=name, entry=match.group(1) if match else None, started_ts=started_ts)
 
 
+def report_unit_drift(root: str) -> None:
+    """Print the installed-vs-repo unit file drift, if any.
+
+    The other half of "the deployed revision is what runs": the unit files the
+    host reads are installed by hand, so a merged unit change is invisible until
+    someone installs it. Reported rather than failed -- fixing it needs root, and
+    blocking a deploy on a root-only action would teach people to ignore the gate.
+    """
+    drift = [d for name in repo_unit_names(root) for d in unit_file_drift(name, root=root)]
+    if not drift:
+        return
+    print()
+    print("{} installed unit file(s) differ from the repo (no restart fixes this):".format(len(drift)))
+    for item in drift:
+        print("  {:<13} {:50s} {}".format(item.reason, item.installed_path, item.repo_path))
+    print("install them, then daemon-reload - the next restart picks them up:")
+    print("  sudo install -m 0644 systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.environ.get("PROJECT_ROOT", os.getcwd()))
@@ -94,6 +113,11 @@ def main():
     if not moved:
         print("px-deploy-check: nothing under {} changed in {}..{}".format(
             "/".join(CODE_DIRS), args.prev, args.head))
+        # The unit-file report is about the *host*, not about the diff, so it
+        # prints here too: the first version returned before reaching it, and a
+        # docs-only deploy therefore reported no drift while five units were
+        # months stale (#390).
+        report_unit_drift(root)
         return 0
 
     try:
@@ -122,14 +146,6 @@ def main():
         mark = "RESTART" if verdict.needs_restart else "ok     "
         print("  {}  {:24s} {}".format(mark, verdict.name, verdict.reason))
 
-    # The other half of "the deployed revision is what runs": the *unit files*
-    # the host reads. They are installed by hand (`sudo install …`), so a merged
-    # unit change is invisible until someone does that, and nothing on the host
-    # noticed six of them being months behind (#336, 2026-09-18). Reported, not
-    # failed: fixing it needs root, and blocking a deploy on a root-only action
-    # would teach people to ignore this gate.
-    drift = [d for name in repo_unit_names(root) for d in unit_file_drift(name, root=root)]
-
     if not stale:
         print("every long-lived unit is executing the deployed revision")
     else:
@@ -137,14 +153,7 @@ def main():
         print("restart these before calling the deploy complete:")
         print("  sudo systemctl restart " + " ".join(v.name.replace(".service", "") for v in stale))
 
-    if drift:
-        print()
-        print("{} installed unit file(s) differ from the repo (no restart fixes this):".format(len(drift)))
-        for item in drift:
-            print("  {:<12} {:44s} {}".format(item.reason, item.installed_path, item.repo_path))
-        print("install them, then daemon-reload — the next restart picks them up:" )
-        print("  sudo install -m 0644 systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload")
-
+    report_unit_drift(root)
     return 1 if stale else 0
 
 
