@@ -688,6 +688,87 @@ def _change_hits(
     return hits
 
 
+@dataclass(frozen=True)
+class CarriedStaleness:
+    """A long-lived unit older than the files it executes — whatever deploy did it (#421).
+
+    A different question from `Verdict`, and the difference is the point.
+    `restart_list` answers "must *this* deploy restart it", which is what a
+    deploy step needs and is computed from `HEAD@{1}..HEAD`. This answers "is
+    this host running what its checkout says", which is what a human reading
+    the gate's summary line believes they are being told. A restart that could
+    not be performed — no `sudo -n` grant for that unit, an interrupted deploy —
+    is invisible to the delta check forever after, because nothing anywhere
+    remembers that it was owed.
+
+    Deliberately not folded into `restart_list`: same inputs, different
+    question, and a summary that mixes them makes a to-do list for the future
+    out of a report about the past.
+    """
+
+    name: str
+    started_ts: float
+    newest: float
+    paths: tuple[str, ...]
+
+
+def carried_staleness(
+    units: Iterable[UnitState],
+    root: str = ".",
+    deploy_ts: float | None = None,
+) -> list[CarriedStaleness]:
+    """Units whose executed files are newer on disk than the process running them.
+
+    Works entirely from what the host already has — the unit's start time from
+    systemd, the file's mtime from the checkout — because a fast-forward writes
+    exactly the files it changed. No git history walk, and no state kept
+    between runs.
+
+    Two deliberate omissions:
+
+    * A unit systemd will not report a start time for is **not** flagged here.
+      `restart_list` already flags those ("start time unknown"), and a second
+      warning built on an absent number would be a guess dressed as a finding.
+    * A unit that runs nothing under this repo is skipped, for the same reason.
+      "Under this repo" is checked on the entry's real path: an out-of-checkout
+      entry has no meaningful mtime to compare against, and `_changed_at` would
+      hand back its conservative infinity for a file that does not exist —
+      flagging a unit on the strength of a comparison it never made.
+
+    Known false positive, stated rather than discovered later: a file whose
+    mtime moved without its content changing (a no-op `git checkout` of an
+    identical blob) flags its unit. A restart on that costs seconds; the exact
+    alternative is a content hash per executed path per run. The conservative
+    rule is the cheap one here.
+    """
+    out: list[CarriedStaleness] = []
+    root_abs = os.path.abspath(root)
+    for unit in units:
+        if not unit.entry or unit.started_ts is None:
+            continue
+        if not os.path.abspath(unit.entry).startswith(root_abs + os.sep):
+            continue
+        executed = executed_paths(unit.entry, root)
+        if not executed:
+            continue
+        newer = [
+            (path, _changed_at(path, root, deploy_ts))
+            for path in sorted(executed)
+            if _changed_at(path, root, deploy_ts) > unit.started_ts
+        ]
+        if not newer:
+            continue
+        out.append(
+            CarriedStaleness(
+                name=unit.name,
+                started_ts=unit.started_ts,
+                newest=max(ts for _p, ts in newer),
+                paths=tuple(path for path, _ts in newer),
+            )
+        )
+    return out
+
+
 def restart_list(
     moved: Sequence[str],
     units: Iterable[UnitState],
@@ -745,6 +826,7 @@ def action_summary(
     changed_files: int,
     restart_units: Sequence[str],
     drift: Sequence["UnitFileDrift"],
+    carried: Sequence[CarriedStaleness] = (),
 ) -> str:
     """The gate's first line: what needs doing, not what was checked.
 
@@ -754,14 +836,20 @@ def action_summary(
     **0** — so a reader who skimmed the reassurance, or a caller that trusted the
     exit code, saw a clean deploy. The counts belong above the reassurance, not
     below it.
+
+    `carried` is the same lesson one layer out (#421): staleness left by an
+    *earlier* deploy is invisible in `changed_files`/`restart_units` by
+    construction, so a host carrying two units on old code printed a summary
+    that read like a clean one.
     """
     missing = sum(1 for item in drift if item.reason == "not installed")
     drift_part = "unit files to install: {}".format(len(drift))
     if missing:
         drift_part += " ({} missing)".format(missing)
-    return "px-deploy-check: {} | units to restart: {} | {}".format(
+    return "px-deploy-check: {} | units to restart: {} | carried staleness: {} | {}".format(
         "changed files: {}".format(changed_files),
         len(restart_units),
+        len(carried),
         drift_part,
     )
 
