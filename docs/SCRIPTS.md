@@ -13,6 +13,8 @@ Comprehensive documentation for every script in `bin/` and every module in `src/
    - [bin/px-diagnostics](#binpx-diagnostics)
    - [bin/px-health-report](#binpx-health-report)
    - [bin/px-status](#binpx-status)
+   - [bin/px-io-attrib](#binpx-io-attrib)
+   - [bin/px-io-attrib-ensure](#binpx-io-attrib-ensure)
 3. [Motion — Direct Actuators](#motion--direct-actuators)
    - [bin/px-circle](#binpx-circle)
    - [bin/px-figure8](#binpx-figure8)
@@ -224,6 +226,60 @@ Battery estimate: 7.82 V (~82% full) [channel A4]
 |---|---|---|
 | `PX_CONFIG` | `/opt/picar-x/picar-x.conf` | Config override |
 | `PX_BATTERY_ADC` | `A4` | ADC channel override |
+
+---
+
+### bin/px-io-attrib
+
+**Purpose:** Record what was writing when a transient block-IO stall was visible (#247). Trigger-on-demand observer, not a poller: between triggers it reads one cheap `/proc` file (io PSI) and px-alive's heartbeat once a second, and when either crosses its threshold it takes **one** bounded snapshot and then stays quiet for a cooldown.
+
+**Usage:**
+```bash
+sudo bin/px-io-attrib                     # observe until stopped (root: the complete writer list)
+bin/px-io-attrib --once                   # one snapshot now, print it, log it, exit
+bin/px-io-attrib --dry-run --window 3      # one snapshot now, print only, write nothing
+```
+
+**Arguments:**
+| Flag | Default | Description |
+|---|---|---|
+| `--io-threshold` | `40.0` | io PSI `some avg10` (%) that counts as a stall |
+| `--heartbeat-threshold` | `7.0` | px-alive heartbeat age (s) that counts as approaching its 15 s watchdog |
+| `--window` | `3.0` | seconds to sample across once triggered |
+| `--sample-interval` | `0.5` | seconds between in-window samples (state + a rotating per-thread slice) |
+| `--cooldown` | `60.0` | seconds of quiet after a snapshot |
+| `--once` / `--dry-run` | — | take one snapshot and exit (print only, under `--dry-run`) |
+| `--no-proc-io` | — | skip the per-process writer channel entirely |
+| `--no-file-growth` | — | skip the file-level writer channel |
+
+**What it records:** ranked `/proc/<pid>/io` deltas, `blocked_in_window` (who was in uninterruptible sleep *during* the window, sampled, with `wchan_withheld` when the kernel hides the symbol from this uid), `stalled` with per-thread D state, `devices`/`ext4`/`vmstat`/PSI context, file growth and mtime movement across a 700-path watchlist, and its own `observer_read_bytes`/`observer_write_bytes`.
+
+**Log:** `logs/tool-io-attrib.log` (one JSON record per trigger). Runbook: [docs/operations/io-attribution.md](operations/io-attribution.md).
+
+**Dependencies:** `/usr/bin/python3`. Root for the complete writer list — unprivileged it still names the *blocked* writer, which is the point of the window channel.
+
+---
+
+### bin/px-io-attrib-ensure
+
+**Purpose:** Keep the unprivileged IO-stall observer running between root installs (#247). The observer exists only while it is running; until `systemd/px-io-attrib.service` is installed it can only be a hand-started process, and on 2026-09-18 it stopped at 03:57 and stayed stopped for an hour while nothing said so.
+
+**Usage:**
+```bash
+bin/px-io-attrib-ensure
+PX_IO_ATTRIB_IO_THRESHOLD=10 bin/px-io-attrib-ensure
+```
+
+**What it does:** reads `logs/px-io-attrib.pid` and decides whether *the observer* (not merely some process with that pid) is running — `/proc/<pid>/stat` plus a `--io-threshold` check on `/proc/<pid>/cmdline`, falling back to `kill -0` where `/proc` is absent. If it is not running, it starts it detached (`setsid nohup`) with `--io-threshold`, and prints one line. If it is running, it prints nothing and writes nothing.
+
+**Log:** one line to stdout on a *transition* only; cron sends it to `logs/cron-io-attrib.log`.
+
+**Typical cron entry:**
+```crontab
+* * * * * cd /home/pi/picar-x-hacking && bin/px-io-attrib-ensure >> logs/cron-io-attrib.log 2>&1
+```
+
+Remove that line when the root unit is installed — a `pi`-run observer cannot read other users' `/proc/<pid>/io`. The liveness check still recognises a root-owned observer, so the two cannot both be started by accident.
 
 ---
 

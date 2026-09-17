@@ -246,6 +246,32 @@ three are root-owned or kernel-side).
 Rollback: `sudo systemctl disable --now px-io-attrib && sudo rm
 /etc/systemd/system/px-io-attrib.service && sudo systemctl daemon-reload`.
 
+### Interim: keeping it running *without* root
+
+The root unit is still the ask, because only root can read the root-owned
+writers' bytes. But the observer is an instrument that exists only while it is
+running, and as a hand-started process it is silently fragile: on 2026-09-18 it
+stopped at **03:57** and stayed stopped for an hour, and nothing said so —
+exactly the failure shape it exists to catch, one level up.
+
+`bin/px-io-attrib-ensure` is the interim. It is idempotent, and on a healthy host
+it prints nothing and writes nothing:
+
+```bash
+# pi crontab — one line, no root, reversible
+* * * * * cd /home/pi/picar-x-hacking && bin/px-io-attrib-ensure >> logs/cron-io-attrib.log 2>&1
+```
+
+It decides "running" from `/proc/<pid>/stat` **plus** a `--io-threshold` check on
+`/proc/<pid>/cmdline`, because a pid file alone would let a stale — or reused —
+pid keep the observer *down* while reporting everything fine. A root-owned
+observer is still recognised (its argv is unreadable, so it is assumed alive),
+which is why the cron line must be removed rather than left in place once the
+unit is installed.
+
+Revert: `crontab -l | grep -v px-io-attrib-ensure | crontab -`
+
+
 ## First live catch (2026-09-17T15:44:17+10:00) — a worked example
 
 Triggered 50 seconds after the observer started, `reason=io_psi`:

@@ -142,5 +142,5 @@ jq '.by_backend | keys' state/token_usage.json
 tail -20 state/model_sessions.jsonl
 
 # No scheduled tasks spawning a model CLI
-crontab -l    # only px-cron-say, which calls pxh.m5
+crontab -l    # px-cron-say (calls pxh.m5) and px-io-attrib-ensure (spawns no model)
 ```
