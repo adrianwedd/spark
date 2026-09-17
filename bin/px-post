@@ -238,16 +238,29 @@ def log(msg: str, **extra) -> None:
         log_file = LOG_DIR / "tool-post.log"
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        # Rotation: keep the last half above 5 MB. Delegated to
-        # `state.rotate_log`, which does the same thing under a lock and
-        # **without** the fsync -- a log's durability bought nothing and forced
-        # an ext4 journal commit while rewriting megabytes (#373/#247). This
-        # script had its own copy of that write, which is how the class survived
-        # the earlier fixes.
+        # Simple rotation: keep last half when file exceeds 5MB.
+        #
+        # Deliberately *no* fsync (#247): a log's durability buys nothing, and
+        # it forced an ext4 journal commit while rewriting half a multi-megabyte
+        # file on the card shared with the microphone ring -- the same class as
+        # #373's rotation fix. The append above never fsynced either, so this
+        # was the only durable write in the log path.
+        #
+        # Deliberately no `from pxh.state import rotate_log` either, which would
+        # be the tidier consolidation: this is the *logging* path, and it must
+        # keep working when the package is broken -- proven by probe, where a
+        # missing import silently disabled rotation and let the log grow
+        # unbounded. A log that stops rotating quietly is a disk-fill bug.
         try:
-            from pxh.state import rotate_log
-
-            rotate_log(log_file, max_bytes=5_000_000)
+            if log_file.stat().st_size > 5_000_000:
+                lines = log_file.read_text(encoding="utf-8").splitlines()
+                half = len(lines) // 2
+                half_content = "\n".join(lines[half:]) + "\n"
+                fd, tmp = tempfile.mkstemp(dir=str(log_file.parent), suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(half_content)
+                    f.flush()
+                os.replace(tmp, str(log_file))
         except Exception:
             pass
     except OSError:
