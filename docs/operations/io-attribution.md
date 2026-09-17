@@ -735,7 +735,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]`. `wchan: null` with `wchan_withheld: true` means the kernel hid the symbol from this uid — not that the process was blocked in nothing |
 | `blocked_in_window[]` | who was blocked *during* the window, sampled (see the window-channel section). This is the list to read when `writers_unreadable_count` is high: it is the only channel that can name a root-owned writer |
 | `d_state_count` / `blocked_thread_count` | stalled processes, and how many of the blocked tasks are non-leader threads |
-| `devices` | per-device deltas. `ms_io` (queue-occupied time) is the trustworthy one; `ms_writing` is reported but over-counts on this kernel — see the caveat above |
+| `devices` | per-device deltas. `ms_io` (queue-occupied time) is the trustworthy one; `ms_writing` is reported but over-counts on this kernel — see the caveat above. `writes_completed`/`sectors_written` are deltas, from which `ms_per_write` and `kb_per_write` are derived. **`ms_per_write` is the card's own state in one number**: measured on `picar` over 162 records the median is **69-86 ms** and the p90 **207 ms**, against ~1.5 ms per *read* — a 50-100x write/read asymmetry that is present in the quiet hours as much as in a stall (the hardware question is #405). Read it as a baseline: a record far above it is a change in the card, not in the writers, and the whole "a few megabytes becomes ten seconds" arithmetic lives here — 10-90 small writes at ~86 ms is 1-8 s of queue occupancy |
 | `ext4` | `{fs, write_kbytes_delta, session_write_kbytes, lifetime_write_kbytes, delayed_allocation_blocks, errors_count, journal_task}`. Compare `write_kbytes_delta` against `devices.<dev>.sectors_written`: a ratio near 1.00 means the device's bytes *are* filesystem writes (no rogue writer), and the interesting number is then amplification — device bytes per byte of file data, which the file channels approximate. `journal_task` is a **tid** on this kernel (217 = `jbd2/mmcblk0p2-8`), so it cross-references `stalled[].pid`. `{}` means unwatched, never zero. `lifetime_write_kbytes` is the wear figure for the card |
 | `device_write_bytes` / `unattributed_write_bytes` / `unattributed_write_share` | the busiest real device's bytes, and how much of that has **no process's name on it**. Measured 60 s window: `mmcblk0` 2596 KB, every readable process 92 KB — share **0.965**. Journal and metadata are charged to kernel threads (`jbd2`, `kblockd`, `flush-179:0`), so *no* `/proc` channel can name them, privileged or not. Caveat that keeps it honest: `write_bytes` charges page-cache writes to the dirtying task, so a high share means "mostly journal/metadata", never "nobody wrote" |
 | `device_inflight_pre` / `device_inflight_post` | `/sys/block/<dev>/inflight` at each end of the window — requests *currently* dispatched. Zero is reported, not dropped: `0/0` during a stall is the finding, not a missing sample. `pre` is inside the stall (the caller triggered because PSI is high now), `post` shows recovery |
@@ -816,6 +816,29 @@ Alternatives, if weighting proves insufficient: move `/var/lib/apt/lists` and
 recurring churn from the card), or accept it and keep the small-write pressure
 low elsewhere. All three are decisions, not code — the evidence lives in #402,
 and the card question in #405.
+
+## A restart is an I/O event on this host (measured 2026-09-18)
+
+Restarting one daemon is enough to move this host's needle: restarting `px-mind`
+produced two records either side of it —
+
+```
+21:00:13Z  reason=heartbeat_age  psi 0.03 %   ms_per_write 110.2   writes 21
+21:01:21Z  reason=io_psi         psi 30.80 %  ms_per_write  10.9   writes 177
+   blocked in 5 of 6 samples: jbd2/mmcblk0p2-8, kworker/0:1H-mmc_complete, python
+```
+
+— because a daemon coming back rereads its state and rewrites the session and
+memory files, and on this card each small write costs ~86 ms of queue time. Two
+consequences for operators:
+
+* **Restart one unit at a time** and let the device drain between them; a deploy
+  that bounces several daemons at once is a self-inflicted burst on a card that
+  already writes at 69-86 ms per write. `bin/px-deploy-check` names exactly which
+  units need it, so the list is never longer than it has to be.
+* A record taken within a minute or two of a deploy may reflect *your* restart
+  rather than the defect under investigation. Both examples above are in
+  `logs/tool-io-attrib.log` and carry the `unit_log` lines that say so.
 
 ## Deliberately not done
 
