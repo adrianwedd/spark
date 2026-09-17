@@ -50,7 +50,12 @@ from pxh import health as health_mod
 from pxh import intention as intention_mod
 from pxh import memory as spark_memory
 from pxh import provenance as prov
-from pxh.presence import ENTER_RADIUS_KM, EXIT_RADIUS_KM, latch_at_home
+from pxh.presence import (
+    ENTER_RADIUS_KM,
+    EXIT_RADIUS_KM,
+    PENDING_REASON,
+    latch_at_home,
+)
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -938,7 +943,7 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
     even if at_home=true — preserves the daemon-restart guard. The cache is
     only mutated when ``findmyhub`` is non-empty, so stale-file windows do
     not erase the prior "away" baseline."""
-    global _last_known_findmyhub, _latch_suppressed
+    global _last_known_findmyhub, _latch_suppressed, _latch_far_streak
     transitions: list[str] = []
     if not findmyhub:
         return transitions
@@ -946,10 +951,16 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
         if not isinstance(curr_data, dict):
             continue
         prev_data = _last_known_findmyhub.get(tracker_name)
+        # `is True` / `is False`, not truthiness: "unknown" and "away" must not
+        # read alike. A tracker whose first sighting was a single far fix has no
+        # latched state, and treating that as away is what turned one bad fix
+        # after a restart into a greeting (2026-09-17). An arrival is a
+        # *transition from known away*, which is also what the restart guard was
+        # always meant to mean.
         if (
-            curr_data.get("at_home")
-            and prev_data is not None
-            and not prev_data.get("at_home")
+            curr_data.get("at_home") is True
+            and isinstance(prev_data, dict)
+            and prev_data.get("at_home") is False
         ):
             transitions.append(f"person_arrived_home:{tracker_name}")
         _last_known_findmyhub[tracker_name] = curr_data
@@ -1002,9 +1013,16 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
         prev_home = prev.get("at_home") if isinstance(prev, dict) else None
         sample_is_new = not isinstance(prev, dict) or prev.get("ts") != curr.get("ts")
 
+        streak = _latch_far_streak.get(name, 0)
         state, reason = latch_at_home(
-            curr["distance_km"], curr.get("accuracy_m"), prev_home
+            curr["distance_km"], curr.get("accuracy_m"), prev_home, streak
         )
+        if reason == PENDING_REASON:
+            _latch_far_streak[name] = streak + 1
+        elif reason not in ("hold-accuracy", "unknown"):
+            # A usable fix that is not far ends the run; an unusable one is not
+            # evidence either way, so it neither extends nor breaks it.
+            _latch_far_streak[name] = 0
         if state is None:
             state = prev_home
         if state is not None:
@@ -1018,7 +1036,12 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
             (curr["distance_km"] <= ENTER_RADIUS_KM) != bool(state)
         )
         suppressed = _latch_suppressed.get(name, 0)
-        changed = state is not None and bool(state) != bool(prev_home)
+        # `prev_home is None` counts as a change on purpose: the *first* latch of
+        # a fresh process was the one unlogged decision here, and on 2026-09-17
+        # that hid exactly the fix that caused a spurious greeting.
+        changed = state is not None and (
+            prev_home is None or bool(state) != bool(prev_home)
+        )
 
         if changed or suppressed == 0 and would_have_flipped:
             absorbed = f"; {suppressed} suppressed flips while latched" if suppressed else ""
@@ -1878,6 +1901,12 @@ _last_known_findmyhub: dict = {}
 # turns "we stopped flapping" into a number, and it is what makes the next real
 # transition line say how much noise the latch absorbed (#305).
 _latch_suppressed: dict = {}
+# Per-tracker run of consecutive usable fixes that said "outside the exit
+# radius". A departure needs two (presence.EXIT_CONFIRMATIONS): a single far fix
+# at ±100 m accuracy, read just after a restart, produced a real greeting on
+# 2026-09-17 — the tracker never left. Arrivals are not confirmed this way,
+# because waiting on the side that greets trades a false greeting for a late one.
+_latch_far_streak: dict = {}
 _consecutive_reflection_failures: int = 0
 # HA host offline flag: when set, awareness_tick skips all HA fetches until expired.
 # Set by the first HA network error in the tick; cleared automatically on expiry.
@@ -2395,6 +2424,7 @@ def _reset_state():
     _last_image_cleanup = 0.0
     _last_known_findmyhub = {}
     _latch_suppressed = {}
+    _latch_far_streak = {}
     _ha_offline_until = 0.0
 
 

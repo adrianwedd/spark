@@ -1307,6 +1307,7 @@ def _fresh_tracker_state():
     from pxh import mind as mind_mod
     mind_mod._last_known_findmyhub = {}
     mind_mod._latch_suppressed = {}
+    mind_mod._latch_far_streak = {}
     return mind_mod
 
 
@@ -1334,7 +1335,7 @@ def test_findmyhub_boundary_jitter_produces_one_transition():
     """
     mind_mod = _fresh_tracker_state()
     jitter = [0.12, 0.16, 0.13, 0.18, 0.14, 0.21, 0.11, 0.19, 0.15, 0.17]
-    transitions = _series(mind_mod, [2.4] + jitter)
+    transitions = _series(mind_mod, [2.4, 2.5] + jitter)
     assert transitions == ["person_arrived_home:adrian"]
 
     # ...and the fix is load-bearing: the old bare threshold on the same series
@@ -1351,10 +1352,12 @@ def test_findmyhub_absorbed_flips_are_counted_not_silently_dropped():
     lines: list[str] = []
     from unittest.mock import patch
     with patch.object(mind_mod, "log", lines.append):
-        _series(mind_mod, [2.4, 0.12, 0.16, 0.18, 0.21, 0.19, 0.40])
-    # 0.16 / 0.18 / 0.21 / 0.19 are the four fixes the old rule would have
-    # called departures; the report rides on the next real transition.
-    assert any("4 suppressed flips while latched" in line for line in lines)
+        _series(mind_mod, [2.4, 2.5, 0.12, 0.16, 0.18, 0.21, 0.19, 0.40, 0.45])
+    # 0.16 / 0.18 / 0.21 / 0.19 while the latch held, plus the first of the two
+    # far fixes that complete the departure: five fixes the old bare threshold
+    # would have flipped and the latch absorbed. The report rides the next real
+    # transition.
+    assert any("5 suppressed flips while latched" in line for line in lines)
     # The count resets with the latch it belongs to.
     assert mind_mod._latch_suppressed["adrian"] == 0
 
@@ -1374,8 +1377,8 @@ def test_findmyhub_genuine_arrival_fires_on_the_first_home_fix():
     period of lateness.
     """
     mind_mod = _fresh_tracker_state()
-    assert _series(mind_mod, [2.4]) == []
-    transitions = mind_mod._findmyhub_transitions({"adrian": _tracker(0.09, ts=2)})
+    assert _series(mind_mod, [2.4, 2.5]) == []
+    transitions = mind_mod._findmyhub_transitions({"adrian": _tracker(0.09, ts=3)})
     assert transitions == ["person_arrived_home:adrian"]
 
 
@@ -1386,7 +1389,7 @@ def test_findmyhub_restart_guard_survives_the_latch():
     mind_mod = _fresh_tracker_state()
     assert _series(mind_mod, [0.10]) == []
     assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
-    assert _series(mind_mod, [1.5]) == []
+    assert _series(mind_mod, [1.5, 1.6]) == []            # a confirmed departure
     assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
     assert _series(mind_mod, [0.10]) == ["person_arrived_home:adrian"]
 
@@ -1398,9 +1401,52 @@ def test_findmyhub_departure_needs_the_wider_radius_then_re_arrival_fires():
     assert _series(mind_mod, [0.12]) == []
     assert _series(mind_mod, [0.22]) == []
     assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
-    assert _series(mind_mod, [0.40]) == []
+    assert _series(mind_mod, [0.40, 0.41]) == []          # confirmed departure
     assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
     assert _series(mind_mod, [0.12]) == ["person_arrived_home:adrian"]
+
+
+def test_findmyhub_one_bad_far_fix_neither_exits_nor_greets():
+    """2026-09-17, on the robot: a tracker sitting at home reported one fix
+    several hundred metres away at ±100 m accuracy. Before this rule the latch
+    retired, and the next good fix greeted an arrival that never happened."""
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.02]) == []                # at home
+    assert _series(mind_mod, [0.6]) == []                 # one bad far fix
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert _series(mind_mod, [0.02]) == []                # no arrival to greet
+    assert mind_mod._latch_far_streak["adrian"] == 0
+
+
+def test_findmyhub_restart_then_one_far_then_home_is_silent():
+    """The deploy-shaped version of the same incident: process restarts, its
+    first sighting is a single far fix, then a good fix. The restart guard
+    suppresses the first *observation*, not a fabricated departure."""
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.6]) == []                 # not yet a departure
+    assert _series(mind_mod, [0.02]) == []                # and so no greeting
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+
+
+def test_findmyhub_two_far_fixes_do_confirm_a_departure():
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.02]) == []
+    assert _series(mind_mod, [0.5]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert _series(mind_mod, [0.5]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert _series(mind_mod, [0.02]) == ["person_arrived_home:adrian"]
+
+
+def test_findmyhub_an_unusable_fix_does_not_break_a_departure_run():
+    """A coarse fix between two far fixes is not evidence either way, so it must
+    not reset a run that is genuinely being established."""
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.02]) == []
+    assert _series(mind_mod, [0.5]) == []
+    assert _series(mind_mod, [0.5], accuracy_m=400.0) == []   # unusable, streak kept
+    assert _series(mind_mod, [0.5]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
 
 
 def test_findmyhub_semantic_tracker_is_untouched_by_the_latch():
@@ -1461,9 +1507,9 @@ def test_findmyhub_coarse_fix_is_evidence_of_a_suppressed_arrival():
     lines: list[str] = []
     from unittest.mock import patch
     with patch.object(mind_mod, "log", lines.append):
-        assert _series(mind_mod, [2.4]) == []           # latched away
+        assert _series(mind_mod, [2.4, 2.5]) == []      # latched away
         transitions = mind_mod._findmyhub_transitions(
-            {"adrian": _tracker(0.10, ts=2, accuracy_m=400.0)}
+            {"adrian": _tracker(0.10, ts=3, accuracy_m=400.0)}
         )
     assert transitions == []
     assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
