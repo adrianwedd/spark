@@ -23,9 +23,18 @@ pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-frigate-stream, /usr/bin/sys
 
 # Root-owned launchers: the arguments each accepts are validated inside the
 # launcher itself (px-signal-alive: fixed signal names; px-gpio-run: fixed
-# target allowlist + charset-checked lease id).
+# target allowlist + charset-checked lease id; px-research-run: exactly one
+# bare v4 uuid).
 pi ALL=(root) NOPASSWD: /usr/local/sbin/px-signal-alive USR1, /usr/local/sbin/px-signal-alive TERM
 pi ALL=(root) NOPASSWD: /usr/local/sbin/px-gpio-run *
+
+# Delegated research (#281 phase 2). The wildcard here is the one unavoidable
+# one: the argument is a uuid, so it cannot be enumerated. The safety is in
+# the launcher, not the line — it accepts exactly one argument, requires it to
+# be a bare v4 uuid, and builds a fixed systemd-run command from it. This
+# grant is live only once the launcher, the worker and /etc/px-research/tier.env
+# are installed; see docs/operations/agent-os-isolation-design.md.
+pi ALL=(root) NOPASSWD: /usr/local/sbin/px-research-run *
 
 # Battery emergency shutdown (mind.py) and the API's confirmed device actions.
 pi ALL=(root) NOPASSWD: /usr/sbin/shutdown -h now, /sbin/shutdown -h now

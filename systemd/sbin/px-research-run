@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# px-research-run — start one sandboxed delegated-research unit (#281 phase 2).
+#
+# Design rule, same as px-signal-alive's: the sudoers entry for this script
+# may not accept a parameter that changes what the command *means*. A uuid is
+# the one thing that has to be caller-supplied, so it is validated here as a
+# bare v4 uuid and used only as a filename component — there is no sandbox
+# parameter, no uid, no path, no command, and no environment passed through
+# from the caller, and the systemd-run invocation below is a fixed string.
+#
+# Installed root:root 0755 at /usr/local/sbin/px-research-run. Invoked only as
+# `sudo -n /usr/local/sbin/px-research-run <uuid4>`.
+#
+# Why the unit runs the *worker* rather than this script doing the work: the
+# isolation is a property of the unit, and a root shell that then drops
+# privileges inside itself is a much larger surface than a root-owned script
+# that only constructs one fixed systemd-run command. The root script never
+# reads the request, never runs the model, and never writes a result.
+set -euo pipefail
+
+INBOX=/var/lib/px-research/inbox
+REPO=/home/pi/picar-x-hacking
+TIER_ENV=/etc/px-research/tier.env
+
+usage() {
+    echo "usage: px-research-run <uuid4>" >&2
+    exit 2
+}
+
+[[ $# -eq 1 ]] || usage
+uuid="$1"
+
+# Strict v4 shape. Anything else — a path, a traversal, a shell
+# metacharacter, a uuid of the wrong version, upper case, a trailing
+# character — is refused before it reaches a filename or a unit name.
+[[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || usage
+
+request="$INBOX/$uuid.json"
+[[ -f "$request" && ! -L "$request" ]] || {
+    echo "px-research-run: no request at $request" >&2
+    exit 1
+}
+
+[[ -r "$TIER_ENV" ]] || {
+    echo "px-research-run: $TIER_ENV is missing (the sandbox needs the tier's" \
+         "model name and key from a file it cannot read for itself)" >&2
+    exit 1
+}
+
+exec systemd-run \
+    --unit="px-research-$uuid" \
+    --collect \
+    --property=DynamicUser=yes \
+    --property=User=spark-research \
+    --property=Type=oneshot \
+    --property=EnvironmentFile="$TIER_ENV" \
+    --property=WorkingDirectory="$REPO" \
+    --property=RuntimeDirectory=px-research \
+    --property=RuntimeDirectoryMode=0700 \
+    --property=Environment=PX_STATE_DIR=/run/px-research/state \
+    --property=Environment=HOME=/run/px-research \
+    --property=Environment=PX_RESEARCH_INBOX="$INBOX" \
+    --property=Environment=PX_RESEARCH_OUTBOX=/var/lib/px-research/outbox \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=yes \
+    --property=PrivateDevices=yes \
+    --property=PrivateTmp=yes \
+    --property=NoNewPrivileges=yes \
+    --property=RestrictSUIDSGID=yes \
+    --property=CapabilityBoundingSet= \
+    --property=LockPersonality=yes \
+    --property=ProtectKernelTunables=yes \
+    --property=ProtectKernelModules=yes \
+    --property=ProtectControlGroups=yes \
+    --property=RestrictNamespaces=yes \
+    --property=RestrictRealtime=yes \
+    --property=SystemCallArchitectures=native \
+    --property=ReadOnlyPaths="$REPO" \
+    --property=InaccessiblePaths="$REPO/state" \
+    --property=BindReadOnlyPaths=/dev/null:"$REPO/.env" \
+    --property=BindPaths=/var/lib/px-research/outbox \
+    -- "$REPO/bin/px-research-worker" "$uuid"
