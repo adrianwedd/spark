@@ -56,7 +56,13 @@ from pxh.presence import (
     PENDING_REASON,
     latch_at_home,
 )
-from pxh.state import atomic_write, load_session, rotate_log, update_session
+from pxh.state import (
+    atomic_write,
+    load_session,
+    rotate_log,
+    trim_jsonl_if_needed,
+    update_session,
+)
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
 from pxh.voice_loop import PERSONA_VOICE_ENV
@@ -110,16 +116,6 @@ BATTERY_MAX_DROP_PER_TICK = 15    # max plausible % drop in one awareness tick (
 BATTERY_GLITCH_CONFIRMS  = 3     # require N consecutive low readings before acting
 THOUGHTS_LIMIT         = 10000  # ~50 days at 200 thoughts/day (~3MB); preserves history for feed/social
 NOTES_LIMIT            = 10000  # ~50 days; matches THOUGHTS_LIMIT to preserve long-term memory
-#: How far past the limit an append-only JSONL may drift before it is rewritten.
-#: The trim is an O(file) rewrite — 3.8 MB for `thoughts-spark.jsonl` — and the
-#: original rule ("rewrite when `len(lines) > LIMIT`") fired on *every append*
-#: once the file reached the limit, because the rewrite also landed exactly on
-#: the limit: 10001 lines > 10000, rewrite to 10000, next line 10001 again. At
-#: 200 thoughts/day that is ~760 MB/day of SD-card writes and a ~7 s card
-#: saturation per thought, on the same device as the microphone and the
-#: watchdog (#247). With slack, the rewrite happens once per
-#: `JSONL_TRIM_SLACK` appends instead of on every one.
-JSONL_TRIM_SLACK       = 500
 PROXIMITY_NEAR_CM      = 60
 PROXIMITY_FAR_CM       = 100
 AMBIENT_STALE_S        = 60    # ignore ambient_sound.json older than this
@@ -2421,33 +2417,6 @@ def load_recent_thoughts(n: int = 5, persona: str = "") -> list[dict]:
         return []
 
 
-def _trim_jsonl_if_needed(path: Path, limit: int, what: str) -> bool:
-    """Trim an append-only JSONL back to `limit` lines, rarely. True if trimmed.
-
-    Rewrites only when the file has drifted `JSONL_TRIM_SLACK` lines past the
-    limit, so the common path is an O(1) append and a newline count — not a
-    multi-megabyte rewrite. The trim itself is **atomic but not durable**: it is
-    maintenance on a file that is appended to again within minutes, so the
-    `fsync` bought no crash durability and forced an ext4 journal commit while
-    writing megabytes (#247, same reasoning as log rotation in `#373`).
-
-    Never raises: a failed trim costs a longer file, and the next append tries
-    again.
-    """
-    try:
-        with path.open("rb") as handle:
-            data = handle.read()
-        if data.count(b"\n") <= limit + JSONL_TRIM_SLACK:
-            return False
-        lines = data.decode("utf-8", "replace").strip().splitlines()
-        atomic_write(path, "\n".join(lines[-limit:]) + "\n", durable=False)
-        log(f"trimmed {what} to {limit} lines ({len(lines)} > {limit} + {JSONL_TRIM_SLACK})")
-        return True
-    except Exception:
-        log(f"{what} trim failed for {path}")
-        return False
-
-
 def append_thought(thought: dict, persona: str = "") -> None:
     """Append thought to persona-scoped thoughts file and trim to THOUGHTS_LIMIT."""
     thoughts_file = thoughts_file_for_persona(persona)
@@ -2456,7 +2425,9 @@ def append_thought(thought: dict, persona: str = "") -> None:
     with lock:
         with thoughts_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(thought) + "\n")
-        _trim_jsonl_if_needed(thoughts_file, THOUGHTS_LIMIT, "thoughts")
+        # Shared with memories and people; the measurement behind the slack
+        # lives in state.trim_jsonl_if_needed (#247).
+        trim_jsonl_if_needed(thoughts_file, THOUGHTS_LIMIT, what="thoughts", log=log)
 
 
 def auto_remember(thought: dict, persona: str = "") -> None:
@@ -2473,7 +2444,7 @@ def auto_remember(thought: dict, persona: str = "") -> None:
     with lock:
         with notes_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
-        _trim_jsonl_if_needed(notes_file, NOTES_LIMIT, "notes")
+        trim_jsonl_if_needed(notes_file, NOTES_LIMIT, what="notes", log=log)
     log(f"auto-remembered [{persona or 'shared'}]: {thought['thought']}")
 
 

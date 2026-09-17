@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from pxh import memory, provenance
+from pxh import memory, provenance, state
 
 
 @pytest.fixture(autouse=True)
@@ -163,11 +163,30 @@ def test_recency_breaks_ties():
 
 
 def test_append_trims_to_limit(monkeypatch):
+    """The limit is enforced, but only once the file has drifted past it by the
+    shared slack — a per-append rewrite cost 3.8 MB per thought in the thoughts
+    store (#247)."""
     monkeypatch.setattr(memory, "MEMORIES_LIMIT", 5)
-    memory.append_memories([_mem(f"m{i}") for i in range(7)])
+    slack = state.JSONL_TRIM_SLACK
+    memory.append_memories([_mem(f"m{i}") for i in range(slack + 6)])
     loaded = memory.load_memories()
     assert len(loaded) == 5
-    assert loaded[0]["text"] == "m2" and loaded[-1]["text"] == "m6"
+    assert loaded[-1]["text"] == f"m{slack + 5}"
+
+
+def test_append_does_not_rewrite_the_store_at_the_limit(monkeypatch):
+    """A few appends past the limit stay appends: the file grows, nothing is
+    rewritten, and the trim waits for the slack."""
+    monkeypatch.setattr(memory, "MEMORIES_LIMIT", 5)
+    memory.append_memories([_mem(f"a{i}") for i in range(5)])
+    path = memory.memories_file("spark")
+    before = path.stat().st_size
+    rewrites = []
+    monkeypatch.setattr(state, "atomic_write", lambda *a, **k: rewrites.append(a))
+    memory.append_memories([_mem("b0")])
+    assert rewrites == []
+    assert path.stat().st_size > before
+    assert len(memory.load_memories()) == 6
 
 
 # --- consolidation ---------------------------------------------------------

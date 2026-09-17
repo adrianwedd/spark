@@ -70,7 +70,7 @@ from zoneinfo import ZoneInfo
 from filelock import FileLock
 
 from pxh import memory, provenance
-from pxh.state import atomic_write
+from pxh.state import atomic_write, trim_jsonl_if_needed
 from pxh.time import utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -376,12 +376,9 @@ def append_person_facts(records: list[dict], persona: str = "spark",
         with f.open("a", encoding="utf-8") as fh:
             for rec in records:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        try:
-            lines = f.read_text(encoding="utf-8").strip().splitlines()
-            if len(lines) > PEOPLE_LIMIT:
-                atomic_write(f, "\n".join(lines[-PEOPLE_LIMIT:]) + "\n")
-        except OSError:
-            pass
+        # Same rule as memories and thoughts: trim rarely, never per append
+        # (#247). `state.trim_jsonl_if_needed` carries the measurement.
+        trim_jsonl_if_needed(f, PEOPLE_LIMIT, what="people")
     return records
 
 

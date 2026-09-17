@@ -712,3 +712,85 @@ def test_log_rotation_is_atomic_but_not_durable(tmp_path, monkeypatch):
     body = target.read_text().splitlines()
     assert 1000 < len(body) < 4000, "rotation should have dropped the oldest half"
     assert body[-1] == "line 3999"
+
+# --- append-only JSONL trimming must be rare, not per append (#247) ---------
+#
+# `thoughts-spark.jsonl` sat at exactly 10000 lines (3.78 MB) and the rule
+# "rewrite when len(lines) > LIMIT" fired on *every* append from then on —
+# because the rewrite landed back on the limit. That is a multi-megabyte SD-card
+# write and a forced journal commit per thought, on the same device as the
+# microphone ring and the watchdog. `memories` (5000) and `people` (2000) had the
+# same rule waiting for a longer file.
+
+
+def _jsonl(path, n, *, start=0):
+    path.write_text("".join('{"i": %d}\n' % i for i in range(start, start + n)))
+
+
+def test_trim_jsonl_does_not_rewrite_at_the_limit(tmp_path, monkeypatch):
+    target = tmp_path / "thoughts.jsonl"
+    _jsonl(target, 10_000)
+    rewrites = []
+    monkeypatch.setattr(state, "atomic_write", lambda *a, **k: rewrites.append(a))
+    assert state.trim_jsonl_if_needed(target, 10_000) is False
+    assert rewrites == [], "an append at the limit must stay an append"
+
+
+def test_trim_jsonl_fires_once_slack_is_exceeded_and_is_not_durable(tmp_path, monkeypatch):
+    target = tmp_path / "thoughts.jsonl"
+    limit, slack = 1_000, state.JSONL_TRIM_SLACK
+    _jsonl(target, limit + slack + 1)
+    calls = []
+    real = state.atomic_write
+
+    def spy(path, content, **kwargs):
+        calls.append(kwargs.get("durable", True))
+        return real(path, content, **kwargs)
+
+    monkeypatch.setattr(state, "atomic_write", spy)
+    assert state.trim_jsonl_if_needed(target, limit, what="thoughts") is True
+    assert calls == [False], "the trim is maintenance: atomic, not durable"
+    body = target.read_text().strip().splitlines()
+    assert len(body) == limit
+    assert body[-1] == '{"i": %d}' % (limit + slack)
+
+
+def test_trim_jsonl_never_raises_on_a_missing_file(tmp_path):
+    assert state.trim_jsonl_if_needed(tmp_path / "nope.jsonl", 10) is False
+
+
+def test_the_append_only_stores_share_one_trim_rule(tmp_path, monkeypatch):
+    """mind, memory and people all trim through state.trim_jsonl_if_needed —
+    three copies of that rule is how the thoughts defect would have come back
+    in the other two files."""
+    import pxh.memory as memory
+    import pxh.mind as mind
+    import pxh.people as people
+
+    calls = []
+
+    def spy(path, limit, **kwargs):
+        calls.append((str(path), limit))
+        return False
+
+    monkeypatch.setattr(memory, "trim_jsonl_if_needed", spy)
+    monkeypatch.setattr(mind, "trim_jsonl_if_needed", spy)
+    monkeypatch.setattr(people, "trim_jsonl_if_needed", spy)
+
+    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
+    thoughts = tmp_path / "thoughts.jsonl"
+    _jsonl(thoughts, 1)
+    monkeypatch.setattr(mind, "thoughts_file_for_persona", lambda persona="": thoughts)
+    mind.append_thought({"ts": "t", "thought": "x"})
+
+    notes = tmp_path / "notes.jsonl"
+    _jsonl(notes, 1)
+    monkeypatch.setattr(mind, "notes_file_for_persona", lambda persona="": notes)
+    mind.auto_remember({"ts": "t", "thought": "y"})
+
+    mem = tmp_path / "memories.jsonl"
+    _jsonl(mem, 1)
+    monkeypatch.setattr(memory, "memories_file", lambda persona="spark": mem)
+    memory.append_memories([{"ts": "t", "text": "z"}])
+
+    assert [limit for _, limit in calls] == [mind.THOUGHTS_LIMIT, mind.NOTES_LIMIT, memory.MEMORIES_LIMIT]
