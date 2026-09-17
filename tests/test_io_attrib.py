@@ -933,3 +933,36 @@ def test_pid_file_helpers_never_raise(tmp_path):
     assert io_attrib.write_pid_file(unwritable) is False
     io_attrib.remove_pid_file(tmp_path / "missing.pid")
     assert io_attrib.read_pid_file(tmp_path / "missing.pid") is None
+
+
+# --- the CLI, not just the module (the gap that let a crash ship) ---------
+#
+# The unit tests exercise io_attrib's functions; they cannot see the argv
+# plumbing or the order of statements in main(). The first version of the pid
+# file wrote it *after* the startup line that reports it, so the observer died
+# with UnboundLocalError on the robot while 44 module tests passed.
+
+
+def test_cli_loop_starts_and_exits_cleanly(tmp_path):
+    """Run the real entry point for ~2 s: no traceback, pid published and cleared."""
+    import subprocess
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [str(root / "bin" / "px-io-attrib"),
+         "--duration-h", "0.0006",       # ~2 s: one or two loop iterations
+         "--io-threshold", "200",        # never a stall: no snapshot in this test
+         "--heartbeat-file", str(tmp_path / "no-heartbeat.json"),
+         "--growth-pattern", str(tmp_path / "nothing-*"),
+         "--poll", "0.5"],
+        cwd=str(root), capture_output=True, text=True, timeout=60,
+        env={**os.environ, "LOG_DIR": str(log_dir), "PX_BYPASS_SUDO": "1",
+             "PX_STATE_DIR": str(tmp_path / "state"), "PATH": os.environ.get("PATH", "")},
+    )
+    assert "Traceback" not in proc.stderr, proc.stderr[-800:]
+    assert "observer start" in proc.stdout, proc.stdout[-400:]
+    assert proc.returncode == 0
+    # It publishes its own pid while running and clears it on a clean exit.
+    assert not (log_dir / "px-io-attrib.pid").exists()
