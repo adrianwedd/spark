@@ -50,8 +50,9 @@ A **trigger-on-demand** observer, not a poller:
    `px-alive`'s heartbeat file;
 2. when **io PSI `some avg10` ≥ 40 %** *or* **heartbeat age ≥ 7 s while px-alive
    is alive** (15 s is its watchdog), it takes **one** bounded snapshot;
-3. the snapshot is a two-ended window (`--window`, default 3 s): process
-   counters and device counters before, sleep, after;
+3. the snapshot is a window (`--window`, default 3 s): process and device
+   counters before, **the window sampled every `--sample-interval` (0.5 s)**
+   rather than slept through, counters after;
 4. it writes one record to `logs/tool-io-attrib.log`, prints one summary line to
    the journal, and stays quiet for `--cooldown` (default 60 s).
 
@@ -71,7 +72,8 @@ bury the real stalls.
 |---|---|---|
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
 | **file** | a bounded *watchlist* (`default_growth_patterns`: the system journal, `logs/*`, `logs/*/*`, `state/*`, `state/health/*.json`, `state/brain/*`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
-| **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI; `/sys/block/*/inflight`; `/sys/fs/ext4/*` | no — world-readable, including for root-owned processes |
+| **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI; `/sys/block/*/inflight`; `/sys/fs/ext4/*` | no — with **one exception measured on 2026-09-18: `wchan` is withheld for root-owned processes** (see the next section). `state`, `schedstat` and the rest are readable for every process |
+| **window** | the same state sampled *across* the window (`sample_window` → `blocked_in_window`), plus per-thread D state for a rotating quarter of the process set | no — and this is the channel that still **names a root-owned writer**, because `state` is readable where `wchan` and `/proc/<pid>/io` are not |
 | **filesystem** | `ext4` counters: `session_write_kbytes` (bytes written *through* this filesystem, metadata and journal included), `lifetime_write_kbytes` (card wear), `delayed_allocation_blocks`, `errors_count`, `journal_task` | no — it cross-checks the device's bytes against the filesystem's, which is how you rule out a raw writer outside the filesystem and how you measure **write amplification**. It does *not* separate file data from metadata — see the calibration below |
 
 **Pid files, two different roles until 2026-09-17:** `--pid-file` (default
@@ -88,9 +90,10 @@ it keeps the stall channel, reports the writer list it *could* read, and names
 the gap — `privileged: false` (the probe: this uid cannot read other users'
 `/proc/<pid>/io`) plus `writers_unreadable_count` (how many processes refused
 one). "The camera pipeline wrote, 152 processes were invisible" is a usable
-reading; "no writers" is not. (`/proc/<pid>/wchan` is what
-turns "someone was blocked" into `jbd2_log_wait_commit` — the symbol the
-2026-08-16 fsync investigation found by hand.
+reading; "no writers" is not. `/proc/<pid>/wchan` is what turns "someone was
+blocked" into `jbd2_log_wait_commit` — the symbol the 2026-08-16 fsync
+investigation found by hand — but it only does that for a process this uid may
+ptrace, which is the correction in the next section.
 
 **Thread-level matters here, which is why `blocked_threads` exists.**
 `/proc/<pid>/stat` reports only the thread group leader, and px-alive's health
@@ -115,6 +118,73 @@ was misled by 2.4 MB/s of `wchar` from go2rtc/rpicam-vid that never reached the
 disk; `wchar` is still reported so that reading stays available, it just does
 not decide the order.
 
+## The window channel, and the one field the kernel withholds
+
+**Measured 2026-09-18, and it changes how to read every earlier record:**
+`/proc/<pid>/wchan` is *silently withheld* for any process this uid may not
+ptrace. It does not fail — it returns `0`, which is the same string the kernel
+returns for a task that is not blocked at all. Eight consecutive passes over
+`/proc`, classifying every process in `S`/`D` state by owner:
+
+| owner | sleeping processes | wchan returned a symbol | returned `0` |
+|---|---|---|---|
+| root | 65 | **0** | 65 |
+| `pi` | 23-24 | 21-22 | 2-3 |
+
+So `wchan` names a writer only when `/proc/<pid>/io` was *already* readable for
+it, and on an unprivileged observer it can never name journald, px-alive or the
+`jbd2` kthread. Consequences, all of them now in the record rather than in a
+reader's head:
+
+* `wchan_withheld_count` and `wchan_unavailable_reason` — derived from the io
+  denial actually measured for each pid, counted over the whole walk and the
+  whole window rather than over the `top`-truncated rows;
+* per-row `wchan_withheld` on `blocked_in_window[]` and `stalled[]`, so
+  `wchan: null` can no longer be misread as "not blocked in anything";
+* the remedy is named in the reason itself: run as root.
+
+What still works unprivileged for a root-owned writer is **state** — and, once
+`kernel.task_delayacct=1`, `delayacct_blkio_ticks`. That is the whole basis of
+the window channel.
+
+**The window channel (`blocked_in_window`) replaces the window's idle `sleep`.**
+A burst that ends before t1 is invisible to a two-ended walk, so the window is
+sampled every `--sample-interval` (default 0.5 s): `/proc/<pid>/stat` for every
+pid (state + delayacct), `wchan` for any task seen in D, and a per-thread D walk
+for a rotating quarter of the process set — rotating because a sample costs
+~40 ms of /proc reads on the robot and a full thread walk every sample would be
+the observer becoming the writer it is hunting. The pid set is the t0 walk, so a
+process that *starts* inside the window is caught by the closing walk only.
+
+| field | meaning |
+|---|---|
+| `blocked_in_window[]` | ranked `{pid, comm, unit, d_samples, thread_d_samples, samples, d_share, wchan, wchan_withheld}`. Ranked on the **worse** of the two sample counts, so a wedged thread behind a healthy leader (#287's shape) cannot sort below a process that flickered into D once |
+| `blocked_in_window_count` | how many processes were blocked at all during the window |
+| `window_samples` / `window_sample_interval_s` / `window_span_s` | how many samples, how far apart, and the span actually covered (`≈ (samples-1) × interval` plus one sample's work — the window's two ends are the walks). `d_share` is a fraction of *samples*; check it against this span, not against `--window` |
+| `window_thread_coverage_s` | how long a full per-thread rotation takes. A thread block shorter than this can fall between two visits to the same process — the sampler's stated resolution, not a hidden limit |
+| `delayacct` | `{enabled, note}`. **The field exists in `/proc/<pid>/stat` and reads 0 for every process while `kernel.task_delayacct=0`**, so a record that emitted the delta anyway would print a measured "waited 0 ms" for everything — the #306 failure mode. `blkio_wait_ms` therefore appears on a row *only* when the sysctl says 1, and a zero there is then a real zero |
+
+Measured cost of the change on the robot (197 pids, 6 samples): the sampler
+covered 2.54 s of a 3 s window, `observer_read_bytes` **0**, `observer_write_bytes`
+**0** — /proc reads are memory, not card traffic, which is the point.
+
+**First real reading from the window channel (2026-09-18 04:33 AEST, robot
+`b9df4527` + this change):**
+
+```
+blocked_in_window = [{"pid": 217, "comm": "jbd2/mmcblk0p2-8", "d_samples": 1,
+  "samples": 6, "d_share": 0.17, "wchan": null, "wchan_withheld": true,
+  "unit": null}]
+wchan_withheld_count = 1
+```
+
+Unprivileged, on an unremarkable window, this now says the thing the whole
+investigation wanted: **the ext4 journal thread itself — the writer that has no
+file and no process — was in uninterruptible sleep for one of six samples**,
+while `writers_unreadable_count` sits at 175 and every byte-level channel is
+blind to it. `unit: null` is correct and not a gap: `jbd2` is a kernel thread
+with no cgroup unit to blame.
+
 ## Install (root, one command block)
 
 ```bash
@@ -124,12 +194,19 @@ cd /home/pi/picar-x-hacking && git pull --ff-only
 # Unprivileged smoke test first — prints one record, writes nothing:
 bin/px-io-attrib --dry-run --window 3
 
-# Optional second lever, one line, if you would rather not install the unit yet:
+# Second lever, now measured rather than hoped for (2026-09-18): the counter is
+# real and switched off. /proc/<pid>/stat field 42 (delayacct_blkio_ticks) exists
+# and reads 0 for every process on the robot while kernel.task_delayacct=0, and
+# the field alignment was verified there (indices 36/37/38 = processor 3,
+# rt_priority 0, policy 0).
 #   sudo sysctl -w kernel.task_delayacct=1
-# It is *unverified* on this host (see "Deliberately not done"): the sysctl
-# exists but /proc/<pid>/delayacct does not, so it may create per-task block-IO
-# wait time — including for root-owned processes — or it may do nothing at all.
-# The unit below subsumes it either way, which is why the unit is the ask.
+#   echo kernel.task_delayacct=1 | sudo tee /etc/sysctl.d/99-spark-delayacct.conf
+#   sudo systemctl restart px-alive px-wake-listen px-mind   # see next paragraph
+# It is a *global* switch and only tasks forked afterwards are accounted, so
+# without the restart the daemons keep reporting 0 and the channel looks broken.
+# Then every blocked_in_window row carries blkio_wait_ms — per-process block-IO
+# wait time, which is readable for root-owned processes. That is the only
+# *quantitative* channel an unprivileged observer has for them.
 
 # Then the real thing, as root:
 sudo install -m 0644 systemd/px-io-attrib.service /etc/systemd/system/px-io-attrib.service
@@ -514,7 +591,8 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `file_touched[]` / `file_touched_count` | files whose **mtime** moved, `{path, bytes}`. **Zero-byte rows sort first**: those are the writes the size channel cannot see (journald appending into its 8 MB preallocated mmap'd journal, and any fixed-size rewrite). A row means *someone wrote this file in this window* — mtime moves when the write lands in page cache, so it is a writer to attribute, not proof that bytes reached the device |
 | `writers[]` | ranked by `write_bytes` (disk) across the window, with `unit` from `/proc/<pid>/cgroup` — the process *and* the thing to change |
 | `writers_with_activity` / `write_bytes_total` | how many processes moved anything at all, and how much of it reached the disk |
-| `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
+| `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]`. `wchan: null` with `wchan_withheld: true` means the kernel hid the symbol from this uid — not that the process was blocked in nothing |
+| `blocked_in_window[]` | who was blocked *during* the window, sampled (see the window-channel section). This is the list to read when `writers_unreadable_count` is high: it is the only channel that can name a root-owned writer |
 | `d_state_count` / `blocked_thread_count` | stalled processes, and how many of the blocked tasks are non-leader threads |
 | `devices` | per-device deltas. `ms_io` (queue-occupied time) is the trustworthy one; `ms_writing` is reported but over-counts on this kernel — see the caveat above |
 | `ext4` | `{fs, write_kbytes_delta, session_write_kbytes, lifetime_write_kbytes, delayed_allocation_blocks, errors_count, journal_task}`. Compare `write_kbytes_delta` against `devices.<dev>.sectors_written`: a ratio near 1.00 means the device's bytes *are* filesystem writes (no rogue writer), and the interesting number is then amplification — device bytes per byte of file data, which the file channels approximate. `journal_task` is a **tid** on this kernel (217 = `jbd2/mmcblk0p2-8`), so it cross-references `stalled[].pid`. `{}` means unwatched, never zero. `lifetime_write_kbytes` is the wear figure for the card |
@@ -543,6 +621,8 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `ext4.lifetime_write_kbytes` is in the hundreds of GB to TB (1.03 TB on `picar`, 2026-09-17) | the card has been written a great deal; a wear-related latency tail is a live hypothesis, not a theory | treat card health as a candidate alongside the kernel/host path, and say so when reporting |
 | both file channels empty with the device saturated | metadata/journal work with no file-level signature at all (ext4 `-rsv-conversion`, `kblockd`, `jbd2` in the D-state roster) | the root channel is the only way in; do not read the empty channels as "nobody wrote" |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
+| `blocked_in_window[0]` is a root-owned daemon or a kernel thread with `wchan_withheld: true`, `writers_unreadable_count` high | the unprivileged reading of "the writer is one of the processes we cannot measure". A `jbd2/mmcblk0p2-8` row is ext4 journal work; the journal thread *is* the writer, and it has no file and no unit | the unit-level fix is journal-side tuning (`SyncIntervalSec`, `Storage=`, rates) or taking fsyncs out of the suspect daemon — not process weighting; install as root for the symbol and the bytes |
+| `blocked_in_window` names a *user-space* daemon with `thread_d_samples` at or near `samples` while `d_samples` is 0 | a thread of that daemon is wedged behind a healthy leader (#287) — the shape a leader-only view reports as "fine" | that daemon's write path, not its park logic |
 | **`device_inflight_pre` is `0/0` while `d_state_count` is high and `devices` shows queue time** | **nothing was in flight: the queue is wedged, not busy — there is no writer in this record to find, and a longer search for one is the wrong search** | take the question to the *waiters*: `stalled[].wchan` and (as root) the kernel threads, and to the other bus users — `mmc1`'s SDIO WiFi shares the `mmc` subsystem and cannot be seen from `/sys/block` |
 
 ## Deliberately not done
@@ -556,16 +636,17 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
   lever is now *closed* rather than deferred: the 2026-09-17 wedge shows the
   stall happens with the device idle and no competing writer, so there is
   nothing to deprioritise.
-- **No `task_delayacct` — and its status changed on 2026-09-17.** The sysctl
-  *exists* on `picar` and reads 0, but **`/proc/<pid>/delayacct` does not exist
-  for any process sampled** (pid 1, `px-alive`, `arecord`), and
-  `sched_schedstats` is also 0. So per-task block-IO wait accounting is not
-  available there today, and whether enabling the sysctl creates the per-task
-  files is **untested — because testing it needs root**. Earlier text here
-  called it a "reversible one-liner, available if the writer channel proves
-  insufficient"; the writer channel has now proved insufficient (2026-09-17
-  20:45) and the one-liner is still unverified, so treat it as *unknown* rather
-  than *available*.
+- **`task_delayacct` is off, and that is now a *measured ask* rather than an
+  unknown.** Corrected 2026-09-18: the earlier note reasoned about
+  `/proc/<pid>/delayacct`, which does not exist on this kernel and never will —
+  the counter moved into `/proc/<pid>/stat` field 42. That field **exists and
+  reads 0 for every process while the sysctl is 0**, and its position was
+  verified against the robot's own `/proc/1/stat` (indices 36/37/38 read
+  processor 3, `rt_priority` 0, `policy` 0). So the channel is real, readable
+  for root-owned processes, and simply switched off; turning it on needs root,
+  which is why it lives in the install block above rather than in a code path.
+  The record emits `blkio_wait_ms` **only** when the sysctl reads 1, so a
+  switched-off kernel can never produce a per-process "waited 0 ms".
 
   What does work there without root, and is already in every record:
   `/proc/<pid>/schedstat` run delay (the observer's `max_run_delay_ms`) —

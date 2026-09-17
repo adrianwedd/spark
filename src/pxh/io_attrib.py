@@ -23,12 +23,28 @@ Two channels, and the difference between them is privilege:
   from go2rtc/rpicam-vid that never touched the disk. Reading it for root-owned
   processes (px-alive, journald) needs root or CAP_SYS_PTRACE — as ``pi``,
   ``/proc/1/io`` is EACCES.
-* **stall channel** — ``/proc/<pid>/stat`` (state), ``schedstat`` (run delay),
-  ``wchan``, plus ``/proc/diskstats`` write-queue time, ``/proc/vmstat`` and
-  PSI. World-readable even for root-owned processes, and it is what separates
-  "a readable process was writing" from "the device was busy and no readable
-  process was writing" — the latter being the signature of ext4 journal work
-  (``jbd2/*`` kthreads) or of a writer this process is not allowed to see.
+* **stall channel** — ``/proc/<pid>/stat`` (state, ``delayacct_blkio_ticks``),
+  ``schedstat`` (run delay), ``wchan``, plus ``/proc/diskstats`` write-queue
+  time, ``/proc/vmstat`` and PSI. It is what separates "a readable process was
+  writing" from "the device was busy and no readable process was writing" — the
+  latter being the signature of ext4 journal work (``jbd2/*`` kthreads) or of a
+  writer this process is not allowed to see.
+
+  Readable for root-owned processes ***except `wchan`***, which is the field
+  this channel was built around and which the kernel silently withholds:
+  measured on `picar` 2026-09-18, 8 consecutive passes returned **0 symbols for
+  65 root-owned sleeping processes and 0 errors** while the 23-24 pi-owned ones
+  returned 21-22. So `wchan` names a writer only when `/proc/<pid>/io` was
+  already readable for it, and every record now says which blocked processes
+  were left unnamed (`wchan_withheld_count`) instead of letting `null` read as
+  "not blocked in anything".
+* **window channel** — the same state sampled *across* the window
+  (`sample_window`, `blocked_in_window`) instead of at its two ends. A burst
+  that ends before t1 is invisible to a two-ended walk, and state is the only
+  reading that survives the privilege boundary, so a 3 s window is sampled every
+  0.5 s: per-pid D fractions, plus per-thread D for a rotating quarter of the
+  process set (px-alive's wedged health thread sits behind a leader that stays
+  ``S``, so threads are where that writer hides).
 
   ``/proc/<pid>/stat`` only reports the *thread group leader*, and that is not
   enough for the daemon this investigation is about: px-alive reports health
@@ -50,7 +66,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from .hostload import host_load_fields
 
@@ -147,6 +163,20 @@ DEFAULT_PATHS = Paths()
 DEFAULT_WINDOW_S = 3.0
 
 
+#: How often the in-window sampler reads /proc while a stall is being captured.
+#: The two-ended walk it replaces could only see a stall that happened to be
+#: blocked at t0 or t1; #247's residual is a *burst*, so the window is spent
+#: sampling instead of sleeping through it.
+DEFAULT_SAMPLE_INTERVAL_S = 0.5
+
+#: The in-window per-thread walk covers this fraction of the process set per
+#: sample, so every process is visited once per rotation instead of paying a
+#: full thread walk every 0.5 s. Threads are where a block hides behind a
+#: healthy leader (px-alive's health thread), so the rotation period is
+#: reported as `window_thread_coverage_s` rather than left implicit.
+THREAD_ROTATION_DIVISOR = 4
+
+
 # --- readers (all total, none raising) -----------------------------------
 
 
@@ -185,6 +215,18 @@ def parse_proc_stat(text: str) -> dict[str, Any]:
     out: dict[str, Any] = {"comm": text[open_paren + 1 : close_paren]}
     if fields:
         out["state"] = fields[0]
+    # Field 42, `delayacct_blkio_ticks` — 0-based index 39 once `pid` and
+    # `comm` are off the front. It is one of the two fields here that survive
+    # the privilege boundary, and unlike `state` it measures *wait* rather than
+    # presence, which is what makes it the only per-process block-IO reading a
+    # root-owned writer (px-alive, journald) can be charged with by an
+    # unprivileged observer. Populated only when kernel.task_delayacct is 1 —
+    # see `delayacct_enabled`, and do not read an absent key as zero.
+    if len(fields) > 39:
+        try:
+            out["delayacct_blkio_ticks"] = int(fields[39])
+        except ValueError:
+            pass
     return out
 
 
@@ -647,6 +689,20 @@ def read_wchan(pid: int, proc_root: Path) -> str | None:
 
     "0" is what the kernel reports for a task that is not blocked at this
     instant, which is why this is only read for tasks observed in D state.
+
+    **It is also what the kernel reports for a task this uid may not ptrace**,
+    and it does that *silently* — the read succeeds and returns "0" for a
+    process that is genuinely blocked, not `EACCES`. Measured on `picar`
+    2026-09-18, 8 consecutive passes: **65 root-owned sleeping processes
+    returned 0 symbols and 0 errors, while the 23-24 pi-owned ones returned
+    21-22 symbols**, so on this host `wchan` names a writer only when the
+    observer can already read that writer's `/proc/<pid>/io`.
+
+    That asymmetry is why a `None` here is never reported as "not blocked":
+    the record derives `wchan_withheld` from the io denial it *has* measured
+    and says so out loud. The remedy is to run the observer as root — this uid
+    cannot see the symbol, and pretending "0" means "running" is the failure
+    mode this whole investigation is about.
     """
     return _wchan_symbol(proc_root / str(pid) / "wchan")
 
@@ -654,6 +710,147 @@ def read_wchan(pid: int, proc_root: Path) -> str | None:
 def read_task_wchan(pid: int, tid: int, proc_root: Path) -> str | None:
     """`read_wchan` for one secondary thread of a process."""
     return _wchan_symbol(proc_root / str(pid) / "task" / str(tid) / "wchan")
+
+
+def delayacct_enabled(paths: Paths = DEFAULT_PATHS) -> bool | None:
+    """Whether the kernel is populating `delayacct_blkio_ticks` (None: unknown).
+
+    `kernel.task_delayacct` defaults to 0 on this kernel, and it is a *global*
+    switch: turning it on only affects tasks forked afterwards, so the field
+    stays 0 for every long-lived daemon until it is restarted. Two consequences
+    worth writing down rather than rediscovering:
+
+    * a record taken with this reading `False` has no per-process block-IO
+      wait, and that is "not measured", never "waited zero";
+    * the switch needs root, so on `picar` this channel is an ask (#247), not
+      a capability — see docs/operations/io-attribution.md.
+    """
+    text = _read_text(paths.proc / "sys" / "kernel" / "task_delayacct")
+    if text is None:
+        return None
+    return text.strip() == "1"
+
+
+def _tick_ms() -> float:
+    """One `delayacct_blkio_ticks` tick in milliseconds (USER_HZ; 100 here)."""
+    try:
+        hz = os.sysconf("SC_CLK_TCK")
+    except (ValueError, OSError, AttributeError):
+        hz = 100
+    return 1000.0 / hz if hz else 10.0
+
+
+def sample_window(
+    paths: Paths,
+    pids: Sequence[int],
+    *,
+    samples: int,
+    interval_s: float = DEFAULT_SAMPLE_INTERVAL_S,
+    thread_pids: Sequence[int] = (),
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Read blocked state *across* the window instead of sleeping through it.
+
+    A two-ended walk — one /proc sweep at t0, another at t1 — can only see a
+    stall that happens to be blocked at one of those two instants. #247's
+    residual after zram is a burst, so a 3 s window sampled twice is mostly
+    blind, and the window is otherwise spent doing nothing.
+
+    What is read, and why exactly this:
+
+    * ``/proc/<pid>/stat`` for every pid, every sample. `state` and
+      `delayacct_blkio_ticks` are the two readings that survive the privilege
+      boundary — on `picar`, 65 root-owned sleeping processes returned a
+      `wchan` of 0 across 8 passes while pi-owned ones returned symbols — so
+      D state is the only signal left that can name a *root-owned* writer.
+    * per-thread D state for a rotating quarter of the process set, plus any
+      pid already known to have had a blocked thread at t0. px-alive's health
+      thread blocks behind a leader that stays `S` (#287), so leader state
+      alone cannot see that writer; rotating keeps the cost bounded while
+      still visiting every process once per rotation.
+    * `wchan` for any task observed in D — a symbol when this uid may read it,
+      nothing when it may not, which is what `wchan_withheld` later calls out.
+
+    Pids that *started* inside the window are not in `pids` and so are not
+    sampled; the closing walk still sees them. Never raises: a missing /proc
+    yields an empty tally, and `samples`/`span_s` are returned so an empty tally
+    can be told from a sampler that never ran.
+
+    Ticks are kept on a target clock rather than by sleeping `interval_s` after
+    each sample, so `samples` really does tile the window it claims to: on the
+    robot a sample costs ~40 ms of /proc reads, and a version that slept a full
+    interval *in addition* would stretch a 3 s window to 3.2 s and quietly
+    misreport every `d_samples/samples` fraction.
+    """
+    ordered = list(dict.fromkeys(pids))
+    watch = list(dict.fromkeys(thread_pids))
+    buckets = max(1, min(THREAD_ROTATION_DIVISOR, len(ordered)))
+    rotation = [ordered[index::buckets] for index in range(buckets)] if ordered else [[]]
+
+    per: dict[int, dict[str, Any]] = {}
+    taken = 0
+    total = max(1, int(samples))
+    started = monotonic()
+    for index in range(total):
+        for pid in ordered:
+            entry = per.get(pid)
+            if entry is None:
+                entry = per[pid] = {
+                    "comm": None,
+                    "samples": 0,
+                    "d_samples": 0,
+                    "thread_d_samples": 0,
+                    "wchan": {},
+                    "thread_wchan": {},
+                    "blkio_ticks_first": None,
+                    "blkio_ticks_last": None,
+                }
+            parsed = parse_proc_stat(_read_text(paths.proc / str(pid) / "stat") or "")
+            if not parsed:
+                continue  # exited mid-window
+            entry["samples"] += 1
+            entry["comm"] = parsed.get("comm") or entry["comm"]
+            ticks = parsed.get("delayacct_blkio_ticks")
+            if ticks is not None:
+                if entry["blkio_ticks_first"] is None:
+                    entry["blkio_ticks_first"] = ticks
+                entry["blkio_ticks_last"] = ticks
+            if parsed.get("state") == "D":
+                entry["d_samples"] += 1
+                symbol = read_wchan(pid, paths.proc)
+                if symbol:
+                    entry["wchan"][symbol] = entry["wchan"].get(symbol, 0) + 1
+        for pid in dict.fromkeys(watch + rotation[index % buckets]):
+            entry = per.get(pid)
+            if entry is None:
+                continue
+            threads = blocked_threads(pid, paths.proc / str(pid))
+            if not threads:
+                continue
+            entry["thread_d_samples"] += 1
+            for thread in threads:
+                symbol = read_task_wchan(pid, thread["tid"], paths.proc)
+                if symbol:
+                    key = symbol
+                    entry["thread_wchan"][key] = entry["thread_wchan"].get(key, 0) + 1
+        taken += 1
+        if taken < total:
+            sleep(max(0.0, started + taken * interval_s - monotonic()))
+
+    span_s = monotonic() - started
+    return {
+        "samples": taken,
+        "interval_s": interval_s,
+        # The span actually covered, so `d_samples/samples` can be checked
+        # against a clock instead of assumed from the requested window.
+        "span_s": round(span_s, 3),
+        # How long a full thread rotation takes: a block shorter than this can
+        # fall between two visits to the same process, and that limit is part
+        # of the reading rather than a footnote.
+        "thread_coverage_s": round(interval_s * buckets, 2),
+        "pids": per,
+    }
 
 
 # --- ranking --------------------------------------------------------------
@@ -766,6 +963,132 @@ def rank_stalled(
     # D-state tasks first (that is the phenomenon), then the longest run delay.
     rows.sort(key=lambda row: (row["d_state"], row["run_delay_ms"]), reverse=True)
     return rows[:top], stalled_processes, blocked_thread_count, max_delay
+
+
+def rank_blocked_in_window(
+    window: Mapping[str, Any],
+    procs_post: Mapping[int, Mapping[str, Any]],
+    denied_pids: Collection[int] = (),
+    *,
+    delayacct_on: bool | None = None,
+    top: int = 8,
+) -> tuple[list[dict[str, Any]], int]:
+    """`(ranked, blocked_pids)` for who was blocked *during* the window.
+
+    This is the channel that survives the privilege boundary, and it is the
+    answer to "who wrote" for a writer whose `wchan` and `/proc/<pid>/io` are
+    both withheld: the kernel will not say *what* a root-owned process is
+    waiting for, but it will say that it is in uninterruptible sleep, for how
+    many of the samples, and whether a thread of it is the one stuck.
+
+    Ranked on the worst of the two sample counts rather than their sum: a
+    process with a blocked *thread* for the whole window is the #287 shape
+    (healthy leader, wedged health write) and must not sort below a process
+    that flickered into D once. `wchan_withheld` is set only where the io
+    denial was measured for that pid — a `None` symbol is otherwise just
+    "blocked somewhere this kernel does not name".
+
+    `blkio_wait_ms` is emitted only when `delayacct_on is True`. The field is
+    *present and zero* in `/proc/<pid>/stat` on a kernel that is not accounting
+    for it, so emitting the delta unconditionally would print a measured
+    "waited 0 ms" for every process on this host — the exact anti-observability
+    failure (#306) this record exists to avoid. Measured on the robot
+    2026-09-18: present-and-zero in every process's stat, `task_delayacct=0`.
+    """
+    denied = set(denied_pids)
+    samples = int(window.get("samples") or 0)
+    rows: list[dict[str, Any]] = []
+    for pid, entry in (window.get("pids") or {}).items():
+        if not isinstance(pid, int):
+            continue
+        d_samples = int(entry.get("d_samples") or 0)
+        thread_samples = int(entry.get("thread_d_samples") or 0)
+        severity = max(d_samples, thread_samples)
+        if severity <= 0:
+            continue
+        symbols = list(entry.get("wchan") or {}) + list(entry.get("thread_wchan") or {})
+        pid_entry = procs_post.get(pid) or {}
+        row: dict[str, Any] = {
+            "pid": pid,
+            "comm": entry.get("comm") or pid_entry.get("comm") or "?",
+            "d_samples": d_samples,
+            "thread_d_samples": thread_samples,
+            "samples": samples,
+            "d_share": round(severity / samples, 2) if samples else None,
+            "wchan": symbols[0] if symbols else None,
+            "wchan_withheld": not symbols and pid in denied,
+        }
+        first = entry.get("blkio_ticks_first")
+        last = entry.get("blkio_ticks_last")
+        if delayacct_on is True and first is not None and last is not None:
+            # Only present when the kernel is accounting for it; absent means
+            # "not measured", which is why this key is conditional. A zero here
+            # is then a real zero.
+            row["blkio_wait_ms"] = round((last - first) * _tick_ms(), 1)
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            max(row["d_samples"], row["thread_d_samples"]),
+            row["d_samples"] + row["thread_d_samples"],
+        ),
+        reverse=True,
+    )
+    return rows[:top], len(rows)
+
+
+def wchan_withheld_pids(
+    procs_post: Mapping[int, Mapping[str, Any]],
+    denied_pids: Collection[int],
+    window: Mapping[str, Any] | None = None,
+) -> set[int]:
+    """Pids that were blocked while their `wchan` was withheld from this uid.
+
+    Derived, not guessed: `/proc/<pid>/wchan` prints "0" (successfully) for a
+    task this uid may not ptrace, so the only honest test is the io denial
+    measured on the same pid. Counted over the whole walk and the whole window
+    rather than over the `top`-truncated rows, because a count that silently
+    inherits a display limit is worse than no count.
+    """
+    denied = set(denied_pids)
+    out: set[int] = set()
+    for pid, entry in procs_post.items():
+        if pid in denied and (entry.get("state") == "D" or entry.get("blocked_threads")):
+            out.add(pid)
+    for pid, entry in ((window or {}).get("pids") or {}).items():
+        if pid not in denied:
+            continue
+        if (entry.get("d_samples") or 0) or (entry.get("thread_d_samples") or 0):
+            out.add(pid)
+    return out
+
+
+def wchan_unavailable_reason(withheld: int) -> str | None:
+    """One sentence for a record whose blocked writers are partly unnamed."""
+    if not withheld:
+        return None
+    return (
+        f"{withheld} process(es) were blocked with their wchan withheld: the kernel "
+        "answers /proc/<pid>/wchan with '0' — not an error — for any task this uid "
+        "may not ptrace, so a root-owned writer (px-alive, journald, a jbd2 kthread) "
+        "reads as 'running' there. State and delayacct fields are unaffected; run "
+        "this as root for the symbol."
+    )
+
+
+def delayacct_note(enabled: bool | None) -> str:
+    """What the delayacct reading means, in one sentence, for the record."""
+    if enabled is True:
+        return (
+            "per-process block-IO wait is present: each blocked_in_window row "
+            "carries blkio_wait_ms (kernel.task_delayacct=1)"
+        )
+    if enabled is False:
+        return (
+            "kernel.task_delayacct=0, so blkio_wait_ms is absent — not zero. The "
+            "field is populated only for tasks forked after it is enabled, so "
+            "turning it on needs the suspect units restarted to be visible."
+        )
+    return "kernel.task_delayacct is unreadable on this host; delayacct not measured"
 
 
 def sample_inflight(paths: Paths = DEFAULT_PATHS) -> dict[str, dict[str, int]]:
@@ -921,8 +1244,13 @@ def _device_deltas(
 
 
 def _attach_units(
-    rows: list[dict[str, Any]], proc_root: Path, *, want_wchan: bool = False
+    rows: list[dict[str, Any]],
+    proc_root: Path,
+    *,
+    want_wchan: bool = False,
+    denied_pids: Collection[int] = (),
 ) -> None:
+    denied = set(denied_pids)
     for row in rows:
         pid = row.get("pid")
         if not isinstance(pid, int):
@@ -931,10 +1259,16 @@ def _attach_units(
         if want_wchan:
             if row.get("d_state"):
                 row["wchan"] = read_wchan(pid, proc_root)
+                if row["wchan"] is None and pid in denied:
+                    # "0" is what a withheld wchan looks like. Saying so keeps
+                    # `wchan: null` from reading as "not blocked in anything".
+                    row["wchan_withheld"] = True
             for thread in row.get("blocked_threads") or []:
                 tid = thread.get("tid")
                 if isinstance(tid, int):
                     thread["wchan"] = read_task_wchan(pid, tid, proc_root)
+                    if thread["wchan"] is None and pid in denied:
+                        thread["wchan_withheld"] = True
 
 
 # --- the record -----------------------------------------------------------
@@ -976,6 +1310,7 @@ def capture(
     *,
     paths: Paths = DEFAULT_PATHS,
     window_s: float = DEFAULT_WINDOW_S,
+    interval_s: float = DEFAULT_SAMPLE_INTERVAL_S,
     allow_proc_io: bool = True,
     privileged: bool | None = None,
     growth_patterns: Sequence[str] = (),
@@ -987,11 +1322,21 @@ def capture(
 
     Order matters: the process walk at t0 *is* the stall (the caller triggered
     because PSI is high or the heartbeat is late right now), and the walk at t1
-    only exists to difference against it. Two walks of /proc, ~3 s apart, then
-    stop — this is not a sampler, and a version of it that polled like one would
-    be a candidate for the very list it produces.
+    only exists to difference against it. Between them the window is **sampled**,
+    not slept through — see `sample_window` for exactly what is read and why
+    state rather than `wchan` is the reading that survives the privilege
+    boundary. The observer-ethics objection that made the first version of this
+    a two-ended walk still stands, so the sampler answers it three ways rather
+    than by polling harder: it runs *only* inside an already-triggered window,
+    it reads one small /proc file per pid per sample instead of the whole walk,
+    and it reports `window_samples` plus its own `observer_read_bytes` so the
+    instrument is in its own record.
+
+    One record per trigger and a 60 s cooldown are unchanged: the failure mode
+    this guards against is an observer that becomes the writer it is hunting.
     """
     started = monotonic()
+    window_samples = max(1, int(round(window_s / interval_s))) if interval_s > 0 else 1
 
     psi_pre = host_load_fields("pre")
     sys_ctx_pre = parse_procs_stat(_read_text(paths.proc_stat) or "")
@@ -1006,11 +1351,24 @@ def capture(
             uptime_s = None
     inflight_pre = sample_inflight(paths)
     ext4_pre = sample_ext4(paths)
+    delayacct = delayacct_enabled(paths)
     procs_pre = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
     files_pre = sample_file_meta(growth_patterns) if growth_patterns else {}
     observer_pre = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
 
-    sleep(max(0.0, window_s))
+    window = sample_window(
+        paths,
+        list(procs_pre),
+        samples=window_samples,
+        interval_s=interval_s,
+        # Carried from t0 so a thread already known to be stuck keeps being
+        # watched for the whole window, whatever the rotation lands on.
+        thread_pids=[
+            pid for pid, entry in procs_pre.items() if entry.get("blocked_threads")
+        ],
+        sleep=sleep,
+        monotonic=monotonic,
+    )
 
     procs_post = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
     files_post = sample_file_meta(growth_patterns) if growth_patterns else {}
@@ -1025,6 +1383,11 @@ def capture(
     elapsed = round(monotonic() - started, 3)
 
     io_denied = sum(1 for entry in procs_post.values() if entry.get("io_denied"))
+    # The measured io refusal is also the only honest test for "this kernel is
+    # hiding a wchan from us", so it is carried into every wchan reading below.
+    denied_pids = {
+        pid for pid, entry in procs_post.items() if entry.get("io_denied")
+    }
     writers, writer_count, write_bytes_total = rank_writers(
         procs_pre, procs_post, top=top
     )
@@ -1032,7 +1395,12 @@ def capture(
     stalled, d_state_count, blocked_thread_count, max_run_delay = rank_stalled(
         procs_pre, procs_post, top=top
     )
-    _attach_units(stalled, paths.proc, want_wchan=True)
+    _attach_units(stalled, paths.proc, want_wchan=True, denied_pids=denied_pids)
+    blocked_window, blocked_window_count = rank_blocked_in_window(
+        window, procs_post, denied_pids, delayacct_on=delayacct, top=top
+    )
+    _attach_units(blocked_window, paths.proc)
+    withheld = wchan_withheld_pids(procs_post, denied_pids, window)
 
     devices = _device_deltas(disk_pre, disk_post)
     (
@@ -1128,6 +1496,36 @@ def capture(
         "file_touched": touched,
         "file_touched_count": touched_count,
         "stalled": stalled,
+        # The window's own reading — who was in uninterruptible sleep *during*
+        # it, sampled rather than inferred from its two ends. This is the
+        # channel that still names a root-owned writer: state is readable for
+        # every process, while wchan and /proc/<pid>/io are not, and a burst
+        # inside the window is exactly what two endpoint walks miss. Read
+        # `d_samples`/`samples` as a fraction of the window, `thread_d_samples`
+        # as the #287 shape (wedged health thread, healthy leader), and prefer
+        # this list over `writers` when `writers_unreadable_count` is large.
+        "blocked_in_window": blocked_window,
+        "blocked_in_window_count": blocked_window_count,
+        "window_samples": window.get("samples"),
+        "window_sample_interval_s": window.get("interval_s"),
+        "window_span_s": window.get("span_s"),
+        # How long a full per-thread rotation takes. A thread block shorter
+        # than this can fall between two visits to the same process — the
+        # sampler's stated resolution, not a hidden limitation.
+        "window_thread_coverage_s": window.get("thread_coverage_s"),
+        # A blocked process whose wchan is missing is *unnamed*, not
+        # unblocked: the kernel answers /proc/<pid>/wchan with "0" for tasks
+        # this uid may not ptrace. Counted over the whole walk and window, not
+        # over the truncated rows.
+        "wchan_withheld_count": len(withheld),
+        "wchan_unavailable_reason": wchan_unavailable_reason(len(withheld)),
+        # Per-process block-IO wait, the one *wait* reading readable for a
+        # root-owned process — off by default on this kernel, hence the note
+        # in every record rather than a silent absence.
+        "delayacct": {
+            "enabled": delayacct,
+            "note": delayacct_note(delayacct),
+        },
         # The instrument accounting for itself: if this record ever shows the
         # observer as the top writer, the observer is the defect.
         "observer_write_bytes": _delta(observer_pre, observer_post, "write_bytes"),

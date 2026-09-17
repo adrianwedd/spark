@@ -4,8 +4,16 @@
 # A trigger-on-demand observer, not a poller. Between triggers it reads one
 # small /proc file (io PSI) and px-alive's heartbeat, once a second. When either
 # crosses its threshold it takes ONE bounded snapshot — /proc/<pid>/io deltas,
-# who is in uninterruptible sleep, mmcblk0 write-queue time, vmstat, PSI before
-# and after — writes one record, then stays quiet for the cooldown.
+# who is in uninterruptible sleep *sampled across the window* rather than only
+# at its two ends, mmcblk0 write-queue time, vmstat, PSI before and after —
+# writes one record, then stays quiet for the cooldown.
+#
+# The in-window sampling exists because of a measured asymmetry: /proc/<pid>/io
+# and `wchan` are both withheld for processes this uid may not ptrace (on the
+# robot, 65 root-owned sleeping processes returned a wchan of "0" across 8
+# passes while pi-owned ones returned symbols), leaving *state* as the only
+# reading that can name a root-owned writer. So the window is spent reading one
+# small file per pid per sample and reporting `blocked_in_window`.
 #
 # That discipline is the whole design: an observer that sampled /proc/*/io for
 # all ~150 processes all day would be a candidate for the very list it produces,
@@ -88,6 +96,19 @@ def _summary(record: dict) -> str:
     parts.extend(
         f"{name}_ms_io={deltas.get('ms_io', 0)}" for name, deltas in devices.items()
     )
+    blocked = record.get("blocked_in_window") or []
+    if blocked:
+        worst = blocked[0]
+        parts.append(
+            f"blocked_in_window={worst['comm']}({worst['pid']}) "
+            f"d={worst['d_samples']}/{worst['samples']} "
+            f"thread_d={worst['thread_d_samples']}"
+            + (" wchan=withheld" if worst.get("wchan_withheld") else "")
+        )
+    parts.append(f"window_samples={record.get('window_samples')}")
+    withheld = record.get("wchan_withheld_count") or 0
+    if withheld:
+        parts.append(f"wchan_withheld={withheld}")
     growth = record.get("file_growth") or []
     if growth:
         parts.append(f"top_file={growth[0]['path']}(+{growth[0]['bytes']}B)")
@@ -106,6 +127,10 @@ def main(argv: list[str]) -> int:
                          "its 15s watchdog deadline")
     ap.add_argument("--window", type=float, default=io_attrib.DEFAULT_WINDOW_S,
                     help="seconds to sample across once triggered (1-10)")
+    ap.add_argument("--sample-interval", type=float,
+                    default=io_attrib.DEFAULT_SAMPLE_INTERVAL_S,
+                    help="seconds between in-window samples (state, and a "
+                         "rotating per-thread slice); 0 falls back to 1 s")
     ap.add_argument("--poll", type=float, default=1.0,
                     help="seconds between the cheap trigger reads")
     ap.add_argument("--cooldown", type=float, default=60.0,
@@ -146,6 +171,7 @@ def main(argv: list[str]) -> int:
         growth_patterns = io_attrib.default_growth_patterns(LOG_DIR, state_dir)
 
     window_s = min(10.0, max(1.0, args.window))
+    sample_interval = max(0.0, args.sample_interval)
     heartbeat_file = (
         Path(args.heartbeat_file)
         if args.heartbeat_file
@@ -168,6 +194,7 @@ def main(argv: list[str]) -> int:
             trigger,
             paths=paths,
             window_s=window_s,
+            interval_s=sample_interval or 1.0,
             allow_proc_io=allow_proc_io,
             privileged=privileged,
             growth_patterns=growth_patterns,
@@ -205,6 +232,7 @@ def main(argv: list[str]) -> int:
     log(
         f"observer start io_threshold={args.io_threshold} "
         f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
+        f"sample_interval_s={sample_interval} "
         f"cooldown_s={args.cooldown} poll_s={args.poll} "
         f"heartbeat_file={heartbeat_file} pid_file={pid_file if pid_published else 'unavailable'} "
         f"growth_patterns={len(growth_patterns)} "
