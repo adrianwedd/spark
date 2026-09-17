@@ -833,6 +833,59 @@ def test_sample_file_sizes_stats_every_match_and_never_raises(tmp_path):
     assert io_attrib.sample_file_sizes([str(tmp_path)]) == {}
 
 
+def test_unattributed_share_names_the_journal_metadata_remainder():
+    """`picar`, 2026-09-17: 2596 KB to the device, 92 KB to every readable
+    process. The remainder is journal/metadata and has no process to name."""
+    devices = {"mmcblk0": {"sectors_written": 5192}}     # 2596 KB
+    device_bytes, unattributed, share = io_attrib.unattributed_write_share(devices, 94_208)
+    assert device_bytes == 2_658_304
+    assert unattributed == 2_658_304 - 94_208
+    assert share == 0.965
+
+
+def test_unattributed_share_is_none_when_the_device_wrote_nothing():
+    """0/0 is not 0 %: an idle device has no share to report."""
+    assert io_attrib.unattributed_write_share({}, 0) == (0, 0, None)
+    assert io_attrib.unattributed_write_share({"mmcblk0": {"sectors_written": 0}}, 0) == (0, 0, None)
+
+
+def test_unattributed_share_picks_the_busiest_device():
+    devices = {
+        "mmcblk0": {"sectors_written": 200},
+        "zram0": {"sectors_written": 800},
+    }
+    device_bytes, unattributed, share = io_attrib.unattributed_write_share(devices, 1000)
+    assert device_bytes == 800 * 512           # zram0 is busier in this window
+    assert unattributed == 800 * 512 - 1000
+    assert 0.99 < share < 1.0
+
+
+def test_unattributed_share_never_goes_negative():
+    """A process can be charged for writes the device counter did not see in the
+    window (page-cache writes flushed later), so the remainder clamps at zero
+    rather than reporting negative unattributed bytes."""
+    devices = {"mmcblk0": {"sectors_written": 2}}          # 1 KB
+    device_bytes, unattributed, share = io_attrib.unattributed_write_share(devices, 500_000)
+    assert (device_bytes, unattributed, share) == (1024, 0, 0.0)
+
+
+def test_capture_reports_the_share_alongside_the_device_deltas(tmp_path, monkeypatch):
+    procs = _stall_procs()
+    paths = _wire_capture(tmp_path, monkeypatch, procs, _stall_post(procs))
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=3.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    # The fixture's device writes 1024 sectors (512 KB) and one writer accounts
+    # for 262144 B of it.
+    assert record["device_write_bytes"] == 1024 * 512
+    assert record["unattributed_write_bytes"] == 1024 * 512 - record["write_bytes_total"]
+    assert 0.0 <= record["unattributed_write_share"] <= 1.0
+
+
 def test_sample_file_meta_carries_size_and_mtime(tmp_path):
     target = tmp_path / "ambient_sound.json"
     target.write_text("{}")
