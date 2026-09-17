@@ -88,14 +88,26 @@ is running, so do not derive that list from memory:
 bin/px-deploy-check     # on the robot, immediately after the ff-merge
 ```
 
-It reads the deploy's changed files from git (`HEAD@{1}..HEAD`), reads every
-`px-*` unit's `ExecStart` and start time from systemd, and flags any unit whose
-entry point — or any `pxh` module reachable from it, including shell wrappers
-that run `python -m pxh.x` — this deploy changed while the process was already
-running. Replayed against the 2026-09-16 20:51 deploy it names six units: the
-four #332 had to restart by hand, plus `px-mind` and `px-wake-listen`, and none
-of the other four. **A deploy is not complete until it exits 0** — the source
-tree being correct is not the property; the processes executing it is.
+**The rule is reachability, not fan-out (#336): a unit is stale when it can
+execute a changed code path from its current process image.** `bin/px-deploy-check`
+reads the deploy's changed files from git (`HEAD@{1}..HEAD`), diffs each changed
+`pxh` module's *top-level symbols* between the two revisions, and flags a unit
+only when it references a name that actually changed — or when the change is
+module-level (an import block, a conditional definition: #332's shape), or when
+static analysis cannot resolve the reference at all. A daemon that merely imports
+a changed module gains nothing from a restart, and a fleet restart on a one-file
+observability change is churn that teaches people to ignore this gate. The
+second stage rests on the first: the import closure must *have* the graph edges,
+which is why #336 fixed three shapes that were invisible to it — `from pxh import
+X as Y` (the dominant idiom: read `node.names`, not just `node.module`), ASGI app
+strings (`exec uvicorn pxh.api:app`), and the Python heredoc inside a bash entry
+(`bin/px-alive` is `<<'PY' … PY`). Replayed against the 2026-09-17 #332/#334/#335
+deploy, the corrected rule names exactly the four units that were restarted by
+hand — `px-mind`, `px-api-server`, `px-blog`, `px-evolve` — and none of the other
+six; `tests/test_deploy_restart_list.py` pins that replay (and skips it on a
+shallow clone rather than passing vacuously). **A deploy is not complete until it
+exits 0** — the source tree being correct is not the property; the processes
+executing it is.
 
 ## Running Tests
 

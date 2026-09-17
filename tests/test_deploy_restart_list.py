@@ -13,17 +13,21 @@ the units' start times, who must restart.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
 from pxh.deploy import (
     UnitState,
+    changed_symbols,
     executed_paths,
     import_closure,
     imported_pxh_modules,
     needs_restart,
     restart_list,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 DEPLOY_TS = 1_758_010_264.0  # 2026-09-16 20:51:04 +10:00, the #332 deploy
 
@@ -190,3 +194,316 @@ def test_shell_wrapper_is_flagged_when_its_module_moves(repo):
     units = [_unit("px-wrapper.service", entry, 0.0)]
     verdicts = restart_list(["src/pxh/beta.py"], units, root=str(repo))
     assert [v.name for v in needs_restart(verdicts)] == ["px-wrapper.service"]
+
+
+# ---------------------------------------------------------------------------
+# #336 — the graph edges the closure was missing, and reachability over fan-out
+# ---------------------------------------------------------------------------
+#
+# The incident: `pxh.health` grew capability-block machinery in `4503782b`, the
+# gate said "every long-lived unit is executing the deployed revision" while
+# eight were not, and the restart list was derived by hand. Two causes — missing
+# closure edges, and a rule that flagged on *import* rather than on *reach*.
+
+
+def _git(tmp_path, files):
+    """A tiny real repo, because `changed_symbols` reads revisions via git."""
+    import subprocess
+
+    def run(*args):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                       capture_output=True, text=True)
+
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    run("add", "-A")
+    run("commit", "-qm", "v1")
+    first = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path,
+                           capture_output=True, text=True, check=True).stdout.strip()
+    for rel, body in files.items():
+        (tmp_path / rel).write_text(body)
+    run("add", "-A")
+    run("commit", "-qm", "v2")
+    return first
+
+
+def test_from_pxh_import_names_the_submodule_not_the_package(repo):
+    """`from pxh import health as _health` put the literal "pxh" in the closure,
+    which then died at src/pxh/pxh.py — the dominant idiom in this tree."""
+    entry = repo / "bin" / "px-import-pkg"
+    entry.write_text("#!/usr/bin/env python3\nfrom pxh import health as _health\n")
+    modules = imported_pxh_modules(str(entry))
+    assert "health" in modules
+    assert "pxh" not in modules
+    assert "src/pxh/health.py" in executed_paths(str(entry), str(repo))
+
+
+def test_from_pxh_import_handles_multiple_names_and_aliases(repo):
+    entry = repo / "bin" / "px-import-many"
+    entry.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pxh import people, policy, policy_context, presence\n"
+        "from pxh import spark_config as cfg\n"
+    )
+    modules = imported_pxh_modules(str(entry))
+    assert {"people", "policy", "policy_context", "presence", "spark_config"} <= modules
+
+
+def test_asgi_app_string_is_an_edge(repo):
+    """`exec uvicorn pxh.api:app` is how px-api-server reaches api.py, and no
+    import-shaped rule can see it."""
+    entry = repo / "bin" / "px-api-server"
+    entry.write_text("#!/usr/bin/env bash\nexec uvicorn pxh.api:app --host 0.0.0.0\n")
+    assert "api" in imported_pxh_modules(str(entry))
+    assert "src/pxh/api.py" in executed_paths(str(entry), str(repo))
+
+
+def test_bash_heredoc_entry_has_a_closure(repo):
+    """bin/px-alive is bash wrapping `<<'PY' … PY`: the file is not Python, so
+    the AST walk found nothing for the most important daemon on the host."""
+    entry = repo / "bin" / "px-alive"
+    entry.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "exec /usr/bin/python3 - \"$@\" <<'PY'\n"
+        "from pxh.beta import three\n"
+        "print(three())\n"
+        "PY\n"
+    )
+    assert "beta" in imported_pxh_modules(str(entry))
+    assert "src/pxh/beta.py" in executed_paths(str(entry), str(repo))
+
+
+def test_the_incident_shape_on_a_wake_listen_like_wrapper(repo):
+    """The probe from the issue: a heredoc entry importing pxh.hostload, which
+    the gate could not see when that file changed."""
+    entry = repo / "bin" / "px-wake-listen"
+    entry.write_text(
+        "#!/usr/bin/env bash\n"
+        "exec /usr/bin/python3 - \"$@\" <<'PY'\n"
+        "from pxh.hostload import host_load_fields\n"
+        "print(host_load_fields('x'))\n"
+        "PY\n"
+    )
+    # `hostload` is not in the fixture repo's modules, so add it and re-probe.
+    (repo / "src" / "pxh" / "hostload.py").write_text("def host_load_fields(p):\n    return {}\n")
+    assert "src/pxh/hostload.py" in executed_paths(str(entry), str(repo))
+    assert "hostload" in import_closure(str(entry), str(repo))
+
+
+def test_changed_symbols_sees_a_body_change_and_ignores_an_untouched_module(tmp_path):
+    _tree(tmp_path, entries={}, modules={"alpha": "def one():\n    return 1\n"})
+    first = _git(tmp_path, {"src/pxh/alpha.py": "def one():\n    return 2\n"})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset({"one"})
+    assert change.module_level is False
+
+
+def test_changed_symbols_sees_a_module_level_import_change(tmp_path):
+    _tree(tmp_path, entries={}, modules={"alpha": "from pxh import beta\n\ndef one():\n    return 1\n"})
+    first = _git(tmp_path, {"src/pxh/alpha.py": "from pxh import gamma\n\ndef one():\n    return 1\n"})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset()
+    assert change.module_level is True, "an import rename is exactly the #332 shape"
+
+
+def test_changed_symbols_is_none_when_a_revision_cannot_be_read(repo):
+    assert changed_symbols("not-a-revision", "HEAD", "src/pxh/alpha.py", str(repo)) is None
+
+
+def test_file_module_references_covers_the_idioms_in_this_tree(repo):
+    from pxh.deploy import file_module_references
+
+    direct = repo / "direct.py"
+    direct.write_text("from pxh.alpha import one, two as trois\n")
+    assert file_module_references(str(direct), "alpha") == ({"one", "two"}, True)
+
+    alias = repo / "alias.py"
+    alias.write_text("from pxh import alpha as a\n\ndef go():\n    return a.one()\n")
+    assert file_module_references(str(alias), "alpha") == ({"one"}, True)
+
+    dotted = repo / "dotted.py"
+    dotted.write_text("import pxh.alpha\n\ndef go():\n    return pxh.alpha.one()\n")
+    assert file_module_references(str(dotted), "alpha") == ({"one"}, True)
+
+    as_dotted = repo / "asdotted.py"
+    as_dotted.write_text("import pxh.alpha as a\n\ndef go():\n    return a.two()\n")
+    assert file_module_references(str(as_dotted), "alpha") == ({"two"}, True)
+
+
+def test_file_module_references_reads_a_heredoc_wrapper(repo):
+    from pxh.deploy import file_module_references
+
+    entry = repo / "bin" / "px-heredoc"
+    entry.write_text(
+        "#!/usr/bin/env bash\n"
+        "exec /usr/bin/python3 - <<'PY'\n"
+        "from pxh import alpha as a\n"
+        "a.one()\n"
+        "PY\n"
+    )
+    assert file_module_references(str(entry), "alpha") == ({"one"}, True)
+
+
+def test_file_module_references_flags_what_it_cannot_resolve(repo):
+    from pxh.deploy import file_module_references
+
+    dynamic = repo / "dynamic.py"
+    dynamic.write_text(
+        "from pxh import alpha as a\n"
+        "def go(name):\n"
+        "    return getattr(a, name)()\n"
+    )
+    names, resolvable = file_module_references(str(dynamic), "alpha")
+    assert resolvable is False, "getattr(module, name) cannot be ruled out"
+
+    star = repo / "star.py"
+    star.write_text("from pxh.alpha import *\n")
+    assert file_module_references(str(star), "alpha") == (set(), False)
+
+    literal = repo / "literal.py"
+    literal.write_text("import importlib\nmod = importlib.import_module(\"pxh.alpha\")\n")
+    assert file_module_references(str(literal), "alpha")[1] is False
+
+
+def test_restart_list_flags_only_units_that_reach_a_changed_symbol(tmp_path):
+    """The issue's decision, as a rule: reachability, not fan-out.
+
+    `health.record_success` is byte-identical across the change; only
+    `read_health` moved. The daemon that reports its own health gains nothing
+    from a restart, and the one that reads the store must restart.
+    """
+    _tree(
+        tmp_path,
+        entries={
+            "px-reports": "#!/usr/bin/env python3\nfrom pxh import health as h\nh.record_success('px-reports')\n",
+            "px-reads": "#!/usr/bin/env python3\nfrom pxh import health as h\nprint(h.read_health())\n",
+        },
+        modules={"health": "def record_success(c):\n    pass\n\n\ndef read_health():\n    return {'ok': 1}\n"},
+    )
+    first = _git(
+        tmp_path,
+        {"src/pxh/health.py": "def record_success(c):\n    pass\n\n\ndef read_health():\n    return {'ok': 2}\n"},
+    )
+    health = "src/pxh/health.py"
+    changes = {health: changed_symbols(first, "HEAD", health, str(tmp_path))}
+    units = [
+        _unit("px-reports.service", tmp_path / "bin" / "px-reports", 0.0),
+        _unit("px-reads.service", tmp_path / "bin" / "px-reads", 0.0),
+    ]
+    verdicts = {v.name: v for v in restart_list([health], units, root=str(tmp_path), changes=changes)}
+    assert verdicts["px-reads.service"].needs_restart is True
+    assert "read_health" in verdicts["px-reads.service"].reason
+    assert verdicts["px-reports.service"].needs_restart is False
+    assert "references none of the changed names" in verdicts["px-reports.service"].reason
+
+
+def test_a_module_level_change_flags_every_importer(tmp_path):
+    _tree(
+        tmp_path,
+        entries={"px-reads": "#!/usr/bin/env python3\nfrom pxh import health as h\nh.read_health()\n"},
+        modules={"health": "def read_health():\n    return 1\n"},
+    )
+    first = _git(
+        tmp_path,
+        {"src/pxh/health.py": "from pxh import logging\n\n\ndef read_health():\n    return 1\n"},
+    )
+    health = "src/pxh/health.py"
+    changes = {health: changed_symbols(first, "HEAD", health, str(tmp_path))}
+    units = [_unit("px-reads.service", tmp_path / "bin" / "px-reads", 0.0)]
+    verdicts = restart_list([health], units, root=str(tmp_path), changes=changes)
+    assert verdicts[0].needs_restart is True
+    assert "module-level change" in verdicts[0].reason
+
+
+def test_an_undetermined_change_is_a_restart(tmp_path):
+    """Fail-safe: "cannot tell" must not read as "nothing changed"."""
+    _tree(
+        tmp_path,
+        entries={"px-reads": "#!/usr/bin/env python3\nfrom pxh import health as h\nh.read_health()\n"},
+        modules={"health": "def read_health():\n    return 1\n"},
+    )
+    health = "src/pxh/health.py"
+    units = [_unit("px-reads.service", tmp_path / "bin" / "px-reads", 0.0)]
+    verdicts = restart_list([health], units, root=str(tmp_path), changes={health: None})
+    assert verdicts[0].needs_restart is True
+    assert "could not be determined" in verdicts[0].reason
+
+
+def test_without_a_change_map_the_old_path_rule_stands(tmp_path):
+    """Callers with no git revisions to hand keep the conservative behaviour."""
+    _tree(
+        tmp_path,
+        entries={"px-reads": "#!/usr/bin/env python3\nfrom pxh import health as h\nh.read_health()\n"},
+        modules={"health": "def read_health():\n    return 1\n"},
+    )
+    health = "src/pxh/health.py"
+    units = [_unit("px-reads.service", tmp_path / "bin" / "px-reads", 0.0)]
+    verdicts = restart_list([health], units, root=str(tmp_path))
+    assert verdicts[0].needs_restart is True
+
+
+def test_the_replayed_incident_flags_exactly_the_hand_restarted_units():
+    """The 2026-09-17 #332/#334/#335 deploy, replayed against the real repo.
+
+    The gate named two units and the truth was four; the corrected-rule table in
+    #336 has them. Skipped where the clone is too shallow to read both
+    revisions (CI checks out depth 1), because a skipped test is honest and a
+    silently-passing one is not.
+    """
+    import datetime as dt
+    import subprocess
+    from zoneinfo import ZoneInfo
+
+    from pxh.deploy import CODE_DIRS
+
+    prev, head = "09b1fbda", "4503782b"
+    probe = subprocess.run(["git", "show", f"{prev}:src/pxh/health.py"],
+                           cwd=str(PROJECT_ROOT), capture_output=True, text=True)
+    if probe.returncode != 0:
+        pytest.skip("revisions unavailable in this clone (shallow checkout)")
+
+    moved = subprocess.run(
+        ["git", "diff", "--name-only", prev, head, "--", *CODE_DIRS],
+        cwd=str(PROJECT_ROOT), capture_output=True, text=True, check=True,
+    ).stdout.split()
+    changes = {
+        path: changed_symbols(prev, head, path, str(PROJECT_ROOT)) for path in moved
+    }
+
+    hobart = ZoneInfo("Australia/Hobart")
+
+    def started(stamp):
+        return dt.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=hobart).timestamp()
+
+    observed = [
+        ("px-alive.service", "bin/px-alive", "2026-09-17 13:17:49"),
+        ("px-api-server.service", "bin/px-api-server", "2026-09-17 11:24:17"),
+        ("px-battery-poll.service", "bin/px-battery-poll", "2026-09-15 19:08:51"),
+        ("px-blog.service", "bin/px-blog", "2026-09-17 11:39:26"),
+        ("px-evolve.service", "bin/px-evolve", "2026-09-17 11:39:26"),
+        ("px-frigate-stream.service", "bin/px-frigate-stream", "2026-09-15 19:08:51"),
+        ("px-mind.service", "bin/px-mind", "2026-09-16 20:51:40"),
+        ("px-post.service", "bin/px-post", "2026-09-17 11:39:26"),
+        ("px-tts-glados.service", "bin/tts-glados-server", "2026-09-15 19:08:51"),
+        ("px-wake-listen.service", "bin/px-wake-listen", "2026-09-16 20:51:32"),
+    ]
+    units = [
+        UnitState(name=name, entry=str(PROJECT_ROOT / entry), started_ts=started(stamp))
+        for name, entry, stamp in observed
+    ]
+
+    flagged = {
+        v.name for v in needs_restart(
+            restart_list(moved, units, root=str(PROJECT_ROOT), changes=changes)
+        )
+    }
+    assert flagged == {
+        "px-api-server.service",
+        "px-blog.service",
+        "px-evolve.service",
+        "px-mind.service",
+    }
