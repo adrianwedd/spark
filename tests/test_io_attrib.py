@@ -1090,6 +1090,37 @@ def test_pid_file_helpers_never_raise(tmp_path):
 
 # --- the CLI, not just the module (the gap that let a crash ship) ---------
 #
+def test_default_watchlist_covers_the_shapes_that_actually_churn(tmp_path):
+    """The 2026-09-18 gap: 112 KB written with `file_growth` and `file_touched`
+    both empty, because the default set was `*.log` + `*.json` and this host
+    churns `.jsonl`, `.lock`, `.out`, `.rotlock` and files one level down."""
+    log_dir, state_dir = tmp_path / "logs", tmp_path / "state"
+    (log_dir / "archive").mkdir(parents=True)
+    (state_dir / "health").mkdir(parents=True)
+    (state_dir / "brain").mkdir(parents=True)
+    shapes = {
+        log_dir / "px-mind.log": 1,
+        log_dir / "hb-gaps.jsonl": 1,
+        log_dir / "px-io-attrib.out": 1,
+        log_dir / "px-mind.log.rotlock": 1,
+        log_dir / "archive" / "px-mind.log.1": 1,
+        state_dir / "thoughts-spark.jsonl": 1,
+        state_dir / "session.json.lock": 1,
+        state_dir / "health" / "px-alive.json": 1,
+        state_dir / "brain" / "resident.log": 1,
+    }
+    for path in shapes:
+        path.write_text("x")
+    patterns = io_attrib.default_growth_patterns(log_dir, state_dir)
+    covered = io_attrib.sample_file_sizes(patterns)
+    missing = sorted(str(p) for p in shapes if str(p) not in covered)
+    assert missing == [], f"watchlist misses {missing}"
+    # Directories are not writers, and the journal stays in the set.
+    assert io_attrib.sample_file_sizes([str(log_dir / "*")]) == {
+        str(p): 1 for p in shapes if p.parent == log_dir
+    }
+
+
 # --- the inflight channel (#247) ------------------------------------------
 #
 # Every other channel in this module is a delta across the window, and a delta

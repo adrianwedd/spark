@@ -70,7 +70,7 @@ bury the real stalls.
 | channel | source | needs root? |
 |---|---|---|
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
-| **file** | a bounded *watchlist* (`/var/log/journal/*/*.journal`, `logs/*.log`, `state/*.json`, `state/health/*.json`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
+| **file** | a bounded *watchlist* (`default_growth_patterns`: the system journal, `logs/*`, `logs/*/*`, `state/*`, `state/health/*.json`, `state/brain/*`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI; `/sys/block/*/inflight`; `/sys/fs/ext4/*` | no — world-readable, including for root-owned processes |
 | **filesystem** | `ext4` counters: `session_write_kbytes` (bytes written *through* this filesystem, metadata and journal included), `lifetime_write_kbytes` (card wear), `delayed_allocation_blocks`, `errors_count`, `journal_task` | no — it cross-checks the device's bytes against the filesystem's, which is how you rule out a raw writer outside the filesystem and how you measure **write amplification**. It does *not* separate file data from metadata — see the calibration below |
 
@@ -81,7 +81,7 @@ running; `--px-alive-pid-file` (default `logs/px-alive.pid`) is the one it
 discovery step wrote root's `px-battery-poll` pid into the observer's file —
 `kill $(cat …)` would have killed a daemon that was doing its job.
 
-The file channel is a **watchlist, not a filesystem scan**: a bounded set of stat calls, opt-in per run (`--growth-pattern`, repeatable; `--no-file-growth` to skip). `file_growth_watched` records how many paths it covered, because growth *outside* the watchlist is invisible and silence there is not evidence of not writing.
+The file channel is a **watchlist, not a filesystem scan**: a bounded set of stat calls, opt-in per run (`--growth-pattern`, repeatable; `--no-file-growth` to skip). It was widened on 2026-09-18 (see `default_growth_patterns`) after a record with **112 KB written to the device and both file channels empty** — the old set matched `*.log` and `*.json` while this host churns `state/*.jsonl`, `state/*.lock`, `logs/*.jsonl`, `logs/*.out`, `logs/*.rotlock` and files one level down. Pattern shape matters more than pattern count: an extension whitelist is a guess about a filesystem you can just list. `file_growth_watched` records how many paths it covered, because growth *outside* the watchlist is invisible and silence there is not evidence of not writing.
 
 An unprivileged record is therefore **not** a record that found no writer:
 it keeps the stall channel, reports the writer list it *could* read, and names
@@ -390,6 +390,19 @@ at 21:50 with `--io-threshold 25` (from the 40 % default) on purpose, because
 episodes at 25-40 % were being missed and the open question — do
 `px-wake-listen`/`px-mind` still appear in `jbd2_log_wait_commit` after `#367` —
 is answered by *record count*, not by peak height.
+
+### Two ways a record can mislead (both observed 2026-09-17)
+
+- **A deploy is itself a workload.** The 11:56:34Z record contains `git` in D
+  state with `wchan: do_get_write_access` — that was *my own* `git fetch &&
+  merge --ff-only` on the host, blocked in a jbd2 metadata wait. Deploying to
+  `picar` rewrites many files at once, so a record taken within a minute of a
+  deploy is contaminated by it. Wait before drawing conclusions from one.
+- **The threshold decides what exists.** Episodes at 25-40 % were invisible to
+  the 40 % default, and a question like "does this unit still appear in
+  `jbd2_log_wait_commit`?" is answered by *record count*, not peak height. That
+  is why the hand-run observer triggers at 25 % now — a measurement choice, not
+  a change in what counts as a stall.
 
 ## Reading a record
 
