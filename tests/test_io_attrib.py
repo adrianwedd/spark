@@ -2072,3 +2072,27 @@ def test_device_deltas_derive_average_write_service_time():
                      "ms_io": 900}},
     )
     assert idle == {} or "ms_per_write" not in idle.get("mmcblk0", {})
+
+
+def test_the_journal_channels_keep_the_onset_of_a_busy_lookback():
+    """A tail-keep drops the `Starting` line of the writer we are hunting.
+
+    Measured 2026-09-18: the unit channel returned 22-24 matches against a cap of
+    20, and the evicted lines were the oldest — where `apt-daily-upgrade`'s
+    `Starting` line sat (#402).
+    """
+    lines = [f"2026-09-18T06:00:{i:02d}+1000 picar systemd[1]: Starting unit-{i}.service" for i in range(30)]
+    out = io_attrib.unit_log_window(600.0, runner=lambda _a: _journal_text(*lines), limit=20)
+    assert out["matched_total"] == 30
+    assert len(out["lines"]) == 20
+    assert out["lines_omitted"] == 10
+    assert "unit-0.service" in out["lines"][0], "the onset must survive"
+    assert "unit-29.service" in out["lines"][-1], "so must the latest"
+    assert out["lines_omitted"] + len(out["lines"]) == out["matched_total"]
+
+
+def test_a_short_lookback_is_not_rearranged():
+    lines = [f"2026-09-18T06:00:{i:02d}+1000 picar kernel: mmc{i} timeout" for i in range(3)]
+    out = io_attrib.kernel_log_window(60.0, runner=lambda _a: _journal_text(*lines), limit=20)
+    assert [line for line in out["lines"]] == lines
+    assert out["lines_omitted"] == 0

@@ -204,6 +204,17 @@ KERNEL_LOG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 KERNEL_LOG_LIMIT = 20
+#: Of the `limit` matched lines kept, this many come from the *start* of the
+#: lookback. The rest come from the end.
+#:
+#: Why both ends, measured 2026-09-18: the unit channel exists to name a writer
+#: that dirtied and exited *before* the stall became visible, so its `Starting`
+#: line sits at the front of the 5-minute lookback — and a plain tail-keep
+#: dropped it. On the real episode, 22-24 matched lines against a cap of 20 meant
+#: the oldest 2-4 were discarded, which is exactly where `apt-daily-upgrade`'s
+#: `Starting` line was (#402). The tail still matters (continuity, failures), so
+#: neither end is allowed to evict the other.
+KERNEL_LOG_HEAD = 7
 KERNEL_LOG_MAX_LINES = 4000
 KERNEL_LOG_TIMEOUT_S = 5.0
 #: Seconds of lookback added to the measured window. The trigger fires on a 10 s
@@ -301,6 +312,14 @@ def _journal_filtered(
     lines = [line for line in text.splitlines() if line.strip()]
     scanned = lines[-KERNEL_LOG_MAX_LINES:]
     matched = [line for line in scanned if pattern.search(line)]
+    # Keep both ends of the match set: the onset of a timer-driven writer is at
+    # the front of the lookback and its recovery at the back.
+    head = min(max(1, KERNEL_LOG_HEAD), limit)
+    if len(matched) <= limit:
+        kept = matched
+    else:
+        tail = max(0, limit - head)
+        kept = matched[:head] + (matched[-tail:] if tail else [])
     return {
         "source": source,
         "available": True,
@@ -309,7 +328,9 @@ def _journal_filtered(
         "lines_total": len(lines),
         "lines_scanned": len(scanned),
         "matched_total": len(matched),
-        "lines": matched[-limit:],
+        # Named, not left to arithmetic on the reader's side.
+        "lines_omitted": max(0, len(matched) - len(kept)),
+        "lines": kept,
     }
 
 
