@@ -2012,6 +2012,42 @@ def _cleanup_thought_images() -> int:
     return deleted
 
 
+def _write_derived_state_files(awareness: dict, health: dict | None, frigate: dict | None) -> None:
+    """Persist the awareness tick's three derived caches — atomically, not durably.
+
+    All three are **rewritten from live sources every `AWARENESS_INTERVAL_S`**
+    and regenerated within one tick of a restart, so the `fsync` bought no crash
+    durability: a power cut costs one tick of freshness and the next tick
+    restores it. What it did buy was an ext4 journal commit per file — three per
+    tick, sixty seconds apart — and `atomic_write` still publishes them with
+    `os.replace`, so readers keep seeing complete files.
+
+    Evidence for the change (#247): with px-mind at the top of the writer list in
+    a stall record, it was found in D state on `jbd2_log_wait_commit` with
+    `state/awareness.json` and `state/health.json` both touched in the same
+    3.2 s window (2026-09-17T11:54:44Z). The health store's *per-component*
+    records were already made non-durable in `#367` for the same reason; this is
+    the rest of px-mind's per-tick fsync budget.
+
+    `health.json` is documented as an aggregate cache for cheap dashboard reads
+    ("readers that must be correct when px-mind is down should call
+    `health.read_health()` instead"), and `frigate_presence.json` is ignored
+    entirely once it is `FRIGATE_STALE_S` old — both are caches by construction.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2), durable=False)
+    # Publish the aggregate for cheap dashboard reads. px-mind is the only
+    # writer of this file, so no lock is needed.
+    if health is not None:
+        try:
+            atomic_write(STATE_DIR / "health.json", json.dumps(health, indent=2),
+                         durable=False)
+        except Exception:
+            pass
+    if frigate is not None:
+        atomic_write(FRIGATE_FILE, json.dumps(frigate, indent=2), durable=False)
+
+
 def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     """Layer 1: gather perception, detect transitions, enrich context."""
     global _cached_weather, _last_weather_fetch, _time_period_start_mono
@@ -2335,18 +2371,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     except Exception:
         _health = None
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write(AWARENESS_FILE, json.dumps(awareness, indent=2))
-    # Publish the aggregate for cheap dashboard reads. px-mind is the only
-    # writer of this file, so no lock is needed; readers that must be correct
-    # when px-mind is down should call health.read_health() instead.
-    if _health is not None:
-        try:
-            atomic_write(STATE_DIR / "health.json", json.dumps(_health, indent=2))
-        except Exception:
-            pass
-    if frigate is not None:
-        atomic_write(FRIGATE_FILE, json.dumps(frigate, indent=2))
+    _write_derived_state_files(awareness, _health, frigate)
 
     if frigate is None:
         frigate_str = "offline"

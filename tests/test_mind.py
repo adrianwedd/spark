@@ -167,6 +167,65 @@ def test_inject_explore_injects_exactly_once():
 # ---------------------------------------------------------------------------
 
 
+
+# --- derived caches must not force a journal commit (#247) ------------------
+#
+# px-mind's awareness tick writes three caches every AWARENESS_INTERVAL_S (60 s):
+# awareness.json, the health.json aggregate, and frigate_presence.json. Each was
+# an atomic_write with fsync, i.e. a forced ext4 journal commit, and px-mind was
+# found in D state on jbd2_log_wait_commit with awareness.json and health.json
+# both touched in the same 3.2 s stall window (2026-09-17T11:54:44Z).
+
+
+def test_derived_state_files_are_written_without_a_journal_commit(tmp_path, monkeypatch):
+    import os as _os
+
+    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(mind, "AWARENESS_FILE", tmp_path / "awareness.json")
+    monkeypatch.setattr(mind, "FRIGATE_FILE", tmp_path / "frigate_presence.json")
+    calls = []
+    monkeypatch.setattr(_os, "fsync", lambda fd: calls.append(fd))
+
+    mind._write_derived_state_files(
+        {"sonar_cm": 42}, {"overall": "ok"}, {"person_present": False}
+    )
+
+    assert calls == [], "a per-tick cache must not force a journal commit"
+    import json as _json
+
+    assert _json.loads((tmp_path / "awareness.json").read_text())["sonar_cm"] == 42
+    assert _json.loads((tmp_path / "health.json").read_text())["overall"] == "ok"
+    assert _json.loads((tmp_path / "frigate_presence.json").read_text())["person_present"] is False
+
+
+def test_a_failed_dashboard_cache_does_not_lose_the_awareness_snapshot(tmp_path, monkeypatch):
+    """The health aggregate is a dashboard cache; awareness is what the tick is
+    *for*. A failed cache write must not take the tick's real output with it."""
+    real = mind.atomic_write
+
+    def selective(path, content, **kwargs):
+        if path.name == "health.json":
+            raise OSError("dashboard cache is not worth failing a tick over")
+        return real(path, content, **kwargs)
+
+    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(mind, "AWARENESS_FILE", tmp_path / "awareness.json")
+    monkeypatch.setattr(mind, "FRIGATE_FILE", tmp_path / "frigate_presence.json")
+    monkeypatch.setattr(mind, "atomic_write", selective)
+
+    mind._write_derived_state_files({"sonar_cm": 7}, {"overall": "ok"}, {"rooms": []})
+
+    import json as _json
+
+    assert _json.loads((tmp_path / "awareness.json").read_text())["sonar_cm"] == 7
+    assert _json.loads((tmp_path / "frigate_presence.json").read_text()) == {"rooms": []}
+    assert not (tmp_path / "health.json").exists()
+    # And nothing to write means nothing written, rather than an empty file.
+    (tmp_path / "awareness.json").unlink()
+    mind._write_derived_state_files({}, None, None)
+    assert not (tmp_path / "health.json").exists()
+
+
 def test_awareness_tick_propagates_lock_timeout(monkeypatch):
     """awareness_tick() re-raises FileLockTimeout so mind_loop can skip the tick."""
     monkeypatch.setattr(mind, "load_session", lambda: (_ for _ in ()).throw(FileLockTimeout("fake.lock")))
