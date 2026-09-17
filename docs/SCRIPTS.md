@@ -1002,13 +1002,16 @@ USB Mic (44100 Hz)
 
 **Sherpa-onnx model:** `sherpa-onnx-streaming-zipformer-en-2023-06-26` (~297MB int8). Streaming `OnlineRecognizer.from_transducer()`, num_threads=4. Processes full utterance at ~5s for a 6.6s clip (RTF ~0.78x, excellent accuracy for en-AU English).
 
-**Audio recording:** PyAudio, USB mic (usually card 2). Records 16-bit mono at 44100 Hz (USB mic hardware constraint), resampled to 16kHz via `audioop.ratecv` for both Vosk and sherpa-onnx.
+**Audio recording:** `arecord` subprocess (`pxh.mic_stream.ArecordStream`) on the USB mic (usually card 2), drained by a reader thread into a 10 s ring buffer. 16-bit mono at 44100 Hz (USB mic hardware constraint), resampled to 16kHz via `audioop.ratecv` for both Vosk and sherpa-onnx. ALSA's own buffer is `DEFAULT_ALSA_BUFFER_S` (4 s) — it is what overruns when the reader stalls (#283).
 
 **Silence detection:** Stops recording when a 30-frame (~960ms) RMS window falls below threshold for 1.5s, or after a hard maximum of 8s.
 
 **Python interpreter:** `$PROJECT_ROOT/.venv/bin/python3` (venv has `vosk`, `pyaudio`, `sherpa_onnx`, `numpy`).
 
-**Log file:** `$LOG_DIR/px-wake-listen.log` (or `PX_LOG_FILE`).
+**Log file:** `$LOG_DIR/px-wake-listen.log` (or `PX_LOG_FILE`). Written by a
+background thread (`pxh.logging.StallProofLineWriter`) and flushed on exit: the
+audio drain path must never block on IO to say something (#283), so a line can
+appear a moment after the event it describes.
 
 ---
 

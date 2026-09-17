@@ -34,6 +34,7 @@ The ``read(frames, exception_on_overflow=...)`` signature deliberately mirrors
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 import subprocess
 import threading
@@ -46,6 +47,14 @@ DEFAULT_RATE = 44100
 DEFAULT_CHANNELS = 1
 DEFAULT_CHUNK_FRAMES = 2048
 DEFAULT_BUFFER_S = 10.0
+#: Seconds of ALSA capture buffer arecord should hold. The app-side ring buffer
+#: above is 10 s, but ALSA's own buffer is the thing that overruns when the
+#: reader thread is stalled, and it was `chunk_frames * 8` — with a 2048-frame
+#: period at 44.1 kHz that is **0.37 s of slack**, which is why the production
+#: overruns are measured in seconds: the reader was stalled far longer than the
+#: buffer could cover (#283). 4 s of slack does not fix a stall, it stops a
+#: stall from silently deleting audio, and it is free (353 KB of kernel buffer).
+DEFAULT_ALSA_BUFFER_S = 4.0
 DEFAULT_READ_TIMEOUT_S = 5.0
 
 # A drop is only audio *loss* if the listener meant to be recording at the
@@ -124,6 +133,7 @@ class ArecordStream:
         chunk_frames: int = DEFAULT_CHUNK_FRAMES,
         buffer_s: float = DEFAULT_BUFFER_S,
         read_timeout_s: float = DEFAULT_READ_TIMEOUT_S,
+        alsa_buffer_s: float = DEFAULT_ALSA_BUFFER_S,
         log=None,
         command: list[str] | None = None,
         max_restarts: int = 5,
@@ -135,6 +145,7 @@ class ArecordStream:
         self.sample_width = 2  # S16_LE
         self.chunk_bytes = chunk_frames * channels * self.sample_width
         self.read_timeout_s = read_timeout_s
+        self.alsa_buffer_s = alsa_buffer_s
         self._log = log or (lambda _msg: None)
         self._command = command
         self._max_restarts = max_restarts
@@ -155,12 +166,24 @@ class ArecordStream:
         self._last_drop_log = 0.0
         self._last_idle_drop_log = 0.0
         self._capturing = 0
+        # Windowed evidence for #283: the reader thread's worst gap between
+        # chunks *during a capture*. Lifetime extrema stop being a signal (the
+        # same lesson px-alive's telemetry carries), so a capture start resets
+        # the window. Reported on every arecord overrun, which is where the
+        # question "was the reader stalled, or was arecord itself in trouble?"
+        # is actually asked.
+        self.reader_gap_last_ms = 0.0
+        self.reader_gap_max_ms = 0.0
+        self._last_chunk_mono: float | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
     def build_command(self) -> list[str]:
         if self._command is not None:
             return list(self._command)
+        # Buffer size is in *frames* and should be a whole number of periods;
+        # rounding up keeps arecord from silently adjusting it for us.
+        periods = max(8, math.ceil(self.alsa_buffer_s * self.rate / self.chunk_frames))
         return [
             "arecord",
             "-D", self.device,
@@ -168,7 +191,7 @@ class ArecordStream:
             "-c", str(self.channels),
             "-r", str(self.rate),
             "-t", "raw",
-            "--buffer-size", str(self.chunk_frames * 8),
+            "--buffer-size", str(self.chunk_frames * periods),
             "--period-size", str(self.chunk_frames),
             "-q",
         ]
@@ -209,6 +232,14 @@ class ArecordStream:
                 data = stdout.read(self.chunk_bytes)
                 if not data:
                     break  # EOF: arecord exited
+                now = time.monotonic()
+                if self._last_chunk_mono is not None:
+                    gap_ms = (now - self._last_chunk_mono) * 1000.0
+                    self.reader_gap_last_ms = gap_ms
+                    if gap_ms > self.reader_gap_max_ms:
+                        self.reader_gap_max_ms = gap_ms
+                self._last_chunk_mono = now
+                dropped = False
                 with self._cond:
                     if self._closing:
                         return
@@ -219,9 +250,15 @@ class ArecordStream:
                             self.dropped_active += 1
                         else:
                             self.dropped_idle += 1
-                        self._maybe_log_drop(active)
+                        dropped = True
                     self._buf.append(data)
                     self._cond.notify_all()
+                # Logged *outside* the lock: the drain thread must never hold the
+                # lock while doing IO, or every consumer waits behind it — and
+                # the log is the one thing here that can touch a stalled card or
+                # a stuck journald socket (#283).
+                if dropped:
+                    self._maybe_log_drop(active)
         except (OSError, ValueError):
             pass  # pipe torn down under us
 
@@ -256,6 +293,14 @@ class ArecordStream:
                         load = {
                             **host_load_fields("at"),
                             **cgroup_pressure_fields("px-wake-listen", "at"),
+                            # The reader thread's own worst gap *this capture*:
+                            # an overrun with reader_gap_max_ms in the hundreds
+                            # says the drain stalled, one with a small gap says
+                            # arecord itself lost the device. Without this the
+                            # two are indistinguishable in the log (#283).
+                            "reader_gap_last_ms_at": round(self.reader_gap_last_ms, 1),
+                            "reader_gap_max_ms_at": round(self.reader_gap_max_ms, 1),
+                            "alsa_buffer_s": self.alsa_buffer_s,
                         }
                         suffix = " ".join(f"{k}={v}" for k, v in load.items())
                         line = f"{line} [{suffix}]" if suffix else line
@@ -371,6 +416,12 @@ class ArecordStream:
         """
         with self._cond:
             self._capturing += 1
+            if self._capturing == 1:
+                # New capture, new window: the gap evidence is "during this
+                # capture", not a lifetime maximum that stops moving.
+                self.reader_gap_max_ms = 0.0
+                self.reader_gap_last_ms = 0.0
+                self._last_chunk_mono = None
         try:
             yield self
         finally:

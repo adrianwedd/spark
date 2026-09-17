@@ -71,6 +71,12 @@ from pxh.gpio_lease import GpioLeaseGuard, GpioLeaseStore  # noqa: E402
 from pxh import policy as _policy                           # noqa: E402
 from pxh import wake_grant                                  # noqa: E402
 from pxh.hostload import cgroup_pressure_fields, host_load_fields  # noqa: E402
+from pxh.logging import StallProofLineWriter                  # noqa: E402
+
+# The daemon's single writer thread: file appends and the journald print both
+# happen there, so no caller — least of all the audio drain thread — touches IO
+# to say something (#283). Flushed on the way out.
+_LOG_WRITER = StallProofLineWriter(LOG_FILE, echo=lambda line: print(line, flush=True))
 
 # How long a wake conversation stays audible without a turn. Refreshed by each
 # turn of the conversation the wake word opened, capped by
@@ -158,27 +164,18 @@ DEFAULT_WHISPER_MODEL = _find_whisper_model()
 
 
 def log(msg: str) -> None:
+    """Queue one log line; the writer thread owns the file and the journal.
+
+    Deliberately non-blocking (#283). `ArecordStream`'s reader thread is what
+    keeps arecord drained, and it logs drops and overruns; a log write that
+    blocks — on this card, or on a journald socket with a stuck reader — stalls
+    the drain, arecord overruns its 0.37 s ALSA buffer, and the overrun is then
+    logged by the same blocked path. Evidence must not be produced by the
+    machinery that is losing the audio, so the capture path hands lines to
+    `_LOG_WRITER` and returns.
+    """
     ts = dt.datetime.now().isoformat(timespec="seconds")
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    line = f"{ts} [wake] {msg}"
-    with LOG_FILE.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
-    print(line, flush=True)
-    # Simple rotation: keep last half when file exceeds 5MB
-    try:
-        if LOG_FILE.stat().st_size > 5_000_000:
-            lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
-            half = len(lines) // 2
-            half_content = "\n".join(lines[half:]) + "\n"
-            import tempfile as _tmpmod
-            fd, tmp = _tmpmod.mkstemp(dir=str(LOG_FILE.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(half_content)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, str(LOG_FILE))
-    except Exception:
-        pass
+    _LOG_WRITER.write(f"{ts} [wake] {msg}")
 
 
 def _sd_notify(message: str) -> bool:
@@ -1625,6 +1622,9 @@ def main(argv) -> int:
     finally:
         PID_FILE.unlink(missing_ok=True)
         log("stopped")
+        # The lines are queued on a background writer, so an exit that does not
+        # flush loses exactly the ones describing why it exited.
+        _LOG_WRITER.flush()
 
     return 0
 
