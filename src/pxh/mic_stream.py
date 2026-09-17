@@ -200,6 +200,13 @@ class ArecordStream:
         The complement of the overrun report: it answers "how long did the
         drain thread go without reading arecord" *before* anything overruns,
         which is the quantity the 12 s ALSA ring is sized against.
+
+        The reader records into this under the same lock, so a gap is reported
+        by exactly one window: it can be neither dropped by a reset racing an
+        update (which would make the window that held the worst gap report 0)
+        nor re-reported by the window after it. The window boundary is
+        therefore well defined — gaps observed between two drains — and a
+        caller that reads it on a fixed cadence is measuring that cadence.
         """
         with self._cond:
             worst = self.reader_gap_window_max_ms
@@ -263,18 +270,31 @@ class ArecordStream:
                 if not data:
                     break  # EOF: arecord exited
                 now = time.monotonic()
+                gap_ms: float | None = None
                 if self._last_chunk_mono is not None:
                     gap_ms = (now - self._last_chunk_mono) * 1000.0
                     self.reader_gap_last_ms = gap_ms
                     if gap_ms > self.reader_gap_max_ms:
                         self.reader_gap_max_ms = gap_ms
-                    if gap_ms > self.reader_gap_window_max_ms:
-                        self.reader_gap_window_max_ms = gap_ms
                 self._last_chunk_mono = now
                 dropped = False
                 with self._cond:
                     if self._closing:
                         return
+                    if (
+                        gap_ms is not None
+                        and gap_ms > self.reader_gap_window_max_ms
+                    ):
+                        # Recorded under the same lock `take_gap_window_ms()`
+                        # drains it with. That read is a read-then-zero
+                        # sequence, so an update outside the lock can be
+                        # clobbered by a reset and survive only into the *next*
+                        # window — the window that held the worst gap reports 0
+                        # and a quiet window reports it later. Misattribution is
+                        # the one error this metric cannot afford, because
+                        # #283's acceptance rests on it: `reader_gap_ms` is the
+                        # quantity the 12 s ALSA ring is sized against.
+                        self.reader_gap_window_max_ms = gap_ms
                     if len(self._buf) == self._buf.maxlen:
                         self.dropped_chunks += 1
                         active = self._capturing > 0
