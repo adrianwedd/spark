@@ -342,6 +342,55 @@ something still converts a modest amount of device work into near-system-wide bl
 and that is the part the root channel exists to see (kernel threads, per-task `wchan`,
 the root-owned writers).
 
+## 2026-09-17 21:35 — the stall reproduced in vitro, and the effect size of one `fsync`
+
+Three 160-operation workloads on `picar`, 8 concurrent processes each doing the
+`atomic_write` shape (`mkstemp` + write + `fsync` + `os.replace`) into a scratch
+directory, then cleaned up. Identical logical writes in every variant; only the
+`fsync` and the directory layout differ.
+
+| variant | wall | p50 | p95 | max | card writes | card KB | ms_io | children caught in `jbd2_log_wait_commit` |
+|---|---|---|---|---|---|---|---|---|
+| V1 `fsync`, one shared dir | 0.8 s | 28.2 ms | 71.7 ms | 83.9 ms | 241 | 2972 | 416 ms | 7/16 samples (44 %) |
+| V2 **no `fsync`**, one shared dir | 0.3 s | 7.4 ms | 19.0 ms | 29.3 ms | 131 | **524** | 112 ms | **0** |
+| V3 `fsync`, own dir per process | 1.8 s | 32.8 ms | 99.4 ms | **832 ms** | 294 | 3644 | 1220 ms | 28/48 (58 %) |
+
+1. **The `fsync` is the cost, and this is the production signature reproduced on
+   demand.** Dropping it cuts card bytes ~5.7× for identical logical writes
+   (524 KB vs 2972-3644 KB — ~3.3 KB per file instead of ~19-23 KB), cuts p50
+   latency ~4× and p95 ~4-5×, and removes `jbd2_log_wait_commit` from the samples
+   entirely. That symbol is what 20 of the 53 production stall records were
+   sitting in (see the tallies above), and those were user-space daemons —
+   `px-wake-listen` 14, `px-mind` 4.
+2. **Directory layout is not the lever.** V3 is slightly *worse* than V1, so the
+   serialisation is filesystem/journal-wide rather than per-directory: spreading
+   writers across directories buys nothing, fewer `fsync`s buys everything. Do
+   not propose a directory-layout change for this.
+3. **The tail is visible even at this scale**: a single 40-byte write taking
+   **832 ms**. Production adds concurrency, 7297 KB/min of idle background churn,
+   and the microphone capture loop on top — which is how a handful of `fsync`s
+   becomes a seconds-long stall.
+
+**Caveat on the PSI columns**: `psi_io_*` is a 10-second average and V1/V2 lasted
+under a second, so their peaks understate the burst (V3, at 1.8 s, reached
+8.7 / 7.2 %). The robust columns here are bytes, latencies, and the
+`jbd2_log_wait_commit` sample rate.
+
+**The fix this measures** (`#367`): the health store — a liveness record every
+daemon rewrites on its next tick, written by `px-wake-listen` *inside the capture
+loop* — now uses `atomic_write(..., durable=False)`. Verified on the deployed
+artifact: `fsync` calls during a real `record_success` = **0**, record written,
+no temps left. The device-rate comparison before/after that change (7297 → 2433
+KB/min, 604 → 301 requests/min) is **suggestive, not proof**: the "after" window
+also contained an io-PSI episode peaking at 33 %, so the two windows are not
+load-matched. The load-matched evidence is the table above.
+
+**Reading a record's threshold**: the hand-run observer on `picar` was restarted
+at 21:50 with `--io-threshold 25` (from the 40 % default) on purpose, because
+episodes at 25-40 % were being missed and the open question — do
+`px-wake-listen`/`px-mind` still appear in `jbd2_log_wait_commit` after `#367` —
+is answered by *record count*, not by peak height.
+
 ## Reading a record
 
 ```bash
