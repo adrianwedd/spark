@@ -13,7 +13,26 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 import pxh.io_attrib as io_attrib
+
+
+@pytest.fixture(autouse=True)
+def _no_real_journalctl(monkeypatch):
+    """Stub the *subprocess boundary*, not the channel.
+
+    `kernel_log_window` shells out to `journalctl`, which on a developer Mac does
+    not exist and in CI may exist while having no journal to read. Left real, it
+    would add a subprocess (and up to its timeout) to every capture test in this
+    module, and the answer would depend on the host. The stub raises at the
+    boundary, so the real function runs its real failure path — `available:
+    false` — and the tests that exercise the parser pass an explicit `runner=`.
+    """
+    def unavailable(_args):
+        raise OSError("journalctl is not available in this test environment")
+
+    monkeypatch.setattr(io_attrib, "_journalctl", unavailable)
 
 PRESSURE = (
     "some avg10=96.40 avg60=1.00 avg300=0.50 total=1\n"
@@ -1720,3 +1739,145 @@ def test_a_disarmed_trigger_is_announced_at_startup_not_left_implicit(tmp_path):
     assert "px_alive_pid_file=" in proc.stdout
     assert "heartbeat trigger DISARMED" in proc.stdout
     assert "only the io-PSI trigger is armed" in proc.stdout
+
+
+# --- the kernel channel (the only witness to a wedge) ----------------------
+
+
+def _journal_text(*lines: str) -> str:
+    return "\n".join(lines) + "\n"
+
+
+def test_kernel_log_window_asks_for_the_kernel_since_the_window():
+    seen: list[list[str]] = []
+
+    def runner(args):
+        seen.append(list(args))
+        return ""
+
+    out = io_attrib.kernel_log_window(30.0, runner=runner)
+    assert seen and seen[0][0] == "-k"
+    assert "--since" in seen[0] and "-o" in seen[0]
+    since = seen[0][seen[0].index("--since") + 1]
+    assert since.startswith("@") and since[1:].isdigit(), since
+    assert out["available"] is True and out["window_s"] == 30.0
+
+
+def test_kernel_log_window_keeps_only_what_can_explain_a_wedge():
+    """A USB enumeration is not evidence about a storage stall."""
+    out = io_attrib.kernel_log_window(
+        60.0,
+        runner=lambda _args: _journal_text(
+            "2026-09-18T05:00:00+1000 picar kernel: mmc1: Timeout waiting for hardware interrupt",
+            "2026-09-18T05:00:01+1000 picar kernel: usb 1-1: new high-speed USB device number 3",
+            "2026-09-18T05:00:02+1000 picar kernel: hwmon hwmon1: Undervoltage detected!",
+        ),
+    )
+    assert out["lines_total"] == 3
+    assert out["matched_total"] == 2
+    assert len(out["lines"]) == 2
+    assert "mmc1" in out["lines"][0]
+    assert "Undervoltage" in out["lines"][1]
+    # The filter is in the record, so `[]` cannot read as "the kernel was quiet".
+    assert out["filter"]
+    assert "mmc" in out["filter"]
+
+
+def test_kernel_log_window_caps_what_it_keeps_but_counts_everything():
+    out = io_attrib.kernel_log_window(
+        60.0,
+        runner=lambda _args: _journal_text(
+            *[f"2026-09-18T05:00:0{i % 10}+1000 picar kernel: mmc{i} timeout" for i in range(30)]
+        ),
+        limit=5,
+    )
+    assert len(out["lines"]) == 5
+    assert out["matched_total"] == 30, "the cap hides nothing from the count"
+
+
+def test_kernel_log_window_scans_a_capped_tail_of_a_flooded_log():
+    flood = io_attrib.KERNEL_LOG_MAX_LINES + 100
+    out = io_attrib.kernel_log_window(
+        60.0, runner=lambda _args: _journal_text(*[f"line {i}" for i in range(flood)])
+    )
+    assert out["lines_total"] == flood
+    assert out["lines_scanned"] == io_attrib.KERNEL_LOG_MAX_LINES
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        OSError("[Errno 2] No such file or directory: 'journalctl'"),
+        RuntimeError("journalctl exit 1: No journal files were found."),
+    ],
+)
+def test_kernel_log_window_says_unavailable_rather_than_quiet(exc):
+    def boom(_args):
+        raise exc
+
+    out = io_attrib.kernel_log_window(10.0, runner=boom)
+    assert out["available"] is False
+    assert "reason" in out
+    assert "lines" not in out, "unavailable is not an empty list"
+
+
+def test_capture_reports_an_unavailable_kernel_log_rather_than_a_quiet_one(
+    tmp_path, monkeypatch
+):
+    """The boundary the autouse stub exercises: the real function, failing."""
+    procs = {7: {"comm": "python3", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    record = io_attrib.capture(
+        {"reason": "manual"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["kernel_log"]["available"] is False
+    assert "journalctl" in record["kernel_log"]["reason"]
+
+
+def test_capture_records_the_kernel_log_and_the_io_it_cost(tmp_path, monkeypatch):
+    procs = {7: {"comm": "python3", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    monkeypatch.setattr(
+        io_attrib,
+        "kernel_log_window",
+        lambda since_s, **_kw: {
+            "source": "journalctl -k",
+            "available": True,
+            "window_s": round(since_s, 1),
+            "filter": io_attrib.KERNEL_LOG_PATTERN.pattern,
+            "lines_total": 12,
+            "lines_scanned": 12,
+            "matched_total": 1,
+            "lines": ["hwmon hwmon1: Undervoltage detected!"],
+        },
+    )
+    # The observer's own /proc/self/io cannot see a child's reads, so the cost of
+    # this channel is differenced explicitly.
+    reads = iter(
+        [{"read_bytes": 0, "write_bytes": 0}, {"read_bytes": 4096, "write_bytes": 512}]
+    )
+    monkeypatch.setattr(io_attrib, "child_io", lambda: next(reads))
+
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["kernel_log"]["matched_total"] == 1
+    assert "Undervoltage" in record["kernel_log"]["lines"][0]
+    assert record["kernel_log_child_read_bytes"] == 4096
+    assert record["kernel_log_child_write_bytes"] == 512
+    # The lookback covers the trigger's own 10 s averaging, not just the window.
+    assert record["kernel_log"]["window_s"] > record["window_s"]
+
+
+def test_child_io_reports_byte_units_not_raw_blocks():
+    counters = io_attrib.child_io()
+    assert set(counters) == {"read_bytes", "write_bytes"}
+    assert all(isinstance(value, int) and value >= 0 for value in counters.values())

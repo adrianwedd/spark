@@ -86,6 +86,7 @@ every poll, so a later px-alive start arms it), and `trigger.px_alive_gate` in
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
 | **file** | a bounded *watchlist* (`default_growth_patterns`: the system journal, `logs/*`, `logs/*/*`, `state/*`, `state/health/*.json`, `state/brain/*`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI; `/sys/block/*/inflight`; `/sys/fs/ext4/*` | no — with **one exception measured on 2026-09-18: `wchan` is withheld for root-owned processes** (see the next section). `state`, `schedstat` and the rest are readable for every process |
+| **kernel** | `journalctl -k` over the window, filtered to what can explain a **wedge** — `mmc`, `sdio`, `brcmf`, `ext4`, `jbd2`, `blk_`, I/O errors, timeouts, undervoltage, thermal, hung-task | no on hosts where the operator is in `adm` — measured on `picar` 2026-09-18 (`pi` is in `adm`, so `journalctl -k` and `dmesg` both work) |
 | **window** | the same state sampled *across* the window (`sample_window` → `blocked_in_window`), plus per-thread D state for a rotating quarter of the process set | no — and this is the channel that still **names a root-owned writer**, because `state` is readable where `wchan` and `/proc/<pid>/io` are not |
 | **filesystem** | `ext4` counters: `session_write_kbytes` (bytes written *through* this filesystem, metadata and journal included), `lifetime_write_kbytes` (card wear), `delayed_allocation_blocks`, `errors_count`, `journal_task` | no — it cross-checks the device's bytes against the filesystem's, which is how you rule out a raw writer outside the filesystem and how you measure **write amplification**. It does *not* separate file data from metadata — see the calibration below |
 
@@ -160,6 +161,41 @@ What still works unprivileged for a root-owned writer is **state** — and, once
 `kernel.task_delayacct=1`, `delayacct_blkio_ticks`. That is the whole basis of
 the window channel.
 
+**The kernel channel (`kernel_log`) is the only one that can name a *mechanism*
+when there is no writer to name.** The 20:20 wedge had `mmcblk0` at 0/0 inflight,
+2-7 % busy, and the whole task set blocked: nothing in any `/proc` or sysfs
+channel can explain that, and if anything in software can, it is a kernel
+message. Measured on the robot with a 14 h window:
+
+```json
+{"source": "journalctl -k", "available": true, "window_s": 50400,
+ "lines_total": 559, "lines_scanned": 559, "matched_total": 24,
+ "filter": "mmc|sdio|brcmf|ext4|jbd2|blk_|i/o error|timeout|undervolt|voltage|..."}
+  2026-09-17T16:55:55+1000 picar kernel: hwmon hwmon1: Undervoltage detected!
+  2026-09-17T16:56:16+1000 picar kernel: hwmon hwmon1: Voltage normalised
+  2026-09-17T17:30:12+1000 picar kernel: hwmon hwmon1: Undervoltage detected!
+  2026-09-17T17:30:20+1000 picar kernel: hwmon hwmon1: Voltage normalised
+```
+
+That is this boot's kernel side of the "power" candidate #247 has been carrying
+on `vcgencmd get_throttled = 0x50000` alone: **two undervoltage events, one
+lasting 21 s and one 8 s**, plus the SDIO WiFi's power-save transitions. Every
+future record will carry the ones that fall inside its window, with timestamps.
+
+Cost, and how to read it: **one** `journalctl` call per capture, after the window
+(never inside it), bounded by `KERNEL_LOG_MAX_LINES`, a 20-line result cap and a
+5 s timeout — the journal lives on the same card as everything else here, so this
+channel buys its evidence with the resource it is measuring. `child_io()` is
+differenced around it because `/proc/self/io` cannot see a child's reads: the 14 h
+call above reported **0 block-read bytes and 4096 block-write bytes**. Read
+`kernel_log_child_read_bytes` as a *lower bound* — journald serves recent entries
+from memory and reads its journal through an `mmap`, and page-fault-driven reads
+are not what `ru_inblock` counts.
+
+`available: false` is a first-class answer (no `journalctl`, no permission, no
+journal). It is never "the kernel was quiet": that is an empty `lines` with
+`lines_total` and the `filter` beside it.
+
 **The window channel (`blocked_in_window`) replaces the window's idle `sleep`.**
 A burst that ends before t1 is invisible to a two-ended walk, so the window is
 sampled every `--sample-interval` (default 0.5 s): `/proc/<pid>/stat` for every
@@ -176,6 +212,8 @@ process that *starts* inside the window is caught by the closing walk only.
 | `blocked_in_window_count` | how many processes were blocked at all during the window |
 | `window_samples` / `window_sample_interval_s` / `window_span_s` | how many samples, how far apart, and the span actually covered (`≈ (samples-1) × interval` plus one sample's work — the window's two ends are the walks). `d_share` is a fraction of *samples*; check it against this span, not against `--window` |
 | `window_thread_coverage_s` | how long a full per-thread rotation takes. A thread block shorter than this can fall between two visits to the same process — the sampler's stated resolution, not a hidden limit |
+| `kernel_log` | `{source, available, window_s, filter, lines_total, lines_scanned, matched_total, lines[]}`. **Read `available` before `lines`**: `false` means nobody looked (no journalctl, no permission), `[]` means the kernel said nothing matching `filter` — which is quoted so that stays checkable. `window_s` is the measured window plus a 5 s pad, because the trigger fires on a 10 s PSI average and the cause can predate t0 |
+| `kernel_log_child_read_bytes` / `_write_bytes` | what the one child process cost in block IO, from `RUSAGE_CHILDREN`. A *lower bound* (see the kernel-channel section) |
 | `delayacct` | `{enabled, note}`. **The field exists in `/proc/<pid>/stat` and reads 0 for every process while `kernel.task_delayacct=0`**, so a record that emitted the delta anyway would print a measured "waited 0 ms" for everything — the #306 failure mode. `blkio_wait_ms` therefore appears on a row *only* when the sysctl says 1, and a zero there is then a real zero |
 
 Measured cost of the change on the robot (197 pids, 6 samples): the sampler
@@ -683,6 +721,9 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `ext4.lifetime_write_kbytes` is in the hundreds of GB to TB (1.03 TB on `picar`, 2026-09-17) | the card has been written a great deal; a wear-related latency tail is a live hypothesis, not a theory | treat card health as a candidate alongside the kernel/host path, and say so when reporting |
 | both file channels empty with the device saturated | metadata/journal work with no file-level signature at all (ext4 `-rsv-conversion`, `kblockd`, `jbd2` in the D-state roster) | the root channel is the only way in; do not read the empty channels as "nobody wrote" |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
+| `kernel_log.matched_total` > 0 with `Undervoltage detected!` in the window | a power event, and the only channel here that dates it. Matches #217's and #247's power candidate (`vcgencmd get_throttled = 0x50000`, one boot-long sticky flag, no timestamps) | correlate it with the record's timestamps before blaming the card; a *currently* undervolted Pi is a different fix (supply/cable) from a slow card |
+| `kernel_log` names `mmc1`/`brcmfmac`/SDIO errors or timeouts | the SDIO WiFi shares the `mmc` subsystem and has no `/sys/block` entry, so this is the only place it appears | cross-read it with `co_blocked_samples`: a shared block means the bus, not a daemon |
+| `kernel_log.available: false` | nobody read the kernel log (no `journalctl`, or not in `adm`) — **not** a quiet kernel | fix the access (`usermod -aG adm pi` needs root) or run as root; do not read this as evidence of anything |
 | a log with `io_psi` records but **no** `heartbeat_age` record ever, on a host whose px-alive has been parked | check `trigger.px_alive_gate` before concluding the heartbeat is healthy | pass `--px-alive-pid-file` explicitly, or stop overriding `LOG_DIR`; the gate is /proc-based and a missing pid file disarms it |
 | `blocked_in_window[0]` is a root-owned daemon or a kernel thread with `wchan_withheld: true`, `writers_unreadable_count` high | the unprivileged reading of "the writer is one of the processes we cannot measure". A `jbd2/mmcblk0p2-8` row is ext4 journal work; the journal thread *is* the writer, and it has no file and no unit | the unit-level fix is journal-side tuning (`SyncIntervalSec`, `Storage=`, rates) or taking fsyncs out of the suspect daemon — not process weighting; install as root for the symbol and the bytes |
 | `blocked_in_window` names a *user-space* daemon with `thread_d_samples` at or near `samples` while `d_samples` is 0 | a thread of that daemon is wedged behind a healthy leader (#287) — the shape a leader-only view reports as "fine" | that daemon's write path, not its park logic |
