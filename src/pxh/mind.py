@@ -139,6 +139,16 @@ FRIGATE_TIMEOUT_S      = 2     # short timeout — must not stall the awareness 
 FRIGATE_FILE           = STATE_DIR / "frigate_presence.json"
 FINDMYHUB_FILE         = STATE_DIR / "findmyhub.json"
 FINDMYHUB_STALE_S      = 900   # treat as stale after 15 min (cron runs every 5 min)
+#: A *fix* (not the file) older than this cannot change a tracker's latched
+#: state: it says where the tracker *was*, not where it is (#305, reopened
+#: 2026-09-18). The flap this explains: the file is rewritten every ~5 min so
+#: the file-level gate always passes, while the fix inside it measured **13.8
+#: hours** old (4.3 days for another tracker) and 4.43 km away — so a stale far
+#: fix latched `away`, and the next fresh home fix flipped it back, manufacturing
+#: an arrival out of nothing but the file being current. One hour is the
+#: compromise: observed fresh fixes arrive minutes old, stale ones are hours or
+#: days old, and nothing in between has ever been seen.
+FINDMYHUB_FIX_STALE_S  = int(os.environ.get("PX_FINDMYHUB_FIX_STALE_S", "3600"))
 # Approximate home coordinates for distance calculation
 HOME_LAT               = float(os.environ.get("PX_HOME_LAT", "-43.13567"))
 HOME_LON               = float(os.environ.get("PX_HOME_LON", "147.11840"))
@@ -949,7 +959,7 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
     even if at_home=true — preserves the daemon-restart guard. The cache is
     only mutated when ``findmyhub`` is non-empty, so stale-file windows do
     not erase the prior "away" baseline."""
-    global _last_known_findmyhub, _latch_suppressed, _latch_far_streak
+    global _last_known_findmyhub, _latch_suppressed, _latch_far_streak, _latch_stale
     transitions: list[str] = []
     if not findmyhub:
         return transitions
@@ -1042,6 +1052,23 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
             if prev_home is not None:
                 curr["at_home"] = prev_home
             continue
+        age_s = curr.get("age_s")
+        if isinstance(age_s, (int, float)) and age_s > FINDMYHUB_FIX_STALE_S:
+            # History, not evidence about now. The latched state is copied onto
+            # this dict (it is about to become the cache) so no consumer sees the
+            # tracker lose its state, and the arrival detector -- which reads that
+            # cache -- cannot manufacture an edge out of a stale fix.
+            if prev_home is not None:
+                curr["at_home"] = prev_home
+            _latch_stale[name] = _latch_stale.get(name, 0) + 1
+            if _latch_stale[name] == 1 or _latch_stale[name] % 100 == 0:
+                log(
+                    f"findmyhub: {name} fix is stale ({age_s / 3600.0:.1f} h old, "
+                    f"limit {FINDMYHUB_FIX_STALE_S / 3600.0:.0f} h) — holding "
+                    f"at_home={prev_home} ({_latch_stale[name]} stale fixes)"
+                )
+            continue
+        _latch_stale[name] = 0
         streak = _latch_far_streak.get(name, 0)
         state, reason = latch_at_home(
             curr["distance_km"], curr.get("accuracy_m"), prev_home, streak
@@ -1990,6 +2017,9 @@ _last_known_findmyhub: dict = {}
 # turns "we stopped flapping" into a number, and it is what makes the next real
 # transition line say how much noise the latch absorbed (#305).
 _latch_suppressed: dict = {}
+#: Stale fixes absorbed per tracker (#305): the gate's own effect, countable
+#: rather than inferred from the absence of transitions.
+_latch_stale: dict = {}
 # Per-tracker run of consecutive usable fixes that said "outside the exit
 # radius". A departure needs two (presence.EXIT_CONFIRMATIONS): a single far fix
 # at ±100 m accuracy, read just after a restart, produced a real greeting on
@@ -2505,7 +2535,7 @@ def _reset_state():
     global _consecutive_reflection_failures, _reflection_offline_spoken
     global _mood_v, _mood_a
     global _time_period_start_mono, _last_image_cleanup
-    global _last_known_findmyhub
+    global _last_known_findmyhub, _latch_stale
     global _ha_offline_until
     global _ha_unavailable_reason
     global _ha_sleep_entity_missing
@@ -2542,6 +2572,7 @@ def _reset_state():
     _last_known_findmyhub = {}
     _latch_suppressed = {}
     _latch_far_streak = {}
+    _latch_stale = {}
     _ha_offline_until = 0.0
     _ha_unavailable_reason = None
 
