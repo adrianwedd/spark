@@ -319,3 +319,84 @@ def test_watchdog_status_exceeded_when_the_margin_is_gone(tmp_path):
     })
 
     assert health.read_watchdog_margin(tmp_path)["watchdog_status"] == "exceeded"
+
+
+# --- crashed writers' temp files (#292) ------------------------------------
+#
+# The sweep is throttled to once an hour per process, but the *first* health
+# write of a process always runs it: a daemon that just started is the one that
+# knows the previous run may have been killed mid-write.
+
+
+@pytest.fixture(autouse=True)
+def _reset_sweep_throttle():
+    health._temps_swept_at = None
+
+
+def test_first_health_write_sweeps_and_the_next_does_not(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        health, "sweep_stale_temps",
+        lambda d, *a, **kw: calls.append(d) or {"removed": 0, "skipped": 0, "failed": 0},
+    )
+    health.record_success("px-mind")
+    health.record_failure("px-post", "boom")
+    assert len(calls) == 1
+
+
+def test_sweep_runs_again_after_the_interval(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        health, "sweep_stale_temps",
+        lambda d, *a, **kw: calls.append(d) or {"removed": 0, "skipped": 0, "failed": 0},
+    )
+    health.record_success("px-mind")
+    health._temps_swept_at -= health._SWEEP_INTERVAL_S + 1
+    health.record_success("px-mind")
+    assert len(calls) == 2
+
+
+def test_sweep_throttle_does_not_skip_the_first_sweep_on_a_fresh_boot(monkeypatch):
+    """`time.monotonic()` is smaller than an hour on a freshly booted host — a
+    0.0 sentinel would skip the sweep exactly when residue is most likely."""
+    calls = []
+    monkeypatch.setattr(
+        health, "sweep_stale_temps",
+        lambda d, *a, **kw: calls.append(d) or {"removed": 0, "skipped": 0, "failed": 0},
+    )
+    monkeypatch.setattr(health.time, "monotonic", lambda: 12.0)
+    health.record_success("px-mind")
+    assert len(calls) == 1
+
+
+def test_sweep_records_what_it_removed(monkeypatch):
+    """A cleanup nobody can see is the residue problem all over again."""
+    events = []
+    monkeypatch.setattr(health, "log_event", lambda name, payload: events.append((name, payload)))
+    monkeypatch.setattr(
+        health, "sweep_stale_temps",
+        lambda d, *a, **kw: {"removed": 3, "skipped": 2, "failed": 0},
+    )
+    health.record_success("px-mind")
+    assert events == [("health-sweep", {"dir": str(health.health_dir()), "removed": 3, "skipped": 2, "failed": 0})]
+
+
+def test_a_quiet_sweep_logs_nothing(monkeypatch):
+    events = []
+    monkeypatch.setattr(health, "log_event", lambda name, payload: events.append(name))
+    monkeypatch.setattr(
+        health, "sweep_stale_temps",
+        lambda d, *a, **kw: {"removed": 0, "skipped": 0, "failed": 0},
+    )
+    health.record_success("px-mind")
+    assert events == []
+
+
+def test_a_failing_sweep_never_breaks_the_health_write(monkeypatch):
+    def boom(d, *a, **kw):
+        raise OSError("filesystem is having a day")
+
+    monkeypatch.setattr(health, "sweep_stale_temps", boom)
+    health.record_success("px-mind")
+    rec = json.loads(health._component_path("px-mind").read_text())
+    assert rec["success_count"] == 1

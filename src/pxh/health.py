@@ -32,6 +32,7 @@ ownership hazard in one move; ``atomic_write()`` handles durability.
 Status is derived at *read* time, never stored — "stale" is a function of now,
 so a component that dies cannot leave a lying "ok" behind.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -41,7 +42,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pxh.state import atomic_write
+from pxh.logging import log_event
+from pxh.state import atomic_write, sweep_stale_temps
 from pxh.time import utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -53,15 +55,15 @@ FAIL_THRESHOLD = 3
 # Roughly 3x its natural cycle — long enough to absorb one slow tick and a
 # systemd restart (most units restart after 10s) without crying wolf.
 STALE_AFTER_S: dict[str, int] = {
-    "px-mind": 300,           # awareness ticks every 60s
+    "px-mind": 300,  # awareness ticks every 60s
     # Reflection backs off to 8x its 300s base when nobody is around (40 min),
     # so its silence window has to clear that or an idle house reads as broken.
     "px-mind-reflection": 3600,
-    "px-alive": 300,          # idle actions are sporadic; heartbeat is periodic
+    "px-alive": 300,  # idle actions are sporadic; heartbeat is periodic
     "px-battery-poll": 300,
-    "px-wake-listen": 900,    # only reports on wake events + periodic heartbeat
-    "px-post": 3600,          # only runs when a postable thought appears
-    "px-blog": 86400,         # daily cadence at its most frequent
+    "px-wake-listen": 900,  # only reports on wake events + periodic heartbeat
+    "px-post": 3600,  # only runs when a postable thought appears
+    "px-blog": 86400,  # daily cadence at its most frequent
     # Memory consolidation is nightly like px-blog, but it fires inside a
     # window (03:00-06:00 Hobart, #310) rather than at a fixed hour, so two
     # perfectly healthy runs can sit ~27h apart (03:00 one night, 05:59 the
@@ -126,6 +128,40 @@ def _read_record(component: str) -> dict[str, Any]:
 # daemon. Sticky keeps one user from deleting another's record.
 _HEALTH_DIR_MODE = 0o1777
 
+# Sweeping leftover `atomic_write` temps costs a directory scan, so it is
+# throttled — but the *first* health write of a process always runs it, because
+# the process that just started is the one that knows a previous run may have
+# been killed mid-write (#292). `None`, not 0.0: `time.monotonic()` is smaller
+# than an hour on a freshly booted host, so a 0.0 sentinel would skip the first
+# sweep exactly when the residue is most likely to be there.
+_SWEEP_INTERVAL_S = 3600.0
+_temps_swept_at: float | None = None
+
+
+def _maybe_sweep_temps(d: Path) -> None:
+    """Prune crashed writers' temp files from the health directory, hourly.
+
+    Never raises, and logs only when it actually did something — a line per
+    daemon per hour saying "removed 0" would be its own small lie about how
+    quiet this system is. The line is structured (`logs/tool-health-sweep.log`)
+    because #292's lesson is that residue found by listing a directory by hand
+    is residue nobody sees.
+    """
+    global _temps_swept_at
+    now = time.monotonic()
+    if _temps_swept_at is not None and (now - _temps_swept_at) < _SWEEP_INTERVAL_S:
+        return
+    _temps_swept_at = now
+    try:
+        counts = sweep_stale_temps(d)
+    except Exception:  # pragma: no cover — health must never break its caller
+        return
+    if counts["removed"] or counts["skipped"] or counts["failed"]:
+        try:
+            log_event("health-sweep", {"dir": str(d), **counts})
+        except Exception:  # pragma: no cover — reporting is never load-bearing
+            pass
+
 
 def _ensure_health_dir() -> Path | None:
     d = health_dir()
@@ -138,6 +174,7 @@ def _ensure_health_dir() -> Path | None:
             os.chmod(d, _HEALTH_DIR_MODE)
     except OSError:
         pass  # not the owner — the creating user already set the mode, or we lose
+    _maybe_sweep_temps(d)
     return d
 
 
@@ -221,7 +258,9 @@ def record_capability_success(component: str, capability: str) -> None:
         pass
 
 
-def record_success(component: str, detail: Any = None, min_interval_s: float = 0.0) -> None:
+def record_success(
+    component: str, detail: Any = None, min_interval_s: float = 0.0
+) -> None:
     """Note that `component` completed its work. Resets the failure streak.
 
     `min_interval_s` throttles writes for fast loops — px-alive ticks twice a
@@ -282,7 +321,9 @@ def _age_s(ts: str | None, now: dt.datetime) -> float | None:
     return (now - parsed).total_seconds()
 
 
-def _derive_status(rec: dict[str, Any], component: str, now: dt.datetime) -> tuple[str, float | None]:
+def _derive_status(
+    rec: dict[str, Any], component: str, now: dt.datetime
+) -> tuple[str, float | None]:
     """The process axis, promoted by any blocked capability on the same record.
 
     A blocked capability is the daemon's own fault and a silent one, so it takes
@@ -296,7 +337,9 @@ def _derive_status(rec: dict[str, Any], component: str, now: dt.datetime) -> tup
     return status, age
 
 
-def _base_status(rec: dict[str, Any], component: str, now: dt.datetime) -> tuple[str, float | None]:
+def _base_status(
+    rec: dict[str, Any], component: str, now: dt.datetime
+) -> tuple[str, float | None]:
     if not rec:
         return "missing", None
     age = _age_s(rec.get("updated_ts"), now)
@@ -353,10 +396,16 @@ def read_watchdog_margin(state_dir: Path | str | None = None) -> dict[str, Any]:
         return {}
 
     out: dict[str, Any] = {}
-    for key in ("heartbeat_gap_last_ms", "heartbeat_gap_max_ms",
-                "heartbeat_gap_max_mode", "heartbeat_gap_buckets",
-                "loop_duration_last_ms", "loop_duration_max_ms",
-                "watchdog_margin_min_ms", "window_started_at"):
+    for key in (
+        "heartbeat_gap_last_ms",
+        "heartbeat_gap_max_ms",
+        "heartbeat_gap_max_mode",
+        "heartbeat_gap_buckets",
+        "loop_duration_last_ms",
+        "loop_duration_max_ms",
+        "watchdog_margin_min_ms",
+        "window_started_at",
+    ):
         if key in rec:
             out[key] = rec[key]
 
@@ -364,7 +413,7 @@ def read_watchdog_margin(state_dir: Path | str | None = None) -> dict[str, Any]:
     margin = rec.get("watchdog_margin_min_ms")
     status = "ok"
     if isinstance(margin, (int, float)) and isinstance(gap_max, (int, float)):
-        limit = margin + gap_max          # reconstruct the deadline in force
+        limit = margin + gap_max  # reconstruct the deadline in force
         if margin <= 0:
             status = "exceeded"
         elif limit > 0 and gap_max >= limit * WATCHDOG_NEAR_MISS_RATIO:
@@ -443,8 +492,14 @@ def read_health(components: tuple[str, ...] | None = None) -> dict[str, Any]:
         entry: dict[str, Any] = {"status": status}
         if age is not None:
             entry["age_s"] = round(age)
-        for key in ("last_success_ts", "last_error", "last_error_ts",
-                    "consecutive_failures", "success_count", "failure_count"):
+        for key in (
+            "last_success_ts",
+            "last_error",
+            "last_error_ts",
+            "consecutive_failures",
+            "success_count",
+            "failure_count",
+        ):
             if key in rec:
                 entry[key] = rec[key]
         caps = blocked_capabilities(rec)
@@ -495,8 +550,11 @@ def summarize(health: dict[str, Any] | None = None) -> str:
     mem = health.get("memory_formation") or {}
     mem_note = ""
     if mem.get("overdue"):
-        mem_note = ("long-term memory: never formed" if not mem.get("last_formed_ts")
-                    else f"long-term memory: last formed {mem.get('age_human')}")
+        mem_note = (
+            "long-term memory: never formed"
+            if not mem.get("last_formed_ts")
+            else f"long-term memory: last formed {mem.get('age_human')}"
+        )
     if not unhealthy:
         return mem_note
     bits = []

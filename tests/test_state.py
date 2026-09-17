@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import pxh.state as state
 
@@ -580,3 +581,77 @@ def test_a_session_lock_we_cannot_open_is_reclaimed(tmp_path, monkeypatch):
     os.chmod(lock, 0o000)
     state.update_session(fields={"mode": "dry-run"})
     assert state.load_session()["mode"] == "dry-run"
+
+
+# --- leftover atomic_write temps (#292) ------------------------------------
+#
+# `atomic_write` unlinks its temp on any exception, but SIGKILL cannot run that
+# branch: a writer killed mid-fsync leaves a complete-looking `tmp*.tmp` behind
+# forever. Nothing inside the dying process can clean up after it, so the sweep
+# belongs to whoever owns the directory — and it must survive the cross-user
+# case, where the sweeper is not the owner.
+
+
+def _temp(path, age_s, *, size=169, now=1_000_000.0):
+    path.write_text("x" * size)
+    os.utime(path, (now - age_s, now - age_s))
+    return path
+
+
+def test_sweep_stale_temps_removes_old_and_keeps_recent(tmp_path):
+    old = _temp(tmp_path / "tmpaaaaaa.tmp", age_s=7200)
+    fresh = _temp(tmp_path / "tmpbbbbbb.tmp", age_s=5)
+    other = _temp(tmp_path / "px-mind.json", age_s=7200)
+    counts = state.sweep_stale_temps(tmp_path, now=1_000_000.0)
+    assert counts == {"removed": 1, "skipped": 0, "failed": 0}
+    assert not old.exists()
+    # A live write in another process must never lose its temp file to a sweep.
+    assert fresh.exists()
+    assert other.exists()
+
+
+def test_sweep_stale_temps_honours_the_age_boundary(tmp_path):
+    exactly = _temp(tmp_path / "tmpexact0.tmp", age_s=state.STALE_TEMP_AGE_S, now=1_000_000.0)
+    just_over = _temp(tmp_path / "tmpexpired.tmp", age_s=state.STALE_TEMP_AGE_S + 1, now=1_000_000.0)
+    state.sweep_stale_temps(tmp_path, now=1_000_000.0)
+    assert exactly.exists()          # `>= cutoff` is not stale
+    assert not just_over.exists()
+
+
+def test_sweep_stale_temps_counts_a_refusal_instead_of_raising(tmp_path, monkeypatch):
+    """The `pi`-sweeps-root case: sticky bit, EPERM, and health reporting must
+    never raise — a directory shared by two users is expected to refuse."""
+    root_owned = _temp(tmp_path / "tmproot00.tmp", age_s=7200)
+    mine = _temp(tmp_path / "tmpmine00.tmp", age_s=7200)
+    real_unlink = Path.unlink
+
+    def refuse_root(self, *args, **kwargs):
+        if self.name == "tmproot00.tmp":
+            raise PermissionError(1, "Operation not permitted")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_root)
+    counts = state.sweep_stale_temps(tmp_path, now=1_000_000.0)
+    assert counts == {"removed": 1, "skipped": 1, "failed": 0}
+    assert root_owned.exists()       # nothing pretends the refusal succeeded
+    assert not mine.exists()
+
+
+def test_sweep_stale_temps_survives_a_vanished_file(tmp_path, monkeypatch):
+    """The writer finishing mid-sweep is a race, not a failure."""
+    _temp(tmp_path / "tmpgone00.tmp", age_s=7200)
+
+    def gone(self, *args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(Path, "unlink", gone)
+    counts = state.sweep_stale_temps(tmp_path, now=1_000_000.0)
+    assert counts == {"removed": 0, "skipped": 0, "failed": 0}
+
+
+def test_sweep_stale_temps_missing_directory_is_not_an_error(tmp_path):
+    assert state.sweep_stale_temps(tmp_path / "nope", now=1_000_000.0) == {
+        "removed": 0,
+        "skipped": 0,
+        "failed": 0,
+    }

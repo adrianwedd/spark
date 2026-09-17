@@ -61,6 +61,11 @@ directory by hand rather than by anything failing:
 | `/tmp/tmux-1000/px-mind{.supervisor.lock}` | a socket file with no server reads as "there is a server here" |
 | `state/health/px-brain.json` | `read_health()` deliberately reports any component that has *ever* written a file, so a retired service reports `stale` forever — a permanent false alarm on the operator board |
 
+One residue class now cleans itself: `state/health/`'s orphaned `atomic_write`
+temps are swept hourly by whoever next writes health there (#292), with each
+removal logged to `logs/tool-health-sweep.log`. Everything else still needs the
+by-hand listing.
+
 So the deploy checklist for a retirement is: stop the unit, kill what it owned
 (check `ps` for the process *and* the tmux socket), remove its health record,
 then watch the board until the name is gone.
@@ -199,6 +204,8 @@ Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every
 **Store: `state/health/<component>.json`, one file per component — never a single shared file.** `px-alive` and `px-battery-poll` run as root while everything else runs as `pi`; a shared file would need a `FileLock`, and a root-created lock at 0644 locks out every `pi` daemon with EACCES. Per-component files remove the lock, the read-modify-write race, and the ownership hazard together.
 
 **The directory is created `1777`** (sticky, world-writable, like `/tmp`) because `atomic_write()`'s `mkstemp` needs directory write permission — a root-created 0755 dir would break every `pi` writer. `_ensure_health_dir()` re-chmods on every write, so whichever user wins the creation race, both can write. Do not "tighten" this to 0755.
+
+**Crashed writers leave temps, and the directory sweeps them itself (#292).** `atomic_write()` unlinks its `tmp*.tmp` on any exception, but **SIGKILL cannot run that branch** — a daemon killed mid-`fsync` (the SD-card stalls in #247/#283/#287) leaves a complete-looking temp behind forever, and 81 of the 99 accumulated by 2026-09-17 were root-owned inside that 1777 directory, unremovable by any `pi` daemon that noticed them. `_ensure_health_dir()` now calls `state.sweep_stale_temps()` at most once an hour per process — and always on the **first** health write of a process, which is the "a previous run may have been killed" case. It is age-based (`STALE_TEMP_AGE_S`, 1 h) so a live write in another process never loses its temp, refusals under the sticky bit are counted rather than raised, and removals are recorded in `logs/tool-health-sweep.log` because cleanup nobody can see is the residue problem again. Do not move the sweep onto every health write: that is a directory scan on a 2 Hz path, on the card this system is already bottlenecked on.
 
 **Status is derived at read time, never stored** — a dead daemon can't leave a lying "ok" behind. `ok` → `degraded` (1–2 failures) → `stale` (silent past its per-component `STALE_AFTER_S`) → `failing` (≥3 consecutive) / `missing`. Per-component windows matter: `px-blog` runs daily, `px-mind` every 60s.
 
