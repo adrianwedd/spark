@@ -72,7 +72,7 @@ bury the real stalls.
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
 | **file** | a bounded *watchlist* (`/var/log/journal/*/*.journal`, `logs/*.log`, `state/*.json`, `state/health/*.json`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI; `/sys/block/*/inflight`; `/sys/fs/ext4/*` | no — world-readable, including for root-owned processes |
-| **filesystem** | `ext4` counters: `session_write_kbytes` (bytes written *to this filesystem*), `lifetime_write_kbytes` (card wear), `delayed_allocation_blocks`, `errors_count`, `journal_task` | no — and it is the only channel that can say *the device moved 500 KB and the filesystem wrote 4 KB*, i.e. metadata/journal work with no file to name |
+| **filesystem** | `ext4` counters: `session_write_kbytes` (bytes written *through* this filesystem, metadata and journal included), `lifetime_write_kbytes` (card wear), `delayed_allocation_blocks`, `errors_count`, `journal_task` | no — it cross-checks the device's bytes against the filesystem's, which is how you rule out a raw writer outside the filesystem and how you measure **write amplification**. It does *not* separate file data from metadata — see the calibration below |
 
 **Pid files, two different roles until 2026-09-17:** `--pid-file` (default
 `logs/px-io-attrib.pid`) is where the observer publishes *its own* pid while
@@ -295,6 +295,46 @@ and the previous boot ended with
 live explanation for a host controller that stops completing requests without
 logging an error, and it is testable from the privileged side.
 
+## 2026-09-17 21:50 — measured: fsync'd small files cost ~43 KB of card writes each (and what that does *not* explain)
+
+Controlled, bounded, in-vitro run on `picar` (8 s windows, cleaned up after), comparing
+the device's bytes against the filesystem's:
+
+```
+window                    dev KB   ext4 KB   ratio   ms_io   write reqs   psi_some
+baseline (idle)              208       208    1.00     44ms            27        0.0
+2 MiB sequential + fsync    2672      2672    1.00    304ms            34        0.2
+300 x 40 B files + fsync   13056     13056    1.00   2780ms          1000        5.5
+idle again                   428       428    1.00    120ms            52        2.7
+```
+
+Two results, one of which corrects the doc's earlier claim.
+
+**1. `session_write_kbytes` tracks the device exactly (ratio 1.00 in every regime), so
+it does not separate file data from metadata.** The earlier claim in this file that it
+does was wrong — it is a *cross-check*, and a valuable one: it rules out a raw writer
+outside the filesystem, because every device byte is accounted for by the filesystem.
+
+**2. Write amplification is enormous for small durable files: ~1088×.** 300 files of
+40 bytes (12 KB of data) cost **13 MB** of card writes — ~43 KB per file, ~1000 write
+requests in 8 s, queue 35 % occupied. This is exactly the `atomic_write()` shape every
+daemon uses (`mkstemp` + write + `fsync` + `os.replace`): one JSON state file is three
+to four journal-committed metadata writes plus a flush.
+
+The arithmetic lines up with the stall records: observed state-file rewrite *clusters*
+are 3-8 files every ~60-90 s (mtime channel), at ~43 KB each that is **129-344 KB per
+cluster** — against **128-524 KB** of device writes in the four `io_psi` records, on
+the same ~1/minute cadence.
+
+**What this does *not* explain — and the honest boundary.** Device work alone does not
+account for the blocking ratio. Those four records show io PSI `some` 40-48 % while the
+device was only 31-118 % *queue-occupied* with 3-18 completions/s, and the controlled
+burst above reached 35 % occupancy with **5.5 %** PSI (0.0 % at idle). So the
+amplification is real, is filesystem-authored, and is the right thing to reduce — but
+something still converts a modest amount of device work into near-system-wide blocking,
+and that is the part the root channel exists to see (kernel threads, per-task `wchan`,
+the root-owned writers).
+
 ## Reading a record
 
 ```bash
@@ -318,7 +358,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
 | `d_state_count` / `blocked_thread_count` | stalled processes, and how many of the blocked tasks are non-leader threads |
 | `devices` | per-device deltas. `ms_io` (queue-occupied time) is the trustworthy one; `ms_writing` is reported but over-counts on this kernel — see the caveat above |
-| `ext4` | `{fs, write_kbytes_delta, session_write_kbytes, lifetime_write_kbytes, delayed_allocation_blocks, errors_count, journal_task}`. `write_kbytes_delta` is file data written to the filesystem across the window; compare it against `devices.<dev>.sectors_written`. `{}` means unwatched, never zero. `lifetime_write_kbytes` is the wear figure for the card |
+| `ext4` | `{fs, write_kbytes_delta, session_write_kbytes, lifetime_write_kbytes, delayed_allocation_blocks, errors_count, journal_task}`. Compare `write_kbytes_delta` against `devices.<dev>.sectors_written`: a ratio near 1.00 means the device's bytes *are* filesystem writes (no rogue writer), and the interesting number is then amplification — device bytes per byte of file data, which the file channels approximate. `journal_task` is a **tid** on this kernel (217 = `jbd2/mmcblk0p2-8`), so it cross-references `stalled[].pid`. `{}` means unwatched, never zero. `lifetime_write_kbytes` is the wear figure for the card |
 | `device_inflight_pre` / `device_inflight_post` | `/sys/block/<dev>/inflight` at each end of the window — requests *currently* dispatched. Zero is reported, not dropped: `0/0` during a stall is the finding, not a missing sample. `pre` is inside the stall (the caller triggered because PSI is high now), `post` shows recovery |
 | `vmstat` / `vmstat_end` | swap-in/out and direct-reclaim deltas; `nr_dirty`/`nr_writeback` gauges |
 | `psi_pre` / `psi_post` | `psi_io_some_avg10_*`, `psi_io_full_avg10_*`, memory PSI, `load1`, `swap_free_kb` on both ends |
@@ -338,7 +378,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `file_growth_groups.journal` is most of the bytes | journald is writing through the stall | journal-side tuning (`SyncIntervalSec`, rates, storage), not process weighting |
 | `file_growth` empty while `mmcblk0.ms_writing` is high | the bytes went somewhere outside the watchlist (root-owned state, another tree, or kernel writeback) | widen `--growth-pattern`, or install as root |
 | `file_growth` empty **and `file_touched` names the journal** | journald wrote in this window without moving any file size — the shape the size channel was blind to | journal-side tuning (`SyncIntervalSec`, rates, `Storage=`) is a real candidate now; install as root to get its bytes |
-| device bytes ≫ `ext4.write_kbytes_delta` (524 KB vs 4 KB) | the device moved metadata/journal bytes, not file data — there is no file for any file channel to name, so their emptiness is expected rather than informative | the root channel (`jbd2`/`kblockd`/`ext4-rsv-conversion` in the D-state roster is the corroboration), then ext4/journal-side tuning |
+| device bytes ≈ `ext4.write_kbytes_delta` (ratio ~1.00) | the device's bytes are filesystem writes — no raw or outside-the-filesystem writer exists, which retires that whole class of suspect | stop looking for a rogue writer; measure amplification (below) and count fsyncs instead |
 | `ext4.lifetime_write_kbytes` is in the hundreds of GB to TB (1.03 TB on `picar`, 2026-09-17) | the card has been written a great deal; a wear-related latency tail is a live hypothesis, not a theory | treat card health as a candidate alongside the kernel/host path, and say so when reporting |
 | both file channels empty with the device saturated | metadata/journal work with no file-level signature at all (ext4 `-rsv-conversion`, `kblockd`, `jbd2` in the D-state roster) | the root channel is the only way in; do not read the empty channels as "nobody wrote" |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
