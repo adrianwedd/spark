@@ -10,6 +10,12 @@
 # Exit codes: 0 = every long-lived unit is executing the deployed revision,
 #             1 = at least one unit needs a restart,
 #             2 = cannot tell (no usable revision to diff, or no systemd).
+#
+# The *first* line is a summary of what needs doing -- restarts and unit-file
+# drift -- because the detail lines print after the reassurance, and on
+# 2026-09-18 a host with seven drifted unit files (one never installed) exited
+# 0 with the drift below the fold. `--strict` widens the exit code from
+# "the processes are current" to "nothing needs doing at all".
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/px-env"
@@ -34,6 +40,7 @@ import sys
 from pxh.deploy import (
     CODE_DIRS,
     UnitState,
+    action_summary,
     changed_symbols,
     needs_restart,
     repo_unit_names,
@@ -71,15 +78,19 @@ def unit_state(name):
     return UnitState(name=name, entry=match.group(1) if match else None, started_ts=started_ts)
 
 
-def report_unit_drift(root: str) -> None:
-    """Print the installed-vs-repo unit file drift, if any.
+def report_unit_drift(root: str) -> list:
+    """Collect the installed-vs-repo unit file drift. Prints nothing.
 
     The other half of "the deployed revision is what runs": the unit files the
     host reads are installed by hand, so a merged unit change is invisible until
     someone installs it. Reported rather than failed -- fixing it needs root, and
     blocking a deploy on a root-only action would teach people to ignore the gate.
     """
-    drift = [d for name in repo_unit_names(root) for d in unit_file_drift(name, root=root)]
+    return [d for name in repo_unit_names(root) for d in unit_file_drift(name, root=root)]
+
+
+def print_unit_drift(drift: list) -> None:
+    """The detail, printed after the summary that counts it."""
     if not drift:
         return
     print()
@@ -100,6 +111,12 @@ def main():
         default=None,
         help="ISO timestamp of the deploy; used for files the deploy deleted (no mtime on disk)",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 if anything needs action (a restart or a unit-file install); "
+             "the default exit code describes the processes only",
+    )
     args = parser.parse_args()
     root = os.path.abspath(args.root)
 
@@ -110,15 +127,18 @@ def main():
         print("  Re-run with an explicit --prev <revision> when the reflog cannot answer.")
         return 2
 
+    # The unit-file report is about the *host*, not about the diff, so it is
+    # collected first and its count leads the output: the first version returned
+    # before reaching it, and a docs-only deploy therefore reported no drift
+    # while five units were months stale (#390).
+    drift = report_unit_drift(root)
+
     if not moved:
-        print("px-deploy-check: nothing under {} changed in {}..{}".format(
+        print(action_summary(0, [], drift))
+        print("  (nothing under {} changed in {}..{})".format(
             "/".join(CODE_DIRS), args.prev, args.head))
-        # The unit-file report is about the *host*, not about the diff, so it
-        # prints here too: the first version returned before reaching it, and a
-        # docs-only deploy therefore reported no drift while five units were
-        # months stale (#390).
-        report_unit_drift(root)
-        return 0
+        print_unit_drift(drift)
+        return 1 if (args.strict and drift) else 0
 
     try:
         units = [unit_state(name) for name in unit_names()]
@@ -141,7 +161,8 @@ def main():
     verdicts = restart_list(moved, units, root=root, deploy_ts=deploy_ts, changes=changes)
     stale = needs_restart(verdicts)
 
-    print("px-deploy-check: {} changed file(s) in {}..{}".format(len(moved), args.prev, args.head))
+    print(action_summary(len(moved), [v.name for v in stale], drift))
+    print("  ({} changed file(s) in {}..{})".format(len(moved), args.prev, args.head))
     for verdict in verdicts:
         mark = "RESTART" if verdict.needs_restart else "ok     "
         print("  {}  {:24s} {}".format(mark, verdict.name, verdict.reason))
@@ -153,8 +174,10 @@ def main():
         print("restart these before calling the deploy complete:")
         print("  sudo systemctl restart " + " ".join(v.name.replace(".service", "") for v in stale))
 
-    report_unit_drift(root)
-    return 1 if stale else 0
+    print_unit_drift(drift)
+    if stale:
+        return 1
+    return 1 if (args.strict and drift) else 0
 
 
 if __name__ == "__main__":
