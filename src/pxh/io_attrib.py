@@ -321,6 +321,33 @@ def growth_group(path: str) -> str:
     return "other"
 
 
+def default_growth_patterns(log_dir: Path | str, state_dir: Path | str) -> list[str]:
+    """The watchlist's default set: the *shapes* that actually churn here.
+
+    Widened 2026-09-18 after a record in which the device wrote 112 KB and every
+    channel came back empty (`file_growth: []`, `file_touched: []`, 115 paths
+    watched). The old set was `*.log` and `*.json`, and the host's churn is not
+    those extensions: `state/*.jsonl` (thoughts, conversations, debug reports),
+    `state/*.lock`, `logs/*.jsonl`, `logs/*.out`, `logs/*.rotlock`, and files one
+    level down (`logs/<subdir>/*`). An ad-hoc probe that globbed `state/*` and
+    `logs/*` saw those files changing while the observer's narrower set saw
+    nothing — which is the difference between a measurement and a claim.
+
+    Still a watchlist, not a scan: a bounded number of globs, `limit=400` per
+    pattern in `sample_file_meta`, and the caller records how many paths were
+    covered so silence outside the list is never read as "nobody wrote".
+    """
+    log_dir, state_dir = Path(log_dir), Path(state_dir)
+    return [
+        "/var/log/journal/*/*.journal",
+        str(log_dir / "*"),
+        str(log_dir / "*" / "*"),
+        str(state_dir / "*"),
+        str(state_dir / "health" / "*.json"),
+        str(state_dir / "brain" / "*"),
+    ]
+
+
 def sample_file_meta(
     patterns: Sequence[str], *, limit: int = 400
 ) -> dict[str, dict[str, int]]:

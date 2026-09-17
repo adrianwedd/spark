@@ -121,8 +121,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--no-proc-io", action="store_true",
                     help="do not attempt the per-process writer channel")
     ap.add_argument("--growth-pattern", action="append", default=None,
-                    help="file glob to watch for size deltas, repeatable "
-                         "(default: system journal, logs/*.log, state/**/*.json)")
+                    help="file glob to watch, repeatable (default: the system "
+                         "journal, logs/*, logs/*/*, state/*, state/health/*.json, "
+                         "state/brain/* — see io_attrib.default_growth_patterns)")
     ap.add_argument("--no-file-growth", action="store_true",
                     help="skip the file-level writer channel")
     ap.add_argument("--once", action="store_true",
@@ -142,12 +143,7 @@ def main(argv: list[str]) -> int:
         # names a writer when /proc/<pid>/io is refused for every root-owned
         # process. A watchlist rather than a filesystem scan, so the cost is a
         # bounded number of stats.
-        growth_patterns = [
-            "/var/log/journal/*/*.journal",
-            str(LOG_DIR / "*.log"),
-            str(state_dir / "*.json"),
-            str(state_dir / "health" / "*.json"),
-        ]
+        growth_patterns = io_attrib.default_growth_patterns(LOG_DIR, state_dir)
 
     window_s = min(10.0, max(1.0, args.window))
     heartbeat_file = (
