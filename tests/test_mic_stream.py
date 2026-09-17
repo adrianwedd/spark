@@ -368,3 +368,84 @@ def test_context_manager_closes():
     with ArecordStream(chunk_frames=64, command=[sys.executable, "-c", src]) as s:
         proc = s._proc
     assert proc is not None and proc.poll() is not None
+
+
+# --- #283: ALSA slack, and evidence about where the stall was --------------
+#
+# The app-side ring buffer is 10 s, but ALSA's own buffer is what overruns when
+# the reader thread stalls, and it was `chunk_frames * 8` — 0.37 s at 44.1 kHz
+# with a 2048-frame period. Production overruns are measured in *seconds*,
+# which only makes sense if the reader was stalled far longer than the buffer
+# could cover.
+
+
+def test_alsa_buffer_holds_seconds_and_whole_periods():
+    chunk_frames = 2048
+    stream = ArecordStream(rate=44100, chunk_frames=chunk_frames)
+    cmd = stream.build_command()
+    buffer_frames = int(cmd[cmd.index("--buffer-size") + 1])
+    assert buffer_frames % chunk_frames == 0, "arecord wants whole periods"
+    assert buffer_frames / 44100 >= 2.0, "less than 2 s of slack is the old defect"
+    assert cmd[cmd.index("--period-size") + 1] == str(chunk_frames)
+
+
+def test_reader_gap_is_tracked_per_capture():
+    """The overrun line now says whether the *reader* was stalled."""
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    stream = ArecordStream(chunk_frames=chunk_frames,
+                           command=_pcm_command(6, chunk_bytes, delay_s=0.05))
+    try:
+        with stream.capturing():
+            for _ in range(6):
+                stream.read(chunk_frames, exception_on_overflow=False)
+        assert stream.reader_gap_max_ms > 20.0, "a 50 ms gap must be visible"
+        assert stream.reader_gap_last_ms > 0.0
+    finally:
+        stream.close()
+
+
+def test_a_new_capture_resets_the_gap_window():
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    stream = ArecordStream(chunk_frames=chunk_frames,
+                           command=_pcm_command(4, chunk_bytes, delay_s=0.05))
+    try:
+        with stream.capturing():
+            stream.read(chunk_frames, exception_on_overflow=False)
+            time.sleep(0.05)
+            stream.read(chunk_frames, exception_on_overflow=False)
+        assert stream.reader_gap_max_ms > 20.0
+        with stream.capturing():
+            pass
+        assert stream.reader_gap_max_ms == 0.0, "extrema are windowed, never lifetime"
+    finally:
+        stream.close()
+
+
+def test_drop_logging_does_not_hold_the_stream_lock():
+    """A blocking log write under the lock would stall every consumer."""
+    chunk_frames = 64
+    chunk_bytes = chunk_frames * 2
+    observations: list[tuple[str, bool]] = []
+    stream = ArecordStream(chunk_frames=chunk_frames, buffer_s=0.01,
+                           command=_pcm_command(200, chunk_bytes))
+
+    def probe(msg: str) -> None:
+        free = stream._cond.acquire(blocking=False)
+        observations.append((msg, free))
+        if free:
+            stream._cond.release()
+
+    stream._log = probe
+    try:
+        stream.start_stream()
+        deadline = time.monotonic() + 5
+        while stream.dropped_chunks == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert observations, "the drop path should have logged"
+        assert all(free for _msg, free in observations), (
+            "logging happened while the stream lock was held"
+        )
+    finally:
+        stream.close()

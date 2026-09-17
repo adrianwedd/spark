@@ -136,3 +136,88 @@ def test_log_event_survives_a_root_created_rotlock_and_data_file(tmp_path, monke
     assert '"who": "root"' in lines[0]
     assert '"who": "pi"' in lines[1]
     assert '"who": "root-again"' in lines[2]
+
+
+# --- StallProofLineWriter: logging that cannot stall its caller (#283) ------
+#
+# `ArecordStream`'s reader thread is what keeps arecord drained, and it logs
+# drops and overruns. A log write that blocks — a stuck journald socket, a card
+# that cannot take it — stalls the drain, arecord overruns its ALSA buffer, and
+# the overrun is logged by the same blocked path. Evidence must not be produced
+# by the machinery that is losing the data.
+
+
+def test_writer_preserves_order_and_flushes(tmp_path):
+    writer = pxlog.StallProofLineWriter(tmp_path / "x.log")
+    for i in range(50):
+        writer.write(f"line {i}")
+    writer.flush()
+    assert (tmp_path / "x.log").read_text().splitlines() == [f"line {i}" for i in range(50)]
+    writer.close()
+
+
+def test_write_does_not_wait_for_a_slow_sink(tmp_path, monkeypatch):
+    """The point of the class: a caller on a hot path never blocks on IO."""
+    import time as _time
+
+    release = __import__("threading").Event()
+
+    def slow_append(self, line):
+        release.wait(2.0)
+
+    monkeypatch.setattr(pxlog.StallProofLineWriter, "_append", slow_append)
+    writer = pxlog.StallProofLineWriter(tmp_path / "x.log")
+    started = _time.monotonic()
+    for i in range(20):
+        writer.write(f"line {i}")
+    elapsed = _time.monotonic() - started
+    release.set()
+    writer.close(timeout=1.0)
+    assert elapsed < 0.1, f"write() blocked for {elapsed:.3f}s behind the sink"
+
+
+def test_a_full_queue_drops_the_oldest_and_says_so(tmp_path, monkeypatch):
+    """Losing the oldest lines of a stall is survivable; growing until OOM is not."""
+    import threading
+
+    gate = threading.Event()
+
+    def blocked_append(self, line):
+        gate.wait(2.0)
+        real_append(self, line)
+
+    real_append = pxlog.StallProofLineWriter._append
+    monkeypatch.setattr(pxlog.StallProofLineWriter, "_append", blocked_append)
+    writer = pxlog.StallProofLineWriter(tmp_path / "x.log", queue_max=3, checks_per_rotate=1)
+    for i in range(12):
+        writer.write(f"line {i}")
+    assert writer.dropped > 0
+    gate.set()
+    writer.flush(timeout=2.0)
+    writer.close()
+    text = (tmp_path / "x.log").read_text()
+    assert "dropped" in text and "log line(s)" in text
+    # The newest line is the one that survived — it describes the stall.
+    assert "line 11" in text
+
+
+def test_writer_never_raises_on_an_unwritable_path(tmp_path):
+    blocked = tmp_path / "not-a-file"
+    blocked.write_text("I am a file, so appending under me fails")
+    writer = pxlog.StallProofLineWriter(blocked / "x.log")
+    writer.write("line")
+    writer.flush(timeout=1.0)
+    writer.close()
+    assert writer.dropped == 0  # dropped is about the queue, not the sink
+
+
+def test_writer_rotates_when_the_file_grows(tmp_path, monkeypatch):
+    monkeypatch.setattr(pxlog, "_LOG_MAX_BYTES", 200)
+    writer = pxlog.StallProofLineWriter(tmp_path / "x.log", checks_per_rotate=1)
+    for i in range(60):
+        writer.write(f"line {i} " + "x" * 20)
+    writer.flush()
+    writer.close()
+    text = (tmp_path / "x.log").read_text()
+    assert "line 59" in text, "the newest lines survive a rotation"
+    assert text.count("\n") < 60

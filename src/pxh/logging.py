@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping
@@ -103,6 +105,142 @@ def _relax_mode(path, owner_like_dir: Path) -> None:
         os.chown(path, dir_stat.st_uid, dir_stat.st_gid)
     except OSError:
         pass  # not privileged to chown — the creating user's uid is what we get
+
+
+class StallProofLineWriter:
+    """Write log lines from a background thread so a caller never blocks on IO.
+
+    Built for the capture path (#283). `ArecordStream`'s reader thread is what
+    keeps `arecord` drained, and it logs — ring-buffer drops, and the stderr
+    thread's ALSA overruns — while holding the stream's condition lock, so a log
+    write that blocks stalls the drain *and* every consumer waiting on that lock.
+    A blocked `print` to a journald socket or a file write to a card that cannot
+    take it therefore turns a short hiccup into arecord overflowing its own ALSA
+    buffer, which is then logged by the same blocked path — a feedback loop that
+    converts hundreds of milliseconds of trouble into seconds of lost audio.
+
+    The invariant this encodes: **a daemon's evidence must not be produced by the
+    machinery that is losing the data.**
+
+    FIFO through one writer thread. The queue is bounded and drops the *oldest*
+    line, recording the gap as a marker line rather than growing without limit —
+    losing the oldest lines of a stall is survivable, growing until the OOM
+    killer arrives is not. `write()` never raises and never blocks; `flush()`
+    exists for exit paths that must not lose the last lines.
+    """
+
+    _FLUSH = object()
+
+    def __init__(self, path: Path, *, queue_max: int = 4096, echo=None,
+                 checks_per_rotate: int = 200):
+        self.path = Path(path)
+        self._echo = echo
+        self._queue: "queue.Queue" = queue.Queue(maxsize=queue_max)
+        self._dropped = 0
+        self._dropped_reported = 0
+        self._lines_since_rotate_check = 0
+        self._checks_per_rotate = max(1, checks_per_rotate)
+        self._flushed = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name="log-writer", daemon=True)
+        self._thread.start()
+
+    # -- producer side -----------------------------------------------------
+
+    def write(self, line: str) -> None:
+        """Queue one line. Never blocks, never raises."""
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(line)
+        except queue.Full:
+            # Drop the *oldest* line and say so, rather than losing the newest
+            # (which is the one that describes the stall in progress).
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self._dropped += 1
+            except (queue.Empty, ValueError):
+                pass
+            try:
+                self._queue.put_nowait(line)
+            except queue.Full:
+                pass
+        except Exception:  # pragma: no cover — logging never load-bearing
+            pass
+
+    def flush(self, timeout: float = 2.0) -> None:
+        """Block until everything queued so far has been written (or timeout)."""
+        if self._closed:
+            return
+        try:
+            self._flushed.clear()
+            self._queue.put(self._FLUSH, timeout=timeout)
+            self._flushed.wait(timeout=timeout)
+        except Exception:
+            pass
+
+    def close(self, timeout: float = 2.0) -> None:
+        self.flush(timeout=timeout)
+        self._closed = True
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+    # -- writer side -------------------------------------------------------
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._FLUSH:
+                    self._flushed.set()
+                    continue
+                self._write_line(item)
+            except Exception:
+                pass  # a logging failure must never take the writer down
+            finally:
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
+
+    def _write_line(self, line: str) -> None:
+        if self._dropped > self._dropped_reported:
+            gap = self._dropped - self._dropped_reported
+            self._dropped_reported = self._dropped
+            self._append(f"[pxh.logging] dropped {gap} log line(s) under IO pressure")
+        self._append(line)
+        if self._echo is not None:
+            try:
+                self._echo(line)
+            except Exception:
+                pass
+
+    def _append(self, line: str) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            return
+        self._lines_since_rotate_check += 1
+        if self._lines_since_rotate_check >= self._checks_per_rotate:
+            self._lines_since_rotate_check = 0
+            try:
+                if self.path.stat().st_size > _LOG_MAX_BYTES:
+                    self._rotate()
+            except OSError:
+                pass
+
+    def _rotate(self) -> None:
+        """Keep the last half — the same policy the wake listener had inline."""
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        half = lines[len(lines) // 2:]
+        tmp = self.path.with_suffix(self.path.suffix + ".rot")
+        tmp.write_text("\n".join(half) + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
 
 
 def log_event(name: str, payload: Mapping[str, Any]) -> None:
