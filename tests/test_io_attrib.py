@@ -10,6 +10,7 @@ be running, and on the stall it is meant to observe.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pxh.io_attrib as io_attrib
@@ -823,6 +824,77 @@ def test_sample_file_sizes_stats_every_match_and_never_raises(tmp_path):
     assert io_attrib.sample_file_sizes([str(tmp_path)]) == {}
 
 
+def test_sample_file_meta_carries_size_and_mtime(tmp_path):
+    target = tmp_path / "ambient_sound.json"
+    target.write_text("{}")
+    meta = io_attrib.sample_file_meta([str(tmp_path / "*.json")])
+    entry = meta[str(target)]
+    assert entry["size"] == 2
+    assert entry["mtime_ns"] > 0
+    # The size half stays available under the old name, same walk.
+    assert io_attrib.sample_file_sizes([str(tmp_path / "*.json")]) == {
+        str(target): 2
+    }
+
+
+def test_rank_file_touches_sees_a_write_that_moves_no_size(tmp_path):
+    """The journald shape: mtime advances, size does not — and a real append."""
+    journal = tmp_path / "system.journal"
+    log = tmp_path / "px-mind.log"
+    journal.write_bytes(b"x" * 8388608)
+    log.write_text("a")
+    pre = io_attrib.sample_file_meta([str(tmp_path / "*")])
+    time.sleep(0.01)
+    journal.write_bytes(open(journal, "rb").read())     # rewrite, same length
+    with open(log, "a") as handle:
+        handle.write("bb")
+    post = io_attrib.sample_file_meta([str(tmp_path / "*")])
+    rows, count = io_attrib.rank_file_touches(pre, post)
+    assert count == 2
+    # Zero-byte touches first, because they are what the size channel cannot see.
+    assert rows[0]["path"].endswith("system.journal")
+    assert rows[0]["bytes"] == 0
+    assert rows[1]["path"].endswith("px-mind.log")
+    assert rows[1]["bytes"] == 2
+
+
+def test_rank_file_touches_ignores_an_untouched_file(tmp_path):
+    target = tmp_path / "quiet.json"
+    target.write_text("{}")
+    pre = io_attrib.sample_file_meta([str(tmp_path / "*")])
+    post = io_attrib.sample_file_meta([str(tmp_path / "*")])
+    rows, count = io_attrib.rank_file_touches(pre, post)
+    assert (rows, count) == ([], 0)
+
+
+def test_capture_records_touched_files_alongside_growth(tmp_path, monkeypatch):
+    """A record must be able to say 'wrote, invisible to the size channel'."""
+    procs = _stall_procs()
+    paths = _wire_capture(tmp_path, monkeypatch, procs, _stall_post(procs))
+    journal = tmp_path / "system.journal"
+    journal.write_bytes(b"x" * 64)
+    pre = {"size": 64, "mtime_ns": 1}
+    post = {"size": 64, "mtime_ns": 2}
+    ends = iter([{str(journal): pre}, {str(journal): post}])
+    monkeypatch.setattr(
+        io_attrib, "sample_file_meta", lambda _patterns=None, **_kw: next(ends, {})
+    )
+    record = io_attrib.capture(
+        {"reason": "io_psi", "io_some_avg10": 44.0},
+        paths=paths,
+        window_s=3.0,
+        growth_patterns=["/var/log/journal/*/*.journal"],
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["file_growth"] == []
+    assert record["file_growth_total_bytes"] == 0
+    assert len(record["file_touched"]) == 1
+    assert record["file_touched"][0]["path"].endswith("system.journal")
+    assert record["file_touched"][0]["bytes"] == 0
+    assert record["file_touched_count"] == 1
+
+
 def test_rank_file_growth_reports_deltas_groups_and_total():
     pre = {
         "/var/log/journal/abc/system.journal": 1000,
@@ -869,7 +941,7 @@ def test_capture_reports_the_file_channel_and_what_it_covered(tmp_path, monkeypa
     (watched / "px-mind.log").write_text("x" * 100)
     (watched / "quiet.log").write_text("y" * 100)
 
-    real_sample = io_attrib.sample_file_sizes
+    real_sample = io_attrib.sample_file_meta
     calls = {"n": 0}
 
     def growing(patterns, **kwargs):
@@ -879,7 +951,7 @@ def test_capture_reports_the_file_channel_and_what_it_covered(tmp_path, monkeypa
         (watched / "px-mind.log").write_text("x" * 1500)
         return real_sample(patterns, **kwargs)
 
-    monkeypatch.setattr(io_attrib, "sample_file_sizes", growing)
+    monkeypatch.setattr(io_attrib, "sample_file_meta", growing)
     record = io_attrib.capture(
         {"reason": "io_psi"},
         paths=paths,

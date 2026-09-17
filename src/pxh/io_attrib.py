@@ -317,15 +317,25 @@ def growth_group(path: str) -> str:
     return "other"
 
 
-def sample_file_sizes(patterns: Sequence[str], *, limit: int = 400) -> dict[str, int]:
-    """`{path: size_bytes}` for everything matching `patterns`, stat only.
+def sample_file_meta(
+    patterns: Sequence[str], *, limit: int = 400
+) -> dict[str, dict[str, int]]:
+    """`{path: {"size": n, "mtime_ns": n}}` for everything matching `patterns`.
 
-    The unprivileged writer channel's file-level form. Never raises: a pattern
-    that matches nothing, a file that vanished between glob and stat, and a
-    directory we may not traverse all mean "not watched", not "did not write" —
-    which is why the caller records how many paths were watched at all.
+    One stat per path — the *size* half feeds `rank_file_growth`, the *mtime*
+    half feeds `rank_file_touches`. Two channels from one walk, because the
+    second exists precisely for writers the first cannot see: journald appends
+    into an 8 MB preallocated, mmap'd journal whose size never moves, and ext4
+    journal/metadata writes change no file size at all. Measured on `picar`
+    2026-09-17: four consecutive `io_psi` records with 128-524 KB written to
+    mmcblk0, `file_growth_groups: {}`, and `file_growth_watched: 115`.
+
+    Never raises: a pattern that matches nothing, a file that vanished between
+    glob and stat, and a directory we may not traverse all mean "not watched",
+    not "did not write" — which is why the caller records how many paths were
+    watched at all.
     """
-    sizes: dict[str, int] = {}
+    meta: dict[str, dict[str, int]] = {}
     for pattern in patterns:
         try:
             matches = sorted(glob.glob(pattern))
@@ -337,10 +347,52 @@ def sample_file_sizes(patterns: Sequence[str], *, limit: int = 400) -> dict[str,
             if not os.path.isfile(path):
                 continue
             try:
-                sizes[path] = os.path.getsize(path)
+                st = os.stat(path)
             except OSError:
                 continue
-    return sizes
+            meta[path] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    return meta
+
+
+def sample_file_sizes(patterns: Sequence[str], *, limit: int = 400) -> dict[str, int]:
+    """`{path: size_bytes}` — the size half of `sample_file_meta`."""
+    return {
+        path: entry["size"]
+        for path, entry in sample_file_meta(patterns, limit=limit).items()
+    }
+
+
+def rank_file_touches(
+    pre: Mapping[str, Mapping[str, int]],
+    post: Mapping[str, Mapping[str, int]],
+    *,
+    top: int = 8,
+) -> tuple[list[dict[str, Any]], int]:
+    """`(ranked_touches, touched_count)` for files whose mtime moved.
+
+    Rows are `{path, bytes}`, and **zero-byte rows sort first**: a file that was
+    written without changing size is the whole reason this channel exists
+    (journald's mmap'd journal), and it would be invisible in `file_growth`.
+
+    This answers *who was asked*, not *what reached the device*: mtime moves
+    when a write lands in page cache, which is upstream of any fsync. A row here
+    is a writer to attribute, not a proven cause of device work — and only files
+    present at both ends are counted, so a rotation cannot manufacture one.
+    """
+    rows: list[dict[str, Any]] = []
+    for path, after in post.items():
+        before = pre.get(path)
+        if before is None or after.get("mtime_ns") == before.get("mtime_ns"):
+            continue
+        rows.append(
+            {
+                "path": "/".join(path.split("/")[-3:]),
+                "bytes": after.get("size", 0) - before.get("size", 0),
+            }
+        )
+    # Zero-byte touches first (the size channel's blind spot), then by bytes.
+    rows.sort(key=lambda row: (row["bytes"] != 0, -row["bytes"]))
+    return rows[:top], len(rows)
 
 
 def rank_file_growth(
@@ -789,13 +841,13 @@ def capture(
             uptime_s = None
     inflight_pre = sample_inflight(paths)
     procs_pre = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
-    files_pre = sample_file_sizes(growth_patterns) if growth_patterns else {}
+    files_pre = sample_file_meta(growth_patterns) if growth_patterns else {}
     observer_pre = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
 
     sleep(max(0.0, window_s))
 
     procs_post = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
-    files_post = sample_file_sizes(growth_patterns) if growth_patterns else {}
+    files_post = sample_file_meta(growth_patterns) if growth_patterns else {}
     disk_post = parse_diskstats(_read_text(paths.diskstats) or "")
     vmstat_post = parse_vmstat(_read_text(paths.vmstat) or "")
     inflight_post = sample_inflight(paths)
@@ -814,7 +866,11 @@ def capture(
     )
     _attach_units(stalled, paths.proc, want_wchan=True)
 
-    growth, growth_total, growth_groups = rank_file_growth(files_pre, files_post)
+    growth, growth_total, growth_groups = rank_file_growth(
+        {path: entry["size"] for path, entry in files_pre.items()},
+        {path: entry["size"] for path, entry in files_post.items()},
+    )
+    touched, touched_count = rank_file_touches(files_pre, files_post)
 
     record: dict[str, Any] = {
         "reason": (trigger or {}).get("reason", "manual"),
@@ -868,6 +924,14 @@ def capture(
         "file_growth_total_bytes": growth_total,
         "file_growth_groups": growth_groups,
         "file_growth_watched": len(files_post),
+        # The same watchlist read through mtime instead of size. This is the
+        # only channel here that can see a writer whose writes change no file
+        # size — journald's preallocated mmap'd journal, and ext4 metadata —
+        # which is exactly the shape the 2026-09-17 records show: 128-524 KB
+        # written to mmcblk0 with `file_growth_groups` empty and 115 paths
+        # watched. `bytes` is 0 for those rows, and they sort first.
+        "file_touched": touched,
+        "file_touched_count": touched_count,
         "stalled": stalled,
         # The instrument accounting for itself: if this record ever shows the
         # observer as the top writer, the observer is the defect.
