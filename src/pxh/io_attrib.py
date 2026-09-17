@@ -257,6 +257,33 @@ def process_alive(pid: int, proc_root: Path) -> bool:
         return False
 
 
+def write_pid_file(path: Path, pid: int | None = None) -> bool:
+    """Publish this process's pid so an operator never has to guess it.
+
+    Matching `/usr/bin/python3 -` in `/proc` is ambiguous — four daemons on this
+    host share that argv, including root's `px-battery-poll` — and the first
+    version of the manual runbook wrote whichever matched last. A pid file
+    pointing at *another* daemon is worse than no pid file: `kill $(cat …)`
+    then kills the wrong thing. Never raises.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(os.getpid() if pid is None else pid))
+        return True
+    except OSError:
+        return False
+
+
+def remove_pid_file(path: Path, pid: int | None = None) -> None:
+    """Remove the pid file — but only while it is still ours. Never raises."""
+    mine = os.getpid() if pid is None else pid
+    try:
+        if read_pid_file(path) == mine:
+            path.unlink()
+    except OSError:
+        pass
+
+
 def read_pid_file(path: Path) -> int | None:
     text = _read_text(path)
     if text is None:

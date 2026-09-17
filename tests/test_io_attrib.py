@@ -9,6 +9,7 @@ be running, and on the stall it is meant to observe.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pxh.io_attrib as io_attrib
@@ -902,3 +903,33 @@ def test_capture_without_growth_patterns_does_no_file_walk(tmp_path, monkeypatch
     )
     assert record["file_growth"] == []
     assert record["file_growth_watched"] == 0
+
+
+# --- the observer's own pid file (operator hygiene) -----------------------
+
+
+def test_write_pid_file_publishes_our_pid_and_removes_only_our_own(tmp_path):
+    """`/usr/bin/python3 -` matches four daemons on this host, including root's
+    px-battery-poll. A pid file that points at the wrong one is worse than none:
+    `kill $(cat …)` then kills a daemon that was doing its job."""
+    pid_file = tmp_path / "logs" / "px-io-attrib.pid"
+    assert io_attrib.write_pid_file(pid_file) is True
+    assert io_attrib.read_pid_file(pid_file) == os.getpid()
+
+    # Someone else's file is left alone.
+    pid_file.write_text("1")
+    io_attrib.remove_pid_file(pid_file)
+    assert io_attrib.read_pid_file(pid_file) == 1
+
+    # Ours is removed.
+    pid_file.write_text(str(os.getpid()))
+    io_attrib.remove_pid_file(pid_file)
+    assert not pid_file.exists()
+
+
+def test_pid_file_helpers_never_raise(tmp_path):
+    unwritable = tmp_path / "nope" / "deeper" / "file.pid"
+    (tmp_path / "nope").write_text("not a directory")
+    assert io_attrib.write_pid_file(unwritable) is False
+    io_attrib.remove_pid_file(tmp_path / "missing.pid")
+    assert io_attrib.read_pid_file(tmp_path / "missing.pid") is None
