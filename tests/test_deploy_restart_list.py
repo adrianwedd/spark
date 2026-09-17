@@ -815,3 +815,35 @@ def test_drop_ins_are_checked_too(tmp_path):
     assert [(d.reason, os.path.basename(d.repo_path)) for d in drift] == [
         ("differs", "10-containment.conf")
     ]
+
+
+def test_repo_unit_names_finds_services_and_timers_and_ignores_scripts(tmp_path):
+    """The drift check iterates the repo's shipped units, not the running ones:
+    a unit outside the px-* namespace, or one never installed at all, is exactly
+    what a `systemctl list-units px-*` sweep cannot see."""
+    from pxh.deploy import repo_unit_names
+
+    src = tmp_path / "systemd"
+    src.mkdir()
+    for name in ("px-mind.service", "spark-pip-cleanup.timer", "px-io-attrib.service",
+                 "spark-pip-cleanup.sh", "README.md"):
+        (src / name).write_text("x")
+    assert repo_unit_names(str(tmp_path)) == [
+        "px-io-attrib.service", "px-mind.service", "spark-pip-cleanup.timer"
+    ]
+    assert repo_unit_names(str(tmp_path / "nope")) == []
+
+
+def test_a_unit_the_repo_ships_but_nobody_installed_is_reported(tmp_path):
+    """`not installed` and `differs` are different facts, and both are actionable."""
+    from pxh.deploy import unit_file_drift
+
+    root = tmp_path / "r"
+    (root / "systemd").mkdir(parents=True)
+    (root / "systemd" / "px-io-attrib.service").write_text("[Service]\nUser=root\n")
+    installed = tmp_path / "i"
+    installed.mkdir()
+    drift = unit_file_drift("px-io-attrib.service", root=str(root), install_dir=str(installed))
+    assert [(d.reason, d.repo_path) for d in drift] == [
+        ("not installed", "systemd/px-io-attrib.service")
+    ]

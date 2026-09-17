@@ -36,6 +36,7 @@ from pxh.deploy import (
     UnitState,
     changed_symbols,
     needs_restart,
+    repo_unit_names,
     restart_list,
     unit_file_drift,
 )
@@ -127,7 +128,7 @@ def main():
     # noticed six of them being months behind (#336, 2026-09-18). Reported, not
     # failed: fixing it needs root, and blocking a deploy on a root-only action
     # would teach people to ignore this gate.
-    drift = [d for name in unit_names() for d in unit_file_drift(name, root=root)]
+    drift = [d for name in repo_unit_names(root) for d in unit_file_drift(name, root=root)]
 
     if not stale:
         print("every long-lived unit is executing the deployed revision")
