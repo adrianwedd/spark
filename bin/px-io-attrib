@@ -201,6 +201,11 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    # Publish our own pid *before* the startup line that reports it:
+    # `/usr/bin/python3 -` matches several daemons here, so an operator (or a
+    # future runbook) must not have to guess which one is us.
+    pid_published = io_attrib.write_pid_file(pid_file)
+
     log(
         f"observer start io_threshold={args.io_threshold} "
         f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
@@ -210,10 +215,6 @@ def main(argv: list[str]) -> int:
         f"privileged={privileged}"
         + ("" if privileged else " (writer list will be partial; root sees the rest)")
     )
-
-    # Publish our own pid: `/usr/bin/python3 -` matches several daemons here, so
-    # an operator (or a future runbook) must not have to guess which one is us.
-    pid_published = io_attrib.write_pid_file(pid_file)
 
     started = time.monotonic()
     cooldown_until = 0.0
