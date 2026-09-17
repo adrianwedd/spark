@@ -2150,3 +2150,55 @@ def test_the_unit_channel_reports_what_it_folded():
     # The kernel channel has no periodic-unit pattern to fold.
     kout = io_attrib.kernel_log_window(300.0, runner=lambda _a: text)
     assert kout.get("lines_collapsed") == 0
+
+
+# --- the card baseline (#405, for an A/B replacement test) ------------------
+
+
+def _card_record(*, writes, reads=0, ms_io, ms_reading=0, errors=0):
+    return {
+        "devices": {
+            "mmcblk0": {
+                "writes_completed": writes, "reads_completed": reads,
+                "ms_io": ms_io, "ms_reading": ms_reading,
+            }
+        },
+        "ext4": {"errors_count": errors},
+    }
+
+
+def test_card_baseline_reports_service_time_and_the_read_asymmetry():
+    """The numbers an A/B replacement test compares."""
+    records = [
+        _card_record(writes=10, ms_io=1000),          # 100 ms/write
+        _card_record(writes=10, ms_io=2000),          # 200 ms/write
+        # 15 ms of read time is subtracted before the division: 298.5, not 300.
+        _card_record(writes=10, ms_io=3000, reads=10, ms_reading=15),
+    ]
+    summary = io_attrib.card_baseline(records)
+    assert summary["writes_measured"] == 3
+    assert summary["ms_per_write_median"] == 200.0
+    assert summary["ms_per_write_max"] == 298.5
+    assert summary["ms_per_read_median"] == 1.5
+    assert summary["ext4_errors"] == 0
+    assert summary["records"] == 3
+
+
+def test_card_baseline_subtracts_read_time_and_ignores_idle_records():
+    """A record with no writes is not evidence about the write path."""
+    records = [
+        _card_record(writes=0, reads=100, ms_io=500, ms_reading=500),
+        _card_record(writes=4, reads=10, ms_io=800, ms_reading=400, errors=0),  # (800-400)/4
+    ]
+    summary = io_attrib.card_baseline(records)
+    assert summary["writes_measured"] == 1
+    assert summary["ms_per_write_median"] == 100.0
+    assert summary["ms_per_read_median"] == 40.0
+
+
+def test_card_baseline_honours_the_tail_so_a_comparison_is_like_for_like():
+    busy = [_card_record(writes=10, ms_io=500) for _ in range(50)]
+    quiet = [_card_record(writes=10, ms_io=50) for _ in range(2)]
+    summary = io_attrib.card_baseline(quiet + busy, tail=40)
+    assert summary["records"] == 40
+    assert summary["ms_per_write_median"] == 50.0, "the quiet records were left out by --tail"
