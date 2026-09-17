@@ -1858,7 +1858,11 @@ def test_capture_records_the_kernel_log_and_the_io_it_cost(tmp_path, monkeypatch
     # The observer's own /proc/self/io cannot see a child's reads, so the cost of
     # this channel is differenced explicitly.
     reads = iter(
-        [{"read_bytes": 0, "write_bytes": 0}, {"read_bytes": 4096, "write_bytes": 512}]
+        [
+            {"read_bytes": 0, "write_bytes": 0},
+            {"read_bytes": 4096, "write_bytes": 512},
+            {"read_bytes": 8192, "write_bytes": 512},
+        ]
     )
     monkeypatch.setattr(io_attrib, "child_io", lambda: next(reads))
 
@@ -1881,3 +1885,163 @@ def test_child_io_reports_byte_units_not_raw_blocks():
     counters = io_attrib.child_io()
     assert set(counters) == {"read_bytes", "write_bytes"}
     assert all(isinstance(value, int) and value >= 0 for value in counters.values())
+
+
+# --- the unit channel (the only way to name a timer) -----------------------
+
+
+def test_unit_log_window_asks_for_lifecycle_lines_not_a_kernel_dump():
+    seen: list[list[str]] = []
+
+    def runner(args):
+        seen.append(list(args))
+        return ""
+
+    out = io_attrib.unit_log_window(30.0, runner=runner)
+    assert seen and "-k" not in seen[0], "the unit channel is not the kernel log"
+    assert "--since" in seen[0]
+    assert out["source"] == "journalctl (unit lifecycle)"
+    assert out["available"] is True
+
+
+def test_unit_log_window_names_the_timer_that_dirtied_and_exited():
+    """The 2026-09-18 shape: 48 MB of device writes, 37 KB of process writes."""
+    out = io_attrib.unit_log_window(
+        600.0,
+        runner=lambda _args: _journal_text(
+            "2026-09-18T05:25:38+1000 picar systemd[1]: Starting apt-daily.service - Daily apt download activities...",
+            "2026-09-18T05:26:00+1000 picar kernel: usb 1-1: new high-speed USB device number 3",
+            "2026-09-18T05:26:14+1000 picar systemd[1]: apt-daily.service: Deactivated successfully.",
+            "2026-09-18T05:26:14+1000 picar systemd[1]: Finished apt-daily.service - Daily apt download activities.",
+        ),
+    )
+    assert out["lines_total"] == 4
+    assert out["matched_total"] == 3
+    assert "Starting apt-daily.service" in out["lines"][0]
+    assert "Deactivated successfully" in out["lines"][1]
+    assert all("usb 1-1" not in line for line in out["lines"])
+    # The filter is quoted in the record: `[]` must mean "no lifecycle line
+    # matched", never "nothing started".
+    assert "Starting" in out["filter"]
+
+
+def test_unit_log_window_says_unavailable_rather_than_quiet():
+    def boom(_args):
+        raise OSError("journalctl is not available in this test environment")
+
+    out = io_attrib.unit_log_window(10.0, runner=boom)
+    assert out["available"] is False
+    assert "lines" not in out
+
+
+def test_capture_records_the_unit_log_and_costs_it_separately(tmp_path, monkeypatch):
+    procs = {7: {"comm": "python3", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    monkeypatch.setattr(
+        io_attrib,
+        "unit_log_window",
+        lambda since_s, **_kw: {
+            "source": "journalctl (unit lifecycle)",
+            "available": True,
+            "window_s": round(since_s, 1),
+            "filter": io_attrib.UNIT_LOG_PATTERN.pattern,
+            "lines_total": 40,
+            "lines_scanned": 40,
+            "matched_total": 1,
+            "lines": ["systemd[1]: Starting apt-daily.service"],
+        },
+    )
+    reads = iter(
+        [
+            {"read_bytes": 0, "write_bytes": 0},
+            {"read_bytes": 1024, "write_bytes": 0},
+            {"read_bytes": 1024 + 2048, "write_bytes": 0},
+        ]
+    )
+    monkeypatch.setattr(io_attrib, "child_io", lambda: next(reads))
+
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["unit_log"]["matched_total"] == 1
+    assert "apt-daily" in record["unit_log"]["lines"][0]
+    assert record["kernel_log_child_read_bytes"] == 1024
+    assert record["unit_log_child_read_bytes"] == 2048, (
+        "each journal channel is costed separately, or the record hides which "
+        "one paid"
+    )
+
+
+def test_the_watchlist_covers_the_apt_trees(tmp_path):
+    """The biggest writer on this host was outside the watchlist (#402)."""
+    patterns = io_attrib.default_growth_patterns(tmp_path / "logs", tmp_path / "state")
+    assert "/var/lib/apt/lists/*" in patterns
+    assert "/var/cache/apt/*.bin" in patterns
+    assert io_attrib.growth_group("/var/cache/apt/pkgcache.bin") == "apt"
+    assert io_attrib.growth_group("/var/lib/apt/lists/archive_Packages") == "apt"
+
+
+def test_recent_file_writes_names_what_was_written_just_before_the_stall():
+    """The delayed-writeback shape: the writer exited minutes ago."""
+    meta = {
+        "/var/cache/apt/pkgcache.bin": {"size": 59_975_048,
+                                        "mtime_ns": 1_200 * 10**9 - 138 * 10**9},
+        "/home/pi/picar-x-hacking/state/health/px-alive.json": {
+            "size": 300, "mtime_ns": 1_199 * 10**9,
+        },
+    }
+    rows = io_attrib.recent_file_writes(meta, now_s=1_200.0, lookback_s=300.0)
+    assert [row["path"] for row in rows] == [
+        "cache/apt/pkgcache.bin",
+        "state/health/px-alive.json",
+    ]
+    assert rows[0]["age_s"] == 138.0
+    assert rows[0]["size_bytes"] == 59_975_048
+    # Ranked by size: the constantly-rewritten gauges must not fill the list.
+    assert rows[1]["size_bytes"] < rows[0]["size_bytes"]
+
+
+def test_recent_file_writes_ignores_files_older_than_the_lookback():
+    meta = {"/x/old.json": {"size": 10_000, "mtime_ns": 0}}
+    assert io_attrib.recent_file_writes(meta, now_s=1_000.0, lookback_s=300.0) == []
+    meta = {"/x/future.json": {"size": 10_000, "mtime_ns": 2_000_000_000_000}}
+    assert io_attrib.recent_file_writes(meta, now_s=1_000.0, lookback_s=300.0) == []
+
+
+def test_capture_records_recent_file_writes(tmp_path, monkeypatch):
+    procs = {7: {"comm": "python3", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    monkeypatch.setattr(
+        io_attrib,
+        "recent_file_writes",
+        lambda meta, **kw: [{"path": "cache/apt/pkgcache.bin", "age_s": 138.0,
+                             "size_bytes": 59_975_048}],
+    )
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["file_recent"][0]["path"] == "cache/apt/pkgcache.bin"
+
+
+def test_the_unit_channel_looks_back_past_the_window():
+    """The writer has exited by the time the stall is visible; measured 2 min."""
+    seen: list[list[str]] = []
+
+    def runner(args):
+        seen.append(list(args))
+        return ""
+
+    io_attrib.unit_log_window(io_attrib.UNIT_LOG_LOOKBACK_S, runner=runner)
+    since = int(seen[0][seen[0].index("--since") + 1][1:])
+    import time as _time
+
+    assert _time.time() - since >= io_attrib.UNIT_LOG_LOOKBACK_S - 5
+    assert io_attrib.UNIT_LOG_LOOKBACK_S > io_attrib.KERNEL_LOG_PAD_S * 10

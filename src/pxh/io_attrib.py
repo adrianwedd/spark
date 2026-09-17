@@ -44,6 +44,10 @@ Two channels, and the difference between them is privilege:
   the operator is in `adm`; the one channel that can name a mechanism when there
   is no writer to name. Bounded to one call per capture, and its cost is
   measured (`kernel_log_child_*_bytes`) rather than assumed.
+* **unit channel** — systemd lifecycle lines over the same window
+  (`unit_log`). The kernel says what the hardware did; this says what the
+  *scheduler* did, which is the only way to name a timer-driven writer that
+  exits before its bytes reach the card — `apt-daily` on 2026-09-18 (#402).
 * **window channel** — the same state sampled *across* the window
   (`sample_window`, `blocked_in_window`) instead of at its two ends. A burst
   that ends before t1 is invisible to a two-ended walk, and state is the only
@@ -206,6 +210,14 @@ KERNEL_LOG_TIMEOUT_S = 5.0
 #: PSI average, so the cause can predate t0; 5 s is a guess, stated as a
 #: constant, and every record carries the window it actually asked for.
 KERNEL_LOG_PAD_S = 5.0
+#: The unit channel looks back further than the window, because the writer it
+#: exists to name *has already exited* by the time the stall is visible. Measured
+#: 2026-09-18: `apt-daily` ran 05:25:38-05:26:14, its 60 MB `pkgcache.bin` write
+#: landed 05:25:54, and the stall it caused was recorded at 05:27:52 — so a
+#: window-sized lookback would have missed the only line that names it.
+UNIT_LOG_LOOKBACK_S = 300.0
+#: Files modified within this long before the window, for the same reason.
+RECENT_FILE_LOOKBACK_S = 300.0
 
 #: The in-window per-thread walk covers this fraction of the process set per
 #: sample, so every process is visited once per rotation instead of paying a
@@ -241,6 +253,89 @@ def _journalctl(args: Sequence[str]) -> str:
     return proc.stdout
 
 
+#: systemd's own lifecycle lines. This is the channel that names a *timer*: a
+#: daily job that dirties a hundred megabytes and exits before the kernel has
+#: written any of it leaves no process to attribute the bytes to (measured
+#: 2026-09-18: `apt-daily` exited at 05:26:14, and the record at 05:27:52 saw
+#: 48 MB written with 37 KB attributable to any readable process — #402). Its
+#: `Starting`/`Deactivated` lines carry the timestamps, and they are in the
+#: journal, not in /proc.
+#: systemd writes lifecycle lines two ways — `Starting x.service ...` and
+#: `x.service: Deactivated successfully.` — so the verb is matched *anywhere*
+#: after the `systemd[1]:` prefix rather than immediately after it. Getting this
+#: wrong is how the 05:26 `Deactivated` line for `apt-daily` would have been
+#: filtered out of the very record that needed it.
+UNIT_LOG_PATTERN = re.compile(
+    r"systemd\[1\]:.*\b(Starting|Started|Finished|Stopping|Stopped|Deactivating|"
+    r"Deactivated|Failed|Scheduling restart|Reloading|Reloaded)\b"
+)
+
+
+def _journal_filtered(
+    source: str,
+    args: Sequence[str],
+    pattern: re.Pattern[str],
+    since_s: float,
+    runner: Callable[[Sequence[str]], str] | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Shared body of the journal channels: run, filter, cap, never raise.
+
+    `available: false` is a first-class answer (no journalctl, no permission, no
+    journal). It is never "the log was quiet" — that is an empty `lines` with
+    `lines_total` beside it — and the `filter` travels with the record so an
+    empty list stays checkable years later.
+    """
+    since = time.time() - max(0.0, since_s)
+    full_args = [*args, "--since", f"@{int(since)}"]
+    run = runner or _journalctl
+    try:
+        text = run(full_args)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return {
+            "source": source,
+            "available": False,
+            "window_s": round(since_s, 1),
+            "reason": f"{type(exc).__name__}: {exc}"[:200],
+        }
+    lines = [line for line in text.splitlines() if line.strip()]
+    scanned = lines[-KERNEL_LOG_MAX_LINES:]
+    matched = [line for line in scanned if pattern.search(line)]
+    return {
+        "source": source,
+        "available": True,
+        "window_s": round(since_s, 1),
+        "filter": pattern.pattern,
+        "lines_total": len(lines),
+        "lines_scanned": len(scanned),
+        "matched_total": len(matched),
+        "lines": matched[-limit:],
+    }
+
+
+def unit_log_window(
+    since_s: float,
+    *,
+    runner: Callable[[Sequence[str]], str] | None = None,
+    limit: int = KERNEL_LOG_LIMIT,
+) -> dict[str, Any]:
+    """systemd lifecycle lines from the last `since_s` seconds. Never raises.
+
+    The complement of the kernel channel: the kernel says what the *hardware*
+    did, this says what the *scheduler* did — and a timer-driven writer is
+    invisible to every other channel here, because it exits before its bytes
+    land. See `UNIT_LOG_PATTERN`.
+    """
+    return _journal_filtered(
+        "journalctl (unit lifecycle)",
+        ["--no-pager", "-o", "short-iso"],
+        UNIT_LOG_PATTERN,
+        since_s,
+        runner,
+        limit,
+    )
+
+
 def kernel_log_window(
     since_s: float,
     *,
@@ -261,31 +356,14 @@ def kernel_log_window(
     journal). It is never "the kernel was quiet" — that is `lines: []` with
     `lines_total` beside it.
     """
-    since = time.time() - max(0.0, since_s)
-    args = ["-k", "--no-pager", "-o", "short-iso", "--since", f"@{int(since)}"]
-    run = runner or _journalctl
-    try:
-        text = run(args)
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        return {
-            "source": "journalctl -k",
-            "available": False,
-            "window_s": round(since_s, 1),
-            "reason": f"{type(exc).__name__}: {exc}"[:200],
-        }
-    lines = [line for line in text.splitlines() if line.strip()]
-    scanned = lines[-KERNEL_LOG_MAX_LINES:]
-    matched = [line for line in scanned if KERNEL_LOG_PATTERN.search(line)]
-    return {
-        "source": "journalctl -k",
-        "available": True,
-        "window_s": round(since_s, 1),
-        "filter": KERNEL_LOG_PATTERN.pattern,
-        "lines_total": len(lines),
-        "lines_scanned": len(scanned),
-        "matched_total": len(matched),
-        "lines": matched[-limit:],
-    }
+    return _journal_filtered(
+        "journalctl -k",
+        ["-k", "--no-pager", "-o", "short-iso"],
+        KERNEL_LOG_PATTERN,
+        since_s,
+        runner,
+        limit,
+    )
 
 
 def child_io() -> dict[str, int]:
@@ -508,6 +586,8 @@ def read_pid_file(path: Path) -> int | None:
 #: Where a growth path belongs, for the record's group totals. Ordered: the
 #: journal check first because journal filenames carry no directory hint.
 _GROWTH_GROUPS = (
+    ("apt", "/var/cache/apt"),
+    ("apt", "/var/lib/apt"),
     ("journal", ".journal"),
     ("health", "/health/"),
     ("state", "/state/"),
@@ -546,6 +626,15 @@ def default_growth_patterns(log_dir: Path | str, state_dir: Path | str) -> list[
         str(state_dir / "*"),
         str(state_dir / "health" / "*.json"),
         str(state_dir / "brain" / "*"),
+        # Not a SPARK daemon, and the largest writer on this host: measured
+        # 2026-09-18, `apt-daily` rewrote `/var/cache/apt/pkgcache.bin` and the
+        # 137 MB `/var/lib/apt/lists` tree and the resulting writeback stalled
+        # the card for minutes (#402). The watchlist covered the journal, the
+        # logs and the state dir — every tree *this repo* writes — and the
+        # biggest one on the box was outside it.
+        "/var/lib/apt/lists/*",
+        "/var/lib/apt/periodic/*",
+        "/var/cache/apt/*.bin",
     ]
 
 
@@ -613,6 +702,47 @@ def _ext4_window(
     if "journal_task" in post:
         out["journal_task"] = post["journal_task"]
     return out
+
+
+def recent_file_writes(
+    meta: Mapping[str, Mapping[str, int]],
+    *,
+    now_s: float,
+    lookback_s: float = RECENT_FILE_LOOKBACK_S,
+    top: int = 8,
+) -> list[dict[str, Any]]:
+    """Watchlist files modified in the `lookback_s` before the window.
+
+    The complement of `rank_file_growth`, and the channel that would have named
+    the 2026-09-18 writer: `apt-daily` rewrote a **60 MB** `pkgcache.bin` at
+    05:25:54 and exited, and by the time the stall was visible at 05:27:52 every
+    window-scoped channel was empty — the bytes were in the page cache, then on
+    the card, and the process that asked for them was gone.
+
+    Ranked by **size**, not by age, because the question is "what mass moved
+    recently": this watchlist contains gauges that are rewritten every few
+    seconds (health records, locks), and ordering by recency would fill the list
+    with them. `size_bytes` is the file's size, not how much it grew — a big file
+    whose mtime just moved is a candidate, and it is the reader's job to weigh it
+    against `file_growth` for the same path.
+    """
+    rows: list[dict[str, Any]] = []
+    for path, entry in meta.items():
+        mtime_s = entry.get("mtime_ns", 0) / 1_000_000_000
+        if not mtime_s:
+            continue
+        age_s = now_s - mtime_s
+        if age_s < 0 or age_s > lookback_s:
+            continue
+        rows.append(
+            {
+                "path": "/".join(path.split("/")[-3:]),
+                "age_s": round(age_s, 1),
+                "size_bytes": int(entry.get("size", 0)),
+            }
+        )
+    rows.sort(key=lambda row: row["size_bytes"], reverse=True)
+    return rows[:top]
 
 
 def rank_file_touches(
@@ -1571,6 +1701,10 @@ def capture(
     # observer's own /proc/self/io cannot see a child's reads.
     child_before = child_io()
     kernel_log = kernel_log_window(elapsed + KERNEL_LOG_PAD_S)
+    child_mid = child_io()
+    unit_log = unit_log_window(
+        max(elapsed + KERNEL_LOG_PAD_S, UNIT_LOG_LOOKBACK_S)
+    )
     child_after = child_io()
 
     io_denied = sum(1 for entry in procs_post.values() if entry.get("io_denied"))
@@ -1604,6 +1738,7 @@ def capture(
         {path: entry["size"] for path, entry in files_post.items()},
     )
     touched, touched_count = rank_file_touches(files_pre, files_post)
+    recent = recent_file_writes(files_pre, now_s=time.time())
 
     record: dict[str, Any] = {
         "reason": (trigger or {}).get("reason", "manual"),
@@ -1686,6 +1821,14 @@ def capture(
         # watched. `bytes` is 0 for those rows, and they sort first.
         "file_touched": touched,
         "file_touched_count": touched_count,
+        # What was written *just before* this stall, which is where the writer
+        # of a delayed writeback lives: a timer dirties tens of megabytes, exits,
+        # and the card is still absorbing it minutes later, so every
+        # window-scoped channel comes back empty. Ranked by size — see
+        # `recent_file_writes`. Measured 2026-09-18: the 60 MB
+        # `/var/cache/apt/pkgcache.bin`, mtime 138 s before the record, named the
+        # writer in one field (#402).
+        "file_recent": recent,
         "stalled": stalled,
         # The window's own reading — who was in uninterruptible sleep *during*
         # it, sampled rather than inferred from its two ends. This is the
@@ -1731,12 +1874,24 @@ def capture(
         # name — and it is readable unprivileged on `picar`. Read `available`
         # before `lines`: unavailable is not quiet.
         "kernel_log": kernel_log,
+        # What systemd itself did in the window. The only channel that can name
+        # a timer-driven writer: `apt-daily` dirtied ~87 MB and exited before any
+        # of it reached the card, leaving 48 MB of device writes with 37 KB
+        # attributable to a process (#402). Read its `Starting`/`Deactivated`
+        # timestamps against `window_s`.
+        "unit_log": unit_log,
         # The instrument accounting for the one thing outside /proc/self/io.
         "kernel_log_child_read_bytes": max(
-            0, child_after["read_bytes"] - child_before["read_bytes"]
+            0, child_mid["read_bytes"] - child_before["read_bytes"]
         ),
         "kernel_log_child_write_bytes": max(
-            0, child_after["write_bytes"] - child_before["write_bytes"]
+            0, child_mid["write_bytes"] - child_before["write_bytes"]
+        ),
+        "unit_log_child_read_bytes": max(
+            0, child_after["read_bytes"] - child_mid["read_bytes"]
+        ),
+        "unit_log_child_write_bytes": max(
+            0, child_after["write_bytes"] - child_mid["write_bytes"]
         ),
         "observer_write_bytes": _delta(observer_pre, observer_post, "write_bytes"),
         "observer_read_bytes": _delta(observer_pre, observer_post, "read_bytes"),

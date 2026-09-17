@@ -87,6 +87,7 @@ every poll, so a later px-alive start arms it), and `trigger.px_alive_gate` in
 | **file** | a bounded *watchlist* (`default_growth_patterns`: the system journal, `logs/*`, `logs/*/*`, `state/*`, `state/health/*.json`, `state/brain/*`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI; `/sys/block/*/inflight`; `/sys/fs/ext4/*` | no — with **one exception measured on 2026-09-18: `wchan` is withheld for root-owned processes** (see the next section). `state`, `schedstat` and the rest are readable for every process |
 | **kernel** | `journalctl -k` over the window, filtered to what can explain a **wedge** — `mmc`, `sdio`, `brcmf`, `ext4`, `jbd2`, `blk_`, I/O errors, timeouts, undervoltage, thermal, hung-task | no on hosts where the operator is in `adm` — measured on `picar` 2026-09-18 (`pi` is in `adm`, so `journalctl -k` and `dmesg` both work) |
+| **units** | `journalctl` lifecycle lines over a **5 min** lookback (`unit_log`), and watchlist files modified in the same lookback ranked by size (`file_recent`) | no on hosts where the operator is in `adm` | 
 | **window** | the same state sampled *across* the window (`sample_window` → `blocked_in_window`), plus per-thread D state for a rotating quarter of the process set | no — and this is the channel that still **names a root-owned writer**, because `state` is readable where `wchan` and `/proc/<pid>/io` are not |
 | **filesystem** | `ext4` counters: `session_write_kbytes` (bytes written *through* this filesystem, metadata and journal included), `lifetime_write_kbytes` (card wear), `delayed_allocation_blocks`, `errors_count`, `journal_task` | no — it cross-checks the device's bytes against the filesystem's, which is how you rule out a raw writer outside the filesystem and how you measure **write amplification**. It does *not* separate file data from metadata — see the calibration below |
 
@@ -161,6 +162,43 @@ What still works unprivileged for a root-owned writer is **state** — and, once
 `kernel.task_delayacct=1`, `delayacct_blkio_ticks`. That is the whole basis of
 the window channel.
 
+**The units channel is how a *timer* gets named, and it exists because of what
+happened on 2026-09-18.** The largest writer on this host is not a SPARK daemon.
+`apt-daily.service` ran 05:25:38-05:26:14, rewrote the 137 MB `/var/lib/apt/lists`
+tree and a **60 MB** `/var/cache/apt/pkgcache.bin`, and **exited** — and the card
+was still absorbing those pages minutes later:
+
+```
+05:26:16  record: nr_dirty 22,238 pages (~87 MB)
+05:27:52  record: io PSI some 93.61 %, 46,976 KB written to ext4 in 36 s,
+          mmcblk0 ms_io 36,324 ms (queue 100 % occupied), pgpgout 14,988 pages,
+          write_bytes_total 37 KB   ->  unattributed_write_share ~0.999
+```
+
+Every window-scoped channel was empty, and *correctly* so: the bytes were in the
+page cache and then on the card, charged to `kblockd`/`flush-179:0`, and the
+process that asked for them had already exited. Page-cache writeback is not
+attributable to a process by any `/proc` channel, privileged or not.
+
+So two channels that look *before* the window:
+
+* **`unit_log`** — systemd's own `Starting`/`Finished`/`Deactivated` lines over a
+  5-minute lookback, because the writer has exited by the time the stall is
+  visible (measured delay: ~2 min). The lifecycle verbs are matched anywhere
+  after the `systemd[1]:` prefix, because systemd writes both
+  `Starting x.service ...` and `x.service: Deactivated successfully.`.
+* **`file_recent`** — watchlist files modified in the same lookback, ranked by
+  **size** (the watchlist contains gauges rewritten every few seconds, and
+  ordering by recency would fill the list with them). On 2026-09-18 this field
+  names `cache/apt/pkgcache.bin`, 60 MB, mtime 138 s before the record.
+
+Neither would have been needed if the writer were a daemon. Both are needed
+because it is a timer. The remedy is a config decision, not a code hunt:
+`IOWeight`/`IOSchedulingClass` on `apt-daily`, moving the APT trees off the card,
+or scheduling around it — see **#402**, which carries the evidence and the
+options. The watchlist now covers `/var/lib/apt/lists/*`, `/var/lib/apt/periodic/*`
+and `/var/cache/apt/*.bin` (739 paths, up from 694) for the same reason.
+
 **The kernel channel (`kernel_log`) is the only one that can name a *mechanism*
 when there is no writer to name.** The 20:20 wedge had `mmcblk0` at 0/0 inflight,
 2-7 % busy, and the whole task set blocked: nothing in any `/proc` or sysfs
@@ -214,6 +252,9 @@ process that *starts* inside the window is caught by the closing walk only.
 | `window_thread_coverage_s` | how long a full per-thread rotation takes. A thread block shorter than this can fall between two visits to the same process — the sampler's stated resolution, not a hidden limit |
 | `kernel_log` | `{source, available, window_s, filter, lines_total, lines_scanned, matched_total, lines[]}`. **Read `available` before `lines`**: `false` means nobody looked (no journalctl, no permission), `[]` means the kernel said nothing matching `filter` — which is quoted so that stays checkable. `window_s` is the measured window plus a 5 s pad, because the trigger fires on a 10 s PSI average and the cause can predate t0 |
 | `kernel_log_child_read_bytes` / `_write_bytes` | what the one child process cost in block IO, from `RUSAGE_CHILDREN`. A *lower bound* (see the kernel-channel section) |
+| `unit_log` | `{source, available, window_s, filter, lines_total, lines_scanned, matched_total, lines[]}` over a **5 min** lookback — what systemd started, finished, failed or restarted. The only channel that names a timer-driven writer that exited before its bytes landed. Read `available` before `lines`, as with `kernel_log` |
+| `unit_log_child_read_bytes` / `_write_bytes` | the unit channel's own block IO, costed separately so the record says which journal query paid |
+| `file_recent[]` | watchlist files modified in the last 5 minutes, `{path, age_s, size_bytes}` ranked by size. `size_bytes` is the file's size, **not** how much it grew; weigh it against `file_growth` for the same path |
 | `delayacct` | `{enabled, note}`. **The field exists in `/proc/<pid>/stat` and reads 0 for every process while `kernel.task_delayacct=0`**, so a record that emitted the delta anyway would print a measured "waited 0 ms" for everything — the #306 failure mode. `blkio_wait_ms` therefore appears on a row *only* when the sysctl says 1, and a zero there is then a real zero |
 
 Measured cost of the change on the robot (197 pids, 6 samples): the sampler
@@ -721,6 +762,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `ext4.lifetime_write_kbytes` is in the hundreds of GB to TB (1.03 TB on `picar`, 2026-09-17) | the card has been written a great deal; a wear-related latency tail is a live hypothesis, not a theory | treat card health as a candidate alongside the kernel/host path, and say so when reporting |
 | both file channels empty with the device saturated | metadata/journal work with no file-level signature at all (ext4 `-rsv-conversion`, `kblockd`, `jbd2` in the D-state roster) | the root channel is the only way in; do not read the empty channels as "nobody wrote" |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
+| device wrote megabytes, `write_bytes_total` is kilobytes, `unattributed_write_share` ≈ 1, and `file_growth`/`file_touched` are empty | **page-cache writeback of a writer that has already exited.** Not a broken measurement — the shape. Read `file_recent` (what mass moved just before) and `unit_log` (which timer did it) | if a timer is named, the fix is I/O priority or placement for it (#402); if nothing is named, widen the watchlist to the tree the bytes went to |
 | `kernel_log.matched_total` > 0 with `Undervoltage detected!` in the window | a power event, and the only channel here that dates it. Matches #217's and #247's power candidate (`vcgencmd get_throttled = 0x50000`, one boot-long sticky flag, no timestamps) | correlate it with the record's timestamps before blaming the card; a *currently* undervolted Pi is a different fix (supply/cable) from a slow card |
 | `kernel_log` names `mmc1`/`brcmfmac`/SDIO errors or timeouts | the SDIO WiFi shares the `mmc` subsystem and has no `/sys/block` entry, so this is the only place it appears | cross-read it with `co_blocked_samples`: a shared block means the bus, not a daemon |
 | `kernel_log.available: false` | nobody read the kernel log (no `journalctl`, or not in `adm`) — **not** a quiet kernel | fix the access (`usermod -aG adm pi` needs root) or run as root; do not read this as evidence of anything |
