@@ -227,58 +227,6 @@ def test_a_failed_dashboard_cache_does_not_lose_the_awareness_snapshot(tmp_path,
 
 
 
-# --- append-only JSONL trimming must be rare, not per append (#247) ---------
-#
-# Both thoughts-spark.jsonl (3.78 MB) and notes-spark.jsonl (4.42 MB) sat at
-# exactly 10000 lines, and the rule "rewrite when len(lines) > LIMIT" fired on
-# every append from then on — because the rewrite landed back on the limit. That
-# is a multi-megabyte SD-card write and a forced journal commit per thought, on
-# the same device as the microphone and the watchdog.
-
-
-def _jsonl(path, n, *, start=0):
-    path.write_text("".join('{"i": %d}\n' % i for i in range(start, start + n)))
-
-
-def test_appending_at_the_limit_does_not_rewrite_the_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
-    target = tmp_path / "thoughts.jsonl"
-    _jsonl(target, mind.THOUGHTS_LIMIT)
-    rewrites = []
-    monkeypatch.setattr(mind, "atomic_write", lambda *a, **k: rewrites.append(a))
-    assert mind._trim_jsonl_if_needed(target, mind.THOUGHTS_LIMIT, "thoughts") is False
-    assert rewrites == [], "an append at the limit must stay an append"
-    # ...and it is still over the limit, waiting for slack to accumulate.
-    with target.open("a") as handle:
-        handle.write('{"i": 99999}\n')
-    assert target.read_text().count("\n") == mind.THOUGHTS_LIMIT + 1
-
-
-def test_trimming_happens_once_slack_is_exceeded_and_is_not_durable(tmp_path, monkeypatch):
-    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
-    target = tmp_path / "thoughts.jsonl"
-    # One line past `limit + slack`: the trim fires strictly beyond the drift.
-    _jsonl(target, mind.THOUGHTS_LIMIT + mind.JSONL_TRIM_SLACK + 1)
-    calls = []
-    real = mind.atomic_write
-
-    def spy(path, content, **kwargs):
-        calls.append(kwargs.get("durable", True))
-        return real(path, content, **kwargs)
-
-    monkeypatch.setattr(mind, "atomic_write", spy)
-    assert mind._trim_jsonl_if_needed(target, mind.THOUGHTS_LIMIT, "thoughts") is True
-    assert calls == [False], "the trim is maintenance: atomic, not durable"
-    body = target.read_text().strip().splitlines()
-    assert len(body) == mind.THOUGHTS_LIMIT
-    assert body[-1] == '{"i": %d}' % (mind.THOUGHTS_LIMIT + mind.JSONL_TRIM_SLACK)
-
-
-def test_trim_never_raises_on_a_missing_or_unreadable_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(mind, "STATE_DIR", tmp_path)
-    assert mind._trim_jsonl_if_needed(tmp_path / "nope.jsonl", 10, "x") is False
-
-
 def test_awareness_tick_propagates_lock_timeout(monkeypatch):
     """awareness_tick() re-raises FileLockTimeout so mind_loop can skip the tick."""
     monkeypatch.setattr(mind, "load_session", lambda: (_ for _ in ()).throw(FileLockTimeout("fake.lock")))

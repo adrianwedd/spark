@@ -81,6 +81,55 @@ def atomic_write(path: Path, content: str, *, durable: bool = True) -> None:
         raise
 
 
+#: How far past a limit an append-only JSONL may drift before it is rewritten.
+#: A trim is an O(file) rewrite, and the naive rule ("rewrite when
+#: `len(lines) > LIMIT`") fires on *every* append once the file reaches the
+#: limit — the rewrite lands back on the limit, so the next line is over it
+#: again. Measured on `picar`: `thoughts-spark.jsonl` sat at exactly 10000 lines
+#: (3.78 MB) and every thought rewrote the whole file with an fsync, ~7 s of
+#: card saturation per thought on the device shared with the microphone ring
+#: (#247, fixed in #376). `memories` and `people` had the same rule waiting for
+#: a longer file. With slack, the rewrite happens once per `JSONL_TRIM_SLACK`
+#: appends instead of on every one.
+JSONL_TRIM_SLACK = 500
+
+
+def trim_jsonl_if_needed(
+    path: Path,
+    limit: int,
+    *,
+    what: str | None = None,
+    slack: int = JSONL_TRIM_SLACK,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """Trim an append-only JSONL back to `limit` lines, rarely. True if trimmed.
+
+    Rewrites only once the file has drifted `slack` lines past the limit, so the
+    common path is an O(1) append plus a newline count rather than a
+    multi-megabyte rewrite. The trim itself is **atomic but not durable**: it is
+    maintenance on a file that is appended to again within minutes, so the
+    `fsync` bought no crash durability and forced an ext4 journal commit while
+    writing megabytes (#247, `#373`).
+
+    Never raises: a failed trim costs a longer file and the next append retries.
+    """
+    label = what or path.name
+    try:
+        with path.open("rb") as handle:
+            data = handle.read()
+        if data.count(b"\n") <= limit + slack:
+            return False
+        lines = data.decode("utf-8", "replace").strip().splitlines()
+        atomic_write(path, "\n".join(lines[-limit:]) + "\n", durable=False)
+        if log is not None:
+            log(f"trimmed {label} to {limit} lines ({len(lines)} > {limit} + {slack})")
+        return True
+    except Exception:
+        if log is not None:
+            log(f"{label} trim failed for {path}")
+        return False
+
+
 #: Leftover `atomic_write` temps younger than this are left alone: another
 #: process may be inside the write right now, and an SD-card `fsync` has been
 #: measured in the seconds, not the milliseconds.

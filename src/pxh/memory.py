@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 from filelock import FileLock
 
 from pxh import provenance
-from pxh.state import atomic_write
+from pxh.state import atomic_write, trim_jsonl_if_needed
 from pxh.time import utc_timestamp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -171,12 +171,10 @@ def append_memories(records: list[dict], persona: str = "spark") -> None:
         with f.open("a", encoding="utf-8") as fh:
             for rec in records:
                 fh.write(json.dumps(rec) + "\n")
-        try:
-            lines = f.read_text(encoding="utf-8").strip().splitlines()
-            if len(lines) > MEMORIES_LIMIT:
-                atomic_write(f, "\n".join(lines[-MEMORIES_LIMIT:]) + "\n")
-        except OSError:
-            pass
+        # Trim rarely, not per append: the naive rule rewrote the whole file on
+        # every append once it reached the limit (#247, see
+        # state.trim_jsonl_if_needed).
+        trim_jsonl_if_needed(f, MEMORIES_LIMIT, what="memories")
 
 
 def _tokenize(text: str) -> set[str]:
