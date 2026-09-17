@@ -1384,6 +1384,61 @@ def test_sample_window_counts_d_state_across_the_window(tmp_path):
     assert entry["comm"] == "px-alive"
 
 
+def test_sample_window_records_which_samples_were_blocked(tmp_path):
+    """A count cannot say *when* — and when is what decides who shared a resource."""
+    paths = _bare_paths(tmp_path, {7: {"stat": _field_line(7, "px-alive", "S")}})
+    stat = paths.proc / "7" / "stat"
+    states = iter(["D", "D", "S", "S"])
+
+    def step(_seconds):
+        stat.write_text(_field_line(7, "px-alive", next(states, "S")))
+
+    window = io_attrib.sample_window(
+        paths, [7], samples=4, interval_s=0.5, sleep=step
+    )
+    assert window["pids"][7]["d_at"] == [1, 2]
+
+
+def test_blocked_by_sample_separates_co_blocking_from_two_lone_blocks():
+    """One `mmc` bus, one journal: *together* is the evidence, not the tally."""
+    window = {
+        "samples": 3,
+        "pids": {
+            92: {"comm": "kworker/u21:0+brcmf_wq/mmc1:0001:1", "samples": 3,
+                 "d_samples": 1, "thread_d_samples": 0, "d_at": [1],
+                 "thread_d_at": [], "wchan": {}, "thread_wchan": {}},
+            217: {"comm": "jbd2/mmcblk0p2-8", "samples": 3, "d_samples": 1,
+                  "thread_d_samples": 0, "d_at": [1], "thread_d_at": [],
+                  "wchan": {}, "thread_wchan": {}},
+            7: {"comm": "lonely", "samples": 3, "d_samples": 1,
+                "thread_d_samples": 0, "d_at": [2], "thread_d_at": [],
+                "wchan": {}, "thread_wchan": {}},
+        },
+    }
+    per_sample = io_attrib.blocked_by_sample(window)
+    assert len(per_sample) == 3
+    assert [row["pid"] for row in per_sample[0]] == []
+    assert [row["pid"] for row in per_sample[1]] == [92, 217]
+    assert [row["pid"] for row in per_sample[2]] == [7]
+    assert io_attrib.co_blocked_sample_count(window) == 1
+
+
+def test_blocked_by_sample_counts_a_blocked_thread_as_blocked(tmp_path):
+    window = {
+        "samples": 2,
+        "pids": {
+            42: {"comm": "px-alive", "samples": 2, "d_samples": 0,
+                 "thread_d_samples": 1, "d_at": [], "thread_d_at": [1],
+                 "wchan": {}, "thread_wchan": {}},
+            217: {"comm": "jbd2/mmcblk0p2-8", "samples": 2, "d_samples": 1,
+                  "thread_d_samples": 0, "d_at": [1], "thread_d_at": [],
+                  "wchan": {}, "thread_wchan": {}},
+        },
+    }
+    assert io_attrib.co_blocked_sample_count(window) == 1
+    assert [row["pid"] for row in io_attrib.blocked_by_sample(window)[1]] == [42, 217]
+
+
 def test_sample_window_records_a_symbol_only_where_the_kernel_gives_one(tmp_path):
     paths = _bare_paths(
         tmp_path,
@@ -1547,6 +1602,8 @@ def test_capture_records_a_root_owned_writer_through_the_window_channel(
     assert record["window_samples"] == 6
     assert record["window_sample_interval_s"] == 0.5
     assert record["blocked_in_window_count"] == 1
+    assert len(record["blocked_at_samples"]) == record["window_samples"]
+    assert record["co_blocked_samples"] == 0
     row = record["blocked_in_window"][0]
     assert row["pid"] == 42 and row["comm"] == "px-alive"
     assert row["d_samples"] == 0  # the leader never enters D ...

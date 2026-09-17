@@ -45,6 +45,9 @@ Two channels, and the difference between them is privilege:
   0.5 s: per-pid D fractions, plus per-thread D for a rotating quarter of the
   process set (px-alive's wedged health thread sits behind a leader that stays
   ``S``, so threads are where that writer hides).
+  Both views record *which* sample, not just how many, so co-blocking is
+  checkable: two processes each blocked once is a different finding depending on
+  whether it was the same half-second (`blocked_at_samples`, `co_blocked_samples`).
 
   ``/proc/<pid>/stat`` only reports the *thread group leader*, and that is not
   enough for the daemon this investigation is about: px-alive reports health
@@ -801,6 +804,13 @@ def sample_window(
                     "samples": 0,
                     "d_samples": 0,
                     "thread_d_samples": 0,
+                    # *Which* samples, not just how many. Two processes each in D
+                    # once is a different finding depending on whether it was the
+                    # same 0.5 s: co-blocking points at whatever they share (the
+                    # `mmc` bus, the journal) rather than at two independent
+                    # writers, and a count alone cannot tell the two apart.
+                    "d_at": [],
+                    "thread_d_at": [],
                     "wchan": {},
                     "thread_wchan": {},
                     "blkio_ticks_first": None,
@@ -818,6 +828,7 @@ def sample_window(
                 entry["blkio_ticks_last"] = ticks
             if parsed.get("state") == "D":
                 entry["d_samples"] += 1
+                entry["d_at"].append(index)
                 symbol = read_wchan(pid, paths.proc)
                 if symbol:
                     entry["wchan"][symbol] = entry["wchan"].get(symbol, 0) + 1
@@ -829,6 +840,7 @@ def sample_window(
             if not threads:
                 continue
             entry["thread_d_samples"] += 1
+            entry["thread_d_at"].append(index)
             for thread in threads:
                 symbol = read_task_wchan(pid, thread["tid"], paths.proc)
                 if symbol:
@@ -1015,6 +1027,8 @@ def rank_blocked_in_window(
             "thread_d_samples": thread_samples,
             "samples": samples,
             "d_share": round(severity / samples, 2) if samples else None,
+            "d_at": list(entry.get("d_at") or []),
+            "thread_d_at": list(entry.get("thread_d_at") or []),
             "wchan": symbols[0] if symbols else None,
             "wchan_withheld": not symbols and pid in denied,
         }
@@ -1034,6 +1048,41 @@ def rank_blocked_in_window(
         reverse=True,
     )
     return rows[:top], len(rows)
+
+
+def blocked_by_sample(window: Mapping[str, Any]) -> list[list[dict[str, Any]]]:
+    """`[[{pid, comm}, ...], ...]` — who was blocked in each sampled instant.
+
+    The count in `blocked_in_window` says *how much*; this says *together*. The
+    distinction decides which investigation is worth running: processes blocked
+    in the same sample share a resource (this host has one `mmc` bus carrying
+    both the SD card and the SDIO WiFi, and one ext4 journal), while processes
+    blocked in different samples are independent writers. Built from the whole
+    per-pid map, not from the `top`-truncated rows.
+
+    A pid blocked as a *thread* counts as blocked in that sample; that is the
+    #287 shape and it must not be invisible in the overlap view.
+    """
+    samples = int(window.get("samples") or 0)
+    out: list[list[dict[str, Any]]] = [[] for _ in range(max(0, samples))]
+    for pid, entry in (window.get("pids") or {}).items():
+        if not isinstance(pid, int):
+            continue
+        row = {"pid": pid, "comm": entry.get("comm") or "?"}
+        indices = set(entry.get("d_at") or []) | set(entry.get("thread_d_at") or [])
+        for index in sorted(indices):
+            if 0 <= index < len(out):
+                out[index].append(row)
+    return out
+
+
+def co_blocked_sample_count(window: Mapping[str, Any]) -> int:
+    """How many sampled instants had **more than one** process blocked.
+
+    A single sentence a reader can act on: non-zero means the stall is shared,
+    which is where "the device was idle and everything waited" lives.
+    """
+    return sum(1 for sample in blocked_by_sample(window) if len(sample) > 1)
 
 
 def wchan_withheld_pids(
@@ -1506,6 +1555,12 @@ def capture(
         # this list over `writers` when `writers_unreadable_count` is large.
         "blocked_in_window": blocked_window,
         "blocked_in_window_count": blocked_window_count,
+        # Who was blocked *together*, sample by sample. The count above cannot
+        # distinguish "two processes, one after the other" from "two processes
+        # at the same instant" — and the second is the evidence for a shared
+        # resource (one `mmc` bus, one journal) rather than two writers.
+        "blocked_at_samples": blocked_by_sample(window),
+        "co_blocked_samples": co_blocked_sample_count(window),
         "window_samples": window.get("samples"),
         "window_sample_interval_s": window.get("interval_s"),
         "window_span_s": window.get("span_s"),

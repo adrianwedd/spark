@@ -158,7 +158,8 @@ process that *starts* inside the window is caught by the closing walk only.
 
 | field | meaning |
 |---|---|
-| `blocked_in_window[]` | ranked `{pid, comm, unit, d_samples, thread_d_samples, samples, d_share, wchan, wchan_withheld}`. Ranked on the **worse** of the two sample counts, so a wedged thread behind a healthy leader (#287's shape) cannot sort below a process that flickered into D once |
+| `blocked_in_window[]` | ranked `{pid, comm, unit, d_samples, thread_d_samples, samples, d_share, d_at, thread_d_at, wchan, wchan_withheld}`. Ranked on the **worse** of the two sample counts, so a wedged thread behind a healthy leader (#287's shape) cannot sort below a process that flickered into D once. `d_at`/`thread_d_at` are the sample *indices*, not just counts — see `blocked_at_samples` |
+| `blocked_at_samples` / `co_blocked_samples` | who was blocked **in each sampled instant**, and how many instants had more than one. The count above cannot tell "two processes, one after another" from "two processes at the same moment", and the second is the evidence for a *shared* resource — on this host one `mmc` bus carries both the SD card (mmcblk0) and the SDIO WiFi (mmc1), and one ext4 journal serves everything. Built from the whole per-pid map, not the `top`-truncated rows, and a blocked *thread* counts as blocked |
 | `blocked_in_window_count` | how many processes were blocked at all during the window |
 | `window_samples` / `window_sample_interval_s` / `window_span_s` | how many samples, how far apart, and the span actually covered (`≈ (samples-1) × interval` plus one sample's work — the window's two ends are the walks). `d_share` is a fraction of *samples*; check it against this span, not against `--window` |
 | `window_thread_coverage_s` | how long a full per-thread rotation takes. A thread block shorter than this can fall between two visits to the same process — the sampler's stated resolution, not a hidden limit |
@@ -168,7 +169,7 @@ Measured cost of the change on the robot (197 pids, 6 samples): the sampler
 covered 2.54 s of a 3 s window, `observer_read_bytes` **0**, `observer_write_bytes`
 **0** — /proc reads are memory, not card traffic, which is the point.
 
-**First real reading from the window channel (2026-09-18 04:33 AEST, robot
+**First reading from the window channel (2026-09-18 04:33 AEST, robot
 `b9df4527` + this change):**
 
 ```
@@ -184,6 +185,27 @@ file and no process — was in uninterruptible sleep for one of six samples**,
 while `writers_unreadable_count` sits at 175 and every byte-level channel is
 blind to it. `unit: null` is correct and not a gap: `jbd2` is a kernel thread
 with no cgroup unit to blame.
+
+**Second reading (2026-09-18 04:48 AEST, deployed `d58af50f`) — and it is the
+first time two blocked processes have been caught in the *same* sample:**
+
+```json
+"blocked_at_samples": [[], [{"pid": 92, "comm": "kworker/u21:0+brcmf_wq/mmc1:0001:1"},
+                            {"pid": 217, "comm": "jbd2/mmcblk0p2-8"}], [], [], [], []],
+"co_blocked_samples": 1
+```
+
+`brcmf_wq/mmc1:0001:1` is the **brcmfmac SDIO WiFi workqueue on mmc1**. An
+unremarkable window, no PSI, no overrun — and the ext4 journal thread and the
+WiFi SDIO workqueue were both in uninterruptible sleep in the same half-second.
+That is the shared-`mmc`-subsystem hypothesis this file already flagged as
+invisible to `/sys/block` (`mmc1` has no block device), now visible as a
+timestamped overlap rather than an inference, and it is the first evidence for
+#217's brcmfmac wedge and #247's residual coming from one channel.
+
+One sample is not a correlation, and the field is presented as an overlap for
+that reason: `co_blocked_samples` counts instants, not duration, and the sampler
+reports its own resolution (`window_thread_coverage_s`) beside it.
 
 ## Install (root, one command block)
 
@@ -623,6 +645,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
 | `blocked_in_window[0]` is a root-owned daemon or a kernel thread with `wchan_withheld: true`, `writers_unreadable_count` high | the unprivileged reading of "the writer is one of the processes we cannot measure". A `jbd2/mmcblk0p2-8` row is ext4 journal work; the journal thread *is* the writer, and it has no file and no unit | the unit-level fix is journal-side tuning (`SyncIntervalSec`, `Storage=`, rates) or taking fsyncs out of the suspect daemon — not process weighting; install as root for the symbol and the bytes |
 | `blocked_in_window` names a *user-space* daemon with `thread_d_samples` at or near `samples` while `d_samples` is 0 | a thread of that daemon is wedged behind a healthy leader (#287) — the shape a leader-only view reports as "fine" | that daemon's write path, not its park logic |
+| `co_blocked_samples` > 0, especially with `brcmf_wq/mmc1:*` and `jbd2/mmcblk0p2-8` in the same instant | the block is **shared**, not a writer: the `mmc` bus carries the card and the SDIO WiFi, and nothing here is competing for it | stop looking for a writer; this is #217/#247's "wedge, not writer" territory — kernel/driver/power, and `mmc1` has no `/sys/block` entry to consult |
 | **`device_inflight_pre` is `0/0` while `d_state_count` is high and `devices` shows queue time** | **nothing was in flight: the queue is wedged, not busy — there is no writer in this record to find, and a longer search for one is the wrong search** | take the question to the *waiters*: `stalled[].wchan` and (as root) the kernel threads, and to the other bus users — `mmc1`'s SDIO WiFi shares the `mmc` subsystem and cannot be seen from `/sys/block` |
 
 ## Deliberately not done
