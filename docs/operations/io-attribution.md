@@ -185,7 +185,7 @@ Calibration from the same window: px-alive's normal heartbeat gap max sits at
 trigger alone (`heartbeat age 0.04s`). Idle io PSI is under 5 %, with bursts past
 40 %; one catch in the first ten minutes is about the expected rate.
 
-## 2026-09-17 19:35-20:05 — the residual stall is not storage *work* (device idle while everything waited)
+## 2026-09-17 19:35-20:20 — two stall shapes, and the bytes are invisible to every channel here
 
 Measured live on `picar` with a bounded ad-hoc sampler (1 s cadence; no unit, no
 root), chasing the residual that #247/#283/#287 share.
@@ -218,17 +218,59 @@ Independent calibration that the storage path itself is healthy when not wedged:
   process read ~0 and wrote ~180 KB total; io PSI some still reached 38 %
 ```
 
-**What this changes.** The residual is not a *writer* problem and not a
-*throughput* problem: it is an episodic **wedge** in which tasks block in
-`io_schedule` for ~10 s while the SD card has nothing in flight and nothing to
-do. Two consequences:
+### Shape 2, from the first four records the `inflight` field produced (20:12-20:18)
 
-1. `IOWeight`/`IOSchedulingClass=` cannot fix it — there is no competing writer
-   to deprioritise. That lever is now closed, not merely deferred.
-2. The observer's empty writer lists were **correct**: the 2026-08-20 "no
-   offender among SPARK's daemons" sample was right about the daemons and wrong
-   only about the device. `device_inflight_pre` is recorded now so the next
-   record says so directly instead of inviting another writer hunt.
+The records immediately after the field went live (observer pid 12516,
+`3dedb851`) show a *different* shape from the one above, and it is the one to
+reason from until told otherwise:
+
+```
+ts                  psi_some  inflight_pre  inflight_post  ms_io  writes sectors  window
+2026-09-17T10:12:14Z   47.81   0/2           0/2           3760ms   28    156KB   3.19s
+2026-09-17T10:14:36Z   41.77   0/2           0/0           1892ms   10    128KB   3.23s
+2026-09-17T10:16:36Z   44.71   0/2           0/0           2612ms   57    524KB   3.21s
+2026-09-17T10:18:17Z   40.27   0/2           0/0           1004ms   40    492KB   3.28s
+```
+
+Here the device is **not** idle: two writes are in flight at every
+`inflight_pre`, the queue is 31-117 % occupied (i.e. essentially saturated), and
+it is delivering **40-160 KB/s** — 4-14× below its own measured sequential rate
+of ~575 KB/s — while `psi_io` `full` tracks `some` within a couple of points.
+The D-state roster in those windows is ext4 metadata work, not a daemon:
+`jbd2/mmcblk0p2-8`, `kworker/*+kblockd`, `kworker/u19:1+ext4-rsv-conversion`,
+plus a `python3` in `folio_wait_bit_common` in the first one (`nr_writeback 16`
+there, 0 in the others).
+
+And **none of it is attributable with the channels this instrument has**:
+`write_bytes_total` is 0-8192 B, the top "writers" are `go2rtc`/`ffmpeg`/
+`cloudflared`/`rpicam-vid` with `write_bytes: 0` (pipe traffic), `privileged:
+false` with ~177 processes refusing, and — the part that matters —
+`file_growth_groups` is `{}` with `file_growth_watched: 115`. Nothing in
+`state/` or `logs/` grew by a byte while the device wrote 128-524 KB.
+
+**This is a limitation of the file channel, not evidence of no writes.** It is a
+*size* delta, and the two likeliest writers in that window have no size delta to
+see: journald appends into an 8 MB preallocated, mmap'd journal file
+(`system.journal` sits at exactly 8388608 bytes), and ext4 journal/metadata
+writes change no file size at all. mtime would see the first of those — an
+ad-hoc mtime watcher did (journal mtimes advanced in 35 of 91 high-PSI samples)
+— and no unprivileged channel sees the second.
+
+**What this changes.** Two consequences, and one corrected claim:
+
+1. `IOWeight`/`IOSchedulingClass=` is still **closed**: whatever is driving these
+   stalls, the device is saturated at 40-160 KB/s with ~2 requests in flight, so
+   there is no *competing* writer to deprioritise — the requests that are there
+   are the ones blocking everyone.
+2. The observer's empty writer lists are still **correct for what it can read**,
+   and now demonstrably incomplete for a reason that is not "nobody wrote":
+   metadata writes and journald are outside both the `/proc/<pid>/io` view
+   (privilege) and the size-delta view (no size change). Install as root, or
+   watch mtime, or both.
+3. **Corrected:** the "device idle while everything waited" reading below was one
+   episode and is *not* the general shape. It is still a real shape (inflight
+   0/0, 2-7 % busy, a 169 B fsync in 7-52 ms during a 64 % `full` stall), and
+   still unexplained, but shape 2 is what the observer keeps catching.
 
 **Where it points instead.** Candidates, in the order the evidence favours:
 the `mmc` host/block path blocking *before* dispatch (`blk_mq_get_tag` waits set
