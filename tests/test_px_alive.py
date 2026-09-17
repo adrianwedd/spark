@@ -1143,7 +1143,9 @@ def test_both_idle_branches_report_health_before_continuing():
         )
 
 
-def test_a_proximity_greeting_is_beaten_and_names_its_own_phase(tmp_path, isolated_project):
+def test_a_proximity_greeting_is_beaten_and_names_its_own_phase(
+    tmp_path, isolated_project, monkeypatch
+):
     """Found in the daemon's own buckets on 2026-09-18: a 9,017 ms gap.
 
     `heartbeat_gap_max_mode` said `ease_proximity`, which is the mode of the beat
@@ -1168,7 +1170,13 @@ def test_a_proximity_greeting_is_beaten_and_names_its_own_phase(tmp_path, isolat
         time.sleep(0.35)  # stands in for a tool-voice run that takes seconds
         return None
 
-    alive["_subprocess"].run = _slow_voice
+    # `monkeypatch`, not a bare assignment: `alive["_subprocess"]` is the real
+    # `subprocess` module, so assigning `run` replaced it for the *whole session*
+    # and every later subprocess test got `None` back —
+    # `AttributeError: 'NoneType' object has no attribute 'returncode'`, 135
+    # failures in one CI run, reproduced locally by running this test before
+    # tests/test_px_mind.py.
+    monkeypatch.setattr(alive["_subprocess"], "run", _slow_voice)
     alive["spark_greet"](dry=True)
 
     assert beats, "the greeting's blocking voice call produced no heartbeat at all"
