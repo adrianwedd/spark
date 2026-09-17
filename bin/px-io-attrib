@@ -188,6 +188,24 @@ def main(argv: list[str]) -> int:
     allow_proc_io = not args.no_proc_io
     privileged = allow_proc_io and io_attrib.proc_io_readable(paths.proc)
 
+    def gate_state() -> tuple[bool, int | None, str]:
+        """`(armed, pid, "armed"|"disarmed")` for the heartbeat trigger.
+
+        The trigger is gated on px-alive's pid file, and its default location is
+        derived from LOG_DIR (`--px-alive-pid-file` defaults to
+        `LOG_DIR/px-alive.pid`). Overriding LOG_DIR therefore *silently* disarms
+        the whole watchdog half of this observer: found on 2026-09-18 by running
+        a bounded verify instance with `LOG_DIR=/tmp/...`, where the heartbeat
+        aged 0.26-0.32 s at 20 of 20 samples and not one `heartbeat_age` capture
+        fired — because `px-alive.pid` was looked for under the scratch log dir.
+        Nothing in the output said the trigger could not fire, which is the same
+        failure shape as the stalls it is meant to catch. So the state is
+        evaluated every poll, printed at startup, and carried in every record.
+        """
+        pid = io_attrib.read_pid_file(px_alive_pid_file)
+        alive = pid is not None and io_attrib.process_alive(pid, paths.proc)
+        return alive, pid, ("armed" if alive else "disarmed")
+
     def snapshot(reason: str, trigger_extra: dict) -> dict:
         trigger = {"reason": reason, **trigger_extra}
         record = io_attrib.capture(
@@ -207,12 +225,16 @@ def main(argv: list[str]) -> int:
     if args.once or args.dry_run:
         age, mode = io_attrib.read_heartbeat_age(heartbeat_file)
         io_now = psi_io_avg10(paths.pressure_io).get("some")
+        alive, pid, gate = gate_state()
         record = snapshot(
             "manual",
             {
                 "io_psi_some_avg10": io_now,
                 "heartbeat_age_s": None if age is None else round(age, 2),
                 "heartbeat_mode": mode,
+                "px_alive_pid": pid if alive else None,
+                "px_alive_pid_file": str(px_alive_pid_file),
+                "px_alive_gate": gate,
             },
         )
         print(json.dumps(record, indent=2, sort_keys=True))
@@ -229,16 +251,28 @@ def main(argv: list[str]) -> int:
     # future runbook) must not have to guess which one is us.
     pid_published = io_attrib.write_pid_file(pid_file)
 
+    gate_alive, gate_pid, gate = gate_state()
     log(
         f"observer start io_threshold={args.io_threshold} "
         f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
         f"sample_interval_s={sample_interval} "
         f"cooldown_s={args.cooldown} poll_s={args.poll} "
         f"heartbeat_file={heartbeat_file} pid_file={pid_file if pid_published else 'unavailable'} "
+        f"px_alive_pid_file={px_alive_pid_file} heartbeat_gate={gate} "
+        f"px_alive_pid={gate_pid if gate_alive else 'none'} "
         f"growth_patterns={len(growth_patterns)} "
         f"privileged={privileged}"
         + ("" if privileged else " (writer list will be partial; root sees the rest)")
     )
+    if not gate_alive:
+        # Said out loud rather than left implicit: without this line the only
+        # symptom is records that never carry `heartbeat_age`, which reads as
+        # "the heartbeat was healthy" instead of "nobody was watching it".
+        log(
+            f"heartbeat trigger DISARMED: no live px-alive pid in "
+            f"{px_alive_pid_file} — only the io-PSI trigger is armed "
+            f"(re-checked every poll)"
+        )
 
     started = time.monotonic()
     cooldown_until = 0.0
@@ -255,8 +289,7 @@ def main(argv: list[str]) -> int:
 
         io_now = psi_io_avg10(paths.pressure_io).get("some")
         age, mode = io_attrib.read_heartbeat_age(heartbeat_file)
-        pid = io_attrib.read_pid_file(px_alive_pid_file)
-        alive = pid is not None and io_attrib.process_alive(pid, paths.proc)
+        alive, pid, gate = gate_state()
         reason = io_attrib.trigger_reason(
             io_some_avg10=io_now,
             heartbeat_age_s=age,
@@ -275,6 +308,12 @@ def main(argv: list[str]) -> int:
                 "heartbeat_age_s": None if age is None else round(age, 2),
                 "heartbeat_mode": mode,
                 "px_alive_pid": pid if alive else None,
+                # Whether the watchdog half of the trigger was even able to
+                # fire for this record. `heartbeat_age_s: null` alone cannot
+                # tell "the daemon was beating on time" from "nobody was
+                # watching it".
+                "px_alive_pid_file": str(px_alive_pid_file),
+                "px_alive_gate": gate,
             },
         )
         captures += 1

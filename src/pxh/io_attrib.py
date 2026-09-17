@@ -325,11 +325,29 @@ def read_heartbeat_age(
 
 
 def process_alive(pid: int, proc_root: Path) -> bool:
-    """Whether `pid` exists. Used to gate the heartbeat trigger, not to trust it."""
+    """Whether `pid` exists in `proc_root`. Gates the heartbeat trigger.
+
+    `proc_root` is authoritative when it exists: a tree without the pid answers
+    False, which is exactly what the observer needs for a pid file left behind
+    by a crash. Where the tree itself is absent — a developer Mac, which has no
+    `/proc` at all — fall back to a signal-0 probe, because otherwise the
+    heartbeat gate can never be armed off-robot and the observer's own
+    diagnostics ("is the trigger armed?") are unreadable exactly where reading
+    them is cheap. On the robot the fallback is never reached, and as `pi` it
+    would answer False for a root-owned pid anyway (EPERM).
+    """
     try:
-        return (proc_root / str(pid)).is_dir()
+        if (proc_root / str(pid)).is_dir():
+            return True
     except OSError:
         return False
+    if not proc_root.exists():
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+    return False
 
 
 def write_pid_file(path: Path, pid: int | None = None) -> bool:
