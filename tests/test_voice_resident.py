@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -330,8 +331,9 @@ def test_voice_turn_names_its_tier_even_when_the_tier_cannot_answer(monkeypatch)
 
 
 def test_command_backend_label_names_the_adapter(monkeypatch):
-    monkeypatch.setenv("PX_OLLAMA_HOST", "https://ollama.com")
     monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    # The adapter's default is Ollama Cloud, so an unset OLLAMA_HOST is metered
+    # spend — labelling it "local" would hide cloud usage in the free bucket.
     assert voice_loop.command_backend_label("bin/codex-ollama") == "ollama-m5"
     monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
     assert voice_loop.command_backend_label("bin/codex-ollama") == "ollama-local"
@@ -340,6 +342,21 @@ def test_command_backend_label_names_the_adapter(monkeypatch):
     # so an unattributed path cannot hide inside a bucket that reads as
     # "not filled in yet".
     assert voice_loop.command_backend_label("bin/my-adapter") == "command:my-adapter"
+
+
+def test_command_backend_label_matches_the_adapter_default():
+    """The label must resolve the host the way the adapter does.
+
+    `bin/codex-ollama` is not importable (no .py suffix), so the relationship is
+    pinned the way this repo pins other cross-file contracts: read the file and
+    check the constant it actually uses.
+    """
+    adapter = (Path(voice_loop.__file__).resolve().parent.parent.parent
+               / "bin" / "codex-ollama").read_text()
+    assert (
+        f'os.environ.get("OLLAMA_HOST", "{voice_loop.CODEX_OLLAMA_DEFAULT_HOST}")'
+        in adapter
+    )
 
 
 def test_supervisor_loop_logs_the_serving_tier_not_unknown(monkeypatch):
