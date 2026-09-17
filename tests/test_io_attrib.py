@@ -37,6 +37,8 @@ def _write_proc_tree(
     vmstat: str = "",
     uptime: str = "12345.67 9000.00\n",
     inflight: dict[str, tuple[int, int]] | None = None,
+    ext4_fs: str = "mmcblk0p2",
+    ext4_fields: dict[str, object] | None = None,
 ):
     proc = tmp_path / "proc"
     proc.mkdir()
@@ -75,6 +77,10 @@ def _write_proc_tree(
     (tmp_path / "pressure_io").write_text(PRESSURE)
     sys_block = tmp_path / "sys_block"
     sys_block.mkdir()
+    ext4 = tmp_path / "sys_fs_ext4" / (ext4_fs or "mmcblk0p2")
+    ext4.mkdir(parents=True)
+    for field, value in (ext4_fields or {}).items():
+        (ext4 / field).write_text(f"{value}\n")
     for name, (reads, writes) in (inflight or {}).items():
         (sys_block / name).mkdir()
         (sys_block / name / "inflight").write_text(f"{reads} {writes}\n")
@@ -85,6 +91,7 @@ def _write_proc_tree(
         vmstat=tmp_path / "vmstat",
         uptime=tmp_path / "uptime",
         sys_block=sys_block,
+        ext4_sysfs=tmp_path / "sys_fs_ext4",
     )
 
 
@@ -429,6 +436,7 @@ def _wire_capture(
     diskstats_post=ACTIVE_DISK,
     vmstat=IDLE_VMSTAT,
     vmstat_post=ACTIVE_VMSTAT,
+    ext4_fields=None,
 ):
     """Two-ended fixture: process walk and device counters both advance once."""
     paths = _write_proc_tree(
@@ -437,6 +445,7 @@ def _wire_capture(
         self_io={"read_bytes": 0, "write_bytes": 0},
         diskstats=diskstats,
         vmstat=vmstat,
+        ext4_fields=ext4_fields or {"session_write_kbytes": 1000, "errors_count": 0},
     )
     _stub_host_load(monkeypatch)
     walks = {"n": 0}
@@ -893,6 +902,71 @@ def test_capture_records_touched_files_alongside_growth(tmp_path, monkeypatch):
     assert record["file_touched"][0]["path"].endswith("system.journal")
     assert record["file_touched"][0]["bytes"] == 0
     assert record["file_touched_count"] == 1
+
+
+def test_sample_ext4_reads_the_counters_and_the_journal_task(tmp_path):
+    paths = _write_proc_tree(
+        tmp_path,
+        {},
+        ext4_fields={
+            "session_write_kbytes": 687840,
+            "lifetime_write_kbytes": 1103980557,
+            "delayed_allocation_blocks": 0,
+            "errors_count": 0,
+            "journal_task": "jbd2/mmcblk0p2-8",
+        },
+    )
+    ext4 = io_attrib.sample_ext4(paths)
+    assert ext4["fs"] == "mmcblk0p2"
+    assert ext4["session_write_kbytes"] == 687840
+    assert ext4["lifetime_write_kbytes"] == 1103980557
+    assert ext4["delayed_allocation_blocks"] == 0
+    assert ext4["journal_task"] == "jbd2/mmcblk0p2-8"
+    # No ext4 on this host (container, macOS dev box): unwatched, not zero.
+    assert io_attrib.sample_ext4(io_attrib.Paths(ext4_sysfs=tmp_path / "nope")) == {}
+
+
+def test_ext4_window_reports_a_delta_and_says_nothing_when_unwatched():
+    pre = {"fs": "mmcblk0p2", "session_write_kbytes": 1000, "errors_count": 0}
+    post = {"fs": "mmcblk0p2", "session_write_kbytes": 1204, "errors_count": 0}
+    assert io_attrib._ext4_window(pre, post)["write_kbytes_delta"] == 204
+    assert io_attrib._ext4_window({}, {}) == {}
+    # Mounted mid-window: no baseline means no delta, not a fabricated zero.
+    assert "write_kbytes_delta" not in io_attrib._ext4_window({}, post)
+
+
+def test_capture_records_filesystem_bytes_against_device_bytes(tmp_path, monkeypatch):
+    """The discrimination this field exists for: the device moved 524 KB and the
+    filesystem wrote 4 KB across the same window — metadata/journal work, which
+    no file channel can attribute."""
+    procs = _stall_procs()
+    paths = _wire_capture(
+        tmp_path,
+        monkeypatch,
+        procs,
+        _stall_post(procs),
+        diskstats="179 0 mmcblk0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        diskstats_post="179 0 mmcblk0 0 0 0 0 57 0 1048 0 0 0 0 0 0 0 0 0\n",
+        ext4_fields={"session_write_kbytes": 1000, "errors_count": 0},
+    )
+    ends = iter(
+        [
+            {"fs": "mmcblk0p2", "session_write_kbytes": 1000, "errors_count": 0},
+            {"fs": "mmcblk0p2", "session_write_kbytes": 1004, "errors_count": 0},
+        ]
+    )
+    monkeypatch.setattr(io_attrib, "sample_ext4", lambda _paths=None: next(ends))
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=3.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["ext4"]["write_kbytes_delta"] == 4
+    assert record["devices"]["mmcblk0"]["sectors_written"] == 1048   # 524 KB
+    assert record["writers_with_activity"] == 1
+    assert record["file_growth"] == []
 
 
 def test_rank_file_growth_reports_deltas_groups_and_total():
