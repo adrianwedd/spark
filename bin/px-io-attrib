@@ -88,6 +88,10 @@ def _summary(record: dict) -> str:
     parts.extend(
         f"{name}_ms_io={deltas.get('ms_io', 0)}" for name, deltas in devices.items()
     )
+    growth = record.get("file_growth") or []
+    if growth:
+        parts.append(f"top_file={growth[0]['path']}(+{growth[0]['bytes']}B)")
+        parts.append(f"file_bytes={record.get('file_growth_total_bytes')}")
     parts.append(f"privileged={record.get('privileged')}")
     return " ".join(parts)
 
@@ -113,7 +117,12 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pid-file", default=str(LOG_DIR / "px-alive.pid"),
                     help="px-alive's pid file, used to gate the heartbeat trigger")
     ap.add_argument("--no-proc-io", action="store_true",
-                    help="force unprivileged mode (stall channel only)")
+                    help="do not attempt the per-process writer channel")
+    ap.add_argument("--growth-pattern", action="append", default=None,
+                    help="file glob to watch for size deltas, repeatable "
+                         "(default: system journal, logs/*.log, state/**/*.json)")
+    ap.add_argument("--no-file-growth", action="store_true",
+                    help="skip the file-level writer channel")
     ap.add_argument("--once", action="store_true",
                     help="take one snapshot now, print it, log it, exit")
     ap.add_argument("--dry-run", action="store_true",
@@ -121,6 +130,22 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--duration-h", type=float, default=0.0,
                     help="stop after this many hours (0 = until signalled)")
     args = ap.parse_args(argv)
+
+    if args.no_file_growth:
+        growth_patterns: list[str] = []
+    elif args.growth_pattern:
+        growth_patterns = list(args.growth_pattern)
+    else:
+        # The file-level writer channel: unprivileged, and the only thing that
+        # names a writer when /proc/<pid>/io is refused for every root-owned
+        # process. A watchlist rather than a filesystem scan, so the cost is a
+        # bounded number of stats.
+        growth_patterns = [
+            "/var/log/journal/*/*.journal",
+            str(LOG_DIR / "*.log"),
+            str(state_dir / "*.json"),
+            str(state_dir / "health" / "*.json"),
+        ]
 
     window_s = min(10.0, max(1.0, args.window))
     heartbeat_file = (
@@ -146,6 +171,7 @@ def main(argv: list[str]) -> int:
             window_s=window_s,
             allow_proc_io=allow_proc_io,
             privileged=privileged,
+            growth_patterns=growth_patterns,
             top=max(1, args.top),
         )
         if not args.dry_run:
@@ -176,7 +202,8 @@ def main(argv: list[str]) -> int:
         f"observer start io_threshold={args.io_threshold} "
         f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
         f"cooldown_s={args.cooldown} poll_s={args.poll} "
-        f"heartbeat_file={heartbeat_file} privileged={privileged}"
+        f"heartbeat_file={heartbeat_file} growth_patterns={len(growth_patterns)} "
+        f"privileged={privileged}"
         + ("" if privileged else " (writer list will be partial; root sees the rest)")
     )
 

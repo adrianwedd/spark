@@ -781,3 +781,124 @@ def test_capture_says_nothing_about_unreadable_writers_when_none_were(
     )
     assert record["writers_unreadable_count"] == 0
     assert record["writers_unavailable_reason"] is None
+
+
+# --- the file-level writer channel (unprivileged attribution) -------------
+
+
+def test_growth_group_classifies_the_watchlist():
+    assert io_attrib.growth_group("/var/log/journal/abc/system.journal") == "journal"
+    assert (
+        io_attrib.growth_group("/home/pi/picar-x-hacking/state/health/px-alive.json")
+        == "health"
+    )
+    assert (
+        io_attrib.growth_group("/home/pi/picar-x-hacking/state/session.json") == "state"
+    )
+    assert io_attrib.growth_group("/home/pi/picar-x-hacking/logs/px-mind.log") == "logs"
+    assert io_attrib.growth_group("/somewhere/else.txt") == "other"
+
+
+def test_sample_file_sizes_stats_every_match_and_never_raises(tmp_path):
+    (tmp_path / "a.log").write_text("x" * 10)
+    (tmp_path / "b.log").write_text("y" * 20)
+    (tmp_path / "c.json").write_text("{}")
+    sizes = io_attrib.sample_file_sizes(
+        [str(tmp_path / "*.log"), str(tmp_path / "*.json")]
+    )
+    assert sizes[str(tmp_path / "a.log")] == 10
+    assert sizes[str(tmp_path / "b.log")] == 20
+    assert sizes[str(tmp_path / "c.json")] == 2
+    # A pattern that matches nothing, and a path that is not a file at all:
+    # "not watched", never an exception.
+    assert io_attrib.sample_file_sizes([str(tmp_path / "nope-*")]) == {}
+    assert io_attrib.sample_file_sizes([str(tmp_path)]) == {}
+
+
+def test_rank_file_growth_reports_deltas_groups_and_total():
+    pre = {
+        "/var/log/journal/abc/system.journal": 1000,
+        "/repo/logs/px-mind.log": 500,
+        "/repo/state/health/px-alive.json": 169,
+        "/repo/logs/quiet.log": 42,
+    }
+    post = {
+        "/var/log/journal/abc/system.journal": 1000 + 152_000,
+        "/repo/logs/px-mind.log": 500 + 4096,
+        "/repo/state/health/px-alive.json": 169 + 169,
+        "/repo/logs/quiet.log": 42,
+    }
+    rows, total, groups = io_attrib.rank_file_growth(pre, post)
+    # Paths are shortened to their last three components: enough to name the
+    # writer, short enough that the record stays one line per stall.
+    assert [row["path"] for row in rows] == [
+        "journal/abc/system.journal",
+        "repo/logs/px-mind.log",
+        "state/health/px-alive.json",
+    ]
+    assert rows[0]["bytes"] == 152_000
+    assert total == 156_265
+    assert groups == {"journal": 152_000, "logs": 4096, "health": 169}
+
+
+def test_rank_file_growth_ignores_a_file_that_appeared_mid_window(tmp_path):
+    """A rotated log has no baseline; its whole size is not growth."""
+    pre = {"/repo/logs/px-mind.log": 100}
+    post = {"/repo/logs/px-mind.log": 100, "/repo/logs/px-mind.log.1": 5_000_000}
+    rows, total, groups = io_attrib.rank_file_growth(pre, post)
+    assert (rows, total, groups) == ([], 0, {})
+
+
+def test_capture_reports_the_file_channel_and_what_it_covered(tmp_path, monkeypatch):
+    """End to end: the file that grows is named, and the record says how many
+    files were watched so growth outside the watchlist is not mistaken for
+    silence."""
+    procs = {1: {"comm": "systemd", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    # Named like the real watchlist so the group classification is exercised.
+    watched = tmp_path / "logs"
+    watched.mkdir()
+    (watched / "px-mind.log").write_text("x" * 100)
+    (watched / "quiet.log").write_text("y" * 100)
+
+    real_sample = io_attrib.sample_file_sizes
+    calls = {"n": 0}
+
+    def growing(patterns, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_sample(patterns, **kwargs)
+        (watched / "px-mind.log").write_text("x" * 1500)
+        return real_sample(patterns, **kwargs)
+
+    monkeypatch.setattr(io_attrib, "sample_file_sizes", growing)
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        growth_patterns=[str(watched / "*.log")],
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert len(record["file_growth"]) == 1
+    assert record["file_growth"][0]["path"].endswith("logs/px-mind.log")
+    assert record["file_growth"][0]["bytes"] == 1400
+    assert record["file_growth_total_bytes"] == 1400
+    assert record["file_growth_groups"] == {"logs": 1400}
+    assert record["file_growth_watched"] == 2
+
+
+def test_capture_without_growth_patterns_does_no_file_walk(tmp_path, monkeypatch):
+    """The default is no file channel at all — the watchlist is opt-in, so a
+    caller that did not ask for it pays nothing and claims nothing."""
+    procs = {1: {"comm": "systemd", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    record = io_attrib.capture(
+        {"reason": "manual"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["file_growth"] == []
+    assert record["file_growth_watched"] == 0
