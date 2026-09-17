@@ -741,5 +741,30 @@ def restart_list(
     return verdicts
 
 
+def action_summary(
+    changed_files: int,
+    restart_units: Sequence[str],
+    drift: Sequence["UnitFileDrift"],
+) -> str:
+    """The gate's first line: what needs doing, not what was checked.
+
+    Added after the same miss twice on 2026-09-18: the detail lines print *after*
+    "every long-lived unit is executing the deployed revision", and a host with
+    seven drifted unit files (one of them a unit that was never installed) exited
+    **0** — so a reader who skimmed the reassurance, or a caller that trusted the
+    exit code, saw a clean deploy. The counts belong above the reassurance, not
+    below it.
+    """
+    missing = sum(1 for item in drift if item.reason == "not installed")
+    drift_part = "unit files to install: {}".format(len(drift))
+    if missing:
+        drift_part += " ({} missing)".format(missing)
+    return "px-deploy-check: {} | units to restart: {} | {}".format(
+        "changed files: {}".format(changed_files),
+        len(restart_units),
+        drift_part,
+    )
+
+
 def needs_restart(verdicts: Iterable[Verdict]) -> list[Verdict]:
     return [v for v in verdicts if v.needs_restart]

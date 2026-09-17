@@ -847,3 +847,40 @@ def test_a_unit_the_repo_ships_but_nobody_installed_is_reported(tmp_path):
     assert [(d.reason, d.repo_path) for d in drift] == [
         ("not installed", "systemd/px-io-attrib.service")
     ]
+
+
+# --- the gate's first line -------------------------------------------------
+
+
+def test_the_summary_leads_with_what_needs_doing():
+    """Added after the same miss twice: detail below the reassurance, exit 0.
+
+    On 2026-09-18 the host had seven drifted unit files — one of them a unit
+    that had never been installed — and `px-deploy-check` exited **0** with the
+    drift printed under "every long-lived unit is executing the deployed
+    revision". A reader who skimmed, or a caller that trusted the code, saw a
+    clean deploy.
+    """
+    from pxh.deploy import UnitFileDrift, action_summary
+
+    missing = UnitFileDrift(
+        unit="px-io-attrib.service",
+        installed_path="/etc/systemd/system/px-io-attrib.service",
+        repo_path="systemd/px-io-attrib.service",
+        reason="not installed",
+    )
+    differs = UnitFileDrift(
+        unit="px-mind.service",
+        installed_path="/etc/systemd/system/px-mind.service",
+        repo_path="systemd/px-mind.service",
+        reason="differs",
+    )
+    line = action_summary(1, ["px-wake-listen.service"], [missing, differs])
+    assert line.startswith("px-deploy-check: ")
+    assert "changed files: 1" in line
+    assert "units to restart: 1" in line
+    assert "unit files to install: 2 (1 missing)" in line
+    # Nothing to do is stated, not implied by an absence.
+    quiet = action_summary(0, [], [])
+    assert quiet.endswith("units to restart: 0 | unit files to install: 0")
+    assert "missing" not in quiet

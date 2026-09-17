@@ -88,6 +88,14 @@ is running, so do not derive that list from memory:
 bin/px-deploy-check     # on the robot, immediately after the ff-merge
 ```
 
+Its **first line is a summary of what needs doing** — restarts and unit-file
+drift — because the detail prints below the reassurance: on 2026-09-18 a host
+with seven drifted unit files (one never installed) exited `0` with the drift
+under the fold, and the same output order had already hidden a `RESTART` flag
+earlier that day. `--strict` widens the exit code from "the processes are
+current" to "nothing needs doing at all", for callers that act on the code
+rather than reading the output.
+
 **The rule is reachability, not fan-out (#336): a unit is stale when it can
 execute a changed code path from its current process image.** `bin/px-deploy-check`
 reads the deploy's changed files from git (`HEAD@{1}..HEAD`), diffs each changed
