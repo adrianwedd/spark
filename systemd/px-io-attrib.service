@@ -1,0 +1,40 @@
+[Unit]
+Description=SPARK transient IO stall attribution observer (#247)
+After=network.target px-alive.service
+StartLimitIntervalSec=0
+
+[Service]
+# Type=simple, no WatchdogSec, deliberately. This unit is an instrument, not a
+# control loop: a wedged observer costs a missing record, and systemd already
+# restarts it. A watchdog here would only add a second thing that can fail
+# during the exact stall the unit exists to measure.
+Type=simple
+# Root is a requirement, not a default: /proc/<pid>/io is EACCES for other
+# users' processes, so as `pi` this unit could not see px-alive's heartbeat
+# writes or journald — two of the three writers #247 names. Run unprivileged
+# and the record says `writers_unavailable_reason` instead of pretending the
+# writer list is complete.
+User=root
+WorkingDirectory=/home/pi/picar-x-hacking
+Environment=HOME=/home/pi
+ExecStart=/home/pi/picar-x-hacking/bin/px-io-attrib
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# The observer must not become the writer it is hunting. Nice and the idle IO
+# class are both about that: the snapshot's reads and its one log line matter
+# least exactly when something else is stalling the device. mq-deadline (this
+# host's default scheduler) ignores ioprio; where the scheduler honours it, it
+# is load-bearing — either way it is never harmful.
+Nice=10
+IOSchedulingClass=idle
+
+# Bounded like every other px-* unit: an observer that grew without limit would
+# be a worse defect than the one it is measuring.
+MemoryHigh=128M
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
