@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# px-io-attrib-ensure — keep the unprivileged IO-stall observer running.
+#
+# The observer is an instrument that exists only while it is running, and until
+# `systemd/px-io-attrib.service` is installed (it needs root, see #247) it can
+# only be a hand-started process. That is how it stopped at 03:57 on 2026-09-18
+# and stayed stopped for an hour while nothing said so — the same silent failure
+# the observer itself exists to catch, one level up.
+#
+# Cron calls this every minute. It is idempotent, says nothing and writes nothing
+# when the observer is already up, and prints one line when it starts one, so the
+# log records the *transitions* and stays empty on a healthy host.
+#
+# It supersedes nothing: install the root unit and remove the cron line, because
+# a `pi`-run observer cannot read other users' /proc/<pid>/io and therefore
+# cannot name the root-owned writers #247 is about. The liveness check below
+# still recognises a root-owned observer, so the two cannot both be started by
+# accident.
+#
+# Usage:
+#   bin/px-io-attrib-ensure              # start the observer if it is not running
+#   PX_IO_ATTRIB_IO_THRESHOLD=10 bin/px-io-attrib-ensure
+#
+# Cron:
+#   * * * * * cd /home/pi/picar-x-hacking && bin/px-io-attrib-ensure >> logs/cron-io-attrib.log 2>&1
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
+PID_FILE="${PX_IO_ATTRIB_PID_FILE:-$LOG_DIR/px-io-attrib.pid}"
+OUT_FILE="${PX_IO_ATTRIB_OUT:-$LOG_DIR/px-io-attrib.out}"
+OBSERVER_CMD="${PX_IO_ATTRIB_CMD:-$SCRIPT_DIR/px-io-attrib}"
+THRESHOLD="${PX_IO_ATTRIB_IO_THRESHOLD:-25}"
+
+observer_alive() {
+    # Alive means "the observer is running", not merely "this pid exists". The
+    # pid file is a hand-off, not a lock: a plain liveness check would let a
+    # reused pid keep the observer down forever, which is the failure this
+    # script exists to prevent.
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    if [ -d /proc ]; then
+        [ -r "/proc/$pid/stat" ] || return 1
+        if [ -r "/proc/$pid/cmdline" ]; then
+            # Our own argv is the evidence: the observer is launched with
+            # --io-threshold. A live pid without it is something else.
+            tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null \
+                | grep -q -- '--io-threshold'
+            return $?
+        fi
+        # Root-owned observer: /proc/<pid>/stat is world-readable but argv is
+        # not, so assume alive rather than start a second instrument.
+        return 0
+    fi
+    # No /proc (a developer Mac, or the test suite): signal 0 is correct for
+    # processes this user owns, which is the only case that matters off-robot.
+    kill -0 "$pid" 2>/dev/null
+}
+
+mkdir -p "$LOG_DIR"
+
+pid=""
+if [ -r "$PID_FILE" ]; then
+    pid="$(tr -cd '0-9' < "$PID_FILE" 2>/dev/null || true)"
+fi
+
+if observer_alive "$pid"; then
+    exit 0
+fi
+
+cd "$PROJECT_ROOT"
+# setsid is what actually detaches the observer from the shell that started it
+# (an SSH session, or cron); the fallback exists for hosts without it.
+if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "$OBSERVER_CMD" --io-threshold "$THRESHOLD" \
+        >>"$OUT_FILE" 2>&1 </dev/null &
+else
+    nohup "$OBSERVER_CMD" --io-threshold "$THRESHOLD" \
+        >>"$OUT_FILE" 2>&1 </dev/null &
+fi
+
+echo "$(date -Is) px-io-attrib-ensure: observer not running (pid file: ${pid:-absent}) — started it (io threshold ${THRESHOLD}%)"
