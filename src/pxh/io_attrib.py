@@ -38,6 +38,12 @@ Two channels, and the difference between them is privilege:
   already readable for it, and every record now says which blocked processes
   were left unnamed (`wchan_withheld_count`) instead of letting `null` read as
   "not blocked in anything".
+* **kernel channel** — `journalctl -k` over the window, filtered to the
+  messages that can explain a wedge (`mmc`, SDIO, `brcmfmac`, `ext4`, `jbd2`,
+  I/O errors, timeouts, undervoltage, thermal). World-readable on hosts where
+  the operator is in `adm`; the one channel that can name a mechanism when there
+  is no writer to name. Bounded to one call per capture, and its cost is
+  measured (`kernel_log_child_*_bytes`) rather than assumed.
 * **window channel** — the same state sampled *across* the window
   (`sample_window`, `blocked_in_window`) instead of at its two ends. A burst
   that ends before t1 is invisible to a two-ended walk, and state is the only
@@ -66,6 +72,9 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
+import resource
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -172,6 +181,32 @@ DEFAULT_WINDOW_S = 3.0
 #: sampling instead of sleeping through it.
 DEFAULT_SAMPLE_INTERVAL_S = 0.5
 
+#: Kernel messages worth keeping in a record, and the reason this channel
+#: exists at all: a *wedge* — a stall where the device is idle and every task is
+#: blocked — has no userspace writer to name, and if it has an explanation in
+#: software, that explanation is a kernel message (an `mmc` timeout, an SDIO
+#: error, an undervoltage event, an ext4 complaint). Readable unprivileged on
+#: `picar` (`pi` is in `adm`, so both `journalctl -k` and `dmesg` work) —
+#: measured 2026-09-18, when the boot's kernel log held two
+#: `hwmon hwmon1: Undervoltage detected!` events, their `Voltage normalised`
+#: recoveries, and the SDIO WiFi's power-save transitions.
+#:
+#: The filter is reported *in* the record, alongside the totals, so an empty
+#: `lines` list reads as "no kernel line matched this filter" and never as "the
+#: kernel said nothing" — the same honesty rule as `file_growth_watched`.
+KERNEL_LOG_PATTERN = re.compile(
+    r"mmc|sdio|brcmf|ext4|jbd2|blk_|i/o error|timeout|undervolt|voltage|"
+    r"thermal|throttl|hung task|blocked for more than",
+    re.IGNORECASE,
+)
+KERNEL_LOG_LIMIT = 20
+KERNEL_LOG_MAX_LINES = 4000
+KERNEL_LOG_TIMEOUT_S = 5.0
+#: Seconds of lookback added to the measured window. The trigger fires on a 10 s
+#: PSI average, so the cause can predate t0; 5 s is a guess, stated as a
+#: constant, and every record carries the window it actually asked for.
+KERNEL_LOG_PAD_S = 5.0
+
 #: The in-window per-thread walk covers this fraction of the process set per
 #: sample, so every process is visited once per rotation instead of paying a
 #: full thread walk every 0.5 s. Threads are where a block hides behind a
@@ -188,6 +223,87 @@ def _read_text(path: Path) -> str | None:
         return path.read_text()
     except (OSError, ValueError):
         return None
+
+
+def _journalctl(args: Sequence[str]) -> str:
+    """Run `journalctl` and return its stdout. Raises on any failure."""
+    proc = subprocess.run(
+        ["journalctl", *args],
+        capture_output=True,
+        text=True,
+        timeout=KERNEL_LOG_TIMEOUT_S,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"journalctl exit {proc.returncode}: {(proc.stderr or '').strip()[:200]}"
+        )
+    return proc.stdout
+
+
+def kernel_log_window(
+    since_s: float,
+    *,
+    runner: Callable[[Sequence[str]], str] | None = None,
+    limit: int = KERNEL_LOG_LIMIT,
+) -> dict[str, Any]:
+    """Kernel messages from the last `since_s` seconds, filtered. Never raises.
+
+    One `journalctl -k` call per capture, with a timeout — the journal lives on
+    the same card as everything else here, so this channel buys its evidence
+    with the resource it is measuring. That is why the call is bounded (a pad,
+    a line cap, a timeout), why it happens *after* the window rather than inside
+    it, and why `capture()` differences `child_io()` around it: the observer's
+    `/proc/self/io` cannot see a child's reads, so without that the instrument's
+    cost would be understated exactly when the device is the thing being read.
+
+    `available: false` is a first-class answer (no journalctl, no permission, no
+    journal). It is never "the kernel was quiet" — that is `lines: []` with
+    `lines_total` beside it.
+    """
+    since = time.time() - max(0.0, since_s)
+    args = ["-k", "--no-pager", "-o", "short-iso", "--since", f"@{int(since)}"]
+    run = runner or _journalctl
+    try:
+        text = run(args)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return {
+            "source": "journalctl -k",
+            "available": False,
+            "window_s": round(since_s, 1),
+            "reason": f"{type(exc).__name__}: {exc}"[:200],
+        }
+    lines = [line for line in text.splitlines() if line.strip()]
+    scanned = lines[-KERNEL_LOG_MAX_LINES:]
+    matched = [line for line in scanned if KERNEL_LOG_PATTERN.search(line)]
+    return {
+        "source": "journalctl -k",
+        "available": True,
+        "window_s": round(since_s, 1),
+        "filter": KERNEL_LOG_PATTERN.pattern,
+        "lines_total": len(lines),
+        "lines_scanned": len(scanned),
+        "matched_total": len(matched),
+        "lines": matched[-limit:],
+    }
+
+
+def child_io() -> dict[str, int]:
+    """Block IO performed by this process's *children* (RUSAGE_CHILDREN).
+
+    `/proc/self/io` excludes children. This module is otherwise pure /proc reads
+    — free of the device it measures — and the kernel-log channel is the one
+    place that changes that, so the cost is measured rather than assumed.
+    `ru_inblock`/`ru_oublock` are in 512-byte units.
+    """
+    try:
+        usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    except (OSError, ValueError):  # pragma: no cover — not reachable on POSIX
+        return {"read_bytes": 0, "write_bytes": 0}
+    return {
+        "read_bytes": int(usage.ru_inblock) * 512,
+        "write_bytes": int(usage.ru_oublock) * 512,
+    }
 
 
 def parse_proc_io(text: str) -> dict[str, int]:
@@ -1449,6 +1565,14 @@ def capture(
 
     elapsed = round(monotonic() - started, 3)
 
+    # The kernel's account of the window, taken *after* it so the read is not
+    # competing with the stall it is describing, and bounded so it cannot become
+    # the writer it is hunting. `child_io` differences around it because the
+    # observer's own /proc/self/io cannot see a child's reads.
+    child_before = child_io()
+    kernel_log = kernel_log_window(elapsed + KERNEL_LOG_PAD_S)
+    child_after = child_io()
+
     io_denied = sum(1 for entry in procs_post.values() if entry.get("io_denied"))
     # The measured io refusal is also the only honest test for "this kernel is
     # hiding a wchan from us", so it is carried into every wchan reading below.
@@ -1601,6 +1725,19 @@ def capture(
         },
         # The instrument accounting for itself: if this record ever shows the
         # observer as the top writer, the observer is the defect.
+        # The kernel's own account of the window: mmc/SDIO/ext4/journal errors,
+        # undervoltage, thermal throttling. This is the only channel here that
+        # can explain a *wedge* — a stall with the device idle and no writer to
+        # name — and it is readable unprivileged on `picar`. Read `available`
+        # before `lines`: unavailable is not quiet.
+        "kernel_log": kernel_log,
+        # The instrument accounting for the one thing outside /proc/self/io.
+        "kernel_log_child_read_bytes": max(
+            0, child_after["read_bytes"] - child_before["read_bytes"]
+        ),
+        "kernel_log_child_write_bytes": max(
+            0, child_after["write_bytes"] - child_before["write_bytes"]
+        ),
         "observer_write_bytes": _delta(observer_pre, observer_post, "write_bytes"),
         "observer_read_bytes": _delta(observer_pre, observer_post, "read_bytes"),
     }
