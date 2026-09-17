@@ -1293,6 +1293,206 @@ def test_findmyhub_arrival_empty_input_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# Find Hub arrival *hysteresis* (issue #305)
+#
+# #305: 277 person_arrived_home transitions in 12.6 days (~22/day, every day)
+# from one tracker's 34 m-accurate fixes jittering across a bare 150 m radius.
+# These tests are about a sequence of fixes, which is why they cannot be
+# expressed as threshold assertions.
+# ---------------------------------------------------------------------------
+
+
+def _fresh_tracker_state():
+    """Reset the module cache so each series starts from the restart guard."""
+    from pxh import mind as mind_mod
+    mind_mod._last_known_findmyhub = {}
+    mind_mod._latch_suppressed = {}
+    return mind_mod
+
+
+def _tracker(distance_km, ts, accuracy_m=34.0):
+    return {"distance_km": distance_km, "accuracy_m": accuracy_m, "ts": ts}
+
+
+def _series(mind_mod, distances, *, accuracy_m=34.0, name="adrian"):
+    """Feed a distance series through the latch + edge detector."""
+    transitions = []
+    for ts, distance in enumerate(distances, start=1):
+        transitions.extend(
+            mind_mod._findmyhub_transitions(
+                {name: _tracker(distance, ts=ts, accuracy_m=accuracy_m)}
+            )
+        )
+    return transitions
+
+
+def test_findmyhub_boundary_jitter_produces_one_transition():
+    """#305 acceptance 1: a stationary tracker sitting on the radius boundary.
+
+    An arrival, then ten fixes jittering across the old 150 m threshold. The
+    filed incident had six transitions in ~100 minutes; this must produce one.
+    """
+    mind_mod = _fresh_tracker_state()
+    jitter = [0.12, 0.16, 0.13, 0.18, 0.14, 0.21, 0.11, 0.19, 0.15, 0.17]
+    transitions = _series(mind_mod, [2.4] + jitter)
+    assert transitions == ["person_arrived_home:adrian"]
+
+    # ...and the fix is load-bearing: the old bare threshold on the same series
+    # produces many more edges, which is the defect, not a tuning difference.
+    old_rule = [d < 0.15 for d in jitter]
+    old_edges = sum(1 for a, b in zip(old_rule, old_rule[1:]) if b and not a)
+    assert old_edges >= 3
+
+
+def test_findmyhub_absorbed_flips_are_counted_not_silently_dropped():
+    """The evidence half of the fix: crossings the latch absorbed are visible as
+    a number, both in the cache the code can read and on the next transition."""
+    mind_mod = _fresh_tracker_state()
+    lines: list[str] = []
+    from unittest.mock import patch
+    with patch.object(mind_mod, "log", lines.append):
+        _series(mind_mod, [2.4, 0.12, 0.16, 0.18, 0.21, 0.19, 0.40])
+    # 0.16 / 0.18 / 0.21 / 0.19 are the four fixes the old rule would have
+    # called departures; the report rides on the next real transition.
+    assert any("4 suppressed flips while latched" in line for line in lines)
+    # The count resets with the latch it belongs to.
+    assert mind_mod._latch_suppressed["adrian"] == 0
+
+
+def test_findmyhub_boundary_jitter_leaves_the_state_latched_home():
+    """The state, not just the greeting: the cache the prompt reads says home."""
+    mind_mod = _fresh_tracker_state()
+    _series(mind_mod, [0.12, 0.16, 0.18, 0.21, 0.19])
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+
+
+def test_findmyhub_genuine_arrival_fires_on_the_first_home_fix():
+    """#305 acceptance 2: a real away→home arrival is believed immediately.
+
+    No consecutive-sample debounce: findmyhub.json is rewritten every ~5 minutes
+    by an external cron, so requiring two samples would cost an arrival a full
+    period of lateness.
+    """
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [2.4]) == []
+    transitions = mind_mod._findmyhub_transitions({"adrian": _tracker(0.09, ts=2)})
+    assert transitions == ["person_arrived_home:adrian"]
+
+
+def test_findmyhub_restart_guard_survives_the_latch():
+    """Empty cache → state is latched but no edge fires; a later away→home pair
+    still fires. Without the guard every restart would greet a tracker that was
+    already home."""
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.10]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert _series(mind_mod, [1.5]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert _series(mind_mod, [0.10]) == ["person_arrived_home:adrian"]
+
+
+def test_findmyhub_departure_needs_the_wider_radius_then_re_arrival_fires():
+    """Hysteresis the other way: 0.22 km does not retire the home latch, and the
+    next genuine home fix after a real departure is an arrival again."""
+    mind_mod = _fresh_tracker_state()
+    assert _series(mind_mod, [0.12]) == []
+    assert _series(mind_mod, [0.22]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert _series(mind_mod, [0.40]) == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert _series(mind_mod, [0.12]) == ["person_arrived_home:adrian"]
+
+
+def test_findmyhub_semantic_tracker_is_untouched_by_the_latch():
+    """`place == "at-dads"` does not jitter, so it keeps deciding for itself."""
+    mind_mod = _fresh_tracker_state()
+    assert mind_mod._findmyhub_transitions(
+        {"adrian": {"semantic": True, "place": "at-mums", "at_home": False, "ts": 1}}
+    ) == []
+    transitions = mind_mod._findmyhub_transitions(
+        {"adrian": {"semantic": True, "place": "at-dads", "at_home": True, "ts": 2}}
+    )
+    assert transitions == ["person_arrived_home:adrian"]
+
+
+def test_findmyhub_one_sample_re_read_stays_one_decision():
+    """The awareness loop ticks every 60 s; the file changes every ~5 min. The
+    same sample re-read must not re-decide, and must not re-log."""
+    mind_mod = _fresh_tracker_state()
+    lines: list[str] = []
+    from unittest.mock import patch
+    with patch.object(mind_mod, "log", lines.append):
+        assert _series(mind_mod, [0.12]) == []
+        logged_after_first = len(lines)
+        for _ in range(4):  # same ts, four more awareness ticks
+            assert mind_mod._findmyhub_transitions(
+                {"adrian": _tracker(0.12, ts=1)}
+            ) == []
+    assert logged_after_first == 1
+    assert len(lines) == logged_after_first
+
+
+def test_findmyhub_hold_line_is_bounded_per_episode():
+    """Noise bound: a tracker parked in the band for ten samples logs one line,
+    not ten — the count carries the rest."""
+    mind_mod = _fresh_tracker_state()
+    lines: list[str] = []
+    from unittest.mock import patch
+    with patch.object(mind_mod, "log", lines.append):
+        _series(mind_mod, [0.12])  # latch home
+        lines.clear()
+        for ts in range(2, 12):  # ten in-band samples, all new
+            mind_mod._findmyhub_transitions(
+                {"adrian": _tracker(0.20 + 0.005 * ts, ts=ts)}
+            )
+        band_lines = [line for line in lines if "hold-band" in line]
+        assert len(band_lines) == 1
+        assert "would have flipped" in band_lines[0]
+        # Re-reading the last sample adds nothing at all.
+        mind_mod._findmyhub_transitions({"adrian": _tracker(0.255, ts=11)})
+        assert len([line for line in lines if "hold-band" in line]) == 1
+        assert mind_mod._latch_suppressed["adrian"] == 10
+
+
+def test_findmyhub_coarse_fix_is_evidence_of_a_suppressed_arrival():
+    """A 400 m-accurate fix 100 m from home cannot prove arrival — and the log
+    says so, rather than silently ignoring the tracker."""
+    mind_mod = _fresh_tracker_state()
+    lines: list[str] = []
+    from unittest.mock import patch
+    with patch.object(mind_mod, "log", lines.append):
+        assert _series(mind_mod, [2.4]) == []           # latched away
+        transitions = mind_mod._findmyhub_transitions(
+            {"adrian": _tracker(0.10, ts=2, accuracy_m=400.0)}
+        )
+    assert transitions == []
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    hold_lines = [line for line in lines if "hold-accuracy" in line]
+    assert len(hold_lines) == 1
+    assert "not evidence" in hold_lines[0]
+
+
+def test_enrich_tracker_defers_at_home_to_the_latch():
+    """The coordinate branch must not decide `at_home` on its own any more —
+    a bare threshold is what flapped. The semantic branch still does."""
+    import time as _time
+    from pxh.mind import _enrich_tracker
+
+    now = _time.time()
+    coord = _enrich_tracker(
+        {"lat": -43.13567, "lon": 147.11840, "accuracy_m": 34, "ts": now}, "adrian"
+    )
+    assert coord is not None
+    assert "distance_km" in coord
+    assert "at_home" not in coord
+    semantic = _enrich_tracker(
+        {"semantic": True, "address": "12 The Shack", "ts": now}, "adrian"
+    )
+    assert semantic is not None
+    assert semantic["at_home"] is True
+
+
+# ---------------------------------------------------------------------------
 # Close-the-loops sprint: action-outcome feedback, night cognition, notes schema
 # ---------------------------------------------------------------------------
 

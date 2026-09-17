@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from filelock import Timeout as FileLockTimeout
 
-from pxh import people, policy, policy_context
+from pxh import people, policy, policy_context, presence
 from pxh.utils import clamp
 from pxh.spark_config import ANNOUNCE_ALLOWED_TARGETS, ANNOUNCE_MAX_CHARS
 
@@ -617,8 +617,21 @@ def build_model_prompt(system_prompt: str, state: Dict[str, Any], user_text: str
                     a = _math.sin(dlat/2)**2 + _math.cos(_math.radians(HOME_LAT_VL)) * _math.cos(_math.radians(lat)) * _math.sin(dlon/2)**2
                     dist_km = 6371 * 2 * _math.asin(_math.sqrt(a))
                     age_min = int((_time.time() - raw["ts"]) / 60)
-                    location = "at home" if dist_km < 0.15 else f"{dist_km:.1f}km from home"
-                    loc_lines.append(f"  {label}: {location} (last seen {age_min}min ago, ±{raw.get('accuracy_m', '?'):.0f}m)")
+                    # Same bands as the arrival latch (#305): this label used to
+                    # carry its own bare 0.15 km threshold, so the prompt could say
+                    # "at home" while px-mind's latched state said away — and a
+                    # jittering tracker made both flap.
+                    location = presence.describe_location(dist_km)
+                    # An absent accuracy must not raise: a format spec applied to a
+                    # "?" placeholder threw, and the except below then dropped the
+                    # whole tracker block from the prompt without a word.
+                    accuracy = raw.get("accuracy_m")
+                    accuracy_txt = (
+                        f"±{accuracy:.0f}m" if isinstance(accuracy, (int, float)) else "±?m"
+                    )
+                    loc_lines.append(
+                        f"  {label}: {location} (last seen {age_min}min ago, {accuracy_txt})"
+                    )
                 if loc_lines:
                     context_sections.append("Tracker locations (use when directly asked — do not volunteer):")
                     context_sections.extend(loc_lines)

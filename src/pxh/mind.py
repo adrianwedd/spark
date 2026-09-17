@@ -50,6 +50,7 @@ from pxh import health as health_mod
 from pxh import intention as intention_mod
 from pxh import memory as spark_memory
 from pxh import provenance as prov
+from pxh.presence import ENTER_RADIUS_KM, EXIT_RADIUS_KM, latch_at_home
 from pxh.state import atomic_write, load_session, rotate_log, update_session
 from pxh.time import utc_timestamp
 from pxh.token_log import log_usage as _log_token_usage
@@ -883,6 +884,12 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
             }
         lat, lon = raw["lat"], raw["lon"]
         distance_km = _haversine_km(HOME_LAT, HOME_LON, lat, lon)
+        # No `at_home` here. A bare threshold cannot be right about a state that
+        # only makes sense against the previous reading: a 34 m-accurate fix
+        # sitting near a 150 m radius crossed it six times an hour (#305). The
+        # latched value is set by _latch_findmyhub_states, which is the only
+        # place that knows what the tracker's state already was; every reader
+        # (arrival edges, the prompt) sees that latched value.
         return {
             "lat":         round(lat, 5),
             "lon":         round(lon, 5),
@@ -890,7 +897,6 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
             "ts":          raw["ts"],
             "age_s":       round(age_s),
             "distance_km": round(distance_km, 2),
-            "at_home":     distance_km < 0.15,
         }
     except Exception as exc:
         log(f"findmyhub: {name} enrich error: {exc}")
@@ -932,7 +938,7 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
     even if at_home=true — preserves the daemon-restart guard. The cache is
     only mutated when ``findmyhub`` is non-empty, so stale-file windows do
     not erase the prior "away" baseline."""
-    global _last_known_findmyhub
+    global _last_known_findmyhub, _latch_suppressed
     transitions: list[str] = []
     if not findmyhub:
         return transitions
@@ -948,6 +954,95 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
             transitions.append(f"person_arrived_home:{tracker_name}")
         _last_known_findmyhub[tracker_name] = curr_data
     return transitions
+
+
+def _latch_detail(curr: dict, reason: str) -> str:
+    """The numbers behind one latch decision, for the log line.
+
+    Reason-specific wording on purpose: "we refused to call this a departure"
+    and "this fix is too coarse to be about the radius it was tested against"
+    are different facts, and an evidence log that blurs them cannot settle
+    whether the tracker is flapping."""
+    numbers = (
+        f"{curr.get('distance_km')}km, ±{curr.get('accuracy_m')}m, "
+        f"{ENTER_RADIUS_KM:.2f}km enter / {EXIT_RADIUS_KM:.2f}km exit"
+    )
+    if reason == "hold-band":
+        return f"{reason}: {numbers} — the old bare threshold would have flipped this"
+    if reason == "hold-accuracy":
+        return f"{reason}: {numbers} — not evidence about the radius it was tested against"
+    return f"{reason}: {numbers}"
+
+
+def _latch_findmyhub_states(findmyhub: dict) -> None:
+    """Latch every coordinate tracker's `at_home` against its previous state.
+
+    In place on purpose. The latched value is what both the arrival detector and
+    `awareness["findmyhub"]` must read; #305 is precisely two readers deciding
+    separately — a greeting that flapped six times per arrival and a prompt label
+    that disagreed with the state SPARK was acting on.
+
+    Semantic-address trackers carry their own `at_home` (an address does not
+    jitter) and pass straight through.
+
+    Logged per *new sample*, not per read: the awareness loop ticks every 60 s
+    while findmyhub.json is rewritten every ~5 min, so per-read logging would be
+    five copies of one fact. Noise is bounded to two lines per event — the real
+    transition, plus the first fix a latch absorbs — while every absorbed fix is
+    *counted*, which is the evidence #305 asked for: "the boundary was crossed"
+    is invisible in a transition count precisely because it no longer produces
+    transitions.
+    """
+    for name, curr in findmyhub.items():
+        if not isinstance(curr, dict) or curr.get("semantic"):
+            continue
+        if "distance_km" not in curr:
+            continue
+        prev = _last_known_findmyhub.get(name)
+        prev_home = prev.get("at_home") if isinstance(prev, dict) else None
+        sample_is_new = not isinstance(prev, dict) or prev.get("ts") != curr.get("ts")
+
+        state, reason = latch_at_home(
+            curr["distance_km"], curr.get("accuracy_m"), prev_home
+        )
+        if state is None:
+            state = prev_home
+        if state is not None:
+            curr["at_home"] = state
+        if not sample_is_new:
+            continue
+
+        # "Would the old bare threshold have flipped here?" — the honest measure
+        # of what the latch absorbed, as opposed to every in-band fix.
+        would_have_flipped = state is not None and (
+            (curr["distance_km"] <= ENTER_RADIUS_KM) != bool(state)
+        )
+        suppressed = _latch_suppressed.get(name, 0)
+        changed = state is not None and bool(state) != bool(prev_home)
+
+        if changed or suppressed == 0 and would_have_flipped:
+            absorbed = f"; {suppressed} suppressed flips while latched" if suppressed else ""
+            log(
+                f"findmyhub: {name} at_home {prev_home}→{state} "
+                f"({_latch_detail(curr, reason)}{absorbed})"
+            )
+        if would_have_flipped:
+            suppressed += 1
+        if changed:
+            suppressed = 0
+        _latch_suppressed[name] = suppressed
+
+
+def _findmyhub_transitions(findmyhub: dict) -> list[str]:
+    """Latch tracker states, then report away→home edges.
+
+    Order matters twice over: the edge detector reads `at_home`, so the latch has
+    to run first, and both share `_last_known_findmyhub` — the latch reads the
+    previous state that the detector is about to overwrite (#156 edges, #305
+    latch).
+    """
+    _latch_findmyhub_states(findmyhub)
+    return _detect_findmyhub_arrivals(findmyhub)
 
 
 def _fetch_ha_sleep(dry: bool = False) -> dict | None:
@@ -1774,8 +1869,15 @@ _mood_history: list[str] = []
 # Per-tracker cache of the most recent fresh Find Hub read (issue #156). Survives
 # stale-file windows so an away→home arrival isn't lost if the M5.local push
 # fails for a few ticks. Empty on daemon start — preserves the restart guard
-# (no false arrivals before we've ever seen a fresh "away" state).
+# (no false arrivals before we've ever seen a fresh "away" state). It is also
+# the hysteresis latch's memory: `at_home` in here is the *decided* state, not
+# a threshold's verdict on one fix (#305).
 _last_known_findmyhub: dict = {}
+# Per-tracker count of fixes the *old* bare threshold would have flipped while
+# the latch held, since the last real transition. Evidence, not log filler: it
+# turns "we stopped flapping" into a number, and it is what makes the next real
+# transition line say how much noise the latch absorbed (#305).
+_latch_suppressed: dict = {}
 _consecutive_reflection_failures: int = 0
 # HA host offline flag: when set, awareness_tick skips all HA fetches until expired.
 # Set by the first HA network error in the tick; cleared automatically on expiry.
@@ -1972,9 +2074,10 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
     if system_stats.get("ram_pct", 0) >= 90 and prev_stats.get("ram_pct", 0) < 90:
         transitions.append("ram_pressure_high")
 
-    # Find Hub arrival transitions — see _detect_findmyhub_arrivals (issue #156).
+    # Find Hub arrival transitions — latched first, then edge-detected; see
+    # _findmyhub_transitions (#156 edges, #305 hysteresis).
     findmyhub = _read_findmyhub()
-    transitions.extend(_detect_findmyhub_arrivals(findmyhub))
+    transitions.extend(_findmyhub_transitions(findmyhub))
 
     awareness = {
         "ts": utc_timestamp(),
@@ -2291,6 +2394,7 @@ def _reset_state():
     _time_period_start_mono = 0.0
     _last_image_cleanup = 0.0
     _last_known_findmyhub = {}
+    _latch_suppressed = {}
     _ha_offline_until = 0.0
 
 
