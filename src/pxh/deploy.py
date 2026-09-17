@@ -46,6 +46,7 @@ is the whole reason this module exists.
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import re
 import subprocess
@@ -486,6 +487,89 @@ def _module_name_for(path: str) -> str | None:
     if not path.startswith(prefix) or not path.endswith(".py"):
         return None
     return path[len(prefix):-3].replace(os.sep, ".")
+
+
+#: Where systemd reads installed units from on the host this runs on.
+SYSTEMD_INSTALL_DIR = "/etc/systemd/system"
+
+
+@dataclass(frozen=True)
+class UnitFileDrift:
+    """A repo unit file whose installed copy is not what the repo says.
+
+    The gate's promise — "every long-lived unit is executing the deployed
+    revision" — is about *code*. It says nothing about the unit file itself, and
+    six installed units on `picar` were months behind the repo on 2026-09-18
+    (`px-post.service` and `px-evolve.service` since March, `px-mind.service`
+    since May, `px-api-server.service` since July, `px-wake-listen.service` since
+    August), including *functional* differences: bounded restarts,
+    `Wants=network-online.target`, and a narrowed `PATH`. Those changes were
+    reviewed and merged; they were simply never installed, and nothing on the
+    host noticed.
+    """
+
+    unit: str
+    repo_path: str
+    installed_path: str
+    reason: str  # "differs" | "not installed" | "unreadable"
+
+
+def _digest(path: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def unit_file_drift(
+    unit: str,
+    root: str = ".",
+    install_dir: str = SYSTEMD_INSTALL_DIR,
+    unit_src_dir: str = "systemd",
+) -> list[UnitFileDrift]:
+    """Repo unit files (and drop-ins) that differ from the installed copies.
+
+    Best-effort and never raising: an unreadable installed file is reported as
+    `unreadable` rather than as drift, because "cannot check" and "changed" are
+    different facts and only one of them is actionable.
+    """
+    src_root = os.path.join(root, unit_src_dir)
+    candidates: list[tuple[str, str]] = [
+        (os.path.join(src_root, unit), os.path.join(install_dir, unit))
+    ]
+    drop_in_src = os.path.join(src_root, unit + ".d")
+    drop_in_dst = os.path.join(install_dir, unit + ".d")
+    try:
+        names = sorted(os.listdir(drop_in_src))
+    except OSError:
+        names = []
+    for name in names:
+        candidates.append((os.path.join(drop_in_src, name), os.path.join(drop_in_dst, name)))
+
+    drift: list[UnitFileDrift] = []
+    for repo_path, installed_path in candidates:
+        if not os.path.isfile(repo_path):
+            continue
+        repo_digest = _digest(repo_path)
+        if repo_digest is None:
+            continue  # the repo copy is unreadable: not something to report here
+        installed_digest = _digest(installed_path)
+        reason = None
+        if installed_digest is None:
+            reason = "unreadable" if os.path.exists(installed_path) else "not installed"
+        elif installed_digest != repo_digest:
+            reason = "differs"
+        if reason is not None:
+            drift.append(
+                UnitFileDrift(
+                    unit=unit,
+                    repo_path=os.path.relpath(repo_path, root),
+                    installed_path=installed_path,
+                    reason=reason,
+                )
+            )
+    return drift
 
 
 @dataclass(frozen=True)

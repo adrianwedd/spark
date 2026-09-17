@@ -37,6 +37,7 @@ from pxh.deploy import (
     changed_symbols,
     needs_restart,
     restart_list,
+    unit_file_drift,
 )
 
 ENTRY_RE = re.compile(r"(/[^\s;\"']*/(?:bin|systemd)/[^\s;\"']*)")
@@ -120,14 +121,30 @@ def main():
         mark = "RESTART" if verdict.needs_restart else "ok     "
         print("  {}  {:24s} {}".format(mark, verdict.name, verdict.reason))
 
+    # The other half of "the deployed revision is what runs": the *unit files*
+    # the host reads. They are installed by hand (`sudo install …`), so a merged
+    # unit change is invisible until someone does that, and nothing on the host
+    # noticed six of them being months behind (#336, 2026-09-18). Reported, not
+    # failed: fixing it needs root, and blocking a deploy on a root-only action
+    # would teach people to ignore this gate.
+    drift = [d for name in unit_names() for d in unit_file_drift(name, root=root)]
+
     if not stale:
         print("every long-lived unit is executing the deployed revision")
-        return 0
+    else:
+        print()
+        print("restart these before calling the deploy complete:")
+        print("  sudo systemctl restart " + " ".join(v.name.replace(".service", "") for v in stale))
 
-    print()
-    print("restart these before calling the deploy complete:")
-    print("  sudo systemctl restart " + " ".join(v.name.replace(".service", "") for v in stale))
-    return 1
+    if drift:
+        print()
+        print("{} installed unit file(s) differ from the repo (no restart fixes this):".format(len(drift)))
+        for item in drift:
+            print("  {:<12} {:44s} {}".format(item.reason, item.installed_path, item.repo_path))
+        print("install them, then daemon-reload — the next restart picks them up:" )
+        print("  sudo install -m 0644 systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload")
+
+    return 1 if stale else 0
 
 
 if __name__ == "__main__":

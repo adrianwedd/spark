@@ -733,3 +733,85 @@ def test_the_replayed_incident_flags_exactly_the_hand_restarted_units():
         "px-evolve.service",
         "px-mind.service",
     }
+
+# --- installed unit files vs the repo (#336) -------------------------------
+#
+# The gate's promise is about *code*; the unit file the host reads is installed
+# by hand. Six installed units on picar were months behind the repo on
+# 2026-09-18, including functional differences (bounded restarts,
+# Wants=network-online.target, a narrowed PATH).
+
+
+def _unit_pair(tmp_path, name="px-mind.service", *, repo_text="[Unit]\nX=1\n",
+               installed_text="[Unit]\nX=1\n", installed=True, drop_in=None,
+               base=None):
+    tmp_path = base or tmp_path
+    repo = tmp_path / "systemd"
+    repo.mkdir(parents=True, exist_ok=True)
+    (repo / name).write_text(repo_text)
+    if drop_in is not None:
+        d = repo / (name + ".d")
+        d.mkdir()
+        (d / "10-containment.conf").write_text(drop_in)
+    installed_dir = tmp_path / "etc"
+    installed_dir.mkdir(parents=True, exist_ok=True)
+    if installed:
+        (installed_dir / name).write_text(installed_text)
+    return str(tmp_path), str(installed_dir)
+
+
+def test_a_matching_unit_file_is_not_reported(tmp_path):
+    from pxh.deploy import unit_file_drift
+
+    root, installed = _unit_pair(tmp_path)
+    assert unit_file_drift("px-mind.service", root=root, install_dir=installed) == []
+
+
+def test_a_stale_installed_unit_file_is_reported(tmp_path):
+    from pxh.deploy import unit_file_drift
+
+    root, installed = _unit_pair(
+        tmp_path, repo_text="[Unit]\nStartLimitBurst=5\n",
+        installed_text="[Unit]\nStartLimitIntervalSec=0\n",
+    )
+    drift = unit_file_drift("px-mind.service", root=root, install_dir=installed)
+    assert [(d.reason, d.repo_path) for d in drift] == [
+        ("differs", "systemd/px-mind.service")
+    ]
+
+
+def test_a_missing_or_unreadable_install_is_not_reported_as_drift(tmp_path):
+    """`cannot check` and `changed` are different facts, and only one is actionable."""
+    from pxh.deploy import unit_file_drift
+
+    root, installed = _unit_pair(tmp_path, installed=False)
+    assert [d.reason for d in unit_file_drift("px-mind.service", root=root, install_dir=installed)] == [
+        "not installed"
+    ]
+    # A directory where the file should be: read fails, path exists.
+    root2, installed2 = _unit_pair(tmp_path, installed=True, base=tmp_path / "second")
+    os.remove(os.path.join(installed2, "px-mind.service"))
+    os.mkdir(os.path.join(installed2, "px-mind.service"))
+    assert [d.reason for d in unit_file_drift("px-mind.service", root=root2, install_dir=installed2)] == [
+        "unreadable"
+    ]
+
+
+def test_drop_ins_are_checked_too(tmp_path):
+    from pxh.deploy import unit_file_drift
+
+    root = tmp_path / "r"
+    (root / "systemd" / "px-frigate-stream.service.d").mkdir(parents=True)
+    (root / "systemd" / "px-frigate-stream.service").write_text("[Unit]\n")
+    (root / "systemd" / "px-frigate-stream.service.d" / "10-containment.conf").write_text("a=1\n")
+    installed = tmp_path / "i"
+    (installed / "px-frigate-stream.service.d").mkdir(parents=True)
+    (installed / "px-frigate-stream.service").write_text("[Unit]\n")
+    (installed / "px-frigate-stream.service.d" / "10-containment.conf").write_text("a=2\n")
+
+    drift = unit_file_drift(
+        "px-frigate-stream.service", root=str(root), install_dir=str(installed)
+    )
+    assert [(d.reason, os.path.basename(d.repo_path)) for d in drift] == [
+        ("differs", "10-containment.conf")
+    ]
