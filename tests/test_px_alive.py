@@ -1141,3 +1141,36 @@ def test_both_idle_branches_report_health_before_continuing():
             f"the {mode} branch skips the loop's health write, so the board "
             f"reads stale for a working daemon"
         )
+
+
+def test_a_proximity_greeting_is_beaten_and_names_its_own_phase(tmp_path, isolated_project):
+    """Found in the daemon's own buckets on 2026-09-18: a 9,017 ms gap.
+
+    `heartbeat_gap_max_mode` said `ease_proximity`, which is the mode of the beat
+    *before* the gap — the proximity branch eases and then greets, and the
+    greeting ran `tool-voice` as a blocking subprocess with an 8 s timeout and no
+    heartbeat of its own. The 15 s watchdog's margin fell to 5.98 s because of
+    it. Same shape as make_px() and the camera teardown, so it takes the same
+    wrapper — and it publishes its own mode, so the next gap of this kind is
+    attributed to the phase that actually blocked.
+    """
+    alive = load_alive_module({
+        "PX_ALIVE_HEARTBEAT_DIR": str(tmp_path / "runtime"),
+        "PX_STATE_DIR": str(isolated_project["state_dir"]),
+        "PX_LOG_FILE": str(isolated_project["log_dir"] / "px-alive.log"),
+    })
+
+    beats = []
+    alive["write_alive_heartbeat"] = lambda mode, now=None: beats.append(mode)
+    alive["HEARTBEAT_EVERY_S"] = 0.05
+
+    def _slow_voice(*_args, **_kwargs):
+        time.sleep(0.35)  # stands in for a tool-voice run that takes seconds
+        return None
+
+    alive["_subprocess"].run = _slow_voice
+    alive["spark_greet"](dry=True)
+
+    assert beats, "the greeting's blocking voice call produced no heartbeat at all"
+    assert set(beats) == {"greeting"}, "the phase that blocked must name itself"
+    assert len(beats) >= 3, f"only {len(beats)} beats across a 0.35s greeting"
