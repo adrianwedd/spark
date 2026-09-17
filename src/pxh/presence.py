@@ -18,7 +18,11 @@ Two mechanisms, both required by the evidence:
   already had instead of re-deciding on every fix;
 * an accuracy gate — a fix whose stated accuracy is worse than the radius it
   would be judged against is not evidence about that radius, so it holds the
-  state rather than flipping it.
+  state rather than flipping it;
+* two agreeing fixes before the state may leave home (``EXIT_CONFIRMATIONS``).
+  Arrivals are single-sample on purpose: waiting on the side that greets would
+  trade a spurious greeting for a late one, which is not a trade this system
+  makes.
 
 Deliberately *not* a "N consecutive samples" debounce: ``findmyhub.json`` is
 refreshed by an external cron roughly every 5 minutes while the awareness loop
@@ -34,6 +38,13 @@ from __future__ import annotations
 ENTER_RADIUS_KM = 0.15
 #: home → away. Never equal to the enter radius: that is the whole point.
 EXIT_RADIUS_KM = 0.30
+#: Usable fixes that must agree before the state may leave home (or latch away
+#: on a first sighting). One far fix is a claim about one GPS sample: on
+#: 2026-09-17 a tracker sitting at home produced one at ±100 m accuracy, the
+#: restart guard latched it as away, and the next good fix greeted the arrival —
+#: a spurious greeting produced by a deploy. Arrivals stay single-sample: this
+#: confirmation is only on the side where waiting costs nothing.
+EXIT_CONFIRMATIONS = 2
 
 ENTER_RADIUS_M = ENTER_RADIUS_KM * 1000
 EXIT_RADIUS_M = EXIT_RADIUS_KM * 1000
@@ -42,6 +53,11 @@ EXIT_RADIUS_M = EXIT_RADIUS_KM * 1000
 #: decision from a refusal, and a refusal worth logging from one that is not.
 DECISION_REASONS = ("enter", "exit", "away", "stay")
 HOLD_REASONS = ("hold-band", "hold-accuracy", "unknown")
+#: Reasons that leave the state unchanged without refusing anything.
+NEUTRAL_REASONS = ("pending-far",)
+#: A usable far fix that is waiting for its confirmation. Not a state change and
+#: not a refusal: the state simply has not moved yet.
+PENDING_REASON = "pending-far"
 #: The two refusals that mean "a flip was suppressed", i.e. the flapping #305
 #: filed. `unknown` is not one of them — it is the first-ever fix being too
 #: coarse to promote, which is a different claim.
@@ -52,6 +68,7 @@ def latch_at_home(
     distance_km: float,
     accuracy_m: float | None,
     previous: bool | None,
+    far_streak: int = 0,
 ) -> tuple[bool | None, str]:
     """Decide — or decline to decide — whether one tracker fix means "home".
 
@@ -77,6 +94,10 @@ def latch_at_home(
         not evidence either way.
     ``unknown``
         no previous state *and* no usable fix — nothing to hold.
+    ``pending-far``
+        a usable far fix waiting for ``EXIT_CONFIRMATIONS``: no state change.
+        `far_streak` is how many consecutive usable far fixes the caller has
+        already seen, because only the caller can count across reads.
     """
     accuracy = 0.0 if accuracy_m is None else max(0.0, float(accuracy_m))
     was_home = bool(previous)
@@ -84,6 +105,8 @@ def latch_at_home(
     if distance_km <= ENTER_RADIUS_KM and accuracy <= ENTER_RADIUS_M:
         return True, ("stay" if was_home else "enter")
     if distance_km > EXIT_RADIUS_KM and accuracy <= EXIT_RADIUS_M:
+        if far_streak + 1 < EXIT_CONFIRMATIONS:
+            return None, PENDING_REASON
         return False, ("away" if not was_home else "exit")
 
     # Nothing is strong enough to move the state. Name why: a suppressed flip
