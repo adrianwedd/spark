@@ -99,8 +99,32 @@ def log(msg: str) -> None:
     print(line, flush=True)
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_DIR / "px-blog.log", "a") as f:
+        log_file = LOG_DIR / "px-blog.log"
+        with open(log_file, "a") as f:
             f.write(line + "\n")
+        # Simple rotation: keep last half when the file exceeds 5MB. This log
+        # had **none** and had reached 5.2 MB (#247's audit: it was the only
+        # unbounded one left -- px-post and px-alive rotate, px-mind goes
+        # through state.rotate_log, and the other seven own-log writers hold
+        # bytes to kilobytes).
+        #
+        # Deliberately no fsync: a log's durability buys nothing, and the fsync
+        # forced an ext4 journal commit while rewriting half a multi-megabyte
+        # file (#373's class). Deliberately inline rather than a call into
+        # pxh.state: the logging path has to keep working when the package is
+        # broken, and a missing import there disabled rotation silently -- a
+        # disk-fill bug hiding inside a tidier call (#383).
+        try:
+            if log_file.stat().st_size > 5_000_000:
+                lines = log_file.read_text(encoding="utf-8").splitlines()
+                half = len(lines) // 2
+                fd, tmp = tempfile.mkstemp(dir=str(log_file.parent), suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines[half:]) + "\n")
+                    f.flush()
+                os.replace(tmp, str(log_file))
+        except Exception:
+            pass
     except OSError:
         pass
 
