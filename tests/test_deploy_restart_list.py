@@ -433,6 +433,93 @@ def test_an_undetermined_change_is_a_restart(tmp_path):
     assert "could not be determined" in verdicts[0].reason
 
 
+# --- a changed name that reaches importers through the module's own code (#365)
+#
+# The mic ring: `DEFAULT_ALSA_BUFFER_S` is read exactly once in
+# `pxh/mic_stream.py`, as the default value of `ArecordStream.__init__`'s
+# `alsa_buffer_s`. `px-wake-listen` names only `ArecordStream`, so the symbol
+# comparison answered "references none of the changed names" and the capture
+# daemon would have been left on the old ring (replayed on `picar` 2026-09-17).
+
+_MIC_V1 = """DEFAULT_ALSA_BUFFER_S = 4.0
+
+
+class ArecordStream:
+    def __init__(self, alsa_buffer_s: float = DEFAULT_ALSA_BUFFER_S):
+        self.alsa_buffer_s = alsa_buffer_s
+
+    def build_command(self):
+        return ["--buffer-size", str(self.alsa_buffer_s)]
+
+
+def unrelated():
+    return 1
+"""
+
+_MIC_V2 = _MIC_V1.replace("= 4.0", "= 12.0")
+
+
+def test_changed_symbols_attributes_a_read_to_the_definition_that_reads_it(tmp_path):
+    _tree(
+        tmp_path,
+        entries={"px-wake-listen": "#!/usr/bin/env python3\nfrom pxh.mic_stream import ArecordStream\n"},
+        modules={"mic_stream": _MIC_V1},
+    )
+    first = _git(tmp_path, {"src/pxh/mic_stream.py": _MIC_V2})
+    path = "src/pxh/mic_stream.py"
+    change = changed_symbols(first, "HEAD", path, str(tmp_path))
+    assert change.symbols == frozenset({"DEFAULT_ALSA_BUFFER_S"})
+    assert change.internal_readers == {
+        "DEFAULT_ALSA_BUFFER_S": frozenset({"ArecordStream"})
+    }
+    assert change.read_at_module_level is False
+
+
+def test_a_constant_behind_a_default_argument_flags_the_unit_that_calls_the_class(tmp_path):
+    _tree(
+        tmp_path,
+        entries={
+            "px-wake-listen": "#!/usr/bin/env python3\nfrom pxh.mic_stream import ArecordStream\nArecordStream()\n",
+            # References the module but not the class whose default moved.
+            "px-other": "#!/usr/bin/env python3\nfrom pxh.mic_stream import unrelated\nunrelated()\n",
+        },
+        modules={"mic_stream": _MIC_V1},
+    )
+    first = _git(tmp_path, {"src/pxh/mic_stream.py": _MIC_V2})
+    path = "src/pxh/mic_stream.py"
+    changes = {path: changed_symbols(first, "HEAD", path, str(tmp_path))}
+    units = [
+        _unit("px-wake-listen.service", tmp_path / "bin" / "px-wake-listen", 0.0),
+        _unit("px-other.service", tmp_path / "bin" / "px-other", 0.0),
+    ]
+    verdicts = {
+        v.name: v
+        for v in restart_list([path], units, root=str(tmp_path), changes=changes)
+    }
+    assert verdicts["px-wake-listen.service"].needs_restart is True
+    assert "DEFAULT_ALSA_BUFFER_S" in verdicts["px-wake-listen.service"].reason
+    assert "reads" in verdicts["px-wake-listen.service"].reason
+    # Precision: the flow is attributed to the definition the unit calls, so a
+    # unit that calls something else in the same module is not dragged in.
+    assert verdicts["px-other.service"].needs_restart is False
+
+
+def test_a_changed_name_read_at_module_level_flags_every_importer(tmp_path):
+    _tree(
+        tmp_path,
+        entries={"px-reads": "#!/usr/bin/env python3\nfrom pxh.cfg import DERIVED\nprint(DERIVED)\n"},
+        modules={"cfg": "BASE = 1\nDERIVED = BASE + 1\n"},
+    )
+    first = _git(tmp_path, {"src/pxh/cfg.py": "BASE = 2\nDERIVED = BASE + 1\n"})
+    path = "src/pxh/cfg.py"
+    change = changed_symbols(first, "HEAD", path, str(tmp_path))
+    assert change.read_at_module_level is True
+    units = [_unit("px-reads.service", tmp_path / "bin" / "px-reads", 0.0)]
+    verdicts = restart_list([path], units, root=str(tmp_path), changes={path: change})
+    assert verdicts[0].needs_restart is True
+    assert "module level" in verdicts[0].reason
+
+
 def test_without_a_change_map_the_old_path_rule_stands(tmp_path):
     """Callers with no git revisions to hand keep the conservative behaviour."""
     _tree(
