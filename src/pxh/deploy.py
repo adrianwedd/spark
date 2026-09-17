@@ -559,6 +559,15 @@ def _change_hits(
         if not resolvable:
             hits.append((path, "references it in a way static analysis cannot resolve"))
             continue
+        if not names:
+            # The unit *runs* this module rather than naming anything in it:
+            # `bin/px-mind` ends in `exec python -m pxh.mind "$@"`, so there is
+            # no name to compare against and every changed symbol is reachable.
+            # This is what hid `#370`'s `awareness_tick` change — the verdict
+            # read "references none of the changed names", which was true and
+            # meaningless. A dead import now costs a restart instead.
+            hits.append((path, "this unit runs the module, so any change in it counts"))
+            continue
         touched = change.symbols & names
         if touched:
             shown = ", ".join(sorted(touched)[:3])

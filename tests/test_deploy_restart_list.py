@@ -25,6 +25,7 @@ from pxh.deploy import (
     imported_pxh_modules,
     needs_restart,
     restart_list,
+    unit_module_references,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -504,6 +505,60 @@ def test_a_constant_behind_a_default_argument_flags_the_unit_that_calls_the_clas
     # Precision: the flow is attributed to the definition the unit calls, so a
     # unit that calls something else in the same module is not dragged in.
     assert verdicts["px-other.service"].needs_restart is False
+
+
+def test_a_wrapper_that_runs_the_module_is_flagged_on_any_change(tmp_path):
+    """The *real* shape of the `#370` miss, which my first version of this test
+    got wrong: `bin/px-mind` is bash ending in `exec python -m pxh.mind "$@"`.
+    The gate resolved the module (it is in the closure) but extracted **no
+    names** from it, so the reference comparison and the reachability walk both
+    came up empty and it reported "references none of the changed names" — a
+    true statement about a unit that runs the whole module."""
+    _tree(
+        tmp_path,
+        entries={
+            "px-mind": (
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "source \"$SCRIPT_DIR/px-env\"\n"
+                'exec python -m pxh.mind "$@"\n'
+            )
+        },
+        modules={
+            "mind": (
+                "def awareness_tick():\n"
+                "    return 1\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    return awareness_tick()\n"
+            )
+        },
+    )
+    first = _git(
+        tmp_path,
+        {"src/pxh/mind.py": (
+            "def awareness_tick():\n"
+            "    return 2\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    return awareness_tick()\n"
+        )},
+    )
+    path = "src/pxh/mind.py"
+    changes = {path: changed_symbols(first, "HEAD", path, str(tmp_path))}
+    units = [_unit("px-mind.service", tmp_path / "bin" / "px-mind", 0.0)]
+    # The closure must actually see the module for this shape: the wrapper only
+    # reaches it through `python -m` (test_shell_wrapper_running_python_m_is_seen).
+    assert "mind" in import_closure(str(tmp_path / "bin" / "px-mind"), str(tmp_path))
+    assert path in executed_paths(str(tmp_path / "bin" / "px-mind"), str(tmp_path))
+    assert unit_module_references(
+        str(tmp_path / "bin" / "px-mind"), str(tmp_path), "pxh.mind"
+    ) == (set(), True)
+    verdicts = restart_list([path], units, root=str(tmp_path), changes=changes)
+    assert verdicts[0].needs_restart is True
+    assert "runs the module" in verdicts[0].reason
 
 
 def test_a_change_two_hops_in_flags_the_unit_that_runs_the_loop(tmp_path):
