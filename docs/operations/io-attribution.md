@@ -433,6 +433,35 @@ open ask: `vm.dirty_*` and `dirty_writeback_centisecs` (the 5 s flusher that
 `Storage=`/`SyncIntervalSec`. Nothing in user space changes how many commits the
 kernel chooses to write.
 
+## 2026-09-18 02:00 — how to read an io-PSI number on *this* box
+
+PSI io is a per-task aggregate, and this host runs ~200 processes with very few
+runnable at any instant. 582 samples at 0.5 s, 300 s:
+
+```
+                    median   max
+procs_running            1      6
+procs_blocked            0      3
+D-state tasks            0      5
+
+worst intervals (accrued task-io-stall per 0.5 s sample):
+   482 ms  running=2 blocked=2 D=4
+   468 ms  running=1 blocked=3 D=5
+   459 ms  running=1 blocked=1 D=2
+```
+
+**So `psi_io some ≈ full` at 25-45 % here means "the one or two runnable tasks
+were waiting on IO", not "the system froze".** Real waits are visible (an
+interval can accrue ~480 ms of a task's stall out of 500 ms), but they involve a
+handful of tasks, and after the `#367`/`#370`/`#373`/`#376`/`#377` fixes the
+tasks doing the waiting are `jbd2`, `flush-179:0`, `kblockd` and
+`systemd-journal` — kernel threads and journald, which no `/proc` channel this
+side of root can name.
+
+Every record therefore carries `procs_running_*` and `procs_blocked_*`: without
+them a 40 % reading invites the wrong story, and this issue's own history shows
+where that goes.
+
 ## Reading a record
 
 ```bash
@@ -460,6 +489,7 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `device_write_bytes` / `unattributed_write_bytes` / `unattributed_write_share` | the busiest real device's bytes, and how much of that has **no process's name on it**. Measured 60 s window: `mmcblk0` 2596 KB, every readable process 92 KB — share **0.965**. Journal and metadata are charged to kernel threads (`jbd2`, `kblockd`, `flush-179:0`), so *no* `/proc` channel can name them, privileged or not. Caveat that keeps it honest: `write_bytes` charges page-cache writes to the dirtying task, so a high share means "mostly journal/metadata", never "nobody wrote" |
 | `device_inflight_pre` / `device_inflight_post` | `/sys/block/<dev>/inflight` at each end of the window — requests *currently* dispatched. Zero is reported, not dropped: `0/0` during a stall is the finding, not a missing sample. `pre` is inside the stall (the caller triggered because PSI is high now), `post` shows recovery |
 | `vmstat` / `vmstat_end` | swap-in/out and direct-reclaim deltas; `nr_dirty`/`nr_writeback` gauges |
+| `procs_running_pre` / `procs_blocked_pre` / `_post_` | the context for reading PSI at all. `some` is "≥1 task stalled" and `full` is "every non-idle task stalled", so with one or two runnable tasks both read 25-45 % while almost nothing is happening. Measured on `picar` 2026-09-18 (582 samples @ 0.5 s): `procs_running` median **1**, max 6; `procs_blocked` median **0**, max 3; `D`-state median **0**, max 5 — including in the intervals with the most accrued stall time, where 1-2 tasks were runnable. `full` tracking `some` on this box is **not** evidence of a system-wide freeze |
 | `psi_pre` / `psi_post` | `psi_io_some_avg10_*`, `psi_io_full_avg10_*`, memory PSI, `load1`, `swap_free_kb` on both ends |
 | `observer_write_bytes` | the observer's own disk writes during the window — if it ever tops the list, the observer is the defect |
 | `uptime_s` | correlates a record with boot-relative kernel logs |

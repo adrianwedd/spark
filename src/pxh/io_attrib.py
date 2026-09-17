@@ -126,6 +126,7 @@ class Paths:
     pressure_io: Path = Path("/proc/pressure/io")
     diskstats: Path = Path("/proc/diskstats")
     vmstat: Path = Path("/proc/vmstat")
+    proc_stat: Path = Path("/proc/stat")
     uptime: Path = Path("/proc/uptime")
     #: Per-device ``inflight`` gauges. A directory rather than a file because
     #: the interesting question is per device, and because the answer "0/0"
@@ -222,6 +223,27 @@ def parse_diskstats(text: str) -> dict[str, dict[str, int]]:
         if counters:
             devices[name] = counters
     return devices
+
+
+def parse_procs_stat(text: str) -> dict[str, int]:
+    """`{"running": n, "blocked": n}` from /proc/stat's procs_* lines.
+
+    The context every io-PSI number needs and neither PSI file carries. `some`
+    is "at least one task stalled" and `full` is "every non-idle task stalled",
+    so on a box where only one or two tasks are runnable, both can read 25-45 %
+    while almost nothing is happening — and the reverse reading ("the whole
+    system froze") is the one that gets written into issues. `procs_running`
+    and `procs_blocked` are what tells the two apart, and they are two lines of
+    a world-readable file.
+    """
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "procs_running":
+            out["running"] = int(value.strip() or 0)
+        elif key == "procs_blocked":
+            out["blocked"] = int(value.strip() or 0)
+    return out
 
 
 def parse_vmstat(text: str) -> dict[str, int]:
@@ -972,6 +994,7 @@ def capture(
     started = monotonic()
 
     psi_pre = host_load_fields("pre")
+    sys_ctx_pre = parse_procs_stat(_read_text(paths.proc_stat) or "")
     disk_pre = parse_diskstats(_read_text(paths.diskstats) or "")
     vmstat_pre = parse_vmstat(_read_text(paths.vmstat) or "")
     uptime_text = _read_text(paths.uptime)
@@ -997,6 +1020,7 @@ def capture(
     ext4_post = sample_ext4(paths)
     observer_post = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
     psi_post = host_load_fields("post")
+    sys_ctx_post = parse_procs_stat(_read_text(paths.proc_stat) or "")
 
     elapsed = round(monotonic() - started, 3)
 
@@ -1052,6 +1076,14 @@ def capture(
         "trigger": dict(trigger or {}),
         "psi_pre": psi_pre,
         "psi_post": psi_post,
+        # The context for reading those two: `full` tracking `some` means "every
+        # runnable task was stalled", which on an idle box is one or two tasks
+        # and not a system-wide freeze. Measured on `picar` 2026-09-18: during
+        # 25-45 % episodes `procs_running` was 1-3.
+        "procs_running_pre": sys_ctx_pre.get("running"),
+        "procs_running_post": sys_ctx_post.get("running"),
+        "procs_blocked_pre": sys_ctx_pre.get("blocked"),
+        "procs_blocked_post": sys_ctx_post.get("blocked"),
         "devices": devices,
         # How much of what reached the disk has a process's name on it. A record
         # whose device wrote megabytes with `write_bytes_total` in the kilobytes
