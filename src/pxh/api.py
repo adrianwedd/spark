@@ -828,16 +828,12 @@ async def public_status() -> Dict[str, Any]:
     except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
         pass  # expected on missing/corrupt thoughts file
 
-    # Claude session budget
-    model_sessions_today = 0
-    model_budget_remaining = 8
-    try:
-        from pxh.model_session import _load_session_log, _today_entries, DAILY_CAP
-        today = _today_entries(_load_session_log())
-        model_sessions_today = len(today)
-        model_budget_remaining = max(0, DAILY_CAP - model_sessions_today)
-    except Exception:
-        pass
+    # Model-session budget. `None` is a reported state, not a fallback: the old
+    # 0-used / 8-remaining default was indistinguishable from a fresh, unspent
+    # day while the dependency that computes it was gone (#332).
+    _budget = _model_budget_today()
+    model_sessions_today = _budget["used_today"] if _budget else None
+    model_budget_remaining = _budget["remaining"] if _budget else None
 
     return {
         "persona": "spark",
@@ -1105,32 +1101,87 @@ async def public_race():
     return result
 
 
+def _model_budget_today() -> Dict[str, Any] | None:
+    """Today's model-session spend, or None when this capability cannot run.
+
+    None means "the dependency that answers this question is unusable", and every
+    caller renders that absence explicitly rather than substituting numbers. The
+    old shape returned a plausible `0 used / 8 remaining` from an `except`
+    clause, which is the worst kind of wrong: a reader — or a dashboard — cannot
+    tell it from a genuine fresh day, so a broken capability read as a quiet
+    one (#332).
+
+    While the dependency is unusable the capability is recorded as blocked, so
+    the health board names the daemon and the capability instead of leaving the
+    evidence in a log line nobody reads. A successful read clears it.
+    """
+    from pxh import health as _health
+
+    try:
+        from pxh.model_session import DAILY_CAP, _load_session_log, _today_entries
+
+        today = _today_entries(_load_session_log())
+    except Exception as exc:
+        _health.record_capability_failure(
+            "px-api-server", "model-budget",
+            f"cannot read model-session budget: {exc!r}",
+        )
+        return None
+    _health.record_capability_success("px-api-server", "model-budget")
+    return {
+        "daily_cap": DAILY_CAP,
+        "used_today": len(today),
+        "remaining": max(0, DAILY_CAP - len(today)),
+        "sessions": today,
+    }
+
+
+# What a reader sees when the budget capability is unavailable. Fixed text: this
+# is an unauthenticated surface and the exception may name internals.
+_BUDGET_UNAVAILABLE = "model-session budget dependency unavailable"
+
+
 @app.get("/api/v1/public/budget")
 async def public_budget():
     """Cognition budget aggregate — unauthenticated.
     Per-call detail (timestamps, models, kinds, outcomes) is kept off the
     public surface; use the authenticated /api/v1/budget for that."""
-    try:
-        from pxh.model_session import DAILY_CAP, _load_session_log, _today_entries
-
-        today = _today_entries(_load_session_log())
+    budget = _model_budget_today()
+    if budget is None:
         return {
-            "daily_cap": DAILY_CAP,
-            "used_today": len(today),
-            "remaining": max(0, DAILY_CAP - len(today)),
+            "available": False,
+            "daily_cap": None,
+            "used_today": None,
+            "remaining": None,
+            "reason": _BUDGET_UNAVAILABLE,
         }
-    except Exception:
-        return {"daily_cap": 8, "used_today": 0, "remaining": 8}
+    return {
+        "available": True,
+        "daily_cap": budget["daily_cap"],
+        "used_today": budget["used_today"],
+        "remaining": budget["remaining"],
+    }
 
 
 @app.get("/api/v1/budget", dependencies=[Depends(_verify_token)])
 async def budget():
     """Cognition budget with per-call detail. Authenticated only."""
-    try:
-        from pxh.model_session import DAILY_CAP, _load_session_log, _today_entries
-
-        today = _today_entries(_load_session_log())
-        sessions = [
+    today = _model_budget_today()
+    if today is None:
+        return {
+            "available": False,
+            "daily_cap": None,
+            "used_today": None,
+            "remaining": None,
+            "sessions": None,
+            "reason": _BUDGET_UNAVAILABLE,
+        }
+    return {
+        "available": True,
+        "daily_cap": today["daily_cap"],
+        "used_today": today["used_today"],
+        "remaining": today["remaining"],
+        "sessions": [
             {
                 "ts": e.get("ts"),
                 "type": e.get("type"),
@@ -1138,16 +1189,9 @@ async def budget():
                 "duration_s": e.get("duration_s"),
                 "outcome": e.get("outcome"),
             }
-            for e in today
-        ]
-        return {
-            "daily_cap": DAILY_CAP,
-            "used_today": len(today),
-            "remaining": max(0, DAILY_CAP - len(today)),
-            "sessions": sessions,
-        }
-    except Exception:
-        return {"daily_cap": 8, "used_today": 0, "remaining": 8, "sessions": []}
+            for e in today["sessions"]
+        ],
+    }
 
 
 @app.get("/api/v1/public/thought-image")

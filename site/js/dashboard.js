@@ -422,15 +422,25 @@ window.SparkDashboard = (function () {
     // Budget widget
     var valBudget = $('val-budget');
     if (valBudget && state.budget) {
-      var used = state.budget.used_today || 0;
-      var cap = state.budget.daily_cap || 8;
-      var remaining = state.budget.remaining != null ? state.budget.remaining : cap;
       valBudget.textContent = '';
       var span = document.createElement('span');
-      if (remaining <= 2) span.style.color = 'var(--mood-anxious)';
-      else if (remaining <= 4) span.style.color = 'var(--mood-alert)';
-      else span.style.color = 'var(--mood-content)';
-      span.textContent = used + '/' + cap;
+      if (state.budget.available === false || state.budget.used_today == null) {
+        // `null` is a reported state, not a zero. The API answers
+        // `available: false` when the model-session dependency cannot load;
+        // rendering 0/8 here would show a broken capability as a quiet day
+        // (#332).
+        span.style.color = 'var(--mood-alert)';
+        span.textContent = '—';
+        span.title = state.budget.reason || 'budget unavailable';
+      } else {
+        var used = state.budget.used_today || 0;
+        var cap = state.budget.daily_cap || 8;
+        var remaining = state.budget.remaining != null ? state.budget.remaining : cap;
+        if (remaining <= 2) span.style.color = 'var(--mood-anxious)';
+        else if (remaining <= 4) span.style.color = 'var(--mood-alert)';
+        else span.style.color = 'var(--mood-content)';
+        span.textContent = used + '/' + cap;
+      }
       valBudget.appendChild(span);
     }
   }

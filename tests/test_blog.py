@@ -806,3 +806,80 @@ class TestBackfillRespectsFailureCap:
                 ns["run_backfill"](dry=False)
 
         mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Capability health (#332): failure at the boundary, not just in the log
+# ---------------------------------------------------------------------------
+
+class TestCapabilityHealth:
+    """The historical shape: the module this daemon imports is gone.
+
+    When `pxh.claude_session` was renamed to `pxh.model_session`, the already
+    running px-blog still executed a statement naming the old module. Its 22:00
+    daily attempt logged `model_session not available, cannot generate daily`,
+    made no model call, and returned `None` — while `read_health()` reported the
+    daemon healthy, because its poll loop kept succeeding at everything else.
+
+    A log line is not a signal. These tests pin both halves: the capability
+    fails closed *and* it becomes visible on the health board.
+    """
+
+    def test_missing_dependency_fails_closed_and_degrades_health(
+        self, blog_mod, block_module_import
+    ):
+        from pxh import health
+
+        ns, state_dir, log_dir = blog_mod
+        yesterday = dt.datetime.now(HOBART_TZ) - dt.timedelta(days=1)
+        _write_thoughts(state_dir, yesterday, count=5)
+
+        block_module_import.block("pxh.model_session")
+        post = ns["generate_post"]("daily", yesterday, {"posts": []})
+
+        assert post is None, "the capability must fail closed, not fabricate a post"
+        entry = health.read_health(components=("px-blog",))["components"]["px-blog"]
+        assert entry["status"] == "degraded"
+        assert "generation" in entry["capabilities"]
+        assert "pxh.model_session" in entry["capabilities"]["generation"]["error"]
+        # The log stays — health answers "is it broken?", the log answers
+        # "what happened?".
+        assert "model_session not available, cannot generate daily" in (
+            log_dir / "px-blog.log"
+        ).read_text()
+
+    def test_capability_recovery_clears_on_a_real_generation(
+        self, blog_mod, block_module_import
+    ):
+        from pxh import health
+
+        ns, state_dir, _ = blog_mod
+        yesterday = dt.datetime.now(HOBART_TZ) - dt.timedelta(days=1)
+        _write_thoughts(state_dir, yesterday, count=5)
+
+        block_module_import.block("pxh.model_session")
+        ns["generate_post"]("daily", yesterday, {"posts": []})
+        assert health.read_health(components=("px-blog",))["components"]["px-blog"]["status"] == "degraded"
+
+        block_module_import.unblock("pxh.model_session")
+        with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
+            assert ns["generate_post"]("daily", yesterday, {"posts": []}) is not None
+
+        assert health.read_health(components=("px-blog",))["components"]["px-blog"]["status"] == "ok"
+
+    def test_a_poll_success_does_not_clear_a_capability_block(self, blog_mod, block_module_import):
+        """The loop proving the process alive is what hid the class."""
+        from pxh import health
+
+        ns, state_dir, _ = blog_mod
+        yesterday = dt.datetime.now(HOBART_TZ) - dt.timedelta(days=1)
+        _write_thoughts(state_dir, yesterday, count=5)
+
+        block_module_import.block("pxh.model_session")
+        ns["generate_post"]("daily", yesterday, {"posts": []})
+
+        ns["_health"].record_success("px-blog", detail={"generated": 0})
+
+        entry = health.read_health(components=("px-blog",))["components"]["px-blog"]
+        assert entry["status"] == "degraded"
+        assert "generation" in entry["capabilities"]

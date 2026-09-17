@@ -172,6 +172,54 @@ def _isolate_observability(tmp_path, monkeypatch, request):
 
 
 @pytest.fixture
+def block_module_import():
+    """Make `import <name>` fail as though the module were gone (#332).
+
+    Both halves are load-bearing. The meta-path hook raises for a fresh import;
+    the `sys.modules` pop drops anything already imported, because otherwise
+    `from pxh.model_session import x` succeeds quietly from the cache — which is
+    the state a *test* is in but a running daemon is not: the daemon was started
+    when the module still existed, and the file has since been removed.
+
+    Yields a controller with ``block(*names)`` / ``unblock(*names)`` so a test
+    can watch a capability fail and then recover.
+    """
+    import importlib.abc
+    import sys
+
+    blocked: set[str] = set()
+    saved: dict[str, object] = {}
+
+    class _Blocker(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if any(fullname == b or fullname.startswith(b + ".") for b in blocked):
+                raise ImportError(f"blocked for test: {fullname}")
+            return None
+
+    class _Controller:
+        def block(self, *names):
+            for name in names:
+                blocked.add(name)
+                if name in sys.modules:
+                    saved[name] = sys.modules.pop(name)
+
+        def unblock(self, *names):
+            for name in names:
+                blocked.discard(name)
+                if name in saved:
+                    sys.modules[name] = saved.pop(name)
+
+    blocker = _Blocker()
+    sys.meta_path.insert(0, blocker)
+    try:
+        yield _Controller()
+    finally:
+        sys.meta_path.remove(blocker)
+        for name, module in saved.items():
+            sys.modules[name] = module
+
+
+@pytest.fixture
 def isolated_project(tmp_path):
     """Creates an isolated project directory for testing."""
     log_dir = tmp_path / "logs"

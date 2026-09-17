@@ -207,6 +207,33 @@ Answers "is this daemon *doing its job*", which `systemctl status` cannot. Every
 - px-mind publishes the aggregate to `state/health.json` and into `awareness["health"]`; `summarize()` feeds reflection context. Readers that must be correct **when px-mind is down** call `read_health()` directly, not the snapshot.
 - `tests/conftest.py` has an **autouse** fixture redirecting `health_dir()` to tmp. Without it, in-process tests write mock health records into the live robot's `state/health/` — `isolated_project` is opt-in and only isolates subprocesses.
 
+**A daemon that is alive and a capability that is gone are different axes, and
+the board has to show both.** `consecutive_failures` describes the *process*;
+`capabilities` on the same record describes a single *boundary* — one named
+thing the daemon advertises and cannot currently do. Use
+`record_capability_failure(component, capability, error)` at the boundary where
+a daemon *was asked to work* and could not because a dependency is gone (an
+`ImportError` for a module a deploy renamed or deleted is the canonical case,
+#332), and `record_capability_success()` when that same capability runs.
+
+- **Do not** turn every optional import into a health failure. Some imports are
+  genuinely optional (a fallback prompt, a degraded mode); only the boundary
+  that just failed knows whether it advertised the capability. Record it there
+  or not at all.
+- A block is **sticky**: `record_success()` on the daemon does not clear it,
+  and neither does a restart — the record is on disk. The loop that keeps
+  proving a process alive is exactly what hid #332 for three daemons. Only the
+  capability succeeding clears it.
+- A blocked capability promotes a healthy process to `degraded`, and never
+  outranks `failing`/`stale`: "this daemon is dying" is the bigger news.
+- Keep the log too. Health answers *is it broken?*; the log answers *what
+  happened?*
+- Prevention and detection are layered, not substitutes: `bin/px-deploy-check`
+  stops a deploy leaving stale processes, and this axis reports the degradation
+  if one happens anyway (manual surgery, a bypassed gate, package drift). An
+  incident that reads as *semantically broken but healthy* is the signal to add
+  the missing boundary, not to widen a status window.
+
 **Long-term memory formation is a health component, `px-mind-consolidation`.**
 Until it existed, the nightly consolidation pass could fail every night while
 `read_health()` reported `overall: ok` — it was simply absent from
