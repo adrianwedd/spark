@@ -70,7 +70,7 @@ bury the real stalls.
 | channel | source | needs root? |
 |---|---|---|
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
-| **file** | size deltas of a bounded *watchlist*: the system journal (`/var/log/journal/*/*.journal`), `logs/*.log`, `state/*.json`, `state/health/*.json` | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal growing is journald by another name |
+| **file** | a bounded *watchlist* (`/var/log/journal/*/*.journal`, `logs/*.log`, `state/*.json`, `state/health/*.json`) read two ways in one stat walk: **size** deltas (`file_growth`) and **mtime** movement (`file_touched`) | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal moving is journald by another name. The mtime half exists because the size half cannot see either likeliest writer — see the two-shapes section below |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI | no — world-readable, including for root-owned processes |
 
 **Pid files, two different roles until 2026-09-17:** `--pid-file` (default
@@ -248,13 +248,17 @@ false` with ~177 processes refusing, and — the part that matters —
 `file_growth_groups` is `{}` with `file_growth_watched: 115`. Nothing in
 `state/` or `logs/` grew by a byte while the device wrote 128-524 KB.
 
-**This is a limitation of the file channel, not evidence of no writes.** It is a
-*size* delta, and the two likeliest writers in that window have no size delta to
-see: journald appends into an 8 MB preallocated, mmap'd journal file
-(`system.journal` sits at exactly 8388608 bytes), and ext4 journal/metadata
-writes change no file size at all. mtime would see the first of those — an
-ad-hoc mtime watcher did (journal mtimes advanced in 35 of 91 high-PSI samples)
-— and no unprivileged channel sees the second.
+**This is a limitation of the size channel, not evidence of no writes.** The two
+likeliest writers in that window have no size delta to see: journald appends
+into an 8 MB preallocated, mmap'd journal file (`system.journal` sits at exactly
+8388608 bytes), and ext4 journal/metadata writes change no file size at all.
+
+**Half of that is now closed** (`#361`): the same watchlist is read through
+mtime as well, as `file_touched` / `file_touched_count`, with zero-byte rows
+sorted first. An ad-hoc mtime watcher found journal mtimes advancing in 35 of 91
+high-PSI samples where the size channel saw nothing, so the first of those two
+writers is now attributable without root. The second — ext4 metadata with no
+file-level signature — still needs the root channel.
 
 **What this changes.** Two consequences, and one corrected claim:
 
@@ -306,7 +310,8 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `writers_unreadable_count` / `writers_unavailable_reason` | the measurement: how many processes actually refused `/proc/<pid>/io` in this snapshot, and one sentence saying which of the three gaps applies — not attempted, unprivileged, or refused-despite-privilege (a non-dumpable process) |
 | `file_growth[]` | files that grew during the window, ranked by bytes, paths shortened to their last three components |
 | `file_growth_total_bytes` / `file_growth_groups` | the total, and the same bytes grouped as `journal` / `logs` / `state` / `health` |
-| `file_growth_watched` | how many paths were covered — the honesty field for this channel |
+| `file_growth_watched` | how many paths were covered — the honesty field for this channel, and it covers `file_touched` too (same walk) |
+| `file_touched[]` / `file_touched_count` | files whose **mtime** moved, `{path, bytes}`. **Zero-byte rows sort first**: those are the writes the size channel cannot see (journald appending into its 8 MB preallocated mmap'd journal, and any fixed-size rewrite). A row means *someone wrote this file in this window* — mtime moves when the write lands in page cache, so it is a writer to attribute, not proof that bytes reached the device |
 | `writers[]` | ranked by `write_bytes` (disk) across the window, with `unit` from `/proc/<pid>/cgroup` — the process *and* the thing to change |
 | `writers_with_activity` / `write_bytes_total` | how many processes moved anything at all, and how much of it reached the disk |
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
@@ -330,6 +335,8 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `file_growth` names a `logs/*.log` or `state/**/*.json` | that file's owner wrote those bytes during the stall, whoever it runs as | that daemon's write path is the thing to look at — no root needed to know which |
 | `file_growth_groups.journal` is most of the bytes | journald is writing through the stall | journal-side tuning (`SyncIntervalSec`, rates, storage), not process weighting |
 | `file_growth` empty while `mmcblk0.ms_writing` is high | the bytes went somewhere outside the watchlist (root-owned state, another tree, or kernel writeback) | widen `--growth-pattern`, or install as root |
+| `file_growth` empty **and `file_touched` names the journal** | journald wrote in this window without moving any file size — the shape the size channel was blind to | journal-side tuning (`SyncIntervalSec`, rates, `Storage=`) is a real candidate now; install as root to get its bytes |
+| both file channels empty with the device saturated | metadata/journal work with no file-level signature at all (ext4 `-rsv-conversion`, `kblockd`, `jbd2` in the D-state roster) | the root channel is the only way in; do not read the empty channels as "nobody wrote" |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
 | **`device_inflight_pre` is `0/0` while `d_state_count` is high and `devices` shows queue time** | **nothing was in flight: the queue is wedged, not busy — there is no writer in this record to find, and a longer search for one is the wrong search** | take the question to the *waiters*: `stalled[].wchan` and (as root) the kernel threads, and to the other bus users — `mmc1`'s SDIO WiFi shares the `mmc` subsystem and cannot be seen from `/sys/block` |
 
