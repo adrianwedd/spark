@@ -834,6 +834,42 @@ def sample_ext4(paths: Paths = DEFAULT_PATHS) -> dict[str, Any]:
     return out
 
 
+def unattributed_write_share(
+    devices: Mapping[str, Mapping[str, int]], write_bytes_total: int
+) -> tuple[int, int, float | None]:
+    """`(device_bytes, unattributed_bytes, share)` for the busiest real device.
+
+    The question this answers is "how much of what reached the disk has a
+    process's name on it". Measured on `picar` 2026-09-17, 60 s window:
+    `mmcblk0` wrote **2596 KB** while every readable process together wrote
+    **92 KB** — 3.5 % — and the two journal files' *mtime* moved with a `size`
+    delta of 0. The rest is journal and metadata, which is charged to kernel
+    threads (`jbd2`, `kblockd`, `flush-179:0`), so no `/proc/<pid>/io` channel
+    can ever name it, privileged or not.
+
+    The caveat that keeps this honest: `write_bytes` charges page-cache writes
+    to the task that *dirtied* the page, so a process that writes a lot and
+    never fsyncs is still counted; and metadata written on its behalf is not.
+    A high share therefore means "mostly journal/metadata", never "nobody
+    wrote anything".
+
+    `None` share when the busiest device wrote nothing: 0/0 is not 0 %.
+    """
+    device = None
+    for name, counters in sorted(devices.items()):
+        sectors = counters.get("sectors_written", 0)
+        if sectors <= 0:
+            continue
+        if device is None or sectors > devices[device].get("sectors_written", 0):
+            device = name
+    if device is None:
+        return 0, 0, None
+    device_bytes = int(devices[device].get("sectors_written", 0)) * 512
+    unattributed = max(0, device_bytes - max(0, write_bytes_total))
+    share = round(unattributed / device_bytes, 3) if device_bytes else None
+    return device_bytes, unattributed, share
+
+
 def _device_deltas(
     pre: Mapping[str, Mapping[str, int]],
     post: Mapping[str, Mapping[str, int]],
@@ -974,6 +1010,12 @@ def capture(
     )
     _attach_units(stalled, paths.proc, want_wchan=True)
 
+    devices = _device_deltas(disk_pre, disk_post)
+    (
+        device_write_bytes,
+        unattributed_bytes,
+        unattributed_share,
+    ) = unattributed_write_share(devices, write_bytes_total)
     growth, growth_total, growth_groups = rank_file_growth(
         {path: entry["size"] for path, entry in files_pre.items()},
         {path: entry["size"] for path, entry in files_post.items()},
@@ -1010,7 +1052,14 @@ def capture(
         "trigger": dict(trigger or {}),
         "psi_pre": psi_pre,
         "psi_post": psi_post,
-        "devices": _device_deltas(disk_pre, disk_post),
+        "devices": devices,
+        # How much of what reached the disk has a process's name on it. A record
+        # whose device wrote megabytes with `write_bytes_total` in the kilobytes
+        # is a record of journal/metadata traffic — see the docstring, and do
+        # not read a high share as "nobody wrote".
+        "device_write_bytes": device_write_bytes,
+        "unattributed_write_bytes": unattributed_bytes,
+        "unattributed_write_share": unattributed_share,
         # Pre is the one that matters: the caller triggered *because* PSI was
         # high, so the walk at t0 is inside the stall. Post shows recovery.
         # A record whose device shows 0/0 here while `devices` shows a queue
