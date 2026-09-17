@@ -527,12 +527,21 @@ def test_consolidate_quota_is_two_per_day(tmp_path, monkeypatch):
     import json
     from pxh import model_session as cs
     log = tmp_path / "model_sessions.jsonl"
-    # Two attempts already spent tonight, spaced far enough apart that neither
-    # cooldown is what refuses the third — the quota must be.
-    now = dt.datetime.now(dt.timezone.utc)
+    # Two attempts already spent *today*, and the quota must be what refuses the
+    # third. The gate order makes the spacing irrelevant: the per-type quota is
+    # evaluated before any cooldown, so it returns first regardless.
+    #
+    # This used to seed `now - 3h` / `now - 2h`, which is in *yesterday* for the
+    # first three hours of the Hobart day — the budget day is keyed to Hobart
+    # midnight — so the test failed on any run between 00:00 and ~03:00 AEST
+    # (observed red on CI at 00:13 AEST 2026-09-18, on master, with no code
+    # change). Anchoring to today's Hobart midnight makes it clock-independent.
+    now_hobart = dt.datetime.now(cs.HOBART_TZ)
+    today_start = now_hobart.replace(hour=0, minute=0, second=0, microsecond=0)
     log.write_text("".join(
-        json.dumps({"ts": (now - dt.timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "type": "consolidate"}) + "\n" for h in (3, 2)), encoding="utf-8")
+        json.dumps({"ts": (today_start + dt.timedelta(minutes=m)).astimezone(dt.timezone.utc)
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "type": "consolidate"}) + "\n" for m in (2, 4)), encoding="utf-8")
     monkeypatch.setattr(cs, "SESSION_LOG", log)
     monkeypatch.setattr(cs, "BUDGET_DISABLED", False)
     reason = cs.check_budget("consolidate")
