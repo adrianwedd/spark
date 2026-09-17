@@ -51,6 +51,14 @@ jobs:
       - name: delegated-agent authority invariant
         run: python tools/check_investigator_agent.py
 
+      # Delegated-research OS isolation (#281 phase 2): the unit properties
+      # that make the sandbox default-deny, and the one sudoers line that
+      # starts it. Its own step for the same reason as the two above — the
+      # artifacts ship inert, and a red build here says "the boundary was
+      # widened", not "one test among 1200 failed".
+      - name: delegated-research isolation invariant
+        run: python tools/check_research_isolation.py
+
       # -m "not live" deselects the hardware tests; see the marker definition in
       # pyproject.toml. Nothing else is passed on purpose: this job exists to be
       # an honest gate, and pre-setting LOG_DIR or PX_BYPASS_SUDO here would

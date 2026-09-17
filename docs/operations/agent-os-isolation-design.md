@@ -1,7 +1,13 @@
 # OS-level delegated-agent isolation — design (#281 phase 2)
 
-Status: **design + working prototype, not implemented.** No live user, group,
-sudoers, or systemd unit change has been made for this phase. See
+Status: **design + working prototype + the artifacts in this repo; not
+installed.** No live user, group, sudoers, or systemd unit change has been
+made for this phase — everything ships inert and nothing in the running system
+reads it. The three artifacts are `systemd/sbin/px-research-run` (the root
+launcher), `bin/px-research-worker` + `src/pxh/research_worker.py` (what runs
+inside), and one line in `systemd/sudoers.d/picar-x-services`; their closure is
+pinned by `tools/check_research_isolation.py`, which runs as its own CI step.
+See
 [agent-authority.md](agent-authority.md) for the phase-1 tool-boundary work
 that already shipped and is out of scope here.
 
@@ -108,7 +114,11 @@ px-research-run (root, /usr/local/sbin)
    │  then runs a hardcoded systemd-run invocation (see below)
    ▼
 systemd-run --unit=px-research-<uuid> --collect \
+   --property=Type=oneshot \
+   --property=EnvironmentFile=/etc/px-research/tier.env \
    --property=DynamicUser=yes --property=User=spark-research \
+   --property=RuntimeDirectory=px-research \
+   --property=Environment=PX_STATE_DIR=/run/px-research/state \
    --property=ProtectSystem=strict --property=ProtectHome=yes \
    --property=PrivateDevices=yes --property=PrivateTmp=yes \
    --property=NoNewPrivileges=yes --property=RestrictSUIDSGID=yes \
@@ -133,6 +143,34 @@ operator applies findings by hand — spark-research never touches the
 production checkout or state/ directly, exactly like px-evolve's PR gate:
 proposals, never auto-applied.
 ```
+
+### The credential, which the design originally left implicit
+
+`BindReadOnlyPaths=/dev/null:.env` is correct and stays, but it has a
+consequence the first draft did not name: `pxh.m5` needs a model name
+(`PX_M5_SPARK_MODEL`) and a key (`OLLAMA_CLOUD_API_KEY`) for a hosted tier, and
+both live in `.env`. A sandbox that cannot read `.env` and has no other route
+to them can make exactly zero model calls, which would make the whole mechanism
+a $0 experiment.
+
+Three ways out, and only one is acceptable:
+
+| route | why not |
+|---|---|
+| `--setenv=PX_M5_SPARK_MODEL=... --setenv=OLLAMA_CLOUD_API_KEY=...` on the launcher | the values become unit properties, and `systemctl show -p Environment` (and `Environment=`) is **world-readable** — the key would be readable by every user on the box, including the one this design is isolating from |
+| point the unit at the real `.env` | defeats `BindReadOnlyPaths=/dev/null`; the sandbox gets the HA token, the admin PIN, the relay token, the Bluesky app password — everything, for the sake of two variables |
+| **a root-owned two-variable file the unit *inherits* and never reads** | chosen |
+
+`/etc/px-research/tier.env` is `root:root 0600`, containing exactly
+`PX_M5_SPARK_MODEL` and `OLLAMA_CLOUD_API_KEY`. systemd (PID 1, already root)
+reads `EnvironmentFile=` and injects the values into the unit's environment;
+the sandboxed process never opens the file, and `systemctl show` on a unit with
+`EnvironmentFile=` reports the *path*, not the values. The cost is honest and
+worth stating: **rotating either value means editing two files**, and this file
+must never grow a third variable — the file *is* the credential boundary, and
+its size is the thing keeping the boundary narrow. `px-research-run` refuses to
+start a unit when it is missing rather than starting one that will fail at the
+first call with no key.
 
 Notes on specific choices:
 - **`ReadOnlyPaths=` the whole checkout, not a separate worktree.** A
@@ -172,25 +210,35 @@ Notes on specific choices:
 
 ## Exact filesystem/group/sudo changes required (not yet made)
 
-1. `useradd`: **none.** `DynamicUser=yes` needs no `/etc/passwd` entry.
-2. `groupadd`: **none.**
-3. `/etc/sudoers.d/picar-x-services` (existing file, one line added):
-   `pi ALL=(root) NOPASSWD: /usr/local/sbin/px-research-run`
-4. New root-owned file `/usr/local/sbin/px-research-run` (0755, root:root) —
-   validates the uuid, checks the inbox entry exists, execs the fixed
-   `systemd-run` invocation above. No caller-supplied sandbox parameters.
-5. New directories: `/var/lib/px-research/{inbox,outbox}`, root:root 1777
-   (sticky, world-writable-by-anyone-who-can-reach-it, matching the existing
-   `state/health/` and `state/brain/` mailbox precedent and its documented
-   reasoning: different Unix users write here, a locked-down parent dir
-   would exclude one of them).
-6. New pi-owned file `bin/px-research-worker` (tracked in the repo like any
-   other `bin/tool-*`) — reads the inbox request, performs the investigation,
-   writes the outbox result. Runs *as* `spark-research` (via the
-   `DynamicUser` unit) but is *owned* by `pi` — `spark-research` can execute
-   it (covered by the `ReadOnlyPaths` bind of the whole checkout) but never
-   modify it, since the mount is read-only for that uid regardless of any
-   file-mode bit.
+Five things, of which two are already tracked in the repo and three are new
+files on the host. `useradd` and `groupadd` are **not** among them —
+`DynamicUser=yes` needs no `/etc/passwd` entry and no group.
+
+| # | what | where it comes from |
+|---|---|---|
+| 1 | `/etc/sudoers.d/picar-x-services` gains one line: `pi ALL=(root) NOPASSWD: /usr/local/sbin/px-research-run *` | tracked: `systemd/sudoers.d/picar-x-services`. The wildcard is the one unavoidable one — the argument is a uuid, so it cannot be enumerated. Safety is in the launcher, which accepts exactly one argument and requires a bare v4 uuid |
+| 2 | `/usr/local/sbin/px-research-run`, root:root 0755 | tracked: `systemd/sbin/px-research-run`, same install shape as `px-signal-alive` / `px-gpio-run` |
+| 3 | `/etc/px-research/tier.env`, root:root 0600, two variables | generated on the host from `.env` (see "The credential" above) — **not** tracked, it holds a key |
+| 4 | `/var/lib/px-research/{inbox,outbox}`, root:root 1777 sticky | the existing `state/health/` / `state/brain/` mailbox precedent: different Unix users write here, so a locked-down parent directory would exclude one of them |
+| 5 | `bin/px-research-worker` (pi-owned, tracked) + `src/pxh/research_worker.py` | runs *as* `spark-research` but is *owned* by `pi`: the sandboxed uid can execute it (the whole checkout is bound read-only) and can never modify it, regardless of file-mode bits |
+
+### The invariant, pinned
+
+Two layers, because they fail differently:
+
+* `tools/check_research_isolation.py` is a **structural** check on the
+  artifacts as shipped — every `--property=` that carries a guarantee (with
+  the reason it is there, printed as a map), the three path properties by
+  their exact argument text, the uuid validation and the single-argument
+  rule, and that no property is built from caller input. It runs as its own CI
+  step, so "somebody added `--setenv=` for convenience" fails the build with
+  the guarantee it removed named in the message.
+* `tests/test_research_worker.py` is the **behavioural** half: the worker can
+  name exactly one readable file and one writable one, refuses everything
+  else, and always leaves the operator a reason.
+
+Neither is the boundary. The boundary is the unit on the robot, which is what
+the canary below is for.
 
 ## Result flow-back
 
@@ -247,6 +295,33 @@ production state. The two write attempts (checks 2–3) used new,
 never-before-existing filenames rather than mutating any tracked file, so a
 sandbox-construction bug would have failed safe (a stray file to delete)
 rather than corrupting anything.
+
+## Install (one block, needs root)
+
+Nothing in this block has been run. It is the whole difference between
+"designed" and "there".
+
+```bash
+# 1. the two tracked artifacts
+sudo install -m 0755 systemd/sbin/px-research-run /usr/local/sbin/px-research-run
+sudo install -m 0755 bin/px-research-worker /home/pi/picar-x-hacking/bin/px-research-worker
+
+# 2. the two-variable credential, from .env — never tracked, never printed
+sudo install -d -m 0755 /etc/px-research
+sudo sh -c 'umask 077; grep -E "^(PX_M5_SPARK_MODEL|OLLAMA_CLOUD_API_KEY)=" \
+  /home/pi/picar-x-hacking/.env > /etc/px-research/tier.env'
+sudo chown root:root /etc/px-research/tier.env && sudo chmod 0600 /etc/px-research/tier.env
+
+# 3. the mailbox pair — 1777 sticky, matching state/health/ and state/brain/
+sudo install -d -m 1777 /var/lib/px-research/inbox /var/lib/px-research/outbox
+
+# 4. the one sudoers line (the file is tracked; visudo -c first, always)
+sudo visudo -c -f systemd/sudoers.d/picar-x-services
+sudo install -m 0440 -o root -g root systemd/sudoers.d/picar-x-services \
+  /etc/sudoers.d/picar-x-services
+```
+
+Then the canary below, then the first real request.
 
 ## Adversarial canary plan (for the real implementation, once shipped)
 

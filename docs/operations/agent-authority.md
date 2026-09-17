@@ -88,7 +88,10 @@ open** for that stronger work — a genuinely separate identity or sandbox
 that removes GPIO/I²C/audio/sudo/production-write authority at the OS
 level, not just at the tool-dispatch level. See
 [agent-os-isolation-design.md](agent-os-isolation-design.md) for that
-phase's design and a working (not-yet-implemented) prototype.
+phase's design, a working prototype, and the three artifacts it needs
+(`systemd/sbin/px-research-run`, `bin/px-research-worker`, one sudoers line) —
+all **tracked and inert**: nothing on the robot reads them yet, and the
+install block in that document is the whole difference.
 
 ## Acceptance
 

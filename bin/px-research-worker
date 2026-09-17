@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# px-research-worker — the delegated-research entry point that runs *inside*
+# the #281 phase-2 sandbox, as the DynamicUser `spark-research`.
+#
+# Deliberately not a `bin/px-*` launcher in the usual sense: it does not
+# source bin/px-env, because px-env exports LOG_DIR and the production
+# environment and this process is meant to have neither. Everything it needs
+# arrives in its own environment from the unit properties in
+# systemd/sbin/px-research-run.
+#
+# All of the behaviour lives in `src/pxh/research_worker.py` so it is
+# importable and unit-testable; this file exists to be the thing the unit
+# execs, and to be pi-owned so the read-only bind can execute it without the
+# sandboxed uid being able to rewrite it.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="${PYTHON:-$REPO/.venv/bin/python3}"
+[[ -x "$PY" ]] || PY=python3
+
+export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+
+exec "$PY" -m pxh.research_worker "$@"
