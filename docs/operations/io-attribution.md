@@ -124,6 +124,13 @@ cd /home/pi/picar-x-hacking && git pull --ff-only
 # Unprivileged smoke test first — prints one record, writes nothing:
 bin/px-io-attrib --dry-run --window 3
 
+# Optional second lever, one line, if you would rather not install the unit yet:
+#   sudo sysctl -w kernel.task_delayacct=1
+# It is *unverified* on this host (see "Deliberately not done"): the sysctl
+# exists but /proc/<pid>/delayacct does not, so it may create per-task block-IO
+# wait time — including for root-owned processes — or it may do nothing at all.
+# The unit below subsumes it either way, which is why the unit is the ask.
+
 # Then the real thing, as root:
 sudo install -m 0644 systemd/px-io-attrib.service /etc/systemd/system/px-io-attrib.service
 sudo systemctl daemon-reload
@@ -395,8 +402,17 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
   lever is now *closed* rather than deferred: the 2026-09-17 wedge shows the
   stall happens with the device idle and no competing writer, so there is
   nothing to deprioritise.
-- **No `task_delayacct`.** `/proc/sys/kernel/task_delayacct=1` would make
-  per-task block-IO wait time world-readable (it is currently 0 on this host),
-  which would give a second unprivileged stall channel. Reversible one-liner,
-  available if the writer channel proves insufficient — not switched on
-  unasked, because it is a global kernel accounting change.
+- **No `task_delayacct` — and its status changed on 2026-09-17.** The sysctl
+  *exists* on `picar` and reads 0, but **`/proc/<pid>/delayacct` does not exist
+  for any process sampled** (pid 1, `px-alive`, `arecord`), and
+  `sched_schedstats` is also 0. So per-task block-IO wait accounting is not
+  available there today, and whether enabling the sysctl creates the per-task
+  files is **untested — because testing it needs root**. Earlier text here
+  called it a "reversible one-liner, available if the writer channel proves
+  insufficient"; the writer channel has now proved insufficient (2026-09-17
+  20:45) and the one-liner is still unverified, so treat it as *unknown* rather
+  than *available*.
+
+  What does work there without root, and is already in every record:
+  `/proc/<pid>/schedstat` run delay (the observer's `max_run_delay_ms`) —
+  measured 2.8 ms for `px-alive` on an idle box. Run delay is CPU, not IO.
