@@ -281,6 +281,38 @@ def iter_pids(proc_root: Path) -> list[int]:
     return pids
 
 
+def proc_io_readable(proc_root: Path = Path("/proc")) -> bool:
+    """Whether /proc/<pid>/io is readable for processes this user does not own.
+
+    Probed against **pid 1** specifically, because reading our *own* io always
+    succeeds: a probe that accepted that would report the writer channel as
+    available on a host where every root-owned writer — px-alive, journald — is
+    invisible, which is worse than reporting it unavailable. Measured live:
+    `/proc/1/io` is `EACCES` for `pi` and readable for root.
+    """
+    try:
+        (proc_root / "1" / "io").read_text()
+        return True
+    except OSError:
+        return False
+
+
+def _read_proc_io(pid_dir: Path) -> tuple[dict[str, int] | None, bool]:
+    """`(counters, denied)` for one pid.
+
+    `EACCES` is a fact about privilege and is reported separately; every other
+    error (a process that exited mid-walk) is not, or the record would blame
+    root for a race.
+    """
+    try:
+        text = (pid_dir / "io").read_text()
+    except PermissionError:
+        return None, True
+    except OSError:
+        return None, False
+    return parse_proc_io(text), False
+
+
 def blocked_threads(pid: int, pid_dir: Path) -> list[dict[str, Any]]:
     """Secondary threads of `pid` sitting in D state, with their comms.
 
@@ -332,9 +364,13 @@ def sample_processes(
         if sched_text is not None:
             entry.update(parse_schedstat(sched_text))
         if allow_proc_io:
-            io_text = _read_text(pid_dir / "io")
-            if io_text is not None:
-                entry["io"] = parse_proc_io(io_text)
+            counters, denied = _read_proc_io(pid_dir)
+            if counters is not None:
+                entry["io"] = counters
+            elif denied:
+                # Kept, not dropped: a process whose io we may not read is
+                # evidence ("a writer we cannot see"), not absence of evidence.
+                entry["io_denied"] = True
         stalled = blocked_threads(pid, pid_dir)
         if stalled:
             entry["blocked_threads"] = stalled
@@ -548,12 +584,44 @@ def _attach_units(
 # --- the record -----------------------------------------------------------
 
 
+def _unavailable_reason(
+    allow_proc_io: bool, privileged: bool, io_denied: int
+) -> str | None:
+    """One sentence naming the gap in the writer list, or None if there is none.
+
+    The writer channel degrades in three distinct ways and they must not read
+    alike: not attempted at all, attempted without the privilege to see other
+    users' processes, and attempted *with* it while some process refused anyway
+    (a non-dumpable process). Only the last is a partial list under conditions
+    where completeness was expected.
+    """
+    if not allow_proc_io:
+        return "writer channel not attempted: --no-proc-io"
+    if io_denied and privileged:
+        return (
+            f"{io_denied} process(es) refused /proc/<pid>/io despite this uid "
+            "being able to read other users' — non-dumpable, invisible here"
+        )
+    if io_denied:
+        return (
+            f"{io_denied} process(es) refused /proc/<pid>/io — root-owned writers "
+            "(px-alive, journald) are among them; run this as root to see them"
+        )
+    if not privileged:
+        return (
+            "privilege probe says other users' /proc/<pid>/io is not readable, "
+            "but no process refused one in this snapshot"
+        )
+    return None
+
+
 def capture(
     trigger: Mapping[str, Any] | None = None,
     *,
     paths: Paths = DEFAULT_PATHS,
     window_s: float = DEFAULT_WINDOW_S,
     allow_proc_io: bool = True,
+    privileged: bool | None = None,
     top: int = 8,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -591,6 +659,7 @@ def capture(
 
     elapsed = round(monotonic() - started, 3)
 
+    io_denied = sum(1 for entry in procs_post.values() if entry.get("io_denied"))
     writers, writer_count, write_bytes_total = rank_writers(
         procs_pre, procs_post, top=top
     )
@@ -608,10 +677,18 @@ def capture(
         # allow_proc_io off, `writers` is not "nothing wrote", it is "nothing
         # readable wrote", and an absent explanation there is the failure mode
         # #306 is about.
-        "privileged": bool(allow_proc_io),
-        "writers_unavailable_reason": None
-        if allow_proc_io
-        else "needs root: /proc/<pid>/io is EACCES for other users' processes",
+        "writer_channel_attempted": bool(allow_proc_io),
+        # The probe (can this uid read *other users'* io at all) and the
+        # measurement (how many processes refused) are separate facts, and the
+        # interesting states are exactly where they disagree — so both are
+        # recorded rather than collapsed into one "privileged" boolean.
+        "privileged": bool(allow_proc_io) if privileged is None else privileged,
+        "writers_unreadable_count": io_denied,
+        "writers_unavailable_reason": _unavailable_reason(
+            allow_proc_io,
+            bool(allow_proc_io) if privileged is None else privileged,
+            io_denied,
+        ),
         "processes_seen": len(procs_post),
         "writers_with_activity": writer_count,
         "write_bytes_total": write_bytes_total,

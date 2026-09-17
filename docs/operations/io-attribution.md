@@ -55,12 +55,15 @@ bury the real stalls.
 
 | channel | source | needs root? |
 |---|---|---|
-| **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes**: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald would be invisible |
+| **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI | no — world-readable, including for root-owned processes |
 
-An unprivileged record is therefore **not** a record that found no writer: it
-sets `privileged: false` and a `writers_unavailable_reason`, keeps the stall
-channel, and says plainly what it could not read. (`/proc/<pid>/wchan` is what
+An unprivileged record is therefore **not** a record that found no writer:
+it keeps the stall channel, reports the writer list it *could* read, and names
+the gap — `privileged: false` (the probe: this uid cannot read other users'
+`/proc/<pid>/io`) plus `writers_unreadable_count` (how many processes refused
+one). "The camera pipeline wrote, 152 processes were invisible" is a usable
+reading; "no writers" is not. (`/proc/<pid>/wchan` is what
 turns "someone was blocked" into `jbd2_log_wait_commit` — the symbol the
 2026-08-16 fsync investigation found by hand.
 
@@ -123,7 +126,9 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | field | meaning |
 |---|---|
 | `reason` | `io_psi`, `heartbeat_age`, both (`io_psi+heartbeat_age`), or `manual` |
-| `privileged` / `writers_unavailable_reason` | whether the writer channel was readable, and why not when it was not |
+| `writer_channel_attempted` | whether the writer channel was tried at all (false only under `--no-proc-io`) |
+| `privileged` | the probe's answer: can this uid read *other users'* `/proc/<pid>/io`? (It asks about pid 1 — reading our own io always succeeds and would prove nothing.) |
+| `writers_unreadable_count` / `writers_unavailable_reason` | the measurement: how many processes actually refused `/proc/<pid>/io` in this snapshot, and one sentence saying which of the three gaps applies — not attempted, unprivileged, or refused-despite-privilege (a non-dumpable process) |
 | `writers[]` | ranked by `write_bytes` (disk) across the window, with `unit` from `/proc/<pid>/cgroup` — the process *and* the thing to change |
 | `writers_with_activity` / `write_bytes_total` | how many processes moved anything at all, and how much of it reached the disk |
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
@@ -142,7 +147,8 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `px-alive` stalled with `blocked_threads` in D state and `wchan: jbd2_log_wait_commit` | an SD-card call inside the daemon is blocking a thread (the park's lease *read*, or an in-flight health fsync) — the park logic is not the defect | take the SD touchpoint out of the park/startup path (#287); the heartbeat itself already moved to tmpfs |
 | no readable writer, `privileged: true`, high `ms_io`, jbd2/kworker in D state | ext4 journal work, not a daemon | journald/ext4 tuning (`SyncIntervalSec`, rates, storage), not process weighting |
 | `go2rtc`/`rpicam-vid` high `wchar`, `write_bytes: 0` | pipe traffic, not the disk | ignore; that reading is a known trap (#247) |
-| `writers: []` **and** `privileged: false` | the writer channel was unavailable, not empty | install as root (above) |
+| a short writer list with `writers_unreadable_count` high | the list is partial by privilege, not by absence of writers | install as root (above); a `pi`-owned writer in that list is still real evidence |
+| `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
 
 ## Deliberately not done
 

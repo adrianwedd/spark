@@ -9,6 +9,8 @@ be running, and on the stall it is meant to observe.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pxh.io_attrib as io_attrib
 
 PRESSURE = (
@@ -490,9 +492,15 @@ def test_capture_records_the_writer_the_device_and_the_stalled_process(
     assert record["observer_write_bytes"] == 0
 
 
-def test_capture_unprivileged_says_so_instead_of_claiming_nobody_wrote(
+def test_capture_without_the_writer_channel_keeps_the_stall_channel(
     tmp_path, monkeypatch
 ):
+    """The unprivileged record is not an empty record.
+
+    This is the shape an unprivileged deployment produces: no writer list, an
+    explicit reason, and the stall channel intact — who was blocked, and how
+    busy the device was.
+    """
     procs = {42: {"comm": "px-alive", "state": "D", "io": {"write_bytes": 0}}}
     paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
     record = io_attrib.capture(
@@ -503,10 +511,12 @@ def test_capture_unprivileged_says_so_instead_of_claiming_nobody_wrote(
         monotonic=_monotonic(),
         sleep=lambda _s: None,
     )
-    assert record["privileged"] is False
-    assert "needs root" in record["writers_unavailable_reason"]
+    assert record["writer_channel_attempted"] is False
+    assert (
+        record["writers_unavailable_reason"]
+        == "writer channel not attempted: --no-proc-io"
+    )
     assert record["writers"] == []
-    # The stall channel still works, which is the point of recording it.
     assert record["d_state_count"] == 1
     assert record["devices"]["mmcblk0"]["ms_io"] == 12000
 
@@ -646,3 +656,128 @@ def test_capture_attributes_a_blocked_thread_with_its_own_wchan(tmp_path, monkey
     assert row["unit"] == "px-alive.service"
     assert row["blocked_threads"][0]["tid"] == 43
     assert row["blocked_threads"][0]["wchan"] == "jbd2_log_wait_commit"
+
+
+# --- the privilege probe, and the measurement that backs it ---------------
+
+
+def test_proc_io_readable_is_not_satisfied_by_reading_our_own_io(tmp_path):
+    """The probe must ask about *other users'* processes.
+
+    An earlier version accepted a readable `/proc/<self>/io` as proof, which is
+    always true — so an unprivileged observer reported `privileged: true` while
+    px-alive and journald were invisible. Reading pid 1 is the question that
+    actually distinguishes the two.
+    """
+    proc = tmp_path / "proc"
+    (proc / "7").mkdir(parents=True)
+    (proc / "7" / "io").write_text("write_bytes: 1\n")
+    assert io_attrib.proc_io_readable(proc) is False  # nothing readable at pid 1
+    (proc / "1").mkdir()
+    (proc / "1" / "io").write_text("write_bytes: 1\n")
+    assert io_attrib.proc_io_readable(proc) is True
+
+
+def test_read_proc_io_separates_denial_from_absence(tmp_path, monkeypatch):
+    pid_dir = tmp_path / "proc" / "7"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "io").write_text("write_bytes: 5\n")
+    assert io_attrib._read_proc_io(pid_dir) == ({"write_bytes": 5}, False)
+    # No file at all: a process that exited mid-walk, not a privilege story.
+    assert io_attrib._read_proc_io(tmp_path / "elsewhere") == (None, False)
+    real_read_text = Path.read_text
+
+    def denied(self, *args, **kwargs):
+        if self.name == "io":
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    assert io_attrib._read_proc_io(pid_dir) == (None, True)
+
+
+def test_capture_unprivileged_still_reports_what_it_could_read(tmp_path, monkeypatch):
+    """A partial writer list plus a refusal count beats no list at all."""
+    procs = {
+        7: {"comm": "go2rtc", "state": "S", "io": {"write_bytes": 0}},
+        9: {"comm": "systemd-journald", "state": "S", "io_missing": True},
+    }
+    paths = _write_proc_tree(
+        tmp_path,
+        procs,
+        self_io={"read_bytes": 0, "write_bytes": 0},
+        diskstats=IDLE_DISK,
+        vmstat=IDLE_VMSTAT,
+    )
+    _stub_host_load(monkeypatch)
+    real_read_proc_io = io_attrib._read_proc_io
+
+    def fake_read_proc_io(pid_dir):
+        if pid_dir.name == "9":
+            return None, True
+        return real_read_proc_io(pid_dir)
+
+    monkeypatch.setattr(io_attrib, "_read_proc_io", fake_read_proc_io)
+
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        privileged=False,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["writer_channel_attempted"] is True
+    assert record["privileged"] is False
+    assert record["writers_unreadable_count"] == 1
+    assert "root-owned writers" in record["writers_unavailable_reason"]
+
+
+def test_capture_distinguishes_a_refusal_from_an_expected_invisibility(
+    tmp_path, monkeypatch
+):
+    """`privileged: true` with a refusal means something different — say it."""
+    procs = {9: {"comm": "systemd-journald", "state": "S", "io_missing": True}}
+    paths = _write_proc_tree(
+        tmp_path,
+        procs,
+        self_io={"read_bytes": 0, "write_bytes": 0},
+        diskstats=IDLE_DISK,
+        vmstat=IDLE_VMSTAT,
+    )
+    _stub_host_load(monkeypatch)
+    real_read_proc_io = io_attrib._read_proc_io
+    monkeypatch.setattr(
+        io_attrib,
+        "_read_proc_io",
+        lambda pid_dir: (None, True)
+        if pid_dir.name == "9"
+        else real_read_proc_io(pid_dir),
+    )
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        privileged=True,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["privileged"] is True
+    assert record["writers_unreadable_count"] == 1
+    assert "non-dumpable" in record["writers_unavailable_reason"]
+
+
+def test_capture_says_nothing_about_unreadable_writers_when_none_were(
+    tmp_path, monkeypatch
+):
+    procs = {1: {"comm": "systemd", "state": "S", "io": {"write_bytes": 0}}}
+    paths = _wire_capture(tmp_path, monkeypatch, procs, procs)
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=1.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["writers_unreadable_count"] == 0
+    assert record["writers_unavailable_reason"] is None

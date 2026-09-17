@@ -66,22 +66,6 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}", flush=True)
 
 
-def _proc_io_readable(proc_root: Path) -> bool:
-    """Whether this process may read /proc/<pid>/io for other users' processes.
-
-    Probed rather than inferred from euid: a uid-0 process in a container
-    without CAP_SYS_PTRACE is exactly the case where guessing wrong would turn
-    "not permitted" into "nothing wrote" in the record.
-    """
-    for candidate in (1, os.getpid()):
-        try:
-            (proc_root / str(candidate) / "io").read_text()
-            return True
-        except OSError:
-            continue
-    return False
-
-
 def _summary(record: dict) -> str:
     writers = record.get("writers") or []
     top = writers[0] if writers else None
@@ -96,6 +80,7 @@ def _summary(record: dict) -> str:
         f"window_s={record.get('window_s')}",
         f"top_writer={top_str}",
         f"writers={record.get('writers_with_activity')}",
+        f"writers_unreadable={record.get('writers_unreadable_count')}",
         f"write_bytes_total={record.get('write_bytes_total')}",
         f"d_state={record.get('d_state_count')}",
         f"blocked_threads={record.get('blocked_thread_count')}",
@@ -145,7 +130,13 @@ def main(argv: list[str]) -> int:
     )
     pid_file = Path(args.pid_file)
     paths = io_attrib.Paths()
-    allow_proc_io = (not args.no_proc_io) and _proc_io_readable(paths.proc)
+    # Attempt the writer channel either way and record what it could actually
+    # read: unprivileged, a partial list plus a count of the refused is more
+    # useful than no list at all, and the record says which it is. The probe
+    # (pid 1, not our own io — reading our own always works and proves nothing)
+    # is only the label.
+    allow_proc_io = not args.no_proc_io
+    privileged = allow_proc_io and io_attrib.proc_io_readable(paths.proc)
 
     def snapshot(reason: str, trigger_extra: dict) -> dict:
         trigger = {"reason": reason, **trigger_extra}
@@ -154,6 +145,7 @@ def main(argv: list[str]) -> int:
             paths=paths,
             window_s=window_s,
             allow_proc_io=allow_proc_io,
+            privileged=privileged,
             top=max(1, args.top),
         )
         if not args.dry_run:
@@ -184,8 +176,8 @@ def main(argv: list[str]) -> int:
         f"observer start io_threshold={args.io_threshold} "
         f"heartbeat_threshold={args.heartbeat_threshold} window_s={window_s} "
         f"cooldown_s={args.cooldown} poll_s={args.poll} "
-        f"heartbeat_file={heartbeat_file} privileged={allow_proc_io}"
-        + ("" if allow_proc_io else " (writer channel unavailable without root)")
+        f"heartbeat_file={heartbeat_file} privileged={privileged}"
+        + ("" if privileged else " (writer list will be partial; root sees the rest)")
     )
 
     started = time.monotonic()
