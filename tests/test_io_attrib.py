@@ -2096,3 +2096,53 @@ def test_a_short_lookback_is_not_rearranged():
     out = io_attrib.kernel_log_window(60.0, runner=lambda _a: _journal_text(*lines), limit=20)
     assert [line for line in out["lines"]] == lines
     assert out["lines_omitted"] == 0
+
+
+def test_repeated_routine_lifecycle_lines_are_folded_but_failures_are_not():
+    """A per-minute service filled 15 of 20 slots and evicted the timers.
+
+    Measured 2026-09-18: `host-telemetry.service` emits three lifecycle lines a
+    minute, so a 5-minute lookback is 15 lines of it — and `apt-daily-upgrade`,
+    the thing worth seeing, sat in the middle and was dropped by the cap.
+    """
+    lines = []
+    for minute in range(5):
+        lines.append(f"2026-09-18T06:0{minute}:59+1000 picar systemd[1]: Starting host-telemetry.service - Publish host health...")
+        lines.append(f"2026-09-18T06:0{minute}:59+1000 picar systemd[1]: host-telemetry.service: Deactivated successfully.")
+        lines.append(f"2026-09-18T06:0{minute}:59+1000 picar systemd[1]: Finished host-telemetry.service - Publish host health.")
+    lines.append("2026-09-18T06:00:44+1000 picar systemd[1]: Starting apt-daily-upgrade.service - Daily apt upgrade...")
+    lines.append("2026-09-18T06:03:31+1000 picar systemd[1]: apt-daily-upgrade.service: Failed with result 'exit-code'.")
+
+    kept, collapsed = io_attrib.collapse_routine_lifecycle(lines)
+    # `Finished` and `Deactivated` fold (5 runs -> 1 each); `Starting` does not,
+    # because "something began" is the onset signal this channel exists for.
+    # Net: host-telemetry's footprint goes 15 slots -> 7, leaving 13 for the rest.
+    assert collapsed == 8
+    assert len(kept) == 9
+    assert sum("host-telemetry" in line for line in kept) == 7
+    assert any("apt-daily-upgrade.service - Daily apt upgrade" in line for line in kept)
+    assert any("Failed with result" in line for line in kept), "a failure is never folded"
+    # The surviving repeat is the *latest* one, in the earlier slot's position.
+    assert kept[1].startswith("2026-09-18T06:04")
+
+
+def test_collapsing_leaves_a_single_run_alone():
+    lines = [
+        "2026-09-18T06:00:44+1000 picar systemd[1]: Starting apt-daily.service - Daily apt download...",
+        "2026-09-18T06:03:31+1000 picar systemd[1]: apt-daily.service: Deactivated successfully.",
+    ]
+    kept, collapsed = io_attrib.collapse_routine_lifecycle(lines)
+    assert kept == lines and collapsed == 0
+
+
+def test_the_unit_channel_reports_what_it_folded():
+    text = _journal_text(*[
+        f"2026-09-18T06:0{i}:00+1000 picar systemd[1]: Finished host-telemetry.service - health"
+        for i in range(4)
+    ])
+    out = io_attrib.unit_log_window(300.0, runner=lambda _a: text)
+    assert out["matched_total"] == 1 and out["lines_collapsed"] == 3
+    assert len(out["lines"]) == 1
+    # The kernel channel has no periodic-unit pattern to fold.
+    kout = io_attrib.kernel_log_window(300.0, runner=lambda _a: text)
+    assert kout.get("lines_collapsed") == 0

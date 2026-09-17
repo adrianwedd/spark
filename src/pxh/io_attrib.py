@@ -282,6 +282,44 @@ UNIT_LOG_PATTERN = re.compile(
 )
 
 
+#: Lifecycle verbs that repeat for a *periodic* unit and so say nothing new
+#: after the first occurrence. Deliberately excludes anything that means "this
+#: went wrong": a repeating failure is the signal, not noise.
+_ROUTINE_VERBS = ("Finished", "Deactivated", "Started", "Stopped")
+
+
+def collapse_routine_lifecycle(
+    lines: Sequence[str], *, pattern: re.Pattern[str] = UNIT_LOG_PATTERN
+) -> tuple[list[str], int]:
+    """`(lines, collapsed)`: repeated routine lifecycle lines folded.
+
+    Measured on the robot 2026-09-18: `host-telemetry.service` fires every minute
+    and emits three lifecycle lines per run, so over the channel's 5-minute
+    lookback it alone filled **15 of the 20 kept slots** — and the timers this
+    channel exists to name (`apt-daily`, `apt-daily-upgrade`) sat in the middle,
+    evicted by the cap. Folding repeats of the same `(unit, verb)` to the most
+    recent occurrence leaves room for the lines that differ between runs.
+    """
+    seen: dict[tuple[str, str], int] = {}
+    kept: list[str] = []
+    collapsed = 0
+    for line in lines:
+        match = pattern.search(line)
+        verb = match.group(1) if match else ""
+        # "2026-09-18T06:03:31+1000 picar systemd[1]: apt-daily-upgrade.service: ..."
+        tail = line.split("systemd[1]: ", 1)[-1]
+        unit = tail.split(":", 1)[0].strip()
+        if verb in _ROUTINE_VERBS and (unit, verb) in seen:
+            collapsed += 1
+            # Latest occurrence wins, in the earlier slot: the surviving line
+            # keeps the most recent timestamp for that unit.
+            kept[seen[(unit, verb)]] = line
+            continue
+        seen[(unit, verb)] = len(kept)
+        kept.append(line)
+    return kept, collapsed
+
+
 def _journal_filtered(
     source: str,
     args: Sequence[str],
@@ -312,6 +350,11 @@ def _journal_filtered(
     lines = [line for line in text.splitlines() if line.strip()]
     scanned = lines[-KERNEL_LOG_MAX_LINES:]
     matched = [line for line in scanned if pattern.search(line)]
+    # A periodic unit's repeats crowd out everything else; the unit channel is
+    # the one that needs folding. The kernel channel has no such pattern.
+    collapsed = 0
+    if pattern is UNIT_LOG_PATTERN:
+        matched, collapsed = collapse_routine_lifecycle(matched, pattern=pattern)
     # Keep both ends of the match set: the onset of a timer-driven writer is at
     # the front of the lookback and its recovery at the back.
     head = min(max(1, KERNEL_LOG_HEAD), limit)
@@ -330,6 +373,10 @@ def _journal_filtered(
         "matched_total": len(matched),
         # Named, not left to arithmetic on the reader's side.
         "lines_omitted": max(0, len(matched) - len(kept)),
+        # Repeats of a *routine* verb for the same unit, folded to the most
+        # recent. Failures and restarts are never folded: repeating is their
+        # signal.
+        "lines_collapsed": collapsed,
         "lines": kept,
     }
 
