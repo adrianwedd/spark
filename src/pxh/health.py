@@ -142,8 +142,25 @@ _SWEEP_INTERVAL_S = 3600.0
 _temps_swept_at: float | None = None
 
 
+def _sweep_targets(d: Path) -> list[Path]:
+    """Every directory this host's daemons write `atomic_write` temps into.
+
+    `sweep_stale_temps` was wired only to the *health* directory (#292), which
+    left the directory that actually accumulates them unswept: measured on the
+    robot 2026-09-18, `state/health/` held **0** leftovers while `state/` itself
+    held **424** (273 of them root-owned) and `state/brain/spark-brain/*box` a
+    further 3, all from crashed `atomic_write` calls on `state/*.json` between
+    June and August. The health dir is `1777`, so a `pi` sweep there can only
+    count root's files as skipped; `state/` is `0755` and pi-owned, so the same
+    sweep removes them.
+    """
+    state = d.parent
+    brain = state / "brain" / "spark-brain"
+    return [d, state, brain / "inbox", brain / "outbox"]
+
+
 def _maybe_sweep_temps(d: Path) -> None:
-    """Prune crashed writers' temp files from the health directory, hourly.
+    """Prune crashed writers' temp files, hourly, from every state directory.
 
     Never raises, and logs only when it actually did something — a line per
     daemon per hour saying "removed 0" would be its own small lie about how
@@ -156,15 +173,16 @@ def _maybe_sweep_temps(d: Path) -> None:
     if _temps_swept_at is not None and (now - _temps_swept_at) < _SWEEP_INTERVAL_S:
         return
     _temps_swept_at = now
-    try:
-        counts = sweep_stale_temps(d)
-    except Exception:  # pragma: no cover — health must never break its caller
-        return
-    if counts["removed"] or counts["skipped"] or counts["failed"]:
+    for target in _sweep_targets(d):
         try:
-            log_event("health-sweep", {"dir": str(d), **counts})
-        except Exception:  # pragma: no cover — reporting is never load-bearing
-            pass
+            counts = sweep_stale_temps(target)
+        except Exception:  # pragma: no cover — health must never break its caller
+            continue
+        if counts["removed"] or counts["skipped"] or counts["failed"]:
+            try:
+                log_event("health-sweep", {"dir": str(target), **counts})
+            except Exception:  # pragma: no cover — reporting is never load-bearing
+                pass
 
 
 def _ensure_health_dir() -> Path | None:

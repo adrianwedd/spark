@@ -341,7 +341,11 @@ def test_first_health_write_sweeps_and_the_next_does_not(monkeypatch):
     )
     health.record_success("px-mind")
     health.record_failure("px-post", "boom")
-    assert len(calls) == 1
+    # One pass over every state directory that `atomic_write` targets, not one
+    # call: `state/` itself is where the leftovers accumulate (#292).
+    assert len(calls) == len(health._sweep_targets(health.health_dir()))
+    assert health.health_dir() in calls
+    assert health.health_dir().parent in calls
 
 
 def test_sweep_runs_again_after_the_interval(monkeypatch):
@@ -351,9 +355,10 @@ def test_sweep_runs_again_after_the_interval(monkeypatch):
         lambda d, *a, **kw: calls.append(d) or {"removed": 0, "skipped": 0, "failed": 0},
     )
     health.record_success("px-mind")
+    first = len(calls)
     health._temps_swept_at -= health._SWEEP_INTERVAL_S + 1
     health.record_success("px-mind")
-    assert len(calls) == 2
+    assert len(calls) == 2 * first
 
 
 def test_sweep_throttle_does_not_skip_the_first_sweep_on_a_fresh_boot(monkeypatch):
@@ -366,7 +371,7 @@ def test_sweep_throttle_does_not_skip_the_first_sweep_on_a_fresh_boot(monkeypatc
     )
     monkeypatch.setattr(health.time, "monotonic", lambda: 12.0)
     health.record_success("px-mind")
-    assert len(calls) == 1
+    assert calls
 
 
 def test_sweep_records_what_it_removed(monkeypatch):
@@ -378,7 +383,12 @@ def test_sweep_records_what_it_removed(monkeypatch):
         lambda d, *a, **kw: {"removed": 3, "skipped": 2, "failed": 0},
     )
     health.record_success("px-mind")
-    assert events == [("health-sweep", {"dir": str(health.health_dir()), "removed": 3, "skipped": 2, "failed": 0})]
+    assert events, "a sweep that removed something must say so"
+    assert all(name == "health-sweep" for name, _payload in events)
+    assert all(payload["removed"] == 3 for _name, payload in events)
+    assert {payload["dir"] for _name, payload in events} == {
+        str(target) for target in health._sweep_targets(health.health_dir())
+    }
 
 
 def test_a_quiet_sweep_logs_nothing(monkeypatch):
@@ -420,3 +430,16 @@ def test_ha_reads_stale_only_after_its_window():
     assert health.read_health(("ha",))["components"]["ha"]["status"] == "ok"
     _shift("ha", health.STALE_AFTER_S["ha"] + 60)
     assert health.read_health(("ha",))["components"]["ha"]["status"] == "stale"
+
+
+def test_the_sweep_covers_the_state_dir_that_actually_accumulates(tmp_path):
+    """#292: `state/health/` held 0 leftovers while `state/` held 424.
+
+    The residue comes from `atomic_write` on `state/*.json`, and `state/` is
+    0755 pi-owned — so unlike the 1777 health dir, a `pi` sweep can remove
+    root's files there rather than counting them as skipped.
+    """
+    targets = health._sweep_targets(tmp_path / "state" / "health")
+    assert targets[0] == tmp_path / "state" / "health"
+    assert targets[1] == tmp_path / "state"
+    assert any(str(t).endswith("brain/spark-brain/inbox") for t in targets)
