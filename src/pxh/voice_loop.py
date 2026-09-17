@@ -1572,9 +1572,49 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             break
 
 
+def cognition_backend_preflight(backend: str, *, dry_run: bool = False) -> str | None:
+    """Why this loop cannot serve a turn, or None if it can (#345).
+
+    The failure this exists for: `bin/px-spark` greets, listens, and then answers
+    *every* turn with the deterministic unavailable acknowledgement, because
+    `PX_M5_SPARK_MODEL` is unset — the systemd units get it from
+    `EnvironmentFile=…/.env` and a hand-started shell does not. From the outside
+    that is indistinguishable from "the cognition tier is down", which is why it
+    wasted a real debugging session and why the fix is a refusal rather than a
+    nicer per-turn message.
+
+    `dry_run` is exempt from the *refusal* because diagnostics and prompt
+    testing legitimately run without a model; the diagnosis is still printed.
+    """
+    if backend != "tier":
+        return None
+    from pxh import m5  # lazy: matches this module's import style for m5
+
+    if m5.configured_model() is not None:
+        return None
+    return (
+        "cognition tier is not configured: PX_M5_SPARK_MODEL must name a model "
+        "explicitly (not auto, not unset).\n"
+        "    The systemd units read it from .env; a shell that launched this "
+        "loop directly does not\n"
+        "    load .env, which is the whole of #345. Either start the loop the "
+        "way the units do, or\n"
+        "    export it yourself:  export PX_M5_SPARK_MODEL=<model>"
+    )
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     try:
         args = parse_args(argv)
+        reason = cognition_backend_preflight(
+            args.backend, dry_run=bool(getattr(args, "dry_run", False))
+        )
+        if reason is not None:
+            print(f"[voice-loop] refusing to start: {reason}", file=sys.stderr)
+            if not getattr(args, "dry_run", False):
+                return 2
+            print("[voice-loop] --dry-run: continuing without a cognition model",
+                  file=sys.stderr)
         supervisor_loop(args)
         return 0
     except VoiceLoopError as exc:
