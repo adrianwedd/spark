@@ -205,8 +205,12 @@ class TestRateLimiting:
 
     def test_priority_gating_blocks_low_priority(self, tmp_path):
         sd = _make_state_dir(tmp_path)
-        # 6 sessions today with cap=8 → 2 remaining → low priority blocked
-        entries = [{"ts": _ts_ago(i * 30 + 60), "type": "conversation"} for i in range(6)]
+        # 6 sessions today with cap=8 → 2 remaining → low priority blocked.
+        # Timestamps are anchored to today's Hobart day rather than "n minutes
+        # ago": a run in the first five minutes of the Hobart day would put a
+        # relative timestamp in *yesterday* and silently change the day's spend
+        # (the same hazard `test_consolidate_quota_is_two_per_day` records).
+        entries = [{"ts": _ts_hobart(0, 30 + i), "type": "conversation"} for i in range(6)]
         _write_session_log(sd, entries)
         import pxh.model_session as cs
         with patch.object(cs, "SESSION_LOG", sd / "model_sessions.jsonl"), \
@@ -221,7 +225,7 @@ class TestRateLimiting:
     def test_priority_gating_allows_high_priority(self, tmp_path):
         sd = _make_state_dir(tmp_path)
         # 6 sessions today with cap=8 → 2 remaining
-        entries = [{"ts": _ts_ago(i * 30 + 60), "type": "conversation"} for i in range(6)]
+        entries = [{"ts": _ts_hobart(0, 30 + i), "type": "conversation"} for i in range(6)]
         _write_session_log(sd, entries)
         import pxh.model_session as cs
         with patch.object(cs, "SESSION_LOG", sd / "model_sessions.jsonl"), \
@@ -230,6 +234,70 @@ class TestRateLimiting:
              patch.object(cs, "COOLDOWN_S", 0):
             # self_debug is high priority (5) — should be allowed
             assert cs.check_budget("self_debug") is None
+
+    def test_the_nightly_pass_survives_a_tight_day(self, tmp_path):
+        """#333: consolidate is priority 4, so a busy day cannot lock out the
+        nightly pass.
+
+        Every other gate test here isolates one gate. This one *composes* them:
+        the spend that brings the day to 6/8 is six ordinary sessions, and the
+        pass is asked for the way `memory` asks for it. Before #333 this
+        assertion failed with "budget tight (2 remaining), consolidate priority
+        too low" — a refusal whose message names no defect, which is why the
+        nine nights it cost were found by reading logs rather than by CI.
+        """
+        sd = _make_state_dir(tmp_path)
+        # Six sessions spent before 03:00 — the state the issue measured as
+        # reachable on a wakeful night, and the state that refused the pass.
+        entries = [{"ts": _ts_hobart(0, 30 + i), "type": "conversation"} for i in range(6)]
+        _write_session_log(sd, entries)
+        import pxh.model_session as cs
+        with patch.object(cs, "SESSION_LOG", sd / "model_sessions.jsonl"), \
+             patch.object(cs, "BUDGET_DISABLED", False), \
+             patch.object(cs, "DAILY_CAP", 8), \
+             patch.object(cs, "COOLDOWN_S", 0):
+            assert cs.check_budget("consolidate") is None
+            # ... and the same state still gates: raising the nightly pass did
+            # not raise the floor for everything else.
+            assert "priority too low" in (cs.check_budget("blog") or "")
+            assert "priority too low" in (cs.check_budget("compose") or "")
+
+    def test_the_nightly_pass_uses_the_last_slot_too(self, tmp_path):
+        """7/8: one slot left. The pass is what that slot is reserved for."""
+        sd = _make_state_dir(tmp_path)
+        entries = [{"ts": _ts_hobart(0, 30 + i), "type": "conversation"} for i in range(7)]
+        _write_session_log(sd, entries)
+        import pxh.model_session as cs
+        with patch.object(cs, "SESSION_LOG", sd / "model_sessions.jsonl"), \
+             patch.object(cs, "BUDGET_DISABLED", False), \
+             patch.object(cs, "DAILY_CAP", 8), \
+             patch.object(cs, "COOLDOWN_S", 0):
+            assert cs.check_budget("consolidate") is None
+
+    def test_the_daily_cap_still_refuses_the_nightly_pass(self, tmp_path):
+        """The one gate above the priority rule: at 8/8 the refusal names the
+        cap, which is a true statement about the machine's spend. The fix for
+        #333 is that the pass is not refused by a rule about *other* kinds."""
+        sd = _make_state_dir(tmp_path)
+        entries = [{"ts": _ts_hobart(0, 30 + i), "type": "conversation"} for i in range(8)]
+        _write_session_log(sd, entries)
+        import pxh.model_session as cs
+        with patch.object(cs, "SESSION_LOG", sd / "model_sessions.jsonl"), \
+             patch.object(cs, "BUDGET_DISABLED", False), \
+             patch.object(cs, "DAILY_CAP", 8), \
+             patch.object(cs, "COOLDOWN_S", 0):
+            assert cs.check_budget("consolidate") == "daily cap reached (8/8)"
+
+    def test_priority_four_is_the_reserved_slot_line(self):
+        """The table's own shape, asserted so a future edit that lowers the
+        nightly pass has to say so in a diff that fails."""
+        from pxh.model_session import _PRIORITY
+        assert _PRIORITY["consolidate"] >= 4
+        # Nothing below the line may be promoted by accident: this is the
+        # invariant the gate reads, and it is one number.
+        assert _PRIORITY["self_debug"] >= 4 and _PRIORITY["evolve"] >= 4
+        assert _PRIORITY["blog"] < 4 and _PRIORITY["compose"] < 4
+        assert _PRIORITY["research"] < 4 and _PRIORITY["conversation"] < 4
 
     def test_cold_start_missing_log(self, tmp_path):
         sd = _make_state_dir(tmp_path)
@@ -519,7 +587,13 @@ def test_consolidate_session_type_registered():
     # than the cooldown, not the same as it.
     assert cs._TYPE_COOLDOWNS["consolidate"] == 2400
     assert memory.RETRY_SPACING_S > cs._TYPE_COOLDOWNS["consolidate"]
-    assert cs._PRIORITY["consolidate"] == 2
+    # Priority 4, not 2 (#333). This line used to assert == 2, which is how a
+    # gate that could lock out the nightly pass survived as a "requirement":
+    # the number was pinned as though it had been chosen, and nothing composed
+    # it with the spend it is compared against. The behavioural test lives in
+    # `TestBudget::test_the_nightly_pass_survives_a_tight_day`; this one stays
+    # as the cheap tripwire on the table itself.
+    assert cs._PRIORITY["consolidate"] >= 4
 
 
 def test_consolidate_quota_is_two_per_day(tmp_path, monkeypatch):
