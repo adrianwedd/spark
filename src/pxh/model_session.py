@@ -132,14 +132,28 @@ _TYPE_QUOTAS: dict[str, int] = {
 }
 
 # Higher number = higher priority.  Used for budget-tight gating.
+#
+# 4 is the line, and it does not mean "important" — everything here is
+# important by somebody's account. It means *the refusal is invisible for
+# long enough that nobody finds out*. `self_debug` (a tool is broken and no
+# human is watching), `evolve` (the machine cannot change itself), and
+# `consolidate` (memory does not form; the only symptom is nights that pass
+# with nothing in them). Everything below 4 costs one post, one composition,
+# one research answer when it is refused — legible, and recoverable tomorrow.
+#
+# `consolidate` was 2 until #333, which made the nightly memory pass the one
+# kind whose *scheduler* could be locked out by a *budget* it does not control:
+# six sessions spent between 00:00 and 03:00 AEST and the pass was refused for
+# the rest of the day with a message that named no defect. Nine nights of no
+# consolidation were the eventual symptom; the gate was never the diagnosis.
 _PRIORITY: dict[str, int] = {
     "self_debug": 5,
     "evolve": 4,
+    "consolidate": 4,
     "conversation": 3,
     "research": 2,
     "compose": 1,
     "blog": 2,
-    "consolidate": 2,
 }
 
 _GLOBAL_COOLDOWN_EXEMPT = {"self_debug", "blog"}
@@ -229,11 +243,13 @@ def check_budget(session_type: str) -> str | None:
     if len(today) >= DAILY_CAP:
         return f"daily cap reached ({len(today)}/{DAILY_CAP})"
 
-    # Priority gating: low-priority blocked when <=2 sessions remain
+    # Priority gating: kinds below priority 4 are blocked when <=2 sessions
+    # remain, so the last two slots are reserved for the kinds whose refusal
+    # would not be noticed. See `_PRIORITY` for what the line means — it is
+    # "invisible if refused", not "important if spent".
     remaining = DAILY_CAP - len(today)
     if remaining <= 2:
         priority = _PRIORITY.get(session_type, 0)
-        # Only allow priority >= 4 (self_debug, evolve) when budget is tight
         if priority < 4:
             return f"budget tight ({remaining} remaining), {session_type} priority too low"
 
