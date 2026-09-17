@@ -886,6 +886,36 @@ def test_capture_reports_the_share_alongside_the_device_deltas(tmp_path, monkeyp
     assert 0.0 <= record["unattributed_write_share"] <= 1.0
 
 
+def test_parse_procs_stat_reads_the_stall_context():
+    """`full` tracking `some` on a box with one runnable task is not a freeze."""
+    text = (
+        "cpu  1 2 3 4 5 6 7 8 9 10\n"
+        "procs_running 2\n"
+        "procs_blocked 4\n"
+        "btime 1758000000\n"
+    )
+    assert io_attrib.parse_procs_stat(text) == {"running": 2, "blocked": 4}
+    assert io_attrib.parse_procs_stat("") == {}
+
+
+def test_capture_records_the_stall_context(tmp_path, monkeypatch):
+    procs = _stall_procs()
+    paths = _wire_capture(tmp_path, monkeypatch, procs, _stall_post(procs))
+    (tmp_path / "proc_stat").write_text("procs_running 1\nprocs_blocked 3\n")
+    monkeypatch.setattr(
+        io_attrib, "parse_procs_stat", lambda _t: {"running": 1, "blocked": 3}
+    )
+    record = io_attrib.capture(
+        {"reason": "io_psi"},
+        paths=paths,
+        window_s=3.0,
+        monotonic=_monotonic(),
+        sleep=lambda _s: None,
+    )
+    assert record["procs_running_pre"] == 1
+    assert record["procs_blocked_post"] == 3
+
+
 def test_sample_file_meta_carries_size_and_mtime(tmp_path):
     target = tmp_path / "ambient_sound.json"
     target.write_text("{}")
