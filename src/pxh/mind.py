@@ -2424,15 +2424,15 @@ def call_llm(prompt: str, system: str, persona: str = "") -> dict:
     Reflection is optional work.  It must neither queue behind a prior M5 turn
     nor widen into a resident Claude, Ollama Cloud, or Pi-local model fallback.
     """
-    from pxh.m5 import ask_m5
+    from pxh.m5 import ask_m5, backend_label
 
     result = ask_m5("reflection", prompt, system)
     if result.status == "available":
         try:
-            _log_token_usage(prompt + system, result.response, "ollama-m5")
+            _log_token_usage(prompt + system, result.response, backend_label())
         except Exception:
             pass
-        return {"response": result.response, "backend": "ollama-m5"}
+        return {"response": result.response, "backend": backend_label()}
     log(f"M5 reflection {result.status}: {result.error}; deferring")
     return {"error": result.error or result.status, "m5_status": result.status,
             BRAIN_DEFER: True}

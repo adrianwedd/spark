@@ -6,7 +6,7 @@ for Claude (English text averages ~3.5–4 bytes per token).
 
 Usage:
     from pxh.token_log import log_usage
-    log_usage(prompt, response_text)
+    log_usage(prompt, response_text, backend=m5.backend_label())
 """
 from __future__ import annotations
 
@@ -33,13 +33,22 @@ def _state_dir() -> Path:
     return Path(os.environ.get("PX_STATE_DIR", root / "state"))
 
 
-def log_usage(input_text: str, output_text: str, backend: str = "unknown") -> None:
+def log_usage(input_text: str, output_text: str, backend: str) -> None:
     """Accumulate estimated token counts into state/token_usage.json.
 
     `backend` splits the totals per tier under ``by_backend``. The top-level
-    totals mix free (Ollama) and paid (Claude) calls, so they cannot answer
-    "what am I spending" — only the per-backend breakdown can. Pass the tier
-    that actually served, not the one that was configured.
+    totals mix free (Ollama) and paid (Ollama Cloud, Codex) calls, so they
+    cannot answer "what am I spending" — only the per-backend breakdown can.
+    Pass the tier that actually served, not the one that was configured; for the
+    cognition tier that value is ``pxh.m5.backend_label()``.
+
+    **Required, deliberately (#306).** It used to default to ``"unknown"``, and
+    the voice loop's one production call site took the default — so every voice
+    turn since 2026-08-20 landed in an ``unknown`` bucket that grew to 1,357
+    calls while the ``claude`` bucket sat frozen. A default here is a silent
+    failure generator: the call compiles, the number moves, and the attribution
+    is wrong. A future call site now has to *say* which tier served, and the
+    wrong answer is a visible one.
     """
     state_dir = _state_dir()
     usage_file = state_dir / "token_usage.json"

@@ -764,11 +764,41 @@ VOICE_TURN_RESPOND_WITH = (
 )
 
 
-def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
+def command_backend_label(codex_cmd: str) -> str:
+    """The token-log bucket for a `--backend command` turn (#306).
+
+    The adapter is the only thing that knows the provider, and naming the bucket
+    from the adapter is not a guess about the answer — it is the same fact the
+    launcher chose: `bin/codex-ollama` talks to Ollama over HTTP (cloud by
+    default, any daemon `OLLAMA_HOST` names), and the plain Codex CLI is
+    OpenAI's. An adapter nobody recognises gets its own explicit bucket rather
+    than `unknown`, so the blind spot cannot hide in a bucket that reads as
+    "not yet filled in".
+    """
+    parts = codex_cmd.split() if codex_cmd else []
+    name = Path(parts[0]).name if parts else ""
+    if "codex-ollama" in name:
+        from pxh import m5
+
+        host = (
+            os.environ.get("OLLAMA_HOST")
+            or os.environ.get("PX_OLLAMA_HOST")
+            or "http://localhost:11434"
+        )
+        return m5.backend_label(host)
+    if name.startswith("codex"):
+        return "codex"
+    return f"command:{name or 'unknown'}"
+
+
+def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str, str]:
     """One conversation turn on the cognition tier.
 
-    Returns run_codex's (rc, stdout, stderr) shape so the turn loop below is
-    unchanged, with VOICE_TIER_UNAVAILABLE for "could not be asked".
+    Returns run_codex's (rc, stdout, stderr) shape **plus the token-log bucket
+    of the tier that answered** (#306), with VOICE_TIER_UNAVAILABLE for "could
+    not be asked". The label is not a return-value nicety: the caller records
+    spend, and a turn whose tier cannot be named is a turn recorded as
+    `unknown`, which is the defect this fourth element exists to close.
 
     **Retry is bounded by attempt count and by how the attempt failed, never by
     sleeping — and now that failure has a name.** This used to be a heuristic
@@ -798,6 +828,7 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
     """
     from pxh import m5
 
+    backend = m5.backend_label()
     last = "cognition tier did not answer"
     for attempt in range(1, attempts + 1):
         try:
@@ -809,17 +840,20 @@ def run_voice_turn(prompt: str, attempts: int = 2) -> Tuple[int, str, str]:
                 lock_wait_s=VOICE_TURN_LOCK_WAIT_S,
             )
         except Exception as exc:  # noqa: BLE001 - the loop must survive the tier
-            return VOICE_TIER_UNAVAILABLE, "", f"cognition call raised: {exc}"
+            return VOICE_TIER_UNAVAILABLE, "", f"cognition call raised: {exc}", backend
 
         if result.status == "available":
-            return 0, result.response, ""
+            # The result carries the label of the host that answered, so a
+            # per-call model/host override cannot be mislabelled by a caller
+            # reading the configured primary instead (#306).
+            return 0, result.response, "", (result.backend or backend)
 
         last = f"cognition tier {result.status}: {result.error}"
         if result.status not in ("offline", "bad_response") or attempt == attempts:
             break
         print(f"[voice-loop] cognition {result.status}; one retry", file=sys.stderr)
 
-    return VOICE_TIER_UNAVAILABLE, "", last
+    return VOICE_TIER_UNAVAILABLE, "", last, backend
 
 
 def acknowledge_unavailable(dry_run: bool = False) -> bool:
@@ -1348,15 +1382,16 @@ def supervisor_loop(args: argparse.Namespace) -> None:
             # watchdog doesn't fire during a legitimately long subprocess.
             heartbeat_val[0] = time.monotonic() + 300.0
         if args.backend == "tier":
-            rc, stdout, stderr = run_voice_turn(prompt)
+            rc, stdout, stderr, backend = run_voice_turn(prompt)
         else:
             rc, stdout, stderr = run_codex(args.codex_cmd, prompt)
+            backend = command_backend_label(args.codex_cmd)
         with heartbeat_lock:
             heartbeat_val[0] = time.monotonic()
         if rc == 0 and stdout.strip():
             try:
                 from .token_log import log_usage
-                log_usage(prompt, stdout)
+                log_usage(prompt, stdout, backend)
             except Exception:
                 print("[voice-loop] token logging failed", file=sys.stderr)
 

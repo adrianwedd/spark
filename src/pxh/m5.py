@@ -99,6 +99,10 @@ class M5Result:
     model: str = ""
     prompt_eval_count: int = 0
     eval_count: int = 0
+    # The token_log bucket for the host that served this call (#306). A caller
+    # that records spend has to name the tier that answered, and only this
+    # module knows which host that was.
+    backend: str = ""
 
 
 def _state_dir() -> Path:
@@ -155,6 +159,20 @@ def is_local_host(host: str) -> bool:
     hostname = netloc.rsplit("@", 1)[-1].split(":")[0].strip("[]").lower()
     return hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"} \
         or hostname.endswith(".local")
+
+
+def backend_label(host: str | None = None) -> str:
+    """The token-log bucket for the tier at `host` (default: the configured one).
+
+    `ollama-local` only for a daemon on this machine or the LAN — the one case
+    where a resident model is legal, and the one case that is *not* metered
+    consumption. Anything hosted is `ollama-m5`, which since #308 means "Ollama
+    Cloud, on a plan": real spend, not free local compute. A caller recording
+    usage must pass this rather than a literal, or a LAN daemon gets billed to
+    the cloud bucket and the number that exists to answer "what am I spending"
+    answers wrong.
+    """
+    return "ollama-local" if is_local_host(host or M5_HOST) else "ollama-m5"
 
 
 def normalize_model(name: str) -> str:
@@ -241,7 +259,8 @@ def _result(status: M5Status, *, response: str = "", error: str = "",
     duration_ms = round((time.monotonic() - started) * 1000)
     _record_request(kind, status, duration_ms)
     return M5Result(status=status, response=response, error=error, duration_ms=duration_ms,
-                    model=model, prompt_eval_count=prompt_eval_count, eval_count=eval_count)
+                    model=model, prompt_eval_count=prompt_eval_count, eval_count=eval_count,
+                    backend=backend_label())
 
 
 def _http_error_detail(exc: urllib.error.HTTPError) -> str:
