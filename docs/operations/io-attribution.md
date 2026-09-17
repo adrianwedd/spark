@@ -391,6 +391,19 @@ episodes at 25-40 % were being missed and the open question — do
 `px-wake-listen`/`px-mind` still appear in `jbd2_log_wait_commit` after `#367` —
 is answered by *record count*, not by peak height.
 
+### Two ways a record can mislead (both observed 2026-09-17)
+
+- **A deploy is itself a workload.** The 11:56:34Z record contains `git` in D
+  state with `wchan: do_get_write_access` — that was *my own* `git fetch &&
+  merge --ff-only` on the host, blocked in a jbd2 metadata wait. Deploying to
+  `picar` rewrites many files at once, so a record taken within a minute of a
+  deploy is contaminated by it. Wait before drawing conclusions from one.
+- **The threshold decides what exists.** Episodes at 25-40 % were invisible to
+  the 40 % default, and a question like "does this unit still appear in
+  `jbd2_log_wait_commit`?" is answered by *record count*, not peak height. That
+  is why the hand-run observer triggers at 25 % now — a measurement choice, not
+  a change in what counts as a stall.
+
 ## Reading a record
 
 ```bash
