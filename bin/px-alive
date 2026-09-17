@@ -215,7 +215,20 @@ def log(msg: str) -> None:
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
     print(line, flush=True)
-    # Simple rotation: keep last half when file exceeds 5MB
+    # Simple rotation: keep last half when file exceeds 5MB.
+    #
+    # Deliberately *no* fsync (#247). This was the last copy of the durable
+    # log-rotation write: a log's durability buys nothing, and the fsync forced
+    # an ext4 journal commit while rewriting half of a multi-megabyte file —
+    # here, in the log path of the *watchdog* daemon, whose log sits at 2.95 MB
+    # against this 5 MB threshold. `px-alive` is the daemon that spent months
+    # being killed by exactly this kind of blocking write (#287), which is why
+    # it is worth stating rather than assuming.
+    #
+    # Kept inline rather than delegated to `state.rotate_log`, for the reason
+    # recorded in `bin/px-post` (#383): the logging path has to keep working when
+    # the package is broken, and a missing import there disabled rotation
+    # silently — a disk-fill bug hiding inside a tidier call.
     try:
         if LOG_FILE.stat().st_size > 5_000_000:
             lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
@@ -226,7 +239,6 @@ def log(msg: str) -> None:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(half_content)
                 f.flush()
-                os.fsync(f.fileno())
             os.replace(tmp, str(LOG_FILE))
     except Exception:
         pass
