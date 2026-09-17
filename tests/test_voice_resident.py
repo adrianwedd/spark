@@ -91,7 +91,7 @@ def test_voice_turn_goes_to_the_cognition_tier(monkeypatch):
     action = {"tool": "tool_voice", "params": {"text": "All cool here, Obi."}}
     calls = _stub_tier(monkeypatch, [_ok(action)])
 
-    rc, stdout, stderr = voice_loop.run_voice_turn("prompt text")
+    rc, stdout, stderr, backend = voice_loop.run_voice_turn("prompt text")
 
     assert rc == 0
     assert json.loads(stdout) == action
@@ -150,7 +150,7 @@ def test_the_prompt_tells_the_model_not_to_act(monkeypatch):
 def test_an_unavailable_tier_never_spawns_anything(monkeypatch):
     """The whole point. No `claude -p`, no ollama subprocess, nothing."""
     _stub_tier(monkeypatch, [_failed("timeout")])
-    rc, _, stderr = voice_loop.run_voice_turn("p")
+    rc, _, stderr, _ = voice_loop.run_voice_turn("p")
     assert rc == voice_loop.VOICE_BRAIN_UNAVAILABLE
     assert "timeout" in stderr
 
@@ -162,7 +162,7 @@ def test_a_transport_fault_retries_exactly_once(monkeypatch):
     classification instead of inferred from how long the attempt took.
     """
     calls = _stub_tier(monkeypatch, [_failed("offline"), _failed("offline")])
-    rc, _, _ = voice_loop.run_voice_turn("p", attempts=2)
+    rc, _, _, _ = voice_loop.run_voice_turn("p", attempts=2)
     assert rc == voice_loop.VOICE_BRAIN_UNAVAILABLE
     assert len(calls) == 2
 
@@ -174,7 +174,7 @@ def test_a_saturated_tier_is_not_asked_twice(monkeypatch):
     makes him wait longer for the same answer."""
     for status in ("timeout", "busy"):
         calls = _stub_tier(monkeypatch, [_failed(status)])
-        rc, _, _ = voice_loop.run_voice_turn("p", attempts=2)
+        rc, _, _, _ = voice_loop.run_voice_turn("p", attempts=2)
         assert rc == voice_loop.VOICE_BRAIN_UNAVAILABLE
         assert len(calls) == 1, f"a saturated tier must not be asked again ({status})"
 
@@ -186,7 +186,7 @@ def test_a_raising_tier_does_not_escalate(monkeypatch):
         raise RuntimeError("socket gone")
 
     monkeypatch.setattr(pxh.m5, "ask_m5", _raise)
-    rc, _, stderr = voice_loop.run_voice_turn("p")
+    rc, _, stderr, _ = voice_loop.run_voice_turn("p")
     assert rc == voice_loop.VOICE_BRAIN_UNAVAILABLE
     assert "raised" in stderr
 
@@ -290,3 +290,114 @@ def test_cron_say_answers_from_the_cognition_tier_too():
     # docstring has to be able to say what it replaced, and prose is not a call
     # path. The two assertions above are about calls.
     assert "call_claude" not in src
+
+
+# ── the serving tier's label reaches the token log (#306) ────────────────
+
+
+def test_voice_turn_returns_the_serving_tiers_bucket(monkeypatch):
+    import pxh.m5
+    _stub_tier(monkeypatch, [_ok({"tool": "tool_voice", "params": {"text": "hi"}})])
+    monkeypatch.setattr(pxh.m5, "M5_HOST", "https://ollama.com")
+
+    rc, _stdout, _stderr, backend = voice_loop.run_voice_turn("prompt")
+
+    assert rc == 0
+    assert backend == "ollama-m5"
+
+
+def test_voice_turn_labels_a_lan_daemon_as_local(monkeypatch):
+    """The label follows the host that answered, not a literal: a LAN daemon is
+    not Ollama Cloud spend (#308)."""
+    import pxh.m5
+    _stub_tier(monkeypatch, [_ok()])
+    monkeypatch.setattr(pxh.m5, "M5_HOST", "http://localhost:11434")
+
+    _rc, _stdout, _stderr, backend = voice_loop.run_voice_turn("prompt")
+
+    assert backend == "ollama-local"
+
+
+def test_voice_turn_names_its_tier_even_when_the_tier_cannot_answer(monkeypatch):
+    import pxh.m5
+    _stub_tier(monkeypatch, [_failed("timeout", "no capacity")])
+    monkeypatch.setattr(pxh.m5, "M5_HOST", "https://ollama.com")
+
+    rc, _stdout, _stderr, backend = voice_loop.run_voice_turn("prompt")
+
+    assert rc == voice_loop.VOICE_TIER_UNAVAILABLE
+    assert backend == "ollama-m5"
+
+
+def test_command_backend_label_names_the_adapter(monkeypatch):
+    monkeypatch.setenv("PX_OLLAMA_HOST", "https://ollama.com")
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    assert voice_loop.command_backend_label("bin/codex-ollama") == "ollama-m5"
+    monkeypatch.setenv("OLLAMA_HOST", "http://localhost:11434")
+    assert voice_loop.command_backend_label("bin/codex-ollama") == "ollama-local"
+    assert voice_loop.command_backend_label("codex exec --full-auto -") == "codex"
+    # An adapter nobody recognises gets its own bucket rather than "unknown",
+    # so an unattributed path cannot hide inside a bucket that reads as
+    # "not filled in yet".
+    assert voice_loop.command_backend_label("bin/my-adapter") == "command:my-adapter"
+
+
+def test_supervisor_loop_logs_the_serving_tier_not_unknown(monkeypatch):
+    """#306 acceptance, end to end through the loop: a turn served by the
+    cognition tier is recorded as that tier."""
+    from pxh import token_log as token_log_mod
+
+    monkeypatch.setattr(voice_loop, "ensure_session", lambda: None)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {})
+    monkeypatch.setattr(voice_loop, "read_prompt", lambda path: "system prompt")
+    texts = iter(["are you there?"])
+    monkeypatch.setattr(voice_loop, "capture_text_input", lambda: next(texts, None))
+    monkeypatch.setattr(
+        voice_loop, "run_voice_turn",
+        lambda prompt, **kw: (0, "All cool here, Obi.", "", "ollama-m5"),
+    )
+    monkeypatch.setattr(voice_loop, "extract_action", lambda text: None)
+    recorded: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        token_log_mod, "log_usage",
+        lambda prompt, out, backend: recorded.append((out, backend)),
+    )
+
+    args = voice_loop.parse_args([
+        "--backend", "tier", "--max-turns", "1",
+        "--input-mode", "text", "--dry-run",
+    ])
+    voice_loop.supervisor_loop(args)
+
+    assert recorded == [("All cool here, Obi.", "ollama-m5")]
+
+
+def test_supervisor_loop_labels_a_command_turn_from_its_adapter(monkeypatch):
+    """The other backend: `--backend command` has no tier result to read, so the
+    label comes from the adapter the launcher chose."""
+    from pxh import token_log as token_log_mod
+
+    monkeypatch.setattr(voice_loop, "ensure_session", lambda: None)
+    monkeypatch.setattr(voice_loop, "load_session", lambda: {})
+    monkeypatch.setattr(voice_loop, "read_prompt", lambda path: "system prompt")
+    texts = iter(["are you there?"])
+    monkeypatch.setattr(voice_loop, "capture_text_input", lambda: next(texts, None))
+    monkeypatch.setattr(
+        voice_loop, "run_codex",
+        lambda cmd, prompt: (0, "All cool here, Obi.", ""),
+    )
+    monkeypatch.setattr(voice_loop, "extract_action", lambda text: None)
+    monkeypatch.setenv("PX_OLLAMA_HOST", "https://ollama.com")
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        token_log_mod, "log_usage",
+        lambda prompt, out, backend: recorded.append(backend),
+    )
+
+    args = voice_loop.parse_args([
+        "--backend", "command", "--codex-cmd", "bin/codex-ollama",
+        "--max-turns", "1", "--input-mode", "text", "--dry-run",
+    ])
+    voice_loop.supervisor_loop(args)
+
+    assert recorded == ["ollama-m5"]

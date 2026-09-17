@@ -1224,7 +1224,7 @@ def test_a_timed_out_voice_turn_acknowledges_exactly_once_without_a_grant(monkey
     monkeypatch.setattr(
         voice_loop, "run_voice_turn",
         lambda prompt, **kw: turn_calls.append(prompt) or
-        (voice_loop.VOICE_TIER_UNAVAILABLE, "", "cognition tier unavailable"),
+        (voice_loop.VOICE_TIER_UNAVAILABLE, "", "cognition tier unavailable", "ollama-m5"),
     )
 
     acked = []

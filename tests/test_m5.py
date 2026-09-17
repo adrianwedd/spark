@@ -6,6 +6,8 @@ it names a role, not a host — see the module docstring.
 """
 from __future__ import annotations
 
+import time
+
 import io
 import json
 import urllib.error
@@ -495,3 +497,36 @@ def test_the_missing_key_message_names_the_variable_not_the_value(_isolated_m5, 
 
     assert result.status == "bad_response"
     assert "OLLAMA_API_KEY" in result.error
+
+
+# ── the token-log bucket for the host that answered (#306) ───────────────
+
+
+def test_backend_label_names_the_cloud_bucket_for_a_hosted_tier(monkeypatch):
+    import pxh.m5 as m5
+
+    monkeypatch.setattr(m5, "M5_HOST", "https://ollama.com")
+    assert m5.backend_label() == "ollama-m5"
+    assert m5.backend_label("https://ollama.com") == "ollama-m5"
+
+
+def test_backend_label_names_the_local_bucket_for_a_lan_daemon(monkeypatch):
+    """A LAN daemon is not metered consumption, and #308 made that distinction
+    load-bearing: `ollama-m5` now means "Ollama Cloud, on a plan"."""
+    import pxh.m5 as m5
+
+    monkeypatch.setattr(m5, "M5_HOST", "http://localhost:11434")
+    assert m5.backend_label() == "ollama-local"
+    assert m5.backend_label("http://m5.local:11434") == "ollama-local"
+    assert m5.backend_label("http://127.0.0.1:11434") == "ollama-local"
+
+
+def test_results_carry_the_serving_backend(monkeypatch):
+    """A caller recording spend reads it off the result, so it has to be there
+    even on a failed call — that is the call the old code logged as unknown."""
+    import pxh.m5 as m5
+
+    monkeypatch.setattr(m5, "M5_HOST", "https://ollama.com")
+    result = m5._result("bad_response", kind="voice_turn", started=time.monotonic(),
+                        error="no")
+    assert result.backend == "ollama-m5"

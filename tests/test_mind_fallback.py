@@ -249,14 +249,17 @@ def test_token_usage_is_split_by_backend(tmp_path, monkeypatch):
     assert data["by_backend"]["claude"]["input_tokens"] > 0
 
 
-def test_token_usage_backend_defaults_to_unknown(tmp_path, monkeypatch):
-    """Two-arg callers predate the split and must keep working."""
+def test_token_usage_backend_is_required(tmp_path, monkeypatch):
+    """#306: the label used to default to "unknown", and the voice loop's one
+    production call site took the default — 1,357 calls landed in a bucket that
+    answers nothing while the bucket that mattered sat frozen. A default here is
+    a silent failure generator: the call compiles, the number moves, and the
+    attribution is wrong. Fail closed instead."""
     monkeypatch.setenv("PX_STATE_DIR", str(tmp_path))
     from pxh import token_log
 
-    token_log.log_usage("prompt", "response")
-    data = json.loads((tmp_path / "token_usage.json").read_text())
-    assert data["by_backend"]["unknown"]["call_count"] == 1
+    with pytest.raises(TypeError):
+        token_log.log_usage("prompt", "response")  # type: ignore[call-arg]
 
 
 # ── There is no tier 2 ────────────────────────────────────────────────────
