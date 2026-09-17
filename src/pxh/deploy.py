@@ -514,6 +514,23 @@ class UnitFileDrift:
     reason: str  # "differs" | "not installed" | "unreadable"
 
 
+def repo_unit_names(root: str = ".", unit_src_dir: str = "systemd") -> list[str]:
+    """Every unit file the repo ships (`*.service`, `*.timer`), by name.
+
+    The drift check iterates *these*, not the running units: a unit named outside
+    the `px-*` namespace (`spark-pip-cleanup.timer`) was invisible to a
+    `systemctl list-units px-*` sweep, and a unit that is **not installed at all**
+    (`px-io-attrib.service`) cannot appear in a list of running units by
+    definition -- which is exactly the case an operator most needs to see.
+    """
+    src_root = os.path.join(root, unit_src_dir)
+    try:
+        names = sorted(os.listdir(src_root))
+    except OSError:
+        return []
+    return [n for n in names if n.endswith((".service", ".timer"))]
+
+
 def _digest(path: str) -> str | None:
     try:
         with open(path, "rb") as handle:
