@@ -61,7 +61,10 @@ bury the real stalls.
 | channel | source | needs root? |
 |---|---|---|
 | **writer** | `/proc/<pid>/io` deltas — `write_bytes`, `read_bytes`, `syscw`, plus `wchar` for context | **yes** for the complete list: as `pi`, `/proc/1/io` is `EACCES`, so px-alive and journald are invisible. It is still *attempted* unprivileged — what is readable is reported, with the number that refused beside it |
+| **file** | size deltas of a bounded *watchlist*: the system journal (`/var/log/journal/*/*.journal`), `logs/*.log`, `state/*.json`, `state/health/*.json` | no — and it names *files*, which is attribution: `logs/px-wake-listen.log` growing by 8 KB during the window names px-wake-listen even when its `/proc/<pid>/io` was refused, and the system journal growing is journald by another name |
 | **stall** | `/proc/<pid>/stat` state, `schedstat` run delay, `wchan`, plus per-thread D state; `/proc/diskstats` write-queue time; `/proc/vmstat`; PSI | no — world-readable, including for root-owned processes |
+
+The file channel is a **watchlist, not a filesystem scan**: a bounded set of stat calls, opt-in per run (`--growth-pattern`, repeatable; `--no-file-growth` to skip). `file_growth_watched` records how many paths it covered, because growth *outside* the watchlist is invisible and silence there is not evidence of not writing.
 
 An unprivileged record is therefore **not** a record that found no writer:
 it keeps the stall channel, reports the writer list it *could* read, and names
@@ -141,6 +144,10 @@ in D state, and **no readable process accounts for the 152 KB that reached the
 disk**. That last line is the whole reason the root channel is the next step:
 "invisible to this uid" is a different statement from "nobody wrote".
 
+That record predates the file channel, so a current run also carries
+`file_growth` / `file_growth_total_bytes` / `file_growth_groups` /
+`file_growth_watched` (see the field table below).
+
 Calibration from the same window: px-alive's normal heartbeat gap max sits at
 ~2.2-2.6 s, so the 7 s trigger has ~3× margin and the first record used the io-PSI
 trigger alone (`heartbeat age 0.04s`). Idle io PSI is under 5 %, with bursts past
@@ -160,6 +167,9 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | `writer_channel_attempted` | whether the writer channel was tried at all (false only under `--no-proc-io`) |
 | `privileged` | the probe's answer: can this uid read *other users'* `/proc/<pid>/io`? (It asks about pid 1 — reading our own io always succeeds and would prove nothing.) |
 | `writers_unreadable_count` / `writers_unavailable_reason` | the measurement: how many processes actually refused `/proc/<pid>/io` in this snapshot, and one sentence saying which of the three gaps applies — not attempted, unprivileged, or refused-despite-privilege (a non-dumpable process) |
+| `file_growth[]` | files that grew during the window, ranked by bytes, paths shortened to their last three components |
+| `file_growth_total_bytes` / `file_growth_groups` | the total, and the same bytes grouped as `journal` / `logs` / `state` / `health` |
+| `file_growth_watched` | how many paths were covered — the honesty field for this channel |
 | `writers[]` | ranked by `write_bytes` (disk) across the window, with `unit` from `/proc/<pid>/cgroup` — the process *and* the thing to change |
 | `writers_with_activity` / `write_bytes_total` | how many processes moved anything at all, and how much of it reached the disk |
 | `stalled[]` | processes whose group leader *or* a secondary thread is in D state (uninterruptible sleep), and/or with the largest run delay, with `wchan`, `unit` and `blocked_threads[]` |
@@ -179,6 +189,9 @@ jq -c '{ts, reason, writers: [.writers[0:3][] | {comm, unit, write_bytes}],
 | no readable writer, `privileged: true`, high `ms_io`, jbd2/kworker in D state | ext4 journal work, not a daemon | journald/ext4 tuning (`SyncIntervalSec`, rates, storage), not process weighting |
 | `go2rtc`/`rpicam-vid` high `wchar`, `write_bytes: 0` | pipe traffic, not the disk | ignore; that reading is a known trap (#247) |
 | a short writer list with `writers_unreadable_count` high | the list is partial by privilege, not by absence of writers | install as root (above); a `pi`-owned writer in that list is still real evidence |
+| `file_growth` names a `logs/*.log` or `state/**/*.json` | that file's owner wrote those bytes during the stall, whoever it runs as | that daemon's write path is the thing to look at — no root needed to know which |
+| `file_growth_groups.journal` is most of the bytes | journald is writing through the stall | journal-side tuning (`SyncIntervalSec`, rates, storage), not process weighting |
+| `file_growth` empty while `mmcblk0.ms_writing` is high | the bytes went somewhere outside the watchlist (root-owned state, another tree, or kernel writeback) | widen `--growth-pattern`, or install as root |
 | `privileged: true` yet processes refused | non-dumpable processes; they are invisible under any uid | note them by pid/unit and reason about them separately |
 
 ## Deliberately not done

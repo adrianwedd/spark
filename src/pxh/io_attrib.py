@@ -44,11 +44,13 @@ stall is worth more than an exception thrown inside it.
 
 from __future__ import annotations
 
+import glob
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .hostload import host_load_fields
 
@@ -263,6 +265,79 @@ def read_pid_file(path: Path) -> int | None:
         return int(text.strip())
     except ValueError:
         return None
+
+
+# --- the file channel ----------------------------------------------------
+
+#: Where a growth path belongs, for the record's group totals. Ordered: the
+#: journal check first because journal filenames carry no directory hint.
+_GROWTH_GROUPS = (
+    ("journal", ".journal"),
+    ("health", "/health/"),
+    ("state", "/state/"),
+    ("logs", "/logs/"),
+)
+
+
+def growth_group(path: str) -> str:
+    for name, marker in _GROWTH_GROUPS:
+        if marker in path:
+            return name
+    return "other"
+
+
+def sample_file_sizes(patterns: Sequence[str], *, limit: int = 400) -> dict[str, int]:
+    """`{path: size_bytes}` for everything matching `patterns`, stat only.
+
+    The unprivileged writer channel's file-level form. Never raises: a pattern
+    that matches nothing, a file that vanished between glob and stat, and a
+    directory we may not traverse all mean "not watched", not "did not write" —
+    which is why the caller records how many paths were watched at all.
+    """
+    sizes: dict[str, int] = {}
+    for pattern in patterns:
+        try:
+            matches = sorted(glob.glob(pattern))
+        except (OSError, ValueError):
+            continue
+        for path in matches[:limit]:
+            # Directories match a literal path glob and their st_size moves as
+            # entries are added — that is not a writer, it is bookkeeping.
+            if not os.path.isfile(path):
+                continue
+            try:
+                sizes[path] = os.path.getsize(path)
+            except OSError:
+                continue
+    return sizes
+
+
+def rank_file_growth(
+    pre: Mapping[str, int],
+    post: Mapping[str, int],
+    *,
+    top: int = 8,
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    """`(ranked_growth, total_bytes, group_totals)` across the window.
+
+    Only files present at both ends: a file that appears mid-window (log
+    rotation) has no baseline, and reporting its whole size as growth would
+    manufacture a writer out of a rename.
+    """
+    rows: list[dict[str, Any]] = []
+    total = 0
+    groups: dict[str, int] = {}
+    for path, after in post.items():
+        before = pre.get(path)
+        if before is None or after <= before:
+            continue
+        grew = after - before
+        total += grew
+        group = growth_group(path)
+        groups[group] = groups.get(group, 0) + grew
+        rows.append({"path": "/".join(path.split("/")[-3:]), "bytes": grew})
+    rows.sort(key=lambda row: row["bytes"], reverse=True)
+    return rows[:top], total, groups
 
 
 # --- sampling -------------------------------------------------------------
@@ -622,6 +697,7 @@ def capture(
     window_s: float = DEFAULT_WINDOW_S,
     allow_proc_io: bool = True,
     privileged: bool | None = None,
+    growth_patterns: Sequence[str] = (),
     top: int = 8,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
@@ -647,11 +723,13 @@ def capture(
         except (ValueError, IndexError):
             uptime_s = None
     procs_pre = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
+    files_pre = sample_file_sizes(growth_patterns) if growth_patterns else {}
     observer_pre = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
 
     sleep(max(0.0, window_s))
 
     procs_post = sample_processes(paths.proc, allow_proc_io=allow_proc_io)
+    files_post = sample_file_sizes(growth_patterns) if growth_patterns else {}
     disk_post = parse_diskstats(_read_text(paths.diskstats) or "")
     vmstat_post = parse_vmstat(_read_text(paths.vmstat) or "")
     observer_post = parse_proc_io(_read_text(paths.proc / "self" / "io") or "")
@@ -668,6 +746,8 @@ def capture(
         procs_pre, procs_post, top=top
     )
     _attach_units(stalled, paths.proc, want_wchan=True)
+
+    growth, growth_total, growth_groups = rank_file_growth(files_pre, files_post)
 
     record: dict[str, Any] = {
         "reason": (trigger or {}).get("reason", "manual"),
@@ -705,6 +785,14 @@ def capture(
         },
         "vmstat_end": {key: vmstat_post.get(key) for key in VMSTAT_GAUGES},
         "writers": writers,
+        # The file-level writer channel: names files (and through them writers)
+        # when /proc/<pid>/io is refused. `file_growth_watched` is the honesty
+        # field — growth outside the watchlist is invisible, and saying so is
+        # the difference between a measurement and a claim.
+        "file_growth": growth,
+        "file_growth_total_bytes": growth_total,
+        "file_growth_groups": growth_groups,
+        "file_growth_watched": len(files_post),
         "stalled": stalled,
         # The instrument accounting for itself: if this record ever shows the
         # observer as the top writer, the observer is the defect.
