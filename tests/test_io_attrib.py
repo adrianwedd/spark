@@ -2220,3 +2220,38 @@ def test_card_baseline_labels_its_sample_as_stall_triggered():
     assert "ms_per_read_median" not in summary, (
         "an unqualified read figure would be read as the quiet-interval one"
     )
+
+
+def test_card_identity_reads_the_device_attributes(tmp_path):
+    """Two JSON blobs of measurements belong to nobody unless the card is named."""
+    dev = tmp_path / "mmcblk0" / "device"
+    dev.mkdir(parents=True)
+    (tmp_path / "mmcblk0" / "size").write_text("62521344\n")   # ~32 GB
+    for field, value in (("type", "SD"), ("name", "EB1QT"), ("manfid", "0x00001b"),
+                         ("date", "08/2019"), ("serial", "0xfb8c6775")):
+        (dev / field).write_text(value + "\n")
+    identity = io_attrib.card_identity(dev)
+    assert identity["type"] == "SD"
+    assert identity["name"] == "EB1QT" and identity["date"] == "08/2019"
+    assert identity["capacity_gb"] == 32.0
+    # Missing attributes are omitted, not invented.
+    assert "fwrev" not in identity
+
+
+def test_card_baseline_carries_identity_psi_incidence_and_the_watchdog_margin():
+    records = [
+        {**_card_record(writes=10, ms_io=1000), "psi_pre": {"psi_io_some_avg10_pre": 30.0}},
+        {**_card_record(writes=10, ms_io=1000), "psi_pre": {"psi_io_some_avg10_pre": 5.0}},
+    ]
+    summary = io_attrib.card_baseline(
+        records, identity={"type": "SD", "name": "EB1QT"},
+        watchdog_margin_min_ms=14063.8,
+    )
+    assert summary["card"] == {"type": "SD", "name": "EB1QT"}
+    assert summary["watchdog_margin_min_ms"] == 14063.8
+    assert summary["io_psi_incidence"] == 0.5, "one of two records triggered at >= 20 %"
+    assert summary["io_psi_median_at_trigger"] == 30.0
+    # Absent context is None, never a zero that would compare as 'better'.
+    bare = io_attrib.card_baseline(records)
+    assert bare["card"] is None and bare["watchdog_margin_min_ms"] is None
+    assert bare["io_psi_incidence"] == 0.5
