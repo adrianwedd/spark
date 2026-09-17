@@ -2045,3 +2045,30 @@ def test_the_unit_channel_looks_back_past_the_window():
 
     assert _time.time() - since >= io_attrib.UNIT_LOG_LOOKBACK_S - 5
     assert io_attrib.UNIT_LOG_LOOKBACK_S > io_attrib.KERNEL_LOG_PAD_S * 10
+
+
+def test_device_deltas_derive_average_write_service_time():
+    """"The card is slow" needs a number; 0/0 must not read as "fast"."""
+    pre = {"mmcblk0": {"writes_completed": 100, "sectors_written": 1_000, "ms_io": 5_000,
+                       "ms_writing": 0, "reads_completed": 0, "sectors_read": 0,
+                       "ms_reading": 0}}
+    post = {"mmcblk0": {"writes_completed": 189, "sectors_written": 1_872, "ms_io": 5_000 + 18_000,
+                        "ms_writing": 0, "reads_completed": 0, "sectors_read": 0,
+                        "ms_reading": 0}}
+    out = io_attrib._device_deltas(pre, post)
+    assert out["mmcblk0"]["ms_per_write"] == 202.2      # 18,000 ms / 89 writes
+    # Read time is subtracted out of the queue figure before the division.
+    with_reads = io_attrib._device_deltas(
+        {**{"mmcblk0": {**pre["mmcblk0"]}}, "mmcblk0": {**pre["mmcblk0"]}},
+        {"mmcblk0": {**post["mmcblk0"], "ms_reading": 3_000,
+                     "reads_completed": 20, "sectors_read": 40}},
+    )
+    assert with_reads["mmcblk0"]["ms_per_write"] == 168.5   # (18,000 - 3,000) / 89
+    assert out["mmcblk0"]["kb_per_write"] == 4.9        # 872 sectors = 436 KB / 89
+    # No writes at all: the ratio is absent, not zero.
+    idle = io_attrib._device_deltas(
+        {"mmcblk0": {**pre["mmcblk0"], "ms_io": 0}},
+        {"mmcblk0": {**post["mmcblk0"], "writes_completed": 100, "sectors_written": 1_000,
+                     "ms_io": 900}},
+    )
+    assert idle == {} or "ms_per_write" not in idle.get("mmcblk0", {})
