@@ -101,7 +101,24 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 def atomic_write(path: Path, content: str) -> None:
-    """Write content atomically via mkstemp + fsync + os.replace."""
+    """Write content atomically, through the shared helper.
+
+    Was a private copy of `mkstemp + fsync + os.replace`, which is how this
+    script missed every fix the shared writer took (#367/#370/#373/#376) and
+    which *also* left files at `mkstemp`'s 0o600 — so `state/blog.json` and the
+    evolve queue were readable only by their writer, against the convention
+    `state.atomic_write` documents (0o644, so mixed-uid readers and writers do
+    not lock each other out).
+
+    The `fsync` stays here on purpose: these files are the record of what was
+    published or enqueued, and losing them to a power cut risks a duplicate
+    post or a re-run. See the criterion in #247 — a write keeps its durability
+    if something readable depends on it surviving a cut.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    from pxh.state import atomic_write as _shared
+
+    _shared(path, content)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
