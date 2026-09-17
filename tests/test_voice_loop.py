@@ -277,3 +277,57 @@ def test_validate_action_does_not_cry_fail_open_when_ha_answered(monkeypatch):
 
     assert tool == "tool_voice"
     assert events == []
+
+# --- the startup preflight (#345) -------------------------------------------
+#
+# The failure it exists for: bin/px-spark greets, listens, then answers every
+# turn with the deterministic unavailable acknowledgement because
+# PX_M5_SPARK_MODEL is unset -- the units read it from .env, a hand-started
+# shell does not. Indistinguishable from "the cognition tier is down", which is
+# why the fix is a refusal with the exact variable named, not a nicer message
+# per turn.
+
+
+def test_preflight_names_the_missing_variable_for_a_tier_loop(monkeypatch):
+    monkeypatch.delenv("PX_M5_SPARK_MODEL", raising=False)
+    reason = voice_loop.cognition_backend_preflight("tier")
+    assert reason is not None
+    assert "PX_M5_SPARK_MODEL" in reason
+    assert "#345" in reason
+
+
+def test_preflight_treats_auto_like_unset(monkeypatch):
+    """`auto` is rejected by the tier for the same reason an unset value is."""
+    monkeypatch.setenv("PX_M5_SPARK_MODEL", "auto")
+    assert voice_loop.cognition_backend_preflight("tier") is not None
+
+
+def test_preflight_passes_for_a_configured_tier(monkeypatch):
+    monkeypatch.setenv("PX_M5_SPARK_MODEL", "deepseek-v4.1-flash:cloud")
+    assert voice_loop.cognition_backend_preflight("tier") is None
+
+
+def test_preflight_ignores_the_command_backend(monkeypatch):
+    """`--backend command` pipes to an external CLI; it needs no tier model."""
+    monkeypatch.delenv("PX_M5_SPARK_MODEL", raising=False)
+    assert voice_loop.cognition_backend_preflight("command") is None
+
+
+def test_main_refuses_to_start_a_tier_loop_without_a_model(monkeypatch, capsys):
+    monkeypatch.delenv("PX_M5_SPARK_MODEL", raising=False)
+    monkeypatch.setattr(voice_loop, "supervisor_loop", lambda args: pytest.fail(
+        "the loop must not run when the cognition tier cannot serve a turn"))
+    rc = voice_loop.main(["--backend", "tier"])
+    assert rc == 2
+    assert "PX_M5_SPARK_MODEL" in capsys.readouterr().err
+
+
+def test_main_starts_anyway_for_dry_run_and_says_so(monkeypatch, capsys):
+    """Diagnostics and prompt testing legitimately run without a model."""
+    monkeypatch.delenv("PX_M5_SPARK_MODEL", raising=False)
+    ran = []
+    monkeypatch.setattr(voice_loop, "supervisor_loop", lambda args: ran.append(args))
+    rc = voice_loop.main(["--backend", "tier", "--dry-run"])
+    assert rc == 0 and ran, "dry-run must still reach the loop"
+    err = capsys.readouterr().err
+    assert "PX_M5_SPARK_MODEL" in err and "dry-run" in err
