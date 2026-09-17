@@ -69,6 +69,58 @@ def atomic_write(path: Path, content: str) -> None:
         raise
 
 
+#: Leftover `atomic_write` temps younger than this are left alone: another
+#: process may be inside the write right now, and an SD-card `fsync` has been
+#: measured in the seconds, not the milliseconds.
+STALE_TEMP_AGE_S = 3600.0
+
+
+def sweep_stale_temps(
+    directory: Path,
+    older_than_s: float = STALE_TEMP_AGE_S,
+    now: float | None = None,
+) -> dict[str, int]:
+    """Remove `tmp*.tmp` leftovers older than `older_than_s`. Never raises.
+
+    `atomic_write` creates its temp with `mkstemp` and unlinks it on any
+    exception — but **SIGKILL cannot run that branch**, so a writer killed
+    mid-`fsync` leaves a complete-looking temp behind forever. Nothing inside
+    the dying process can clean up after it, which is why the sweep belongs to
+    whoever owns the directory (#292: 99 such files in `state/health/`, 81 of
+    them root-owned inside a 1777 directory that no `pi` daemon may prune).
+
+    Two deliberate properties:
+
+    * **Age-based, not "not mine".** The sweeper may be a different user from
+      the writer — a `pi` daemon looking at `root`'s files — so a live
+      `atomic_write` in another process must never lose its temp file to a
+      sweep. Only files old enough that no in-flight write could still own them
+      are candidates.
+    * **Refusals are counted, not raised.** Under the sticky bit, `pi` cannot
+      unlink `root`'s files. That is an expected outcome of a shared directory,
+      not a failure of the sweep, and health reporting must never raise.
+    """
+    counts = {"removed": 0, "skipped": 0, "failed": 0}
+    cutoff = (time.time() if now is None else now) - older_than_s
+    try:
+        candidates = list(Path(directory).glob("tmp*.tmp"))
+    except OSError:
+        return counts
+    for path in candidates:
+        try:
+            if path.stat().st_mtime >= cutoff:
+                continue  # recent: possibly an in-flight write
+            path.unlink()
+            counts["removed"] += 1
+        except FileNotFoundError:
+            continue  # the writer finished and replaced it mid-sweep
+        except PermissionError:
+            counts["skipped"] += 1  # not ours: sticky bit, or a root file
+        except OSError:
+            counts["failed"] += 1
+    return counts
+
+
 def tail_lines(path: "Path", n: int = 10, chunk_size: int = 8192) -> list:
     """Read the last n lines of a file by seeking backward in chunks until
     n+1 newlines are accumulated or BOF is reached. Handles lines longer than
@@ -98,7 +150,9 @@ def tail_lines(path: "Path", n: int = 10, chunk_size: int = 8192) -> list:
         return []
 
 
-def rotate_log(path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | None" = None) -> None:
+def rotate_log(
+    path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | None" = None
+) -> None:
     """Rotate log file by keeping the last half of lines when it exceeds max_bytes.
 
     Uses atomic_write for SD card durability. Callers should hold the .rotlock
@@ -134,6 +188,7 @@ def rotate_log(path: Path, max_bytes: int = 5_000_000, held_lock: "FileLock | No
             _rotate_inner()
         else:
             from filelock import Timeout as _FLTimeout
+
             lock_path = str(path) + ".rotlock"
             try:
                 with FileLock(lock_path, timeout=2):
@@ -248,11 +303,11 @@ def _reclaim_unusable_lock(lock_path: str) -> None:
     """
     try:
         os.close(os.open(lock_path, os.O_WRONLY))
-        return                                  # already usable
+        return  # already usable
     except FileNotFoundError:
-        return                                  # nothing to reclaim
+        return  # nothing to reclaim
     except PermissionError:
-        pass                                    # exists, and is not ours to write
+        pass  # exists, and is not ours to write
     except OSError:
         return
     try:
@@ -336,19 +391,24 @@ def _persist_canonical_quiet(data: Dict[str, Any]) -> None:
         data[quiet_mode.QUIET_STATE_KEY] = record
         data.pop(quiet_mode.LEGACY_KEY, None)
         history = list(data.get("history") or [])
-        history.append({
-            "ts": utc_timestamp(),
-            "event": "quiet_mode_migrated",
-            "source": record["source"],
-            "reason": record["reason"],
-            "enabled": record["enabled"],
-        })
+        history.append(
+            {
+                "ts": utc_timestamp(),
+                "event": "quiet_mode_migrated",
+                "source": record["source"],
+                "reason": record["reason"],
+                "enabled": record["enabled"],
+            }
+        )
         data["history"] = history
-        log_event("state-quiet-migration", {
-            "enabled": record["enabled"],
-            "source": record["source"],
-            "reason": record["reason"],
-        })
+        log_event(
+            "state-quiet-migration",
+            {
+                "enabled": record["enabled"],
+                "source": record["source"],
+                "reason": record["reason"],
+            },
+        )
     elif quiet_mode.has_canonical_state(data):
         data.pop(quiet_mode.LEGACY_KEY, None)
 
@@ -382,11 +442,14 @@ def _heal_corrupt_session(path: Path) -> Dict[str, Any]:
     _trim_corrupt_backups(path, keep=3)
     data = default_state()
     data[RECOVERED_KEY] = {"ts": utc_timestamp(), "backup": corrupt_backup.name}
-    log_event("state-corruption", {
-        "path": str(path),
-        "backup": corrupt_backup.name,
-        "message": "session.json was corrupt; reset to default state",
-    })
+    log_event(
+        "state-corruption",
+        {
+            "path": str(path),
+            "backup": corrupt_backup.name,
+            "message": "session.json was corrupt; reset to default state",
+        },
+    )
     atomic_write(path, json.dumps(data, indent=2) + "\n")
     return data
 
@@ -548,7 +611,11 @@ def set_quiet_mode(
     now = time.time()
     expires_at = now + ttl_s if ttl_s is not None else None
     record = quiet_mode.new_state(
-        enabled=enabled, source=source, reason=reason, set_at=now, expires_at=expires_at,
+        enabled=enabled,
+        source=source,
+        reason=reason,
+        set_at=now,
+        expires_at=expires_at,
     )
 
     def _history_entry(pre_mutation_data: Dict[str, Any]) -> Dict[str, Any]:
