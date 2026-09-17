@@ -238,18 +238,16 @@ def log(msg: str, **extra) -> None:
         log_file = LOG_DIR / "tool-post.log"
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
-        # Simple rotation: keep last half when file exceeds 5MB
+        # Rotation: keep the last half above 5 MB. Delegated to
+        # `state.rotate_log`, which does the same thing under a lock and
+        # **without** the fsync -- a log's durability bought nothing and forced
+        # an ext4 journal commit while rewriting megabytes (#373/#247). This
+        # script had its own copy of that write, which is how the class survived
+        # the earlier fixes.
         try:
-            if log_file.stat().st_size > 5_000_000:
-                lines = log_file.read_text(encoding="utf-8").splitlines()
-                half = len(lines) // 2
-                half_content = "\n".join(lines[half:]) + "\n"
-                fd, tmp = tempfile.mkstemp(dir=str(log_file.parent), suffix=".tmp")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(half_content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, str(log_file))
+            from pxh.state import rotate_log
+
+            rotate_log(log_file, max_bytes=5_000_000)
         except Exception:
             pass
     except OSError:
