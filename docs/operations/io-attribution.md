@@ -854,7 +854,7 @@ What *is* measurable, unprivileged, in every record:
 
 | signal | on `picar` | how to read it |
 |---|---|---|
-| `ms_per_write` | median **69-86 ms**, p90 **207 ms** (184 records) | the card's service latency; ~50-100x its read side (~1.5 ms) |
+| `ms_per_write` | median **69-86 ms**, p90 **207 ms** (184 records) | the card's service latency, and ~50-100x its **quiet-interval** read side (~1.5 ms per read over a bulk-read interval). Reads *inside* a stall window are a different number — 933 ms median on `picar` — because a record exists only because something stalled and reads then queue behind write-back. Both are real; do not compare one against the other |
 | `ext4.errors_count` | **0** | no filesystem-level errors, ever, on this card |
 | host writes | ~1.03 TB (~35 full-card writes) | usage context, **not** a failure threshold |
 | stalls | correlate with write-back, never with idleness | the mechanism, not the health |

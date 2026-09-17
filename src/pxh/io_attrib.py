@@ -1574,8 +1574,12 @@ def card_baseline(
     * `ms_per_write` median / p90 / max — queue time per write, read time
       subtracted, i.e. the number that turns "a few megabytes" into 1-8 s of
       occupancy on a slow card;
-    * `ms_per_read` median, for the asymmetry (a healthy card is within a small
-      factor, not 50x);
+    * `ms_per_read_median_in_stall_windows` — **only meaningful as a
+      stall-window figure.** These records are trigger-on-demand: they exist
+      *because* something stalled, so reads inside them queue behind write-back
+      (933 ms median on `picar`) while the same card reads at ~1.5 ms per read in
+      a quiet bulk-read interval. Both are real, they answer different questions,
+      and the key is named so a comparison cannot mistake one for the other;
     * `ext4_errors` (last reading) and the window's record count, so a comparison
       cannot quietly use three records of a quiet hour against forty of a busy one.
     """
@@ -1604,12 +1608,15 @@ def card_baseline(
         return round(ordered[index], 1)
 
     return {
+        # Named because every record here was triggered by a stall: a figure from
+        # this sample is "under contention", never "idle".
+        "sampled": "stall-triggered records",
         "records": len(list(records)[-tail:]),
         "writes_measured": len(per_write),
         "ms_per_write_median": _pct(per_write, 0.5),
         "ms_per_write_p90": _pct(per_write, 0.9),
         "ms_per_write_max": round(max(per_write), 1) if per_write else None,
-        "ms_per_read_median": _pct(per_read, 0.5),
+        "ms_per_read_median_in_stall_windows": _pct(per_read, 0.5),
         "ext4_errors": errors,
     }
 
