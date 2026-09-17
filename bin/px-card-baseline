@@ -81,11 +81,12 @@ def main(argv: list[str]) -> int:
         )
     print(
         "card: ms_per_write median {median} p90 {p90} max {maxv} | "
-        "ms_per_read {read} (stall windows) | ext4 errors {errors} | "
+        "ms_per_read {read} (stall windows, n={reads}) | ext4 errors {errors} | "
         "from {n} record(s), all stall-triggered".format(
             median=summary["ms_per_write_median"], p90=summary["ms_per_write_p90"],
             maxv=summary["ms_per_write_max"],
             read=summary["ms_per_read_median_in_stall_windows"],
+            reads=summary["reads_measured"],
             errors=summary["ext4_errors"], n=summary["records"],
         )
     )

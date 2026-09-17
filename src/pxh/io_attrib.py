@@ -1666,6 +1666,11 @@ def card_baseline(
         "ms_per_write_median": _pct(per_write, 0.5),
         "ms_per_write_p90": _pct(per_write, 0.9),
         "ms_per_write_max": round(max(per_write), 1) if per_write else None,
+        # How many records the read figure came from. It is *noisy*: a stall
+        # window often contains a handful of reads, so two samples of the same
+        # card gave 933 ms and 1.0 ms — the sample size is what lets a reader
+        # judge whether a difference between two cards is real.
+        "reads_measured": len(per_read),
         "ms_per_read_median_in_stall_windows": _pct(per_read, 0.5),
         "ext4_errors": errors,
     }
