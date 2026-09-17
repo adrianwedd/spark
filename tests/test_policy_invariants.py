@@ -896,6 +896,86 @@ def test_refresh_cannot_extend_a_conversation_forever(grant_dir, monkeypatch):
     assert wake_grant.is_grant_active() is False
 
 
+@pytest.fixture
+def a_real_grant(grant_dir, monkeypatch):
+    """A grant that can be opened on *any* host, with a controlled clock.
+
+    `boot_id()` reads /proc/sys/kernel/random/boot_id, so on a dev Mac
+    `open_grant()` returns None and every test in this section fails at its
+    first line — the tests that need a grant are effectively Linux-only. That
+    is not a reason to write the new ones the same way: a failed write is a
+    filesystem event, not a Linux one, and #323 is about a test that could not
+    tell the two apart.
+    """
+    monkeypatch.setattr(wake_grant, "boot_id", lambda: "test-boot-id")
+    monkeypatch.setattr(wake_grant, "boottime", lambda: 1000.0)
+
+
+def test_the_grant_write_raises_rather_than_reporting_a_verdict(grant_dir, tmp_path, monkeypatch):
+    """`_write` returned a bool, which made its two failure modes one value.
+
+    The three callers do not agree about what a failed write means — see
+    `wake_grant.GrantWriteFailed` — so the helper raises and each decides
+    (#323). The refusal paths are unaffected: they return before any write.
+    """
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory")
+    monkeypatch.setattr(wake_grant, "grant_path", lambda: blocked / "wake_grant.json")
+    with pytest.raises(OSError):
+        wake_grant._write({"conversation_id": "x"})
+
+
+def test_a_refresh_that_cannot_be_persisted_raises_instead_of_refusing(a_real_grant, monkeypatch):
+    """The defect #323 names: False meant both "the rule refused you" and
+    "the write did not land".
+
+    That is not a cosmetic distinction. A refusal is a decision and belongs in
+    the return value; a lost write means the window is about to close under a
+    conversation that is still talking, and it used to be reported as though
+    the *policy* had made that call. This is the flake that cost a rerun per
+    affected PR, misread every time as a regression in the ceiling rule.
+    """
+    cid = wake_grant.open_grant(ttl_s=180.0)
+    before = _json.loads(wake_grant.grant_path().read_text())
+
+    def _boom(doc):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(wake_grant, "_write", _boom)
+
+    # A refusal is still a bool, and still False — and still says nothing about
+    # the disk.
+    assert wake_grant.refresh_grant("some-other-conversation") is False
+
+    with pytest.raises(wake_grant.GrantWriteFailed) as excinfo:
+        wake_grant.refresh_grant(cid)
+    assert "No space left on device" in str(excinfo.value)
+    # OSError, so fail-closed handlers still catch it; chained, so the next
+    # occurrence names the errno instead of only an assertion.
+    assert issubclass(wake_grant.GrantWriteFailed, OSError)
+    assert isinstance(excinfo.value.__cause__, OSError)
+    # Nothing was half-written: the document on disk is exactly as it was.
+    assert _json.loads(wake_grant.grant_path().read_text()) == before
+
+
+def test_opening_and_confirming_stay_quiet_when_the_write_fails(a_real_grant, monkeypatch):
+    """The asymmetry, pinned deliberately.
+
+    A window that cannot be *opened* is silence — there was no window before
+    the call and there is none after it, so there is nothing to report. A
+    window that cannot be *extended* is a degradation mid-conversation. Only
+    the second is loud, and that is a decision rather than an oversight.
+    """
+    cid = wake_grant.open_grant(ttl_s=180.0)
+
+    def _boom(doc):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(wake_grant, "_write", _boom)
+    assert wake_grant.confirm_grant(cid) is False
+    assert wake_grant.open_grant() is None
+
+
 def test_a_new_summons_starts_a_new_conversation(grant_dir):
     first = wake_grant.open_grant()
     second = wake_grant.open_grant()

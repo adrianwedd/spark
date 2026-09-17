@@ -200,16 +200,42 @@ def is_grant_active() -> bool:
     return read_grant() is not None
 
 
-def _write(doc: dict) -> bool:
+class GrantWriteFailed(OSError):
+    """The window could not be written, so nothing was extended (#323).
+
+    Deliberately not the same event as a *refused* refresh. Refusing is a
+    decision — wrong conversation, expired window, past the ceiling — and
+    `refresh_grant` returning False for it is correct. A write that did not
+    land is a host problem with the opposite consequence: the window closes
+    under a conversation that is still talking.
+
+    The two used to be the same `False`, which made
+    `test_refresh_cannot_extend_a_conversation_forever` unable to tell a policy
+    regression from a failed write — it reported "the rule is broken" when the
+    write had not landed, and the errno was discarded. Raising here also makes
+    the *asymmetry* explicit, which is the part worth reasoning about:
+
+      * `open_grant` failing is fail-closed and quiet. There was no window
+        before, there is none now, and SPARK behaves exactly as he did.
+      * `refresh_grant` failing is not quiet anywhere but the log, because the
+        window it could not extend is one somebody is in the middle of using.
+
+    An OSError so fail-closed handlers still catch it, raised with the original
+    errno chained.
+    """
+
+
+def _write(doc: dict) -> None:
+    """Write the grant atomically, or raise OSError.
+
+    Callers decide what a failed write means — see `GrantWriteFailed` for why
+    the three of them do not agree.
+    """
     path = grant_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(doc), encoding="utf-8")
-        os.replace(tmp, path)          # atomic: a reader never sees a half file
-        return True
-    except OSError:
-        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(doc), encoding="utf-8")
+    os.replace(tmp, path)              # atomic: a reader never sees a half file
 
 
 def open_grant(*, ttl_s: float = DEFAULT_TTL_S) -> str | None:
@@ -233,7 +259,13 @@ def open_grant(*, ttl_s: float = DEFAULT_TTL_S) -> str | None:
         "utterance_confirmed": False,
         "opened_utc": _utc_hint(),
     }
-    return conversation_id if _write(doc) else None
+    try:
+        _write(doc)
+    except OSError:
+        # Fail-closed and quiet, on purpose: there was no window before this
+        # call and there is none after it. Nothing observable changed.
+        return None
+    return conversation_id
 
 
 def confirm_grant(conversation_id: str) -> bool:
@@ -248,7 +280,13 @@ def confirm_grant(conversation_id: str) -> bool:
         return False
     doc["utterance_confirmed"] = True
     doc["confirmed_utc"] = _utc_hint()
-    return _write(doc)
+    try:
+        _write(doc)
+    except OSError:
+        # Also fail-closed: an unconfirmed grant does not bypass night silence,
+        # which is the safe direction.
+        return False
+    return True
 
 
 def is_grant_confirmed() -> bool:
@@ -272,6 +310,11 @@ def refresh_grant(conversation_id: str, *, ttl_s: float = DEFAULT_TTL_S) -> bool
       * an already-expired grant — inactivity closes the window, and a late
         turn asks to be summoned again rather than resumed;
       * anything past MAX_CONVERSATION_S from the original summons.
+
+    Returns True when the window was extended (or was already at its ceiling —
+    the turn is allowed, there is simply nothing left to extend). A write that
+    did not land raises `GrantWriteFailed` rather than returning False: see
+    that class for why the two must not share a value (#323).
     """
     doc = read_grant()
     if doc is None or doc.get("conversation_id") != conversation_id:
@@ -284,7 +327,13 @@ def refresh_grant(conversation_id: str, *, ttl_s: float = DEFAULT_TTL_S) -> bool
     doc["expires_boottime"] = max(expires, doc["expires_boottime"])
     doc["turns"] = int(doc.get("turns", 1)) + 1
     doc["refreshed_utc"] = _utc_hint()
-    return _write(doc)
+    try:
+        _write(doc)
+    except OSError as exc:
+        raise GrantWriteFailed(
+            f"could not extend the wake window for {conversation_id}: {exc}"
+        ) from exc
+    return True
 
 
 def close_grant(conversation_id: str) -> None:
