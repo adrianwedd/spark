@@ -330,6 +330,10 @@ systemctl status px-io-attrib --no-pager
 bin/px-deploy-check
 ```
 
+That last line is the deploy gate (#421): it reports `carried staleness` for
+*every* long-lived unit, so a non-zero count here may be about units this
+runbook does not touch — those restarts live in the #247 block.
+
 `sudo` is required, not preferred: without it the observer can still see *who
 was blocked*, but not *who wrote* for the root-owned writers (#247 names
 `bin/px-alive`'s heartbeat fsync, journald, and the camera pipeline — two of the

@@ -117,6 +117,19 @@ shallow clone rather than passing vacuously). **A deploy is not complete until i
 exits 0** — the source tree being correct is not the property; the processes
 executing it is.
 
+**The gate asks two questions, and only their conjunction means "current"
+(#421).** `HEAD@{1}..HEAD` answers *must this deploy restart it* — and it cannot
+see a restart that was owed from an *earlier* deploy and never performed,
+because nothing anywhere remembers that it was owed. So the same run compares
+each long-lived unit against the files *it* executes: the first line carries
+`carried staleness: N`, the detail names the units and the files whose mtime is
+newer than the process, and the exit code is 1 whenever it is non-empty.
+`units to restart: 0` describes the delta; `carried staleness: 0` describes the
+host. The reassurance line — *every long-lived unit is executing the deployed
+revision* — prints only when both are zero, because on 2026-09-18 it printed
+over three units that were not, and the only reason they were found is that a
+previous deploy's output had been read by hand.
+
 ## Running Tests
 
 ```bash
