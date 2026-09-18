@@ -471,6 +471,16 @@ first half evidence about the real sandbox: `tools/check_research_isolation.py`
 compares the canary's `--property=` lines against the launcher's and fails CI if
 they drift.
 
+### Phase 0 — the credential covers production's tier variables
+
+Every tier variable name in `.env` must be present in
+`/etc/px-research/tier.env`. Names only — the values stay in the file and in the
+unit's environment — because a missing name is *silent*: no
+`PX_M5_SPARK_HOST` in the sandbox means it talks to the default host while the
+robot talks to the configured one, and no `_TIMEOUT_S` means a different
+deadline. This is the check that makes the install block's credential step
+verifiable rather than hopeful.
+
 ### Phase 1 — the properties, with a real uid
 
 `systemd-run --wait --collect` with the launcher's property list, verbatim,
@@ -496,29 +506,39 @@ checked for the first time as *facts* rather than as arguments:
 | **17** | no sudoers entry names `spark-research` |
 | **18** | the **invoking environment** does not reach the sandbox. The canary exports `PX_CANARY_LEAK_PROBE` in its own shell and passes it through no property; this probe is the *effect* of the launcher's `env -i`, so it is the check that fails if that line is ever removed |
 
-13–17 are the ones the bwrap prototype structurally could not reach; the probe's
-verdict is also written to the outbox as JSON, so the evidence outlives the
-transient unit.
+13–17 are the ones the bwrap prototype structurally could not reach, and 18 is
+the invoking environment; the probe's verdict is also written to the outbox as
+JSON, so the evidence outlives the transient unit. The exit status is the number
+of violated claims, which is what `systemd-run --wait` propagates.
 
 ### Phase 2 — the real path, end to end
 
-A real request through `/usr/local/sbin/px-research-run <uuid>`, then: a result
-must appear in the outbox within 60 s, it must **not** be owned by `root:root`
-(the work ran as the sandbox identity), and the transient unit must be gone
-afterwards (`--collect` leaves nothing behind). This is the positive control
-the property phase cannot give, and it is the chain an operator actually uses.
+A real request driven the way an operator drives it —
+`/usr/sbin/runuser -u pi -- sudo -n /usr/local/sbin/px-research-run <uuid>`, not
+the launcher as root, because as root this phase would pass with a **broken
+sudoers grant**, which is the one thing the grant exists for. Then: a result
+must appear in the outbox within 120 s (the tier's own deadline is 60 s, and
+this phase is about whether the flow-back works, not how fast a provider is), it
+must **not** be owned by `root:root` (the work ran as the sandbox identity), and
+the transient unit must be gone afterwards (`--collect` leaves nothing behind).
+This is the positive control the property phase cannot give.
 
 ### Phase 3 — the allocation is released
 
-A long-running unit under the same properties, killed mid-run: `getent passwd
-spark-research` must resolve *while* it runs and must resolve to **nothing**
-once it is stopped. An identity that persists between invocations is a standing
-attack surface, and the design claims not to have one.
+A long-running unit under the same properties, killed mid-run: a genuinely
+different principal must be observable *while* it runs, and the allocation must
+be gone once it is stopped. The observation does not depend on `nss-systemd`:
+if `getent passwd spark-research` cannot answer, the uid is read from the unit's
+`MainPID` via `/proc/<pid>/status` and asserted not to be `pi` — the claim is
+about the identity, not about nss. An identity that persists between
+invocations is a standing attack surface, and the design claims not to have one.
 
 ### Phase 4 — nothing leaked
 
-`git status --porcelain` on the production checkout, plus explicit checks that
-none of the probe's write attempts escaped into the repo, `state/`, or `/home`.
+A `git status --porcelain` snapshot taken *before* phase 1 is compared with one
+taken after it, so a pre-existing dirty file cannot read as "the canary leaked"
+and a real leak cannot hide behind one — plus explicit checks that none of the
+probe's write attempts escaped into the repo, `state/`, or `/home`.
 
 ### What remains a human's job
 
