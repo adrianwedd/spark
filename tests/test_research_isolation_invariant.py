@@ -285,3 +285,70 @@ def test_the_dry_run_does_not_depend_on_the_callers_path():
     run and a re-read. Every binary this script names is absolute now, and this
     pins that: the report must be identical under a restricted PATH."""
     assert _dry_run_missing("/usr/bin:/bin") == _dry_run_missing(os.environ.get("PATH", ""))
+
+
+# ---------------------------------------------------------------------------
+# The probe's own machinery (#281 phase 2)
+# ---------------------------------------------------------------------------
+#
+# The probe's first execution used to be the acceptance step: once, as root,
+# under systemd-run, with no way to tell a bash mistake from a violated claim.
+# `--self-test` proves the assertions can fail; `run-probe-rehearsal.sh` runs the
+# whole probe inside a sandbox and asserts its verdict profile. Both found bugs
+# in the probe before the authorised run, which is the point of having them.
+
+def _run(bash_file, *args, cwd=None, env=None):
+    import os
+    import subprocess
+
+    return subprocess.run(
+        ["bash", str(bash_file), *args], capture_output=True, text=True,
+        cwd=str(cwd or REPO_ROOT), env={**os.environ, **(env or {})},
+    )
+
+
+def test_the_probe_self_test_passes_and_reports_both_directions():
+    proc = _run(REPO_ROOT / PROBE, "--self-test")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "PASS" in proc.stdout and "FAIL" in proc.stdout
+    assert "the assertion helpers can fail, and do" in proc.stdout
+
+
+def test_the_probe_self_test_detects_broken_machinery(tmp_path):
+    """Tamper the helper so it can no longer fail a command: the self-test must
+    notice, because a canary that cannot fail is not a canary."""
+    text = (REPO_ROOT / PROBE).read_text()
+    broken = text.replace('    if out=$("$@" 2>&1); then', "    if false; then", 1)
+    assert broken != text
+    copy = tmp_path / "canary-probe.sh"
+    copy.write_text(broken)
+
+    proc = _run(copy, "--self-test")
+
+    assert proc.returncode != 0, proc.stdout
+    assert "would pass claims it should not" in proc.stdout
+
+
+def test_the_probe_counts_failures_rather_than_flagging_them():
+    """Found by `run-probe-rehearsal.sh` on its first run: `record` *assigned*
+    `fail=1` rather than counting, so a run with two violated claims exited 1
+    and recorded `"failures": 1` — while the canary's own message and the
+    rehearsal both read that number as a count."""
+    text = (REPO_ROOT / PROBE).read_text()
+    assert "fail_count=$((fail_count + 1))" in text
+    assert 'exit "$fail_count"' in text
+    assert '"failures": $fail_count' in text or '"failures": %s' in text
+    assert "[[ \"$1\" == \"FAIL\" ]] && fail=1" not in text
+
+
+def test_the_rehearsal_expects_both_demonstrable_failures():
+    """Claim 14 (the credential file the install creates) and claim 18 (the
+    invoking environment, which bwrap passes through) must be *expected* to fail
+    in the bwrap rehearsal — that is what makes them non-vacuous there."""
+    text = (REPO_ROOT / "tools/prototypes/agent-os-isolation/run-probe-rehearsal.sh").read_text()
+    assert '"$failed_claims" == "14 18 "' in text
+    assert "PX_CANARY_LEAK_PROBE=" in text, (
+        "the rehearsal must export the leak probe variable, or claim 18 passes "
+        "vacuously and the rehearsal proves nothing about it")
+    assert "16 PASS, 2 FAIL" in text
+    assert 'PX_REHEARSAL_PROBE' in text

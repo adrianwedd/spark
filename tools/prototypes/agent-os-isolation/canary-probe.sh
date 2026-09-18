@@ -15,18 +15,63 @@
 # and fails CI if they drift apart.
 set -u
 
+# `--self-test` first, before anything else runs: it proves the *machinery* —
+# that a claim which does not hold is recorded FAIL and a claim which does is
+# recorded PASS. A canary whose assertions cannot fail is not a canary, and this
+# is the only way to know that before the one authorised run rather than after
+# it. It needs no sandbox: it uses claims that are false *here* (a command that
+# succeeds, a file that is readable).
+self_test() {
+    results=()
+    fail_count=0
+    say() { :; }                       # the self-test reports its own way
+    expect_blocked     1 "a command that succeeds must record FAIL" true
+    expect_blocked     2 "a command that fails must record PASS"     false
+    expect_denied_read 3 "a readable file must record FAIL"          "$0"
+    expect_denied_read 4 "an absent file must record PASS"           /nonexistent-canary-self-test
+
+    local v1 v2 v3 v4 ok=0
+    v1="$(verdict_for 1)"; v2="$(verdict_for 2)"
+    v3="$(verdict_for 3)"; v4="$(verdict_for 4)"
+    printf 'self-test: expect_blocked(succeeds)=%s  expect_blocked(fails)=%s  ' "$v1" "$v2"
+    printf 'expect_denied_read(readable)=%s  expect_denied_read(absent)=%s\n' "$v3" "$v4"
+
+    [[ "$v1" == FAIL ]] || { printf 'self-test: a succeeding command was not recorded FAIL\n'; ok=1; }
+    [[ "$v2" == PASS ]] || { printf 'self-test: a failing command was not recorded PASS\n'; ok=1; }
+    [[ "$v3" == FAIL ]] || { printf 'self-test: a readable file was not recorded FAIL\n'; ok=1; }
+    [[ "$v4" == PASS ]] || { printf 'self-test: an absent file was not recorded PASS\n'; ok=1; }
+    [[ $fail_count -ge 1 ]] || { printf 'self-test: a FAIL did not advance the failure count\n'; ok=1; }
+    if [[ $ok -eq 0 ]]; then
+        printf 'self-test: PASS — the assertion helpers can fail, and do\n'
+        return 0
+    fi
+    printf 'self-test: FAILED — the probe would pass claims it should not\n'
+    return 1
+}
+
 REPO="${PWD:-/home/pi/picar-x-hacking}"
 OUT_DIR="${PX_RESEARCH_OUTBOX:-/var/lib/px-research/outbox}"
 OUT="$OUT_DIR/canary-$$.json"
 
-fail=0
+# The exit status is the number of violated claims, not a flag — `systemd-run
+# --wait` propagates it, so journald carries "how many claims failed" without
+# anyone opening the JSON record. This was a flag until the probe rehearsal
+# executed it for the first time: two violated claims exited 1 and recorded
+# "failures": 1, because `record` assigned rather than counted.
+fail_count=0
 results=()
 say() { printf '%s\n' "$*"; }
 record() {  # record <PASS|FAIL> <n> <claim>
     results+=("{\"n\": $2, \"verdict\": \"$1\", \"claim\": \"$(printf '%s' "$3" | sed 's/\\/\\\\/g; s/"/\\"/g')\"}")
     say "$1  $2  $3"
-    [[ "$1" == "FAIL" ]] && fail=1
+    [[ "$1" == "FAIL" ]] && fail_count=$((fail_count + 1))
     return 0
+}
+
+# verdict_for <n> — the recorded verdict for claim <n>, or empty.
+verdict_for() {
+    printf '%s\n' "${results[@]:-}" \
+        | sed -n "s/.*\"n\": $1, \"verdict\": \"\([A-Z]*\)\".*/\1/p" | head -1
 }
 
 # expect_blocked <n> <claim> <cmd...> — the command must fail.
@@ -48,6 +93,12 @@ expect_denied_read() {
         record PASS "$n" "$claim"
     fi
 }
+
+case "${1:-}" in
+    --self-test) self_test; exit $? ;;
+    "") ;;
+    *) printf 'usage: %s [--self-test]\n' "$0" >&2; exit 2 ;;
+esac
 
 say "== identity =="
 id
@@ -156,8 +207,8 @@ fi
 # --- the record -------------------------------------------------------------
 {
     printf '{"probe": "canary", "uid": %s, "failures": %s, "results": [%s]}\n' \
-        "$(id -u)" "$fail" "$(IFS=,; printf '%s' "${results[*]}")"
+        "$(id -u)" "$fail_count" "$(IFS=,; printf '%s' "${results[*]}")"
 } > "$OUT" 2>/dev/null || say "WARN: could not write the canary record to $OUT"
 
-say "== canary verdict: $([[ $fail -eq 0 ]] && echo PASS || echo FAIL) (record: $OUT) =="
-exit "$fail"
+say "== canary verdict: $([[ $fail_count -eq 0 ]] && echo PASS || echo FAIL) — $fail_count violated claim(s) (record: $OUT) =="
+exit "$fail_count"

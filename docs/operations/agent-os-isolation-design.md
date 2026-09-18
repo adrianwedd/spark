@@ -433,6 +433,30 @@ executed — and it has already earned its keep: run on the robot it reported
 `/usr/sbin` is not on a non-login shell's PATH. Every binary the script names is
 absolute now, and a test pins that the report does not change with `PATH`.
 
+**The probe is rehearsed too, because its first execution used to be the
+acceptance step.** Two halves:
+
+* `canary-probe.sh --self-test` runs the assertion helpers against claims that
+  are false *here* — a command that succeeds, a file that is readable — and
+  requires them to be recorded FAIL, and against claims that hold, requiring
+  PASS. A canary whose assertions cannot fail is not a canary, and this is the
+  only way to know before the one authorised run.
+* `run-probe-rehearsal.sh` runs the whole probe inside the bwrap sandbox and
+  asserts its verdict profile: 16 PASS, 2 FAIL, exit 2. **Both failures are the
+  point**: claim 14 fails because `/etc/px-research/tier.env` does not exist
+  until the install block runs (and "unreadable because absent" is not the
+  property), and claim 18 fails because bwrap passes the calling environment
+  through — the rehearsal *exports* the probe variable so that claim is
+  demonstrated rather than vacuous, which is also why the launcher needs
+  `env -i`.
+
+Both found bugs in the probe before the authorised run, which is the whole
+reason they exist. The second one is worth stating plainly: `record` assigned
+`fail=1` instead of counting, so a run with **two** violated claims exited `1`
+and recorded `"failures": 1` — while the canary's own message and the rehearsal
+both read that number as a count. `systemd-run --wait` would have propagated a
+number that meant something else. It is a counter now, and a test pins it.
+
 ### One correction to the plan this replaces
 
 The previous version said to run all twelve probes "inside a
