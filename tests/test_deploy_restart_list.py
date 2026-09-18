@@ -882,5 +882,143 @@ def test_the_summary_leads_with_what_needs_doing():
     assert "unit files to install: 2 (1 missing)" in line
     # Nothing to do is stated, not implied by an absence.
     quiet = action_summary(0, [], [])
-    assert quiet.endswith("units to restart: 0 | unit files to install: 0")
+    assert quiet.endswith("units to restart: 0 | carried staleness: 0 | unit files to install: 0")
     assert "missing" not in quiet
+
+
+# ---------------------------------------------------------------------------
+# Staleness carried from an earlier deploy (#421)
+# ---------------------------------------------------------------------------
+#
+# `restart_list` answers "must *this* deploy restart it", from HEAD@{1}..HEAD.
+# A restart that could not be performed — no non-interactive sudo grant for
+# that unit, an interrupted deploy — leaves no trace there, so the next deploy
+# reports a clean delta over a host still executing the older module. That is
+# a different question, and these tests pin that it is asked separately.
+
+def _ages(repo, *, entry_age_s=1000.0, module_age_s=100.0, now=None):
+    """Set every file's mtime, so nothing depends on when the test ran."""
+    import time as _time
+
+    base = now if now is not None else _time.time()
+    for path in repo.rglob("*"):
+        if path.is_file():
+            os.utime(path, (base - entry_age_s, base - entry_age_s))
+    os.utime(repo / "src" / "pxh" / "alpha.py",
+             (base - module_age_s, base - module_age_s))
+    return base
+
+
+def test_staleness_from_an_earlier_deploy_is_visible_and_the_delta_is_not(repo):
+    """The crux of #421: both statements are true at once.
+
+    With an empty delta the gate correctly has nothing to restart; the host is
+    still executing `alpha.py` as it was before that file changed.
+    """
+    import time as _time
+
+    from pxh.deploy import UnitState, carried_staleness, needs_restart, restart_list
+
+    now = _ages(repo)
+    old = UnitState("px-old.service", str(repo / "bin" / "px-changed"),
+                    started_ts=now - 500.0)   # started after the entry, before alpha.py
+    fresh = UnitState("px-new.service", str(repo / "bin" / "px-changed"),
+                      started_ts=now - 50.0)  # started after everything
+
+    verdicts = restart_list([], [old, fresh], root=str(repo))
+    assert needs_restart(verdicts) == [], "an empty delta must not invent a restart"
+
+    carried = carried_staleness([old, fresh], root=str(repo))
+    assert [c.name for c in carried] == ["px-old.service"]
+    assert carried[0].paths and "src/pxh/alpha.py" in carried[0].paths
+    assert carried[0].newest == pytest.approx(now - 100.0, abs=1.0)
+
+
+def test_a_unit_started_after_its_files_is_not_flagged(repo):
+    import time as _time
+
+    from pxh.deploy import UnitState, carried_staleness
+
+    now = _ages(repo)
+    unit = UnitState("px-new.service", str(repo / "bin" / "px-changed"),
+                     started_ts=now - 1.0)
+    assert carried_staleness([unit], root=str(repo)) == []
+
+
+def test_an_unknown_start_time_is_not_guessed_at(repo):
+    """`restart_list` already flags unknown start times; a second warning built
+    on an absent number would be a guess dressed as a finding."""
+    from pxh.deploy import UnitState, carried_staleness
+
+    _ages(repo)
+    unit = UnitState("px-unknown.service", str(repo / "bin" / "px-changed"), started_ts=None)
+    assert carried_staleness([unit], root=str(repo)) == []
+
+
+def test_a_unit_running_nothing_under_this_repo_is_skipped(repo):
+    """A unit whose entry point is outside the checkout has no executed paths to
+    compare, and inventing an answer from the absence would be a guess."""
+    from pxh.deploy import UnitState, carried_staleness
+
+    _ages(repo)
+    assert carried_staleness(
+        [UnitState("px-elsewhere.service", "/usr/local/bin/other", started_ts=1.0)],
+        root=str(repo),
+    ) == []
+    # A unit whose entry point *is* in the repo is not skipped: px-nopxh
+    # executes only itself, and that file is as much a part of the comparison as
+    # an imported module.
+    assert carried_staleness(
+        [UnitState("px-nopxh.service", str(repo / "bin" / "px-nopxh"), started_ts=1.0)],
+        root=str(repo),
+    ) != []
+
+
+def test_the_carried_list_names_every_file_newer_than_the_process(repo):
+    import time as _time
+
+    from pxh.deploy import UnitState, carried_staleness
+
+    now = _ages(repo)
+    unit = UnitState("px-old.service", str(repo / "bin" / "px-changed"),
+                     started_ts=now - 500.0)
+    carried = carried_staleness([unit], root=str(repo))
+    assert len(carried) == 1
+    # The entry point is written at the same age as the rest of the tree, so it
+    # is not newer than the process and must not appear.
+    assert "bin/px-changed" not in carried[0].paths
+    assert all(p.endswith(".py") for p in carried[0].paths)
+
+
+def test_a_deleted_executed_file_counts_as_newer(repo):
+    """A unit importing a module that no longer exists is executing code the
+    checkout cannot supply — the conservative direction, with no mtime to
+    compare against."""
+    import time as _time
+
+    from pxh.deploy import UnitState, carried_staleness
+
+    now = _ages(repo)
+    (repo / "src" / "pxh" / "beta.py").unlink()
+    unit = UnitState("px-old.service", str(repo / "bin" / "px-changed"),
+                     started_ts=now - 500.0)
+    carried = carried_staleness([unit], root=str(repo))
+    assert carried and "src/pxh/beta.py" in carried[0].paths
+
+
+def test_the_summary_line_states_carried_staleness():
+    """#421's own near-miss: the first line read like a clean deploy on a host
+    carrying two stale units."""
+    from pxh.deploy import CarriedStaleness, action_summary
+
+    carried = CarriedStaleness(
+        name="px-blog.service",
+        started_ts=1_758_010_264.0,
+        newest=1_758_013_000.0,
+        paths=("src/pxh/model_session.py",),
+    )
+    line = action_summary(4, [], [], [carried])
+    assert "carried staleness: 1" in line
+    assert line.index("carried staleness") < line.index("unit files to install")
+    # Nothing carried and nothing to do is still stated, not implied.
+    assert action_summary(0, [], []).count("carried staleness: 0") == 1

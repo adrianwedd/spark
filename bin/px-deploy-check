@@ -8,7 +8,8 @@
 # (#332).
 #
 # Exit codes: 0 = every long-lived unit is executing the deployed revision,
-#             1 = at least one unit needs a restart,
+#             1 = at least one unit needs a restart, or the host is carrying
+#                 staleness from an earlier deploy (#421),
 #             2 = cannot tell (no usable revision to diff, or no systemd).
 #
 # The *first* line is a summary of what needs doing -- restarts and unit-file
@@ -41,6 +42,7 @@ from pxh.deploy import (
     CODE_DIRS,
     UnitState,
     action_summary,
+    carried_staleness,
     changed_symbols,
     needs_restart,
     repo_unit_names,
@@ -101,6 +103,30 @@ def print_unit_drift(drift: list) -> None:
     print("  sudo install -m 0644 systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload")
 
 
+def print_carried(carried: list) -> None:
+    """The units no deploy delta will ever name (#421).
+
+    Printed *before* any reassurance line, for the same reason the counts moved
+    to the top in #406: this is the section a reader who skims will otherwise
+    never reach, and it is the one that says the host is not what the checkout
+    says.
+    """
+    if not carried:
+        return
+    print()
+    print("{} long-lived unit(s) started before a file they execute changed on disk "
+          "\u2014 carried from an earlier deploy, no restart performed:".format(len(carried)))
+    for item in sorted(carried, key=lambda c: c.name):
+        print("  {:24s} started {}  newest executed change {}  ({})".format(
+            item.name,
+            dt.datetime.fromtimestamp(item.started_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            dt.datetime.fromtimestamp(item.newest).strftime("%Y-%m-%d %H:%M:%S"),
+            ", ".join(item.paths[:2]) + ("\u2026" if len(item.paths) > 2 else ""),
+        ))
+    print("  restart: sudo systemctl restart " + " ".join(
+        item.name.replace(".service", "") for item in sorted(carried, key=lambda c: c.name)))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.environ.get("PROJECT_ROOT", os.getcwd()))
@@ -115,7 +141,8 @@ def main():
         "--strict",
         action="store_true",
         help="exit 1 if anything needs action (a restart or a unit-file install); "
-             "the default exit code describes the processes only",
+             "the default exit code describes the processes - which now includes "
+             "staleness carried from an earlier deploy (#421)",
     )
     args = parser.parse_args()
     root = os.path.abspath(args.root)
@@ -133,13 +160,6 @@ def main():
     # while five units were months stale (#390).
     drift = report_unit_drift(root)
 
-    if not moved:
-        print(action_summary(0, [], drift))
-        print("  (nothing under {} changed in {}..{})".format(
-            "/".join(CODE_DIRS), args.prev, args.head))
-        print_unit_drift(drift)
-        return 1 if (args.strict and drift) else 0
-
     try:
         units = [unit_state(name) for name in unit_names()]
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
@@ -149,6 +169,20 @@ def main():
     deploy_ts = None
     if args.deploy_stamp:
         deploy_ts = dt.datetime.fromisoformat(args.deploy_stamp).timestamp()
+
+    # Host state, not deploy state (#421). A restart that could not be performed
+    # -- no non-interactive grant for that unit, an interrupted deploy -- leaves
+    # no trace in HEAD@{1}..HEAD, so a later deploy reports a clean delta over a
+    # host that is still running the older module.
+    carried = carried_staleness(units, root=root, deploy_ts=deploy_ts)
+
+    if not moved:
+        print(action_summary(0, [], drift, carried))
+        print("  (nothing under {} changed in {}..{})".format(
+            "/".join(CODE_DIRS), args.prev, args.head))
+        print_carried(carried)
+        print_unit_drift(drift)
+        return 1 if (carried or (args.strict and drift)) else 0
 
     # Per-file symbol diffs, so the restart list is about *reachability* rather
     # than fan-out (#336): a daemon whose only reference to a changed module is a
@@ -161,21 +195,26 @@ def main():
     verdicts = restart_list(moved, units, root=root, deploy_ts=deploy_ts, changes=changes)
     stale = needs_restart(verdicts)
 
-    print(action_summary(len(moved), [v.name for v in stale], drift))
+    print(action_summary(len(moved), [v.name for v in stale], drift, carried))
     print("  ({} changed file(s) in {}..{})".format(len(moved), args.prev, args.head))
     for verdict in verdicts:
         mark = "RESTART" if verdict.needs_restart else "ok     "
         print("  {}  {:24s} {}".format(mark, verdict.name, verdict.reason))
 
-    if not stale:
-        print("every long-lived unit is executing the deployed revision")
-    else:
+    # Order matters: the reassurance may only print when it is true of the whole
+    # fleet, and staleness carried from an earlier deploy is part of that
+    # (#421). Printing it above this section is how a host with two stale units
+    # read as a clean deploy.
+    if stale:
         print()
         print("restart these before calling the deploy complete:")
         print("  sudo systemctl restart " + " ".join(v.name.replace(".service", "") for v in stale))
+    print_carried(carried)
+    if not stale and not carried:
+        print("every long-lived unit is executing the deployed revision")
 
     print_unit_drift(drift)
-    if stale:
+    if stale or carried:
         return 1
     return 1 if (args.strict and drift) else 0
 
