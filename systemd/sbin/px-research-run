@@ -47,7 +47,14 @@ request="$INBOX/$uuid.json"
     exit 1
 }
 
-exec systemd-run \
+# `env -i`: the sandbox's environment must be exactly what the properties below
+# and EnvironmentFile= set, and nothing else. sudo's env_reset already keeps
+# *pi's* environment out of this script, but nothing keeps root's own out of the
+# unit — systemd-run hands the calling environment to the service. A channel
+# that carries "whatever happened to be exported by whoever invoked this" is the
+# same default-allow shape this whole design exists to remove, and it costs one
+# token to close. canary probe 18 measures it rather than assuming it.
+exec env -i /usr/bin/systemd-run \
     --unit="px-research-$uuid" \
     --collect \
     --property=DynamicUser=yes \
