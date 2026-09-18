@@ -213,6 +213,10 @@ def test_the_canary_declares_the_three_phases_it_claims():
     edit that drops one has to delete a comment that says what it was for."""
     text = (REPO_ROOT / CANARY).read_text()
     assert "phase 1" in text and "phase 2" in text and "phase 3" in text
+    assert "phase 0" in text, (
+        "the credential-coverage check is what makes a missing PX_M5_SPARK_HOST "
+        "or TIMEOUT_S a failure instead of a silent difference from production")
+    assert "comm -23" in text and "TIER_ENV" in text
     assert "getent passwd spark-research" in text, (
         "the release check is the one that proves DynamicUser does not leave a "
         "standing identity behind")
@@ -239,7 +243,7 @@ def test_the_canary_dry_run_needs_no_root_and_renders_what_it_would_do():
         guard._code_only((REPO_ROOT / guard.LAUNCHER).read_text()))
     assert f"properties ({len(launcher_props)})" in proc.stdout
 
-    for phase in ("phase 1 would run", "phase 2 would run",
+    for phase in ("phase 0 would check", "phase 1 would run", "phase 2 would run",
                   "phase 3 would run", "phase 4 would check"):
         assert phase in proc.stdout, f"{phase!r} missing from the dry run"
     # The probe and the release check are the two programs the phases exec.

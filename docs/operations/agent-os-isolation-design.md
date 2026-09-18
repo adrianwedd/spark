@@ -314,15 +314,27 @@ Nothing in this block has been run. It is the whole difference between
 "designed" and "there".
 
 ```bash
-# 1. the two tracked artifacts
+# 1. the one artifact that needs installing. `bin/px-research-worker` needs no
+#    step: it is tracked, already executable in the checkout, and the sandbox
+#    executes it from the read-only bind. (`install src dest` with src == dest
+#    is an error — "are the same file" — so the earlier version of this block
+#    printed one at the acceptance step for no reason.)
 sudo install -m 0755 systemd/sbin/px-research-run /usr/local/sbin/px-research-run
-sudo install -m 0755 bin/px-research-worker /home/pi/picar-x-hacking/bin/px-research-worker
 
-# 2. the two-variable credential, from .env — never tracked, never printed
+# 2. the credential, from .env — never tracked, never printed. By *pattern*, not
+#    by a hardcoded pair: every variable `pxh.m5` reads is a name here, so a
+#    value production sets cannot be silently absent from the sandbox. Missing
+#    `PX_M5_SPARK_HOST` would send the sandbox to a different host; missing
+#    `PX_M5_SPARK_TIMEOUT_S` would give it a different deadline.
 sudo install -d -m 0755 /etc/px-research
-sudo sh -c 'umask 077; grep -E "^(PX_M5_SPARK_MODEL|OLLAMA_CLOUD_API_KEY)=" \
+sudo sh -c 'umask 077; grep -E "^(PX_M5_SPARK_[A-Z_]+|OLLAMA_[A-Z_]*API_KEY)=" \
   /home/pi/picar-x-hacking/.env > /etc/px-research/tier.env'
 sudo chown root:root /etc/px-research/tier.env && sudo chmod 0600 /etc/px-research/tier.env
+
+# 2b. and check the coverage, names only (no output = nothing missing; the
+#     canary asserts the same thing as phase 0)
+comm -23 <(grep -oE '^(PX_M5_SPARK_[A-Z_]+|OLLAMA_[A-Z_]*API_KEY)=' /home/pi/picar-x-hacking/.env | sort -u) \
+         <(grep -oE '^(PX_M5_SPARK_[A-Z_]+|OLLAMA_[A-Z_]*API_KEY)=' /etc/px-research/tier.env | sort -u)
 
 # 3. the mailbox pair — 1777 sticky, matching state/health/ and state/brain/
 sudo install -d -m 1777 /var/lib/px-research/inbox /var/lib/px-research/outbox

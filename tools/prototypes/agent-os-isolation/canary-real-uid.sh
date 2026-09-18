@@ -152,6 +152,7 @@ $(printf '      %s \\\n' "${props[@]}")
       -- /bin/sleep 120
   then: observe the allocated uid, SIGTERM the unit, assert it is released
 
+phase 0 would check: every tier variable name in $REPO/.env is present in $TIER_ENV
 phase 4 would check: git status on $REPO, and that no probe write escaped
 EOF
     if ((${#missing[@]})); then
@@ -162,6 +163,24 @@ EOF
     echo
     echo "dry run: install looks complete; no unit was started"
     exit 0
+fi
+
+# Phase 0: the credential file must carry every tier variable production uses.
+# Names only — the values stay in the file and in the unit's environment — and
+# the claim matters because a missing name is *silent*: no `PX_M5_SPARK_HOST` in
+# here means the sandbox talks to the default host while the robot talks to the
+# configured one, and no `PX_M5_SPARK_TIMEOUT_S` means a different deadline.
+echo "########## phase 0: the credential covers production's tier variables ##########"
+tier_names() { grep -oE '^(PX_M5_SPARK_[A-Z_]+|OLLAMA_[A-Z_]*API_KEY)=' "$1" 2>/dev/null | sort -u; }
+prod_names="$(tier_names "$REPO/.env")"
+sandbox_names="$(tier_names "$TIER_ENV")"
+missing_names="$(comm -23 <(printf '%s\n' "$prod_names") <(printf '%s\n' "$sandbox_names") | tr -d '=')"
+if [[ -z "$prod_names" ]]; then
+    fail "could not read any tier variable names out of $REPO/.env — is the coverage check meaningful?"
+elif [[ -z "$missing_names" ]]; then
+    pass "every tier variable production sets is present in the sandbox's credential file ($(printf '%s\n' "$prod_names" | wc -l) names)"
+else
+    fail "the sandbox's credential file is missing: $(printf '%s' "$missing_names" | tr '\n' ' ')"
 fi
 
 status_before="$(git -C "$REPO" status --porcelain)"
