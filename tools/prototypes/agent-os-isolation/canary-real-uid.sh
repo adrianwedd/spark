@@ -29,7 +29,21 @@
 # launcher, once, with a uuid it generates. It never restarts or stops a
 # production unit (the systemctl probe inside the sandbox uses a nonexistent
 # name on purpose).
+#
+# `--dry-run` prints the exact systemd-run invocations this host would execute,
+# reports what the install is missing, and exits without touching systemd. It is
+# the half that can be checked *before* the root run — a 200-line script whose
+# first execution happens at the acceptance step is a script whose first
+# execution is untested, and its argument construction is the part that can be
+# wrong without systemd being involved at all.
 set -uo pipefail
+
+DRY_RUN=0
+case "${1:-}" in
+    --dry-run) DRY_RUN=1 ;;
+    "") ;;
+    *) printf 'usage: %s [--dry-run]\n' "$0" >&2; exit 2 ;;
+esac
 
 REPO=/home/pi/picar-x-hacking
 INBOX=/var/lib/px-research/inbox
@@ -44,7 +58,9 @@ fail() { printf 'FAIL  %s\n' "$*"; fails=$((fails + 1)); }
 note() { printf '      %s\n' "$*"; }
 die()  { printf 'canary: %s\n' "$*" >&2; exit 2; }
 
-[[ "$(id -u)" -eq 0 ]] || die "must run as root (the property phase builds a root-side systemd-run)"
+if [[ $DRY_RUN -eq 0 ]]; then
+    [[ "$(id -u)" -eq 0 ]] || die "must run as root (the property phase builds a root-side systemd-run)"
+fi
 
 # --- preconditions: the install must actually be there -----------------------
 missing=()
@@ -54,13 +70,27 @@ missing=()
 [[ -d "$OUTBOX" ]]   || missing+=("$OUTBOX")
 [[ -r "$TIER_ENV" ]] || missing+=("$TIER_ENV (the sandbox's two-variable credential)")
 [[ -f "$REPO/bin/px-research-worker" ]] || missing+=("$REPO/bin/px-research-worker")
+[[ -x /usr/bin/systemd-run ]] || missing+=("/usr/bin/systemd-run")
+[[ -x /usr/bin/env ]] || missing+=("/usr/bin/env")
+[[ -x /bin/bash ]]    || missing+=("/bin/bash")
+# Absolute, like every other binary this script names. `command -v runuser`
+# depends on the caller's PATH — measured on the robot, where /usr/sbin/runuser
+# is present but /usr/sbin is not on a non-login shell's PATH, and the check
+# therefore reported a false missing piece on the acceptance step.
+[[ -x /usr/sbin/runuser ]] || missing+=("/usr/sbin/runuser (phase 2 drives the real path as pi)")
+grep -qE '^pi ALL=\(root\) NOPASSWD: /usr/local/sbin/px-research-run \*$' \
+    /etc/sudoers.d/picar-x-services 2>/dev/null \
+    || missing+=("the sudoers grant for px-research-run in /etc/sudoers.d/picar-x-services")
+
 if ((${#missing[@]})); then
-    printf 'canary: not installed yet:\n' >&2
+    printf 'canary: %s\n' "$([[ $DRY_RUN -eq 1 ]] && echo "the install is incomplete:" || echo "not installed yet:")" >&2
     printf '  - %s\n' "${missing[@]}" >&2
-    exit 2
+    # A dry run is *for* the incomplete case: it reports and still shows the
+    # commands it would build. A real run must not start against a partial
+    # install, because a canary that passes over a missing piece is the worst
+    # kind of green.
+    [[ $DRY_RUN -eq 1 ]] || exit 2
 fi
-grep -qE '^pi ALL=\(root\) NOPASSWD: /usr/local/sbin/px-research-run \*$' /etc/sudoers.d/picar-x-services \
-    || die "the sudoers grant for px-research-run is not installed"
 
 uuid() { python3 -c 'import uuid;print(uuid.uuid4())'; }
 uid_now() { getent passwd spark-research 2>/dev/null | cut -d: -f3; }
@@ -101,9 +131,62 @@ sandbox_props() {
     --property=BindPaths=/var/lib/px-research/outbox
 }
 
+if [[ $DRY_RUN -eq 1 ]]; then
+    mapfile -t props < <(sandbox_props)
+    printf '\nproperties (%s):\n' "${#props[@]}"
+    printf '  %s\n' "${props[@]}"
+    cat <<EOF
+
+phase 1 would run:
+  env -i /usr/bin/systemd-run --unit=px-canary-<uuid1> --collect --wait \\
+$(printf '      %s \\\n' "${props[@]}")
+      -- /bin/bash $PROBE
+
+phase 2 would run (as pi, through the sudoers grant — the documented invocation):
+  /usr/sbin/runuser -u pi -- sudo -n $LAUNCHER <uuid2>
+  then: poll $OUTBOX/<uuid2>.json, assert it exists, is not root:root, and the unit is collected
+
+phase 3 would run:
+  env -i /usr/bin/systemd-run --unit=px-canary-<uuid3> --collect \\
+$(printf '      %s \\\n' "${props[@]}")
+      -- /bin/sleep 120
+  then: observe the allocated uid, SIGTERM the unit, assert it is released
+
+phase 0 would check: every tier variable name in $REPO/.env is present in $TIER_ENV
+phase 4 would check: git status on $REPO, and that no probe write escaped
+EOF
+    if ((${#missing[@]})); then
+        echo
+        echo "dry run: ${#missing[@]} piece(s) of the install are missing — a real run would exit 2 above"
+        exit 2
+    fi
+    echo
+    echo "dry run: install looks complete; no unit was started"
+    exit 0
+fi
+
+# Phase 0: the credential file must carry every tier variable production uses.
+# Names only — the values stay in the file and in the unit's environment — and
+# the claim matters because a missing name is *silent*: no `PX_M5_SPARK_HOST` in
+# here means the sandbox talks to the default host while the robot talks to the
+# configured one, and no `PX_M5_SPARK_TIMEOUT_S` means a different deadline.
+echo "########## phase 0: the credential covers production's tier variables ##########"
+tier_names() { grep -oE '^(PX_M5_SPARK_[A-Z_]+|OLLAMA_[A-Z_]*API_KEY)=' "$1" 2>/dev/null | sort -u; }
+prod_names="$(tier_names "$REPO/.env")"
+sandbox_names="$(tier_names "$TIER_ENV")"
+missing_names="$(comm -23 <(printf '%s\n' "$prod_names") <(printf '%s\n' "$sandbox_names") | tr -d '=')"
+if [[ -z "$prod_names" ]]; then
+    fail "could not read any tier variable names out of $REPO/.env — is the coverage check meaningful?"
+elif [[ -z "$missing_names" ]]; then
+    pass "every tier variable production sets is present in the sandbox's credential file ($(printf '%s\n' "$prod_names" | wc -l) names)"
+else
+    fail "the sandbox's credential file is missing: $(printf '%s' "$missing_names" | tr '\n' ' ')"
+fi
+
+status_before="$(git -C "$REPO" status --porcelain)"
+
 echo "########## phase 1: the same properties, a real uid ##########"
 u1="$(uuid)"
-marker="$(mktemp -u /var/tmp/px-canary-marker.XXXXXX)"
 leak="leak-probe-$(uuid)"
 mapfile -t props < <(sandbox_props)
 set +e
@@ -138,13 +221,19 @@ u2="$(uuid)"
 request="$INBOX/$u2.json"
 printf '{"prompt": "Canary request: state one sentence about what you cannot reach."}\n' > "$request"
 chmod 0644 "$request"
-if "$LAUNCHER" "$u2" >/dev/null 2>&1; then
-    pass "the launcher accepted a bare uuid and started the transient unit"
+# As pi, through `sudo -n`: that is the documented invocation, and the only one
+# the sudoers grant exists for. Running it as root here would pass even with a
+# broken grant, which is the false green this phase should not produce.
+if launch_out="$(/usr/sbin/runuser -u pi -- sudo -n "$LAUNCHER" "$u2" 2>&1)"; then
+    pass "the real invocation (pi -> sudo -n -> launcher) started the transient unit"
 else
-    fail "the launcher refused a valid uuid"
+    fail "the real invocation failed: ${launch_out:0:160}"
 fi
 result="$OUTBOX/$u2.json"
-for _ in $(seq 60); do [[ -s "$result" ]] && break; sleep 1; done
+# 120s, not 60: the tier's own deadline is PX_M5_SPARK_TIMEOUT_S (60s default),
+# and this poll is for whether the *flow-back* works, not for how fast the model
+# is. A canary that fails on a slow provider would be measuring the wrong thing.
+for _ in $(seq 120); do [[ -s "$result" ]] && break; sleep 1; done
 if [[ -s "$result" ]]; then
     pass "a result came back through the real path ($result)"
     note "status: $(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("status"), d.get("status_detail"), d.get("backend") or "-")' "$result" 2>/dev/null || echo unreadable)"
@@ -155,7 +244,7 @@ if [[ -s "$result" ]]; then
         pass "the result was written by the sandbox identity ($owner), not by root"
     fi
 else
-    fail "no result in the outbox within 60s — the operator would have been left with silence"
+    fail "no result in the outbox within 120s — the operator would have been left with silence"
 fi
 if systemctl status "px-research-$u2" >/dev/null 2>&1; then
     fail "the transient unit px-research-$u2 is still present"
@@ -170,10 +259,24 @@ mapfile -t props < <(sandbox_props)
 env -i /usr/bin/systemd-run --unit="px-canary-$u3" --collect "${props[@]}" -- /bin/sleep 120 >/dev/null 2>&1
 for _ in $(seq 20); do [[ -n "$(uid_now)" ]] && break; sleep 0.5; done
 during="$(uid_now)"
+if [[ -z "$during" ]]; then
+    # nss-systemd is what makes `getent` answer for a DynamicUser. If it is not
+    # in play, read the uid from the process itself rather than declaring the
+    # allocation absent — the claim is about the *identity*, not about nss.
+    run_pid="$(systemctl show -p MainPID --value "px-canary-$u3" 2>/dev/null)"
+    if [[ -n "$run_pid" && -r "/proc/$run_pid/status" ]]; then
+        during="$(awk '/^Uid:/{print $2}' "/proc/$run_pid/status")"
+        [[ "$during" == "$(id -u pi 2>/dev/null)" ]] && during=""
+    fi
+fi
 if [[ -n "$during" ]]; then
-    pass "an active unit has a real allocated uid ($during) with no /etc/passwd entry of its own"
+    if [[ "$during" == "$(id -u pi 2>/dev/null)" ]]; then
+        fail "the sandboxed unit ran as pi (uid $during)"
+    else
+        pass "an active unit runs as a genuinely different principal (uid $during)"
+    fi
 else
-    fail "no uid was allocated while the unit was running"
+    fail "no allocated uid was observable while the unit was running"
 fi
 systemctl kill --signal=SIGTERM "px-canary-$u3" >/dev/null 2>&1
 sleep 3
@@ -185,18 +288,22 @@ else
     fail "spark-research still resolves after the unit stopped (uid $after)"
 fi
 
+status_after="$(git -C "$REPO" status --porcelain)"
+
 echo
 echo "########## phase 4: nothing leaked ##########"
-if git -C "$REPO" status --porcelain | grep -q .; then
-    fail "the canary left changes in the checkout:"
-    git -C "$REPO" status --porcelain | sed 's/^/      /'
+# Compare against a snapshot taken before phase 1: the claim is "the canary left
+# nothing behind", not "this host happened to be clean when it ran".
+if [[ "$status_after" == "$status_before" ]]; then
+    pass "the production checkout is unchanged ($([[ -z "$status_before" ]] && echo "and was clean before" || echo "$(printf '%s' "$status_before" | wc -l) pre-existing entr(y|ies)"))"
 else
-    pass "the production checkout is unchanged"
+    fail "the canary changed the checkout:"
+    diff <(printf '%s\n' "$status_before") <(printf '%s\n' "$status_after") | sed 's/^/      /'
 fi
 for stray in "$REPO/CANARY-281-DELETE-ME.tmp" "$REPO/state/CANARY-281-DELETE-ME.tmp" /home/pi/CANARY-281-DELETE-ME.tmp; do
     if [[ -e "$stray" ]]; then fail "a probe write escaped the sandbox: $stray"; fi
 done
-rm -f "$marker" "$request"
+rm -f "$request"
 [[ -n "$record" ]] && note "probe record kept: $record"
 [[ -n "$result" ]] && note "real-path result kept: $result"
 

@@ -243,7 +243,11 @@ def check(root: Path | None = None) -> list[str]:
                 "(`env -i /usr/bin/systemd-run`) — then it is not testing the "
                 "sandbox that ships"
             )
-        if "id -u" not in canary_code or "must run as root" not in canary_code:
+        # The guard's *shape*, not the string `id -u`: phase 3 also reads
+        # `id -u pi` to prove the sandbox is not running as pi, so a substring
+        # check for `id -u` would pass a canary with the guard deleted.
+        if '"$(id -u)" -eq 0 ]] || die' not in canary_code \
+                or "must run as root" not in canary_code:
             violations.append(
                 f"{CANARY}: no root guard — the property phase builds a root-side "
                 "systemd-run and must refuse to run without one"
