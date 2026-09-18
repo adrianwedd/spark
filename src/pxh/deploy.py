@@ -283,6 +283,31 @@ def _internal_flows(source: str) -> tuple[dict[str, set[str]], set[str]]:
     return edges, top_level
 
 
+class _DropProse(ast.NodeTransformer):
+    """Remove bare string statements before anything is compared (#431).
+
+    Comments never reach the AST; docstrings did. A docstring added to a
+    *method* changes the dump of the class containing it, so on 2026-09-18 a
+    documentation-only commit to `src/pxh/gpio_lease.py` reported
+    `GpioLeaseGuard` as a changed symbol and every unit referencing that name was
+    told to restart. Three daemons were restarted for prose — the exact churn the
+    reachability rule exists to avoid, and the failure mode that teaches people
+    to leave a gate alone.
+
+    The rule is "a bare string is prose or dead code, never behaviour" and it is
+    applied at *every* nesting level, not just module level. `_module_symbols`
+    already ignored a module-level bare string; leaving nested ones counted made
+    the same edit a change or not depending on where it sat, which is how the
+    class above became a "changed symbol". A statement that evaluates a string
+    and discards it cannot affect behaviour, so nothing real is hidden by this.
+    """
+
+    def visit_Expr(self, node):
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            return None
+        return node
+
+
 def _module_symbols(source: str) -> tuple[dict[str, str], str]:
     """`({name: ast dump}, dump of everything else at module level)`.
 
@@ -293,7 +318,7 @@ def _module_symbols(source: str) -> tuple[dict[str, str], str]:
     must not make every importer stale, which is what a presence check would do
     (every module has imports).
     """
-    tree = ast.parse(source)
+    tree = _DropProse().visit(ast.parse(source))
     symbols: dict[str, str] = {}
     others: list[str] = []
     for node in tree.body:
@@ -305,8 +330,6 @@ def _module_symbols(source: str) -> tuple[dict[str, str], str]:
                     symbols[target.id] = ast.dump(node)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             symbols[node.target.id] = ast.dump(node)
-        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-            continue  # a docstring: prose, not behaviour
         else:
             others.append(ast.dump(node))
     return symbols, "\n".join(others)

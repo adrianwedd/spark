@@ -311,6 +311,70 @@ def test_changed_symbols_sees_a_module_level_import_change(tmp_path):
     assert change.module_level is True, "an import rename is exactly the #332 shape"
 
 
+def test_a_method_docstring_is_not_a_change(tmp_path):
+    """#431, measured: a documentation-only commit to `src/pxh/gpio_lease.py`
+    reported `GpioLeaseGuard` as a changed symbol, because a method docstring
+    lives in the class's AST. Two units referencing that name were told to
+    restart, and three daemons were restarted for prose on 2026-09-18."""
+    before = (
+        "class Guard:\n"
+        "    def owns(self):\n"
+        "        return True\n"
+    )
+    after = (
+        "class Guard:\n"
+        "    def owns(self):\n"
+        "        \"\"\"Whether the guard owns it.\"\"\"\n"
+        "        return True\n"
+    )
+    _tree(tmp_path, entries={}, modules={"alpha": before})
+    first = _git(tmp_path, {"src/pxh/alpha.py": after})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset()
+    assert change.module_level is False
+
+
+def test_a_module_docstring_is_not_a_change(tmp_path):
+    _tree(tmp_path, entries={}, modules={"alpha": '"""One."""\n\n\ndef one():\n    return 1\n'})
+    first = _git(tmp_path, {"src/pxh/alpha.py": '"""Two, reworded."""\n\n\ndef one():\n    return 1\n'})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset() and change.module_level is False
+
+
+def test_a_docstring_does_not_hide_a_real_change_beneath_it(tmp_path):
+    """The other direction: dropping docstrings must not blunt the rule."""
+    _tree(tmp_path, entries={}, modules={"alpha": "def one():\n    return 1\n"})
+    first = _git(tmp_path, {
+        "src/pxh/alpha.py": '"""Now documented."""\n\n\ndef one():\n    return 2\n'})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset({"one"}), "the real change must survive"
+
+
+def test_prose_is_ignored_at_every_nesting_level(tmp_path):
+    """The rule is "a bare string is never behaviour", applied uniformly. Before
+    #431 it was applied at module level only, which is why a *method* docstring
+    became a changed class and a module docstring did not — the same edit
+    counted or not depending on where it sat."""
+    _tree(tmp_path, entries={}, modules={
+        "alpha": "def one():\n    return 1\n\n\ndef two():\n    return 2\n"})
+    first = _git(tmp_path, {"src/pxh/alpha.py": (
+        "def one():\n"
+        "    \"\"\"Inside a function, not first in the file.\"\"\"\n"
+        "    return 1\n"
+        "\n\n"
+        "def two():\n"
+        "    return 2\n"
+        "    \"stray\"\n"
+    )})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset(), "prose and dead strings are not behaviour"
+    assert change.module_level is False
+
+
 def test_changed_symbols_is_none_when_a_revision_cannot_be_read(repo):
     assert changed_symbols("not-a-revision", "HEAD", "src/pxh/alpha.py", str(repo)) is None
 
