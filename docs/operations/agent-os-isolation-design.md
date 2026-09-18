@@ -407,6 +407,15 @@ It is the equivalent of phase 1's canary: phase 1 was closed by *actually
 attempting* the escalations, not by reading the agent definition, and this is
 the same discipline applied to the unit properties.
 
+**`--dry-run` needs no root and touches nothing**: it reports what the install
+is missing, prints the exact invocations it would build, and exits 2 on an
+incomplete install. It exists because a script whose first execution happens at
+the acceptance step is a script whose argument construction has never been
+executed — and it has already earned its keep: run on the robot it reported
+`/usr/sbin/runuser` as missing, because the check used `command -v` and
+`/usr/sbin` is not on a non-login shell's PATH. Every binary the script names is
+absolute now, and a test pins that the report does not change with `PATH`.
+
 ### One correction to the plan this replaces
 
 The previous version said to run all twelve probes "inside a

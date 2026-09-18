@@ -8,6 +8,7 @@ can trust.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -183,7 +184,7 @@ def test_a_canary_that_adds_a_property_is_detected(tmp_path):
 
 
 def test_a_canary_without_a_root_guard_is_detected(tmp_path):
-    root = _tamper(tmp_path, CANARY, '[[ "$(id -u)" -eq 0 ]] || die', "true || die")
+    root = _tamper(tmp_path, CANARY, '"$(id -u)" -eq 0 ]] || die', "true")
     violations = guard.check(root)
     assert any("root guard" in v for v in violations), violations
 
@@ -216,3 +217,67 @@ def test_the_canary_declares_the_three_phases_it_claims():
         "the release check is the one that proves DynamicUser does not leave a "
         "standing identity behind")
     assert "px-research-run" in text, "the real path is what phase 2 must exercise"
+
+
+def test_the_canary_dry_run_needs_no_root_and_renders_what_it_would_do():
+    """Run rather than read: a 300-line script whose first execution happens at
+    the acceptance step is a script whose argument construction has never been
+    executed. `--dry-run` is that half, and it must work as an ordinary user —
+    on this repo's CI runner the install is absent, which is itself a case it
+    has to report rather than crash on."""
+    import subprocess
+
+    proc = subprocess.run(
+        ["bash", str(REPO_ROOT / CANARY), "--dry-run"],
+        capture_output=True, text=True, cwd=str(REPO_ROOT),
+    )
+    out = proc.stdout + proc.stderr
+    assert "must run as root" not in out, "the dry run must not require root"
+    assert proc.returncode in (0, 2), out
+
+    launcher_props = guard._property_lines(
+        guard._code_only((REPO_ROOT / guard.LAUNCHER).read_text()))
+    assert f"properties ({len(launcher_props)})" in proc.stdout
+
+    for phase in ("phase 1 would run", "phase 2 would run",
+                  "phase 3 would run", "phase 4 would check"):
+        assert phase in proc.stdout, f"{phase!r} missing from the dry run"
+    # The probe and the release check are the two programs the phases exec.
+    assert "-- /bin/bash" in proc.stdout
+    assert "-- /bin/sleep 120" in proc.stdout
+    # And the real path is driven the way an operator drives it, not as root:
+    # as root it would pass with a broken sudoers grant.
+    assert "/usr/sbin/runuser -u pi -- sudo -n /usr/local/sbin/px-research-run" in proc.stdout
+    if proc.returncode == 2:
+        assert "the install is incomplete" in out
+
+
+def test_the_canary_drives_the_real_path_through_the_grant():
+    text = (REPO_ROOT / CANARY).read_text()
+    assert "/usr/sbin/runuser -u pi -- sudo -n" in text, (
+        "phase 2 must exercise the documented invocation (pi -> sudo -n -> "
+        "launcher); running the launcher as root would pass with a broken grant")
+    assert "getent passwd spark-research" in text
+
+
+def _dry_run_missing(path_env: str) -> set:
+    """The `  - ` lines the dry run reports, with a given PATH."""
+    import subprocess
+
+    proc = subprocess.run(
+        ["bash", str(REPO_ROOT / CANARY), "--dry-run"],
+        capture_output=True, text=True, cwd=str(REPO_ROOT),
+        env={**os.environ, "PATH": path_env},
+    )
+    return {line.strip()[2:] for line in proc.stdout.splitlines()
+            if line.startswith("  - ")}
+
+
+def test_the_dry_run_does_not_depend_on_the_callers_path():
+    """Found by running it on the robot: `/usr/sbin/runuser` is present there but
+    `/usr/sbin` is not on a non-login shell's PATH, so a `command -v` check
+    reported a piece of the install as missing that was there. A false
+    "missing" on the acceptance step is worse than no check — it costs a root
+    run and a re-read. Every binary this script names is absolute now, and this
+    pins that: the report must be identical under a restricted PATH."""
+    assert _dry_run_missing("/usr/bin:/bin") == _dry_run_missing(os.environ.get("PATH", ""))
