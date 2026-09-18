@@ -82,17 +82,24 @@ def test_guard_keeps_legitimate_owner_live_then_releases(tmp_path):
     observable effect: ``expires_at`` advancing beyond the initial TTL,
     proving at least one refresh succeeded.  A generous timeout bounds the
     wait so a broken refresh thread still fails the test deterministically.
+
+    **Measured, not assumed (#323).** Re-run on `picar` under `nice -19` load,
+    this test failed **5 of 60** iterations at `ttl_s=2.0`, two ways: "the lease
+    vanished immediately after acquire()" and "the lease was lost after an
+    unrelated release attempt" — both the same cause, the *test process itself*
+    being descheduled past the TTL, not the refresh thread failing. Raising the
+    TTL from 80 ms to 2 s had only moved that threshold.
+
+    The TTL is now 30 s — 600 refresh intervals — so the assertion is about the
+    thread and never about the runner's scheduler. What proves the thread works
+    is `expires_at` *advancing*, which the poll below still requires; expiry
+    semantics are covered with an injected clock by
+    `test_expired_lease_is_rejected_deterministically`, which is deterministic
+    and needs no thread at all. Nothing this test used to prove was dropped to
+    make it stop flaking: the tight TTL was never what covered expiry.
     """
-    # ttl_s must leave room for the *scheduler*, not just for the refresh
-    # thread's own work. At 80 ms a loaded runner could starve the thread past
-    # the TTL, the lease expired, and `store.current()` returned None — the
-    # test then failed on a TypeError about a None lease, which reads as a
-    # defect in the guard rather than in the test's timing budget (#323).
-    # What proves the thread works is expires_at *advancing*; the TTL only has
-    # to be wide enough that the observation is about the guard and not about
-    # the runner's load.
     store = GpioLeaseStore(tmp_path, pid_alive=lambda _pid: True)
-    guard = GpioLeaseGuard(store, "voice", ttl_s=2.0, refresh_s=0.05, pid=1060)
+    guard = GpioLeaseGuard(store, "voice", ttl_s=30.0, refresh_s=0.05, pid=1060)
 
     assert guard.acquire() is True
     current = store.current()

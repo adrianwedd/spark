@@ -247,6 +247,15 @@ class GpioLeaseGuard:
 
     @property
     def owns_gpio(self) -> bool:
+        """True until a renewal attempt *reports* the lease lost — nothing more.
+
+        It reads no file: `self.lost` is set by the refresh thread when
+        `store.refresh()` returns False, so between a renewal failing and the
+        thread noticing, this property still says True while the store's lease
+        has already lapsed. That window is bounded by the thread being scheduled
+        and is the window #323's soak was reading as a guard defect; do not use
+        this property as "the store agrees I hold it" — read the store for that.
+        """
         return self.lease is not None and not self.lost.is_set()
 
 
