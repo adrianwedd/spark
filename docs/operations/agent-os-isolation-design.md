@@ -323,11 +323,65 @@ sudo install -m 0440 -o root -g root systemd/sudoers.d/picar-x-services \
 
 Then the canary below, then the first real request.
 
+## Rehearsal — the worker itself, inside the sandbox (2026-09-18)
+
+`tools/prototypes/agent-os-isolation/run-worker-rehearsal.sh`. Still no root,
+no password, no persistent state. It is a different question from the prototype
+above: that one proved the *mechanism* against a probe script, this one asks
+whether the thing we actually intend to install — `bin/px-research-worker` —
+runs inside the sandbox shape at all, and whether its one-readable/one-writable
+contract holds there rather than in a pytest tmpdir.
+
+Why it was worth doing before the install: the sandbox is a read-only checkout,
+a hidden `state/`, a neutered `.env`, no devices and a different uid, and the
+parts that can *only* fail under those conditions — bytecode writes into a
+read-only tree, the mailbox path, the tier client's state directory, the
+network path — are exactly the parts an install would discover at 2am.
+
+Two runs, same sandbox, one request each:
+
+| probe | result |
+|---|---|
+| identity | `uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)` |
+| P1 write a new file into the repo root | **blocked** — `Read-only file system` |
+| P2 write a new file into `state/` | **blocked** — `Read-only file system` |
+| P3 list `state/` | **blocked** — empty (hidden, not merely unwritable) |
+| P4 read `.env` | **blocked** — `Permission denied` |
+| P5 `sudo -n true` | **blocked** — *"the no new privileges flag is set"* |
+| P6 `/dev/gpiomem`, `/dev/i2c-1`, `/dev/snd` | **blocked** — absent |
+| P7 read its own request | **passes** |
+| P8 run 1: the worker, with a tier reachable | **exit 0** |
+| P9 outbox: results for this uuid / `.tmp` left | **1 / 0** |
+| P10 run 1 result | `status: ok`, `status_detail: available`, `backend: ollama-local`, a real HTTP round trip to a throwaway local stand-in for the tier (`duration_ms: 17`) |
+| run 2: the same worker, no credential in the sandbox | **exit 4**, and the outbox carries the reason verbatim: `PX_M5_SPARK_MODEL must name a model explicitly (not auto)` |
+| post-run `git status --porcelain` on the real tree | **empty** — nothing escaped |
+
+Run 2 is the shape to expect if `EnvironmentFile=/etc/px-research/tier.env` is
+ever missing on the host: the unit still produces a result file with the reason
+in it, rather than a silent failure, which is what makes the install step's
+credential file a *diagnosable* requirement rather than a mysterious one.
+
+Two honest notes about the transcript:
+
+* **`.env` reads as `Permission denied`, not as an empty file.** `/dev/null` is
+  bound read-only over it, and the bind is what changes the access, not the
+  file's mode. The property's intent — unreadable — is what the probe shows.
+* **`sudo` complains that `/etc/sudo.conf` is owned by uid 65534.** That is an
+  artefact of the uid *remap*: inside this namespace the real root-owned files
+  appear owned by the remapped uid, and sudo says so before `no_new_privs`
+  stops it. It is not a misconfiguration and it is not evidence about the real
+  implementation — with a real `DynamicUser`, root-owned files are root-owned
+  and the same `no_new_privs` block applies, which is what canary item 1 checks.
+
+What remains unproven is unchanged, and it is the part that needs the install:
+
 ## Adversarial canary plan (for the real implementation, once shipped)
 
 Same discipline as the phase-1 canary — actually attempt each escalation
 through the real `px-research-run` → `systemd-run` → `spark-research` path,
-not just read the unit file and assume:
+not just read the unit file and assume. The *worker's* half of items 2–4 below
+is already rehearsed (the section above, 2026-09-18); what is left for each is
+the part that needs the real uid and the real mailbox paths:
 
 1. From inside a `px-research-worker` invocation (or a manual `systemd-run`
    using the exact same properties), attempt all 12 probes above again —
