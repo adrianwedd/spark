@@ -333,7 +333,14 @@ sudo install -m 0440 -o root -g root systemd/sudoers.d/picar-x-services \
   /etc/sudoers.d/picar-x-services
 ```
 
-Then the canary below, then the first real request.
+Then the canary, which is one command and is what closes this phase:
+
+```bash
+sudo tools/prototypes/agent-os-isolation/canary-real-uid.sh
+```
+
+It exits 2 if any part of the install above is missing, so a partial install
+cannot read as a passing boundary.
 
 ## Rehearsal — the worker itself, inside the sandbox (2026-09-18)
 
