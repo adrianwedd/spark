@@ -151,27 +151,32 @@ proposals, never auto-applied.
 
 `BindReadOnlyPaths=/dev/null:.env` is correct and stays, but it has a
 consequence the first draft did not name: `pxh.m5` needs a model name
-(`PX_M5_SPARK_MODEL`) and a key (`OLLAMA_CLOUD_API_KEY`) for a hosted tier, and
-both live in `.env`. A sandbox that cannot read `.env` and has no other route
-to them can make exactly zero model calls, which would make the whole mechanism
-a $0 experiment.
+(`PX_M5_SPARK_MODEL`), a host, a deadline and a key — all of which live in
+`.env`. A sandbox that cannot read `.env` and has no other route to them can
+make exactly zero model calls, which would make the whole mechanism a $0
+experiment.
 
 Three ways out, and only one is acceptable:
 
 | route | why not |
 |---|---|
 | `--setenv=PX_M5_SPARK_MODEL=... --setenv=OLLAMA_CLOUD_API_KEY=...` on the launcher | the values become unit properties, and `systemctl show -p Environment` (and `Environment=`) is **world-readable** — the key would be readable by every user on the box, including the one this design is isolating from |
-| point the unit at the real `.env` | defeats `BindReadOnlyPaths=/dev/null`; the sandbox gets the HA token, the admin PIN, the relay token, the Bluesky app password — everything, for the sake of two variables |
-| **a root-owned two-variable file the unit *inherits* and never reads** | chosen |
+| point the unit at the real `.env` | defeats `BindReadOnlyPaths=/dev/null`; the sandbox gets the HA token, the admin PIN, the relay token, the Bluesky app password — everything, for the sake of one variable family |
+| **a root-owned file of the tier's variables, which the unit *inherits* and never reads** | chosen |
 
-`/etc/px-research/tier.env` is `root:root 0600`, containing exactly
-`PX_M5_SPARK_MODEL` and `OLLAMA_CLOUD_API_KEY`. systemd (PID 1, already root)
+`/etc/px-research/tier.env` is `root:root 0600`, containing **every name
+`pxh.m5` reads** — `PX_M5_SPARK_*` and the key — matched by pattern from `.env`
+rather than by a hardcoded pair, because a missing name is silent: no
+`PX_M5_SPARK_HOST` in the sandbox means it talks to the default host while the
+robot talks to the configured one, and no `_TIMEOUT_S` means a different
+deadline. The canary's phase 0 asserts that coverage by name. systemd (PID 1, already root)
 reads `EnvironmentFile=` and injects the values into the unit's environment;
 the sandboxed process never opens the file, and `systemctl show` on a unit with
 `EnvironmentFile=` reports the *path*, not the values. The cost is honest and
-worth stating: **rotating either value means editing two files**, and this file
-must never grow a third variable — the file *is* the credential boundary, and
-its size is the thing keeping the boundary narrow. `px-research-run` refuses to
+worth stating: **rotating a value means editing two files**, and this file must
+never grow a variable outside the tier family — a secret the sandbox has no
+business holding (an HA token, a relay token) would be inside the boundary's one
+deliberate hole. Its narrowness is the thing keeping the boundary narrow. `px-research-run` refuses to
 start a unit when it is missing rather than starting one that will fail at the
 first call with no key.
 
@@ -230,7 +235,7 @@ files on the host. `useradd` and `groupadd` are **not** among them —
 |---|---|---|
 | 1 | `/etc/sudoers.d/picar-x-services` gains one line: `pi ALL=(root) NOPASSWD: /usr/local/sbin/px-research-run *` | tracked: `systemd/sudoers.d/picar-x-services`. The wildcard is the one unavoidable one — the argument is a uuid, so it cannot be enumerated. Safety is in the launcher, which accepts exactly one argument and requires a bare v4 uuid |
 | 2 | `/usr/local/sbin/px-research-run`, root:root 0755 | tracked: `systemd/sbin/px-research-run`, same install shape as `px-signal-alive` / `px-gpio-run` |
-| 3 | `/etc/px-research/tier.env`, root:root 0600, two variables | generated on the host from `.env` (see "The credential" above) — **not** tracked, it holds a key |
+| 3 | `/etc/px-research/tier.env`, root:root 0600, the tier variable family | generated on the host from `.env` by pattern (see "The credential" above) — **not** tracked, it holds a key |
 | 4 | `/var/lib/px-research/{inbox,outbox}`, root:root 1777 sticky | the existing `state/health/` / `state/brain/` mailbox precedent: different Unix users write here, so a locked-down parent directory would exclude one of them |
 | 5 | `bin/px-research-worker` (pi-owned, tracked) + `src/pxh/research_worker.py` | runs *as* `spark-research` but is *owned* by `pi`: the sandboxed uid can execute it (the whole checkout is bound read-only) and can never modify it, regardless of file-mode bits |
 
