@@ -23,7 +23,11 @@ ARTIFACTS = (
     Path("systemd/sbin/px-research-run"),
     Path("src/pxh/research_worker.py"),
     Path("systemd/sudoers.d/picar-x-services"),
+    Path("tools/prototypes/agent-os-isolation/canary-real-uid.sh"),
+    Path("tools/prototypes/agent-os-isolation/canary-probe.sh"),
 )
+CANARY = ARTIFACTS[3]
+PROBE = ARTIFACTS[4]
 
 
 def _fake_repo(tmp_path) -> Path:
@@ -143,3 +147,72 @@ def test_the_bin_entry_point_execs_the_module_without_px_env():
     assert "-m pxh.research_worker" in text
     assert not [line for line in guard._code_only(text).splitlines()
                 if "px-env" in line], "the worker must not source bin/px-env"
+
+
+# ---------------------------------------------------------------------------
+# The canary must test the sandbox that ships (#281 phase 2)
+# ---------------------------------------------------------------------------
+#
+# The real path execs `bin/px-research-worker` and nothing else — no shell, no
+# probes — so the property set has to be canaried by a root-side systemd-run
+# with the *same* properties and a different program. That identity is the
+# load-bearing claim, and two lists in two files drift unless something compares
+# them. These are the canaries for the comparison itself.
+
+def test_the_canary_uses_the_launchers_property_set():
+    launcher = guard._property_lines(guard._code_only((REPO_ROOT / guard.LAUNCHER).read_text()))
+    canary = guard._property_lines(guard._code_only((REPO_ROOT / CANARY).read_text()))
+    assert sorted(canary) == sorted(launcher)
+    assert len(launcher) >= 25, "a property list this short is not the design's"
+
+
+def test_a_canary_that_drops_a_property_is_detected(tmp_path):
+    root = _tamper(tmp_path, CANARY, "    --property=ProtectHome=yes \\\n", "")
+    violations = guard.check(root)
+    assert any("differs from" in v for v in violations), violations
+
+
+def test_a_canary_that_adds_a_property_is_detected(tmp_path):
+    root = _tamper(
+        tmp_path, CANARY,
+        "    --property=PrivateTmp=yes \\\n",
+        "    --property=PrivateTmp=yes \\\n    --property=ReadWritePaths=/tmp \\\n",
+    )
+    violations = guard.check(root)
+    assert any("differs from" in v for v in violations), violations
+
+
+def test_a_canary_without_a_root_guard_is_detected(tmp_path):
+    root = _tamper(tmp_path, CANARY, '[[ "$(id -u)" -eq 0 ]] || die', "true || die")
+    violations = guard.check(root)
+    assert any("root guard" in v for v in violations), violations
+
+
+def test_a_canary_that_names_another_unit_is_detected(tmp_path):
+    root = _tamper(tmp_path, CANARY, '--unit="px-canary-$u1"', '--unit="px-mind"')
+    violations = guard.check(root)
+    assert any("px-canary-*" in v for v in violations), violations
+
+
+def test_a_probe_that_targets_a_real_unit_is_detected(tmp_path):
+    root = _tamper(tmp_path, PROBE, "px-canary-nonexistent.service", "px-alive.service")
+    violations = guard.check(root)
+    assert any("nonexistent" in v for v in violations), violations
+
+
+def test_a_missing_canary_is_detected(tmp_path):
+    root = _fake_repo(tmp_path)
+    (root / CANARY).unlink()
+    violations = guard.check(root)
+    assert any("no executable acceptance artifact" in v for v in violations), violations
+
+
+def test_the_canary_declares_the_three_phases_it_claims():
+    """Properties, the real path, and release — named in the file so a future
+    edit that drops one has to delete a comment that says what it was for."""
+    text = (REPO_ROOT / CANARY).read_text()
+    assert "phase 1" in text and "phase 2" in text and "phase 3" in text
+    assert "getent passwd spark-research" in text, (
+        "the release check is the one that proves DynamicUser does not leave a "
+        "standing identity behind")
+    assert "px-research-run" in text, "the real path is what phase 2 must exercise"

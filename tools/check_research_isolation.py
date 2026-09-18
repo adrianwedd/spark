@@ -31,6 +31,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = Path("systemd/sbin/px-research-run")
 WORKER = Path("src/pxh/research_worker.py")
 SUDOERS = Path("systemd/sudoers.d/picar-x-services")
+# The acceptance artifact for phase 2, and the reason it is checked here: the
+# real path can only exec `bin/px-research-worker` (no shell, no probes), so the
+# property set has to be canaried by a root-side systemd-run with the *same*
+# properties and a different program. "Same properties" is the load-bearing
+# claim, and two lists in two files drift unless something compares them.
+CANARY = Path("tools/prototypes/agent-os-isolation/canary-real-uid.sh")
+CANARY_PROBE = Path("tools/prototypes/agent-os-isolation/canary-probe.sh")
 
 # Properties the design requires, by the reason each one is there. A missing
 # property is a hole; the map is printed with all of them so a change that
@@ -83,6 +90,18 @@ FORBIDDEN_IN_LAUNCHER = {
 WORKER_WRITE_ALLOWANCE = 1  # exactly one write_text: the tmp file in write_result
 
 
+def _property_lines(text: str) -> list[str]:
+    """Every `--property=` line, stripped. Values are compared literally, which
+    is why the canary uses the launcher's variable names (`$REPO`, `$INBOX`,
+    `$TIER_ENV`) rather than its own."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip().rstrip("\\").strip()
+        if line.startswith("--property="):
+            out.append(line)
+    return out
+
+
 def _read(root: Path, rel: Path) -> str:
     path = root / rel
     if not path.exists():
@@ -130,10 +149,11 @@ def check(root: Path | None = None) -> list[str]:
             f"{LAUNCHER}: the v4-uuid validation is missing or altered; it is the "
             "single caller-controlled input"
         )
-    if "exec systemd-run" not in code:
+    if "exec env -i /usr/bin/systemd-run" not in code:
         violations.append(
-            f"{LAUNCHER}: does not exec systemd-run — a launcher that does the work "
-            "itself moves the sandbox's guarantee into its own process"
+            f"{LAUNCHER}: does not exec systemd-run under `env -i` — the unit's "
+            "environment must be exactly what the properties and EnvironmentFile= "
+            "set, and systemd-run otherwise hands it the calling environment"
         )
 
     # 3. Every required property, by name.
@@ -199,7 +219,56 @@ def check(root: Path | None = None) -> list[str]:
     else:
         violations.append(f"{SUDOERS} is missing — the launcher has no granted caller")
 
-    # 6. The worker writes in exactly one place.
+    # 6. The canary must test the sandbox that ships, not one that resembles it.
+    canary_text = _read(base, CANARY)
+    if not canary_text:
+        violations.append(
+            f"{CANARY} is missing — phase 2 has no executable acceptance artifact")
+    else:
+        canary_code = _code_only(canary_text)
+        launcher_props = sorted(_property_lines(code))
+        canary_props = sorted(_property_lines(canary_code))
+        if not canary_props:
+            violations.append(f"{CANARY}: no --property= lines — it would test nothing")
+        elif canary_props != launcher_props:
+            missing = [p for p in launcher_props if p not in canary_props]
+            extra = [p for p in canary_props if p not in launcher_props]
+            violations.append(
+                f"{CANARY}: its property set differs from {LAUNCHER}'s — the canary "
+                f"must test the sandbox that ships. missing={missing} extra={extra}"
+            )
+        if "env -i /usr/bin/systemd-run" not in canary_code:
+            violations.append(
+                f"{CANARY}: does not use the launcher's exec context "
+                "(`env -i /usr/bin/systemd-run`) — then it is not testing the "
+                "sandbox that ships"
+            )
+        if "id -u" not in canary_code or "must run as root" not in canary_code:
+            violations.append(
+                f"{CANARY}: no root guard — the property phase builds a root-side "
+                "systemd-run and must refuse to run without one"
+            )
+        for line in canary_code.splitlines():
+            if "--unit=" in line and "px-canary-" not in line:
+                violations.append(
+                    f"{CANARY}: creates a unit that is not px-canary-*: {line.strip()!r} "
+                    "— the canary may never touch a production unit"
+                )
+        probe_text = _read(base, CANARY_PROBE)
+        if not probe_text:
+            violations.append(f"{CANARY_PROBE} is missing — the canary has nothing to run")
+        elif "PX_CANARY_LEAK_PROBE" not in probe_text:
+            violations.append(
+                f"{CANARY_PROBE}: the calling-environment leak probe is gone — the "
+                "only claim here that cannot be settled by reading the launcher"
+            )
+        elif "px-canary-nonexistent.service" not in probe_text:
+            violations.append(
+                f"{CANARY_PROBE}: the systemctl probe must name a *nonexistent* unit "
+                "(zero blast radius), the same discipline as the prototype"
+            )
+
+    # 7. The worker writes in exactly one place.
     worker = _read(base, WORKER)
     if not worker:
         violations.append(f"{WORKER} is missing — nothing for the unit to run")
@@ -242,6 +311,13 @@ def report(root: Path | None = None) -> list[str]:
     if worker:
         lines.append(f"worker:   {WORKER} ({len(worker.splitlines())} lines, "
                      f"{worker.count('.write_text(')} write path)")
+    canary = _read(base, CANARY)
+    if canary:
+        lines.append(f"canary:   {CANARY} ({len(canary.splitlines())} lines, "
+                     f"{len(_property_lines(_code_only(canary)))} properties, "
+                     "compared below against the launcher)")
+        lines.append(f"probe:    {CANARY_PROBE} "
+                     f"({len(_read(base, CANARY_PROBE).splitlines())} lines)")
     return lines
 
 

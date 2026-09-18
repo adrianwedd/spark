@@ -6,7 +6,10 @@ made for this phase — everything ships inert and nothing in the running system
 reads it. The three artifacts are `systemd/sbin/px-research-run` (the root
 launcher), `bin/px-research-worker` + `src/pxh/research_worker.py` (what runs
 inside), and one line in `systemd/sudoers.d/picar-x-services`; their closure is
-pinned by `tools/check_research_isolation.py`, which runs as its own CI step.
+pinned by `tools/check_research_isolation.py`, which runs as its own CI step,
+and the acceptance bar is now a script rather than a transcript to read
+(`tools/prototypes/agent-os-isolation/canary-real-uid.sh`, root, after the
+install).
 See
 [agent-authority.md](agent-authority.md) for the phase-1 tool-boundary work
 that already shipped and is out of scope here.
@@ -172,6 +175,15 @@ its size is the thing keeping the boundary narrow. `px-research-run` refuses to
 start a unit when it is missing rather than starting one that will fail at the
 first call with no key.
 
+**The launcher execs `systemd-run` under `env -i`.** `sudo`'s `env_reset`
+already keeps *pi's* environment out of a root shell, but nothing kept *root's*
+out of the unit: `systemd-run` hands the calling environment to the service, so
+"whatever happened to be exported by whoever invoked this" would have been a
+reachable channel inside a sandbox whose entire purpose is to have no such
+channel. Probe 18 above tests the *effect* of that line rather than its
+presence in a file: without `env -i` the exported variable reaches the sandbox
+and the probe fails.
+
 Notes on specific choices:
 - **`ReadOnlyPaths=` the whole checkout, not a separate worktree.** A
   read-only bind mount already prevents any write regardless of what's
@@ -321,7 +333,14 @@ sudo install -m 0440 -o root -g root systemd/sudoers.d/picar-x-services \
   /etc/sudoers.d/picar-x-services
 ```
 
-Then the canary below, then the first real request.
+Then the canary, which is one command and is what closes this phase:
+
+```bash
+sudo tools/prototypes/agent-os-isolation/canary-real-uid.sh
+```
+
+It exits 2 if any part of the install above is missing, so a partial install
+cannot read as a passing boundary.
 
 ## Rehearsal — the worker itself, inside the sandbox (2026-09-18)
 
@@ -375,44 +394,88 @@ Two honest notes about the transcript:
 
 What remains unproven is unchanged, and it is the part that needs the install:
 
-## Adversarial canary plan (for the real implementation, once shipped)
+## Adversarial canary plan — a script, not a transcript
 
-Same discipline as the phase-1 canary — actually attempt each escalation
-through the real `px-research-run` → `systemd-run` → `spark-research` path,
-not just read the unit file and assume. The *worker's* half of items 2–4 below
-is already rehearsed (the section above, 2026-09-18); what is left for each is
-the part that needs the real uid and the real mailbox paths:
+`tools/prototypes/agent-os-isolation/canary-real-uid.sh`, run as root on the
+robot **after** the install block. One command; it fails rather than printing
+something for a human to judge, and it refuses to start with exit 2 if any part
+of the install is missing (launcher, probe, mailbox, credential file, sudoers
+grant) — a canary that passes because the thing under test is absent is the
+worst kind.
 
-1. From inside a `px-research-worker` invocation (or a manual `systemd-run`
-   using the exact same properties), attempt all 12 probes above again —
-   this time the identity is a **real** `DynamicUser`-allocated uid, not a
-   namespace remap of `pi`, so this also validates the primary default-deny
-   layer the prototype couldn't reach.
-2. Attempt to reach a resource **not explicitly enumerated above** — e.g. a
-   second GPIO chip added after this design was written, or a new `state/`
-   subdirectory — to confirm the default-deny posture actually holds for
-   things nobody thought to list, not just the specific paths this doc
-   named. (This is the check the bwrap prototype's default-allow posture
-   structurally cannot pass, and the reason the identity layer matters.)
-3. Confirm `sudo -l` for `spark-research` shows no entries at all (there
-   should be no sudoers line naming it — only `pi` gets the one-line grant
-   to invoke the launcher).
-4. Confirm the outbox write path works (positive control) and that
-   `spark-research` cannot write anywhere else under `/var/lib/px-research/`
-   or `/home/pi/picar-x-hacking` (negative control, including the inbox
-   directory itself — read-only from the worker's side once the request is
-   picked up).
-5. Kill the transient unit mid-run and confirm `DynamicUser`'s allocation is
-   released (`getent passwd spark-research` shows nothing outside an active
-   unit) — the account should not persist as a standing attack surface
-   between invocations.
-6. Run the full CI suite's negative-control pattern from
-   `feedback_containment_tests_must_be_inert` (memory) — the canary itself
-   must never touch a real production unit; use a nonexistent unit name for
-   the systemctl probe exactly as the prototype did here.
+It is the equivalent of phase 1's canary: phase 1 was closed by *actually
+attempting* the escalations, not by reading the agent definition, and this is
+the same discipline applied to the unit properties.
 
-Once (1)–(6) pass against the real implementation, that's the equivalent
-acceptance bar phase 1 used ("proven with an adversarial canary, not trusted
-from the prompt") — at that point issue #281 can be reassessed for closure,
-though the "out of scope" items above (resource limits, network isolation)
-would still be open follow-ups, not blockers.
+### One correction to the plan this replaces
+
+The previous version said to run all twelve probes "inside a
+`px-research-worker` invocation (or a manual `systemd-run` using the exact same
+properties)". The second half is the only executable one, and that is a
+property of the design rather than an inconvenience: **the real path execs
+`bin/px-research-worker` and nothing else** — no shell, no probes. A sandbox
+that could run arbitrary probe code through its own entry point would not be
+the sandbox this design claims. So the canary is split by what each half can
+actually reach, and the *identity* of the property lists is what makes the
+first half evidence about the real sandbox: `tools/check_research_isolation.py`
+compares the canary's `--property=` lines against the launcher's and fails CI if
+they drift.
+
+### Phase 1 — the properties, with a real uid
+
+`systemd-run --wait --collect` with the launcher's property list, verbatim,
+running `canary-probe.sh` instead of the worker. That is a real
+`DynamicUser`-allocated uid, not a namespace remap, so the following are
+checked for the first time as *facts* rather than as arguments:
+
+| # | claim |
+|---|---|
+| 1 | `sudo -n true` cannot gain root |
+| 2–3 | cannot write a new file into the checkout, or into `state/` |
+| 4 | `state/` is hidden, not merely unwritable |
+| 5–7 | `/dev/gpiomem`, `/dev/i2c-1`, `/dev/snd` are absent |
+| 8 | `systemctl restart` has no authority (against a **nonexistent** unit name: zero blast radius) |
+| 9 | repo source is still readable |
+| 10 | `.env` yields nothing readable — asserted as *no content*, because the read-only bind is of `/dev/null`, whose mode is 0666, so "the read fails" would be a false failure of a property that holds |
+| 11 | `~/.claude` is hidden |
+| 12 | the outbox accepts a write (positive control) |
+| **13** | the identity has **no supplementary groups** — the claim `DynamicUser` is chosen for, which a namespace remap cannot test |
+| **14** | `/etc/px-research/tier.env` is unreadable from inside — an **unenumerated** resource: the credential the unit *inherits* must not be readable by the sandbox for itself |
+| **15** | no `/dev/gpiochip*` is visible — whatever this host actually has, not a list written when the doc was |
+| **16** | cannot write outside the checkout, under `/home` |
+| **17** | no sudoers entry names `spark-research` |
+| **18** | the **invoking environment** does not reach the sandbox. The canary exports `PX_CANARY_LEAK_PROBE` in its own shell and passes it through no property; this probe is the *effect* of the launcher's `env -i`, so it is the check that fails if that line is ever removed |
+
+13–17 are the ones the bwrap prototype structurally could not reach; the probe's
+verdict is also written to the outbox as JSON, so the evidence outlives the
+transient unit.
+
+### Phase 2 — the real path, end to end
+
+A real request through `/usr/local/sbin/px-research-run <uuid>`, then: a result
+must appear in the outbox within 60 s, it must **not** be owned by `root:root`
+(the work ran as the sandbox identity), and the transient unit must be gone
+afterwards (`--collect` leaves nothing behind). This is the positive control
+the property phase cannot give, and it is the chain an operator actually uses.
+
+### Phase 3 — the allocation is released
+
+A long-running unit under the same properties, killed mid-run: `getent passwd
+spark-research` must resolve *while* it runs and must resolve to **nothing**
+once it is stopped. An identity that persists between invocations is a standing
+attack surface, and the design claims not to have one.
+
+### Phase 4 — nothing leaked
+
+`git status --porcelain` on the production checkout, plus explicit checks that
+none of the probe's write attempts escaped into the repo, `state/`, or `/home`.
+
+### What remains a human's job
+
+Running one command as root after the install:
+`sudo tools/prototypes/agent-os-isolation/canary-real-uid.sh`. Everything else
+is mechanical, including the reading of the result.
+
+Once it passes, this issue is at the bar phase 1 was closed on. The "out of
+scope" items above (resource limits, network isolation) stay open follow-ups,
+not blockers.
