@@ -43,6 +43,7 @@ from pxh.deploy import (
     UnitState,
     action_summary,
     carried_staleness,
+    changed_files_between,
     changed_symbols,
     needs_restart,
     repo_unit_names,
@@ -55,11 +56,6 @@ ENTRY_RE = re.compile(r"(/[^\s;\"']*/(?:bin|systemd)/[^\s;\"']*)")
 
 def sh(args):
     return subprocess.run(args, capture_output=True, text=True, check=True).stdout
-
-
-def changed_files(root, prev, head):
-    out = sh(["git", "diff", "--name-only", prev, head, "--", *CODE_DIRS])
-    return [line.strip() for line in out.splitlines() if line.strip()]
 
 
 def unit_names():
@@ -103,6 +99,10 @@ def print_unit_drift(drift: list) -> None:
     print("  sudo install -m 0644 systemd/*.service /etc/systemd/system/ && sudo systemctl daemon-reload")
 
 
+def _stamp(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def print_carried(carried: list) -> None:
     """The units no deploy delta will ever name (#421).
 
@@ -110,19 +110,34 @@ def print_carried(carried: list) -> None:
     to the top in #406: this is the section a reader who skims will otherwise
     never reach, and it is the one that says the host is not what the checkout
     says.
+
+    `since_rev` is the revision the process started on, printed because it is
+    the part the reader can check: `git log --oneline <rev>..HEAD` is the range
+    the claim covers. A unit with no `since_rev` was judged by mtimes instead
+    (git could not name the revision) and the line says so rather than leaving
+    the weaker source implicit.
     """
     if not carried:
         return
     print()
-    print("{} long-lived unit(s) started before a file they execute changed on disk "
-          "\u2014 carried from an earlier deploy, no restart performed:".format(len(carried)))
+    print("{} long-lived unit(s) started before a change they can reach landed in this "
+          "checkout \u2014 carried from an earlier deploy, no restart performed:".format(len(carried)))
     for item in sorted(carried, key=lambda c: c.name):
-        print("  {:24s} started {}  newest executed change {}  ({})".format(
-            item.name,
-            dt.datetime.fromtimestamp(item.started_ts).strftime("%Y-%m-%d %H:%M:%S"),
-            dt.datetime.fromtimestamp(item.newest).strftime("%Y-%m-%d %H:%M:%S"),
-            ", ".join(item.paths[:2]) + ("\u2026" if len(item.paths) > 2 else ""),
-        ))
+        if item.since_rev:
+            scope = "changed since {}".format(item.since_rev[:9])
+            why = list(zip(item.paths, item.reasons)) or [(path, "") for path in item.paths]
+        else:
+            scope = "newest executed change {} (mtime; git could not name the revision)".format(
+                _stamp(item.newest))
+            why = [(path, "") for path in item.paths]
+        shown = "; ".join(
+            "{}{}".format(path, " ({})".format(reason) if reason else "")
+            for path, reason in why[:2]
+        )
+        if len(item.paths) > 2:
+            shown += " \u2026"
+        print("  {:24s} started {}  {}  ({})".format(
+            item.name, _stamp(item.started_ts), scope, shown))
     print("  restart: sudo systemctl restart " + " ".join(
         item.name.replace(".service", "") for item in sorted(carried, key=lambda c: c.name)))
 
@@ -147,10 +162,9 @@ def main():
     args = parser.parse_args()
     root = os.path.abspath(args.root)
 
-    try:
-        moved = changed_files(root, args.prev, args.head)
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        print("px-deploy-check: cannot read the deploy diff ({}..{}): {}".format(args.prev, args.head, exc))
+    moved = changed_files_between(root, args.prev, args.head)
+    if moved is None:
+        print("px-deploy-check: cannot read the deploy diff ({}..{})".format(args.prev, args.head))
         print("  Re-run with an explicit --prev <revision> when the reflog cannot answer.")
         return 2
 
@@ -174,7 +188,7 @@ def main():
     # -- no non-interactive grant for that unit, an interrupted deploy -- leaves
     # no trace in HEAD@{1}..HEAD, so a later deploy reports a clean delta over a
     # host that is still running the older module.
-    carried = carried_staleness(units, root=root, deploy_ts=deploy_ts)
+    carried = carried_staleness(units, root=root, deploy_ts=deploy_ts, head=args.head)
 
     if not moved:
         print(action_summary(0, [], drift, carried))

@@ -207,6 +207,48 @@ def test_shell_wrapper_is_flagged_when_its_module_moves(repo):
 # closure edges, and a rule that flagged on *import* rather than on *reach*.
 
 
+def _init_repo(tmp_path):
+    """An empty repository with an identity, so the helpers below can commit."""
+    import subprocess
+
+    for args in (
+        ("init", "-q"),
+        ("config", "user.email", "t@example.com"),
+        ("config", "user.name", "t"),
+    ):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                       capture_output=True, text=True)
+
+
+def _iso(ts: float) -> str:
+    """A git-acceptable local timestamp for an epoch."""
+    import datetime as _dt
+
+    return _dt.datetime.fromtimestamp(ts).isoformat()
+
+
+def _dated_commit(tmp_path, files, ts, *, message="step"):
+    """Commit `files` with a chosen committer date; returns the new sha.
+
+    The date is load-bearing for the carried-staleness tests: both sources
+    `revision_at` reads consult it — a commit's reflog entry carries the
+    commit's own date — and a synthetic process start time only means something
+    between two dates the test chose.
+    """
+    import subprocess
+
+    for rel, body in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    env = {**os.environ, "GIT_AUTHOR_DATE": _iso(ts), "GIT_COMMITTER_DATE": _iso(ts)}
+    for args in (("add", "-A"), ("commit", "-qm", message)):
+        subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                       capture_output=True, text=True, env=env)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path,
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
 def _git(tmp_path, files):
     """A tiny real repo, because `changed_symbols` reads revisions via git."""
     import subprocess
@@ -215,9 +257,7 @@ def _git(tmp_path, files):
         subprocess.run(["git", *args], cwd=tmp_path, check=True,
                        capture_output=True, text=True)
 
-    run("init", "-q")
-    run("config", "user.email", "t@example.com")
-    run("config", "user.name", "t")
+    _init_repo(tmp_path)
     run("add", "-A")
     run("commit", "-qm", "v1")
     first = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path,
@@ -338,6 +378,24 @@ def test_a_method_docstring_is_not_a_change(tmp_path):
 def test_a_module_docstring_is_not_a_change(tmp_path):
     _tree(tmp_path, entries={}, modules={"alpha": '"""One."""\n\n\ndef one():\n    return 1\n'})
     first = _git(tmp_path, {"src/pxh/alpha.py": '"""Two, reworded."""\n\n\ndef one():\n    return 1\n'})
+    change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
+    assert change is not None
+    assert change.symbols == frozenset() and change.module_level is False
+
+
+def test_a_class_docstring_is_not_a_change(tmp_path):
+    """#431's exact shape: the class's own AST is what the symbol comparison
+    dumps, so a docstring in its body — or in the class's methods — is what
+    turned the class into a "changed symbol" and cost three restarts."""
+    _tree(tmp_path, entries={}, modules={
+        "alpha": "class Guard:\n    def owns(self):\n        return True\n"})
+    first = _git(tmp_path, {"src/pxh/alpha.py": (
+        "class Guard:\n"
+        "    \"\"\"The lease guard.\"\"\"\n"
+        "\n"
+        "    def owns(self):\n"
+        "        return True\n"
+    )})
     change = changed_symbols(first, "HEAD", "src/pxh/alpha.py", str(tmp_path))
     assert change is not None
     assert change.symbols == frozenset() and change.module_level is False
@@ -959,6 +1017,13 @@ def test_the_summary_leads_with_what_needs_doing():
 # that unit, an interrupted deploy — leaves no trace there, so the next deploy
 # reports a clean delta over a host still executing the older module. That is
 # a different question, and these tests pin that it is asked separately.
+#
+# The second half of #431 is *which* question the carried check asks. It first
+# compared mtimes, so on 2026-09-18 a documentation-only commit to a shared
+# module flagged three units and the three restarts that followed changed
+# nothing. It now asks the delta's own question — `changed_symbols` +
+# `_change_hits` over `[revision_at(started_ts), HEAD]` — and keeps the mtime
+# comparison only where git cannot name that revision.
 
 def _ages(repo, *, entry_age_s=1000.0, module_age_s=100.0, now=None):
     """Set every file's mtime, so nothing depends on when the test ran."""
@@ -1086,3 +1151,176 @@ def test_the_summary_line_states_carried_staleness():
     assert line.index("carried staleness") < line.index("unit files to install")
     # Nothing carried and nothing to do is still stated, not implied.
     assert action_summary(0, [], []).count("carried staleness: 0") == 1
+
+
+# --- #431, second half: the carried question is the delta's question ---------
+
+
+def test_a_docstring_only_change_carries_no_staleness(tmp_path):
+    """#431's measurement on the carried question: a docstring added to a method
+    made its *class* a changed symbol, so the commit that cost three daemons a
+    restart also flagged three units as carried-stale."""
+    import time
+
+    from pxh.deploy import UnitState, carried_staleness
+
+    now = time.time()
+    _init_repo(tmp_path)
+    _dated_commit(tmp_path, {
+        "bin/px-guard": "#!/usr/bin/env python3\nfrom pxh.alpha import Guard\n",
+        "src/pxh/alpha.py": "class Guard:\n    def owns(self):\n        return True\n",
+    }, now - 7200)
+    _dated_commit(tmp_path, {"src/pxh/alpha.py": (
+        "class Guard:\n"
+        "    def owns(self):\n"
+        "        \"\"\"Whether the guard owns the lease.\"\"\"\n"
+        "        return True\n"
+    )}, now - 3600)
+
+    unit = UnitState("px-guard.service", str(tmp_path / "bin" / "px-guard"),
+                     started_ts=now - 1800)
+    assert carried_staleness([unit], root=str(tmp_path)) == []
+
+
+def test_a_real_change_after_the_process_started_is_carried(tmp_path):
+    import time
+
+    from pxh.deploy import UnitState, carried_staleness, revision_at
+
+    now = time.time()
+    _init_repo(tmp_path)
+    first = _dated_commit(tmp_path, {
+        "bin/px-guard": "#!/usr/bin/env python3\nfrom pxh.alpha import one\n",
+        "src/pxh/alpha.py": "def one():\n    return 1\n",
+    }, now - 7200)
+    second = _dated_commit(tmp_path, {"src/pxh/alpha.py": "def one():\n    return 2\n"},
+                           now - 3600)
+
+    # Started between the two commits: the second landed while it was running.
+    unit = UnitState("px-guard.service", str(tmp_path / "bin" / "px-guard"),
+                     started_ts=now - 5400)
+    carried = carried_staleness([unit], root=str(tmp_path))
+    assert [c.name for c in carried] == ["px-guard.service"]
+    assert carried[0].since_rev == first, "the range starts where the process did"
+    assert carried[0].paths == ("src/pxh/alpha.py",)
+    assert "one" in carried[0].reasons[0]
+    assert carried[0].newest is None, "the revision rule never looks at an mtime"
+
+    # A process that started *after* the change is running it: nothing carried,
+    # and the revision it started on is the revision that changed.
+    fresh = UnitState("px-guard.service", str(tmp_path / "bin" / "px-guard"),
+                      started_ts=now - 60)
+    assert revision_at(str(tmp_path), now - 60) == second
+    assert carried_staleness([fresh], root=str(tmp_path)) == []
+
+
+def test_the_checkout_state_at_start_beats_the_commit_date_proxy(tmp_path):
+    """`rev-list --before` answers "the newest commit *committed* before you
+    started", and commit dates are merge times rather than deploy times: a
+    commit merged in the morning and deployed in the afternoon is dated before
+    every process that started in the gap, so on its own it reports "nothing
+    changed since you started" for a unit genuinely running older code — the
+    state #421 exists to expose. The reflog records where the checkout actually
+    was, so it is asked first."""
+    import subprocess
+    import time
+
+    from pxh.deploy import UnitState, carried_staleness, revision_at
+
+    now = time.time()
+    _init_repo(tmp_path)
+    started = now - 1800  # after the commit's date, before the merge that ships it
+    baseline = _dated_commit(tmp_path, {
+        "bin/px-guard": "#!/usr/bin/env python3\nfrom pxh.alpha import one\n",
+        "src/pxh/alpha.py": "def one():\n    return 1\n",
+    }, now - 7200)
+
+    # The change that arrives later but is dated earlier: tree it on the side,
+    # put it on a branch, and let a real ff-merge — the deploy — bring it in, so
+    # HEAD's reflog has never seen it while the process is starting.
+    (tmp_path / "src" / "pxh" / "alpha.py").write_text("def one():\n    return 2\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True, capture_output=True)
+    tree = subprocess.run(["git", "write-tree"], cwd=tmp_path, capture_output=True,
+                          text=True, check=True).stdout.strip()
+    subprocess.run(["git", "reset", "-q", "--hard"], cwd=tmp_path, check=True,
+                   capture_output=True)
+    later = subprocess.run(
+        ["git", "commit-tree", tree, "-p", baseline, "-m", "merged upstream this morning"],
+        cwd=tmp_path, capture_output=True, text=True, check=True,
+        env={**os.environ, "GIT_AUTHOR_DATE": _iso(now - 3600),
+             "GIT_COMMITTER_DATE": _iso(now - 3600)},
+    ).stdout.strip()
+    subprocess.run(["git", "branch", "feature", later], cwd=tmp_path, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "merge", "--ff-only", "feature"], cwd=tmp_path, check=True,
+                   capture_output=True, text=True)
+
+    assert revision_at(str(tmp_path), started) == baseline
+    proxy = subprocess.run(
+        ["git", "rev-list", "-1", "--before=@{}".format(int(started)), "HEAD"],
+        cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
+    assert proxy == later, "the date proxy cannot see the gap; that is why it is second"
+
+    unit = UnitState("px-guard.service", str(tmp_path / "bin" / "px-guard"),
+                     started_ts=started)
+    carried = carried_staleness([unit], root=str(tmp_path))
+    assert [c.name for c in carried] == ["px-guard.service"]
+    assert carried[0].since_rev == baseline
+
+
+def test_a_start_older_than_the_history_falls_back_to_mtimes(tmp_path):
+    """A weaker answer beats none: where git cannot name the revision in force at
+    the process's start — here, a start older than the repository's first
+    commit — the mtime comparison runs, and `since_rev` stays None so the caller
+    can say which question answered."""
+    import time
+
+    from pxh.deploy import UnitState, carried_staleness
+
+    now = time.time()
+    _init_repo(tmp_path)
+    _dated_commit(tmp_path, {
+        "bin/px-guard": "#!/usr/bin/env python3\nfrom pxh.alpha import one\n",
+        "src/pxh/alpha.py": "def one():\n    return 1\n",
+    }, now - 3600)
+
+    unit = UnitState("px-guard.service", str(tmp_path / "bin" / "px-guard"), started_ts=1.0)
+    carried = carried_staleness([unit], root=str(tmp_path))
+    assert [c.name for c in carried] == ["px-guard.service"]
+    assert carried[0].since_rev is None
+    assert carried[0].newest is not None
+    assert "src/pxh/alpha.py" in carried[0].paths
+
+
+def test_an_empty_range_is_not_a_failed_one(tmp_path):
+    """`None` (git could not answer, so mtimes decide) and `[]` (git answered
+    "nothing differs", so the host is current) must not be the same value:
+    collapsing them turns a failed diff into a clean deploy."""
+    import time
+
+    from pxh.deploy import changed_files_between, revision_at
+
+    now = time.time()
+    _init_repo(tmp_path)
+    sha = _dated_commit(tmp_path, {"src/pxh/alpha.py": "def one():\n    return 1\n"},
+                        now - 60)
+    assert changed_files_between(str(tmp_path), sha, "HEAD") == []
+    assert changed_files_between(str(tmp_path), "no-such-revision", "HEAD") is None
+    assert revision_at(str(tmp_path), now + 60) == sha
+
+
+def test_the_revision_helpers_decline_outside_a_repository(tmp_path):
+    """Every "cannot tell" path: git's absence is a fallback to mtimes, never a
+    finding, which is why these return None rather than raising or guessing."""
+    import subprocess
+    import time
+
+    from pxh.deploy import changed_files_between, revision_at
+
+    probe = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=tmp_path,
+                           capture_output=True, text=True)
+    if probe.returncode == 0:
+        pytest.skip("tmp_path sits inside a git repository; the walk-up would answer")
+
+    assert revision_at(str(tmp_path), time.time()) is None
+    assert changed_files_between(str(tmp_path), "HEAD~1", "HEAD") is None
