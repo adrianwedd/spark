@@ -120,15 +120,24 @@ executing it is.
 **The gate asks two questions, and only their conjunction means "current"
 (#421).** `HEAD@{1}..HEAD` answers *must this deploy restart it* — and it cannot
 see a restart that was owed from an *earlier* deploy and never performed,
-because nothing anywhere remembers that it was owed. So the same run compares
-each long-lived unit against the files *it* executes: the first line carries
-`carried staleness: N`, the detail names the units and the files whose mtime is
-newer than the process, and the exit code is 1 whenever it is non-empty.
-`units to restart: 0` describes the delta; `carried staleness: 0` describes the
-host. The reassurance line — *every long-lived unit is executing the deployed
-revision* — prints only when both are zero, because on 2026-09-18 it printed
-over three units that were not, and the only reason they were found is that a
-previous deploy's output had been read by hand.
+because nothing anywhere remembers that it was owed. So the same run asks the
+delta's own question over a longer range, `[revision_at(started_ts), HEAD]`, and
+the first line carries `carried staleness: N`. It is the *same* rule, not a
+second one: `changed_symbols` and `_change_hits` decide it, so a unit is carried
+stale only when a change it can reach landed after its process started. The
+first version compared mtimes, and on 2026-09-18 that named three units for a
+documentation-only commit and three daemons were restarted for prose (#431):
+`mtime > started_ts` says a file was written, not that behaviour moved.
+`revision_at` reads the start revision from the reflog (exact) and falls back to
+`git rev-list --before` (a proxy — commit dates are merge times, not deploy
+times); where git can answer neither, the mtime comparison runs for that unit
+and the detail line says so. The detail names the units, the revision their
+range starts at, and the files they reach; the exit code is 1 whenever the count
+is non-empty. `units to restart: 0` describes the delta; `carried staleness: 0`
+describes the host. The reassurance line — *every long-lived unit is executing
+the deployed revision* — prints only when both are zero, because on 2026-09-18
+it printed over three units that were not, and the only reason they were found
+is that a previous deploy's output had been read by hand.
 
 ## Running Tests
 

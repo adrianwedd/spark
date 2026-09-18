@@ -711,17 +711,101 @@ def _change_hits(
     return hits
 
 
+# --- carried staleness: is this host running what its checkout says? (#421) --
+
+
+_RELOG_TIME_RE = re.compile(r"@\{(\d+)\}:")
+
+
+def _git(args: Sequence[str], root: str) -> str | None:
+    """stdout of a git command run in `root`, or None when git cannot answer.
+
+    "Cannot answer" and "answered nothing" are different facts in this section —
+    the first makes the caller fall back to mtimes, the second is a finding — so
+    the return type keeps them apart instead of collapsing both into `""`.
+    """
+    try:
+        out = subprocess.run(
+            ["git", *args], cwd=root, capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _reflog_revision_at(root: str, ts: float, head: str) -> str | None:
+    """Where `head` pointed at `ts` according to the reflog, or None."""
+    out = _git(["reflog", "show", "--no-abbrev", "--date=unix", head], root)
+    if out is None:
+        return None
+    best: tuple[int, str] | None = None
+    for line in out.splitlines():
+        match = _RELOG_TIME_RE.search(line)
+        if not match:
+            continue
+        when = int(match.group(1))
+        if when <= ts and (best is None or when > best[0]):
+            best = (when, line.split()[0])
+    return best[1] if best else None
+
+
+def revision_at(root: str, ts: float, head: str = "HEAD") -> str | None:
+    """The revision the checkout was on at `ts`, or None when git cannot say.
+
+    Two sources, in order, and the difference between them is why this is not
+    just `git rev-list -1 --before=@<ts>`:
+
+    * The **reflog** records where the checkout actually was, so the newest entry
+      at or before `ts` answers the question exactly — and a same-second tie
+      falls the safe way, because a process that started *with* a deploy is
+      running that deploy.
+    * `rev-list --before` approximates "the revision then" as "the newest commit
+      *committed* then", and commit dates are merge times rather than deploy
+      times. A pull request merged this morning and deployed this afternoon is
+      dated before every process that started in the gap, so this source reports
+      "nothing changed since you started" for a process genuinely running older
+      code — the exact state #421 exists to expose. It stays as the second
+      source for a reflog that cannot reach back that far (expired, shallow
+      clone, a process older than the first entry).
+
+    None means neither could answer. The caller falls back to mtimes on that,
+    never to a finding.
+    """
+    exact = _reflog_revision_at(root, ts, head)
+    if exact is not None:
+        return exact
+    out = _git(["rev-list", "-1", "--before=@{:d}".format(int(ts)), head], root)
+    if out is None:
+        return None
+    return out.strip() or None
+
+
+def changed_files_between(root: str, prev: str, head: str) -> list[str] | None:
+    """Paths under CODE_DIRS that differ between two revisions.
+
+    None means git could not answer (not a repository, an unknown revision); an
+    empty list means it answered "nothing differs". The carried-staleness check
+    falls back to mtimes on the first and reports a current host on the second,
+    so collapsing them would turn "the range cannot be computed" into "this host
+    is up to date".
+    """
+    out = _git(["diff", "--name-only", prev, head, "--", *CODE_DIRS], root)
+    if out is None:
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 @dataclass(frozen=True)
 class CarriedStaleness:
-    """A long-lived unit older than the files it executes — whatever deploy did it (#421).
+    """A long-lived unit older than the code it executes — whatever deploy did it (#421).
 
     A different question from `Verdict`, and the difference is the point.
     `restart_list` answers "must *this* deploy restart it", which is what a
     deploy step needs and is computed from `HEAD@{1}..HEAD`. This answers "is
-    this host running what its checkout says", which is what a human reading
-    the gate's summary line believes they are being told. A restart that could
-    not be performed — no `sudo -n` grant for that unit, an interrupted deploy —
-    is invisible to the delta check forever after, because nothing anywhere
+    this host running what its checkout says", which is what a human reading the
+    gate's summary line believes they are being told. A restart that could not
+    be performed — no `sudo -n` grant for that unit, an interrupted deploy — is
+    invisible to the delta check forever after, because nothing anywhere
     remembers that it was owed.
 
     Deliberately not folded into `restart_list`: same inputs, different
@@ -731,41 +815,65 @@ class CarriedStaleness:
 
     name: str
     started_ts: float
-    newest: float
+    #: The executed paths this unit reaches that changed after it started.
     paths: tuple[str, ...]
+    #: Why each path counts — the same statements `restart_list` makes, so the
+    #: detail line says *what* changed rather than only *that* something did.
+    #: Empty on the mtime fallback, where nothing was compared but mtimes.
+    reasons: tuple[str, ...] = ()
+    #: The revision the process started on, when git could name it. None means
+    #: git could not, and the mtime comparison answered instead.
+    since_rev: str | None = None
+    #: Fallback only: the newest mtime among `paths`. None under the revision
+    #: rule, which never looks at an mtime.
+    newest: float | None = None
 
 
 def carried_staleness(
     units: Iterable[UnitState],
     root: str = ".",
     deploy_ts: float | None = None,
+    head: str = "HEAD",
 ) -> list[CarriedStaleness]:
-    """Units whose executed files are newer on disk than the process running them.
+    """Units running code older than the checkout, whatever deploy did it (#421).
 
-    Works entirely from what the host already has — the unit's start time from
-    systemd, the file's mtime from the checkout — because a fast-forward writes
-    exactly the files it changed. No git history walk, and no state kept
-    between runs.
+    The same *statement* as the delta, over a longer range: a unit is stale when
+    a change it can reach landed after its process started. The range is
+    `[revision_at(started_ts), HEAD]`, the changed symbols come from
+    `changed_symbols`, and `_change_hits` decides reachability — the two
+    functions the deploy step itself uses, so the two answers cannot drift apart.
 
-    Two deliberate omissions:
+    That is exactly what the first version of this check (mtimes) got wrong, in
+    the direction that costs trust. On 2026-09-18 a documentation-only commit to
+    `src/pxh/gpio_lease.py` named three units as carried-stale and three daemons
+    were restarted for prose (#431). `mtime > started_ts` says a file was
+    *written*; it does not say behaviour moved.
+
+    Where git cannot name the revision — no repository, a shallow clone, a
+    process older than the reflog — the mtime comparison runs for that unit,
+    unchanged, including its known false positive (a file whose mtime moved
+    without its content changing). A conservative answer to a weaker question
+    still beats no answer, and `CarriedStaleness.since_rev` says which question
+    was answered.
+
+    Two deliberate omissions, unchanged from the first version:
 
     * A unit systemd will not report a start time for is **not** flagged here.
       `restart_list` already flags those ("start time unknown"), and a second
       warning built on an absent number would be a guess dressed as a finding.
-    * A unit that runs nothing under this repo is skipped, for the same reason.
-      "Under this repo" is checked on the entry's real path: an out-of-checkout
-      entry has no meaningful mtime to compare against, and `_changed_at` would
-      hand back its conservative infinity for a file that does not exist —
-      flagging a unit on the strength of a comparison it never made.
-
-    Known false positive, stated rather than discovered later: a file whose
-    mtime moved without its content changing (a no-op `git checkout` of an
-    identical blob) flags its unit. A restart on that costs seconds; the exact
-    alternative is a content hash per executed path per run. The conservative
-    rule is the cheap one here.
+    * A unit that runs nothing under this repo is skipped, for the same reason:
+      an out-of-checkout entry has no revision or mtime to compare against, and
+      inventing an answer from the absence would be the same guess.
     """
     out: list[CarriedStaleness] = []
     root_abs = os.path.abspath(root)
+    # Units restarted by the same deploy share a start time, so they share a
+    # range. Both the revision and the changed-file list are computed once per
+    # distinct value rather than once per unit.
+    rev_cache: dict[float, str | None] = {}
+    range_cache: dict[str, list[str] | None] = {}
+    change_cache: dict[tuple[str, str], ModuleChange | None] = {}
+
     for unit in units:
         if not unit.entry or unit.started_ts is None:
             continue
@@ -774,6 +882,41 @@ def carried_staleness(
         executed = executed_paths(unit.entry, root)
         if not executed:
             continue
+
+        if unit.started_ts not in rev_cache:
+            rev_cache[unit.started_ts] = revision_at(root, unit.started_ts, head)
+        since = rev_cache[unit.started_ts]
+
+        if since is not None:
+            if since not in range_cache:
+                range_cache[since] = changed_files_between(root, since, head)
+            moved = range_cache[since]
+            if moved is not None:
+                changes: dict[str, ModuleChange | None] = {}
+                for path in moved:
+                    if path not in executed:
+                        continue
+                    key = (since, path)
+                    if key not in change_cache:
+                        change_cache[key] = changed_symbols(since, head, path, root)
+                    changes[path] = change_cache[key]
+                hits = _change_hits(unit, moved, root, executed, changes)
+                if not hits:
+                    continue
+                out.append(
+                    CarriedStaleness(
+                        name=unit.name,
+                        started_ts=unit.started_ts,
+                        paths=tuple(path for path, _why in sorted(hits)),
+                        reasons=tuple(why for _path, why in sorted(hits)),
+                        since_rev=since,
+                    )
+                )
+                continue
+            # git named the revision but not the range. Fall through to the
+            # mtimes rather than call a host current on the strength of a diff
+            # that failed.
+
         newer = [
             (path, _changed_at(path, root, deploy_ts))
             for path in sorted(executed)
@@ -785,8 +928,8 @@ def carried_staleness(
             CarriedStaleness(
                 name=unit.name,
                 started_ts=unit.started_ts,
-                newest=max(ts for _p, ts in newer),
                 paths=tuple(path for path, _ts in newer),
+                newest=max(ts for _p, ts in newer),
             )
         )
     return out
