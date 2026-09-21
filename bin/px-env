@@ -31,6 +31,55 @@ PYTHONPATH="$(append_path "${PYTHONPATH:-}" "$PROJECT_ROOT/src")"
 PYTHONPATH="$(append_path "$PYTHONPATH" "/home/pi/picar-x")"
 export PYTHONPATH
 
+# Load .env (#345, option 1): one source of truth for environment construction,
+# so every `bin/px-*` launcher behaves like the systemd units do.
+#
+# The units get their environment from `EnvironmentFile=…/.env`. A human running
+# `bin/px-spark` from a fresh shell got nothing, and the symptom was invisible:
+# `pxh.m5.configured_model()` reads `PX_M5_SPARK_MODEL`, returns None when it is
+# unset, and `ask_m5` then refuses per-turn with "must name a model explicitly
+# (not auto)" — after greeting. The loop started, accepted input, and answered
+# every turn with the unavailable acknowledgement. Verified on the robot:
+#
+#   $ bin/px-spark --input-mode text --dry-run --max-turns 1
+#   [voice-loop] cognition tier bad_response: PX_M5_SPARK_MODEL must name a
+#   model explicitly (not auto)
+#
+# Guarded twice, deliberately:
+#   * `-f` so a host without .env (a fresh clone, CI) is not an error;
+#   * `set -a` for the whole source so every assignment in the file is exported,
+#     which is what `EnvironmentFile=` means to systemd — without it, the file
+#     is read but its variables stay shell-local and nothing changes.
+#
+# `PX_ENV_SKIP_DOTENV=1` opts out for a caller that is deliberately constructing
+# its own environment (test seams, the deploy gate). Existing values always win:
+# a variable already exported by the caller is not overwritten, so systemd,
+# `env FOO=bar bin/px-x` and the test suite all keep behaving as before.
+if [[ "${PX_ENV_SKIP_DOTENV:-0}" != "1" && -f "$PROJECT_ROOT/.env" ]]; then
+    # The caller's existing values must win, and `source` cannot be told to
+    # leave them alone. So save the ones .env would override, source, restore.
+    # Only the names .env actually assigns are touched — nothing else in the
+    # environment is read, written, or re-exported.
+    _px_names=()
+    _px_vals=()
+    while IFS= read -r _px_name; do
+        [[ -n "${!_px_name+set}" ]] || continue
+        _px_names+=("$_px_name")
+        _px_vals+=("${!_px_name}")
+    done < <(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' \
+                 "$PROJECT_ROOT/.env")
+
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/.env"
+    set +a
+
+    for _px_i in "${!_px_names[@]}"; do
+        export "${_px_names[$_px_i]}=${_px_vals[$_px_i]}"
+    done
+    unset _px_names _px_vals _px_i _px_name
+fi
+
 if [[ -d "$PROJECT_ROOT/.venv" && -z "${VIRTUAL_ENV:-}" ]]; then
     # shellcheck disable=SC1091
     source "$PROJECT_ROOT/.venv/bin/activate"
