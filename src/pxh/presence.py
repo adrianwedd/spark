@@ -34,6 +34,85 @@ criteria for #305 explicitly rule out.
 
 from __future__ import annotations
 
+#: The decided claim about one tracker, as a name rather than a boolean.
+#:
+#: ``at_home`` used to be a bare ``True``/``False`` — and, crucially, *absent*
+#: meant a third thing nobody had named. Two readers then disagreed about the
+#: same name: the coordinate branch published a dict with no ``at_home`` at all,
+#: while the semantic-address branch published its own boolean derived from an
+#: address string. When one tracker's representation alternated between those two
+#: shapes, the arrival detector compared a coordinate claim against a semantic
+#: claim and manufactured ``UNKNOWN → HOME`` edges that it read as arrivals
+#: (measured on the robot 2026-09-21: 17 false ``person_arrived_home`` for a
+#: tracker that never left, every one of them asserted off a 23.95 h old fix
+#: 4.01 km away that the staleness gate had just refused as evidence).
+#:
+#: Naming the third state is the fix. ``AWAY`` requires positive evidence of
+#: absence; absence of evidence is ``UNKNOWN``, and ``UNKNOWN`` can never be the
+#: far side of an arrival (issue #305).
+AT_HOME = "HOME"
+AWAY = "AWAY"
+UNKNOWN = "UNKNOWN"
+#: Valid values for the latched state. A consumer that sees anything else has a
+#: bug, not a tracker.
+AT_HOME_STATES = (AT_HOME, AWAY, UNKNOWN)
+#: Representations that may be compared to each other as evidence about the same
+#: physical fact. Two coordinate fixes are comparable because distance is a
+#: property of the place; a semantic address and a coordinate are not comparable
+#: at all, and a change of representation is not movement.
+COORDINATE = "coordinate"
+SEMANTIC = "semantic"
+#: ``UNKNOWN`` carries no kind: it is the absence of a claim, so there is nothing
+#: for a later fix to be compared against.
+N_KINDS = (COORDINATE, SEMANTIC)
+
+
+def normalise_state(state) -> str | None:
+    """Read a state that may be written in the pre-#305 boolean dialect.
+
+    ``True``/``False`` were the old encoding of "at home" / "not at home", and
+    the arrival detector's documented contract (#156) is still to be handed
+    already-formed states. Accepting them here — in one place, named as a
+    migration rather than left implicit — is what keeps a boolean from being read
+    as a third, *unnamed* value by consumers that never learned about ``UNKNOWN``.
+    Anything that is not a recognised state returns ``None``, i.e. no claim.
+    """
+    if state is True:
+        return AT_HOME
+    if state is False:
+        return AWAY
+    if state in AT_HOME_STATES:
+        return state
+    return None
+
+
+def arrival_edge(
+    previous: str | None,
+    previous_kind: str | None,
+    current: str | None,
+    current_kind: str | None,
+) -> bool:
+    """Is ``(previous, previous_kind) → (current, current_kind)`` an arrival?
+
+    The whole acceptance criterion for #305 lives here, in one place, because the
+    bug was two readers deciding separately:
+
+    * ``previous`` must be a *known* ``AWAY`` — ``UNKNOWN → HOME`` is not an
+      arrival, it is a first sighting, and treating it as one is what greeted a
+      tracker that had never been seen away (the daemon-restart guard);
+    * both sides must be *comparable* evidence — a coordinate fix and a semantic
+      address are different kinds of claim about the same name, and a change of
+      representation is not movement, so the pairing is refused rather than
+      treated as an edge.
+    """
+    previous, current = normalise_state(previous), normalise_state(current)
+    if previous != AWAY or current != AT_HOME:
+        return False
+    if previous_kind not in N_KINDS or current_kind not in N_KINDS:
+        return False
+    return previous_kind == current_kind
+
+
 #: away → home
 ENTER_RADIUS_KM = 0.15
 #: home → away. Never equal to the enter radius: that is the whole point.

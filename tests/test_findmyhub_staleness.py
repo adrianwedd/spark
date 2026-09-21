@@ -9,6 +9,7 @@ manufactured out of nothing but the file being current.
 from __future__ import annotations
 
 import pxh.mind as mind
+from pxh import presence
 from pxh.mind import _findmyhub_transitions, _latch_findmyhub_states
 
 
@@ -36,7 +37,7 @@ def test_a_stale_far_fix_cannot_latch_away_and_manufacture_an_arrival():
 
     stale_far = {"adrian": _fix(distance_km=4.43, age_s=13.8 * 3600, ts=2)}
     assert _findmyhub_transitions(stale_far) == []
-    assert stale_far["adrian"]["at_home"] is True, "the state must be held, not flipped"
+    assert stale_far["adrian"]["at_home"] == presence.AT_HOME, "the state must be held, not flipped"
     assert mind._latch_stale["adrian"] == 1
 
     fresh_home = {"adrian": _fix(distance_km=0.01, age_s=30, ts=3)}
@@ -49,7 +50,7 @@ def test_a_fresh_far_fix_still_confirms_a_departure_and_then_a_real_arrival():
     _findmyhub_transitions({"adrian": _fix(distance_km=9.0, age_s=120, ts=2)})
     away = {"adrian": _fix(distance_km=9.0, age_s=180, ts=3)}
     _findmyhub_transitions(away)
-    assert away["adrian"]["at_home"] is False
+    assert away["adrian"]["at_home"] == presence.AWAY
 
     home = {"adrian": _fix(distance_km=0.01, age_s=45, ts=4)}
     assert _findmyhub_transitions(home) == ["person_arrived_home:adrian"]

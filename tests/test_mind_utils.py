@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import pxh.mind  # needed for module-attribute writes (pxh.mind.X = val)
+from pxh import presence
 from pxh.mind import (
     # Functions
     _can_explore,
@@ -1376,7 +1377,7 @@ def test_findmyhub_boundary_jitter_leaves_the_state_latched_home():
     """The state, not just the greeting: the cache the prompt reads says home."""
     mind_mod = _fresh_tracker_state()
     _series(mind_mod, [0.12, 0.16, 0.18, 0.21, 0.19])
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
 
 
 def test_findmyhub_genuine_arrival_fires_on_the_first_home_fix():
@@ -1398,9 +1399,9 @@ def test_findmyhub_restart_guard_survives_the_latch():
     already home."""
     mind_mod = _fresh_tracker_state()
     assert _series(mind_mod, [0.10]) == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
     assert _series(mind_mod, [1.5, 1.6]) == []            # a confirmed departure
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AWAY
     assert _series(mind_mod, [0.10]) == ["person_arrived_home:adrian"]
 
 
@@ -1410,9 +1411,9 @@ def test_findmyhub_departure_needs_the_wider_radius_then_re_arrival_fires():
     mind_mod = _fresh_tracker_state()
     assert _series(mind_mod, [0.12]) == []
     assert _series(mind_mod, [0.22]) == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
     assert _series(mind_mod, [0.40, 0.41]) == []          # confirmed departure
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AWAY
     assert _series(mind_mod, [0.12]) == ["person_arrived_home:adrian"]
 
 
@@ -1423,7 +1424,7 @@ def test_findmyhub_one_bad_far_fix_neither_exits_nor_greets():
     mind_mod = _fresh_tracker_state()
     assert _series(mind_mod, [0.02]) == []                # at home
     assert _series(mind_mod, [0.6]) == []                 # one bad far fix
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
     assert _series(mind_mod, [0.02]) == []                # no arrival to greet
     assert mind_mod._latch_far_streak["adrian"] == 0
 
@@ -1435,16 +1436,16 @@ def test_findmyhub_restart_then_one_far_then_home_is_silent():
     mind_mod = _fresh_tracker_state()
     assert _series(mind_mod, [0.6]) == []                 # not yet a departure
     assert _series(mind_mod, [0.02]) == []                # and so no greeting
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
 
 
 def test_findmyhub_two_far_fixes_do_confirm_a_departure():
     mind_mod = _fresh_tracker_state()
     assert _series(mind_mod, [0.02]) == []
     assert _series(mind_mod, [0.5]) == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
     assert _series(mind_mod, [0.5]) == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AWAY
     assert _series(mind_mod, [0.02]) == ["person_arrived_home:adrian"]
 
 
@@ -1456,7 +1457,7 @@ def test_findmyhub_an_unusable_fix_does_not_break_a_departure_run():
     assert _series(mind_mod, [0.5]) == []
     assert _series(mind_mod, [0.5], accuracy_m=400.0) == []   # unusable, streak kept
     assert _series(mind_mod, [0.5]) == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AWAY
 
 
 def test_findmyhub_semantic_tracker_is_untouched_by_the_latch():
@@ -1522,15 +1523,20 @@ def test_findmyhub_coarse_fix_is_evidence_of_a_suppressed_arrival():
             {"adrian": _tracker(0.10, ts=3, accuracy_m=400.0)}
         )
     assert transitions == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AWAY
     hold_lines = [line for line in lines if "hold-accuracy" in line]
     assert len(hold_lines) == 1
     assert "not evidence" in hold_lines[0]
 
 
 def test_enrich_tracker_defers_at_home_to_the_latch():
-    """The coordinate branch must not decide `at_home` on its own any more —
-    a bare threshold is what flapped. The semantic branch still does."""
+    """Neither branch decides `at_home` any more — the latch owns the decision.
+
+    The coordinate branch never could (a bare threshold is what flapped), and the
+    semantic branch must not either: publishing its own boolean is what let a
+    tracker's representation change read as movement (#305, 2026-09-21). What both
+    branches publish instead is the *kind* of evidence they carry.
+    """
     import time as _time
     from pxh.mind import _enrich_tracker
 
@@ -1541,11 +1547,27 @@ def test_enrich_tracker_defers_at_home_to_the_latch():
     assert coord is not None
     assert "distance_km" in coord
     assert "at_home" not in coord
+    assert coord["kind"] == presence.COORDINATE
     semantic = _enrich_tracker(
         {"semantic": True, "address": "12 The Shack", "ts": now}, "adrian"
     )
     assert semantic is not None
-    assert semantic["at_home"] is True
+    assert "at_home" not in semantic
+    assert semantic["kind"] == presence.SEMANTIC
+    assert semantic["place"] == presence_home_place()
+
+    # And the decision the semantic branch withheld is made by the latch, from
+    # the place, in its own kind.
+    mind_mod = _fresh_tracker_state()
+    transitions = mind_mod._findmyhub_transitions({"adrian": semantic})
+    assert transitions == []  # first sighting: no arrival
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home_kind"] == presence.SEMANTIC
+
+
+def presence_home_place() -> str:
+    from pxh.mind import HOME_PLACE
+    return HOME_PLACE
 
 
 # ---------------------------------------------------------------------------
@@ -2050,9 +2072,9 @@ def test_findmyhub_a_re_read_is_not_a_second_opinion():
     same_sample_ts = next(_TS) - 1
     for _ in range(5):
         mind_mod._findmyhub_transitions({"adrian": _tracker(0.6, ts=same_sample_ts)})
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is True
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AT_HOME
     assert mind_mod._latch_far_streak.get("adrian", 0) == 0
 
     # Two genuinely distinct far fixes still confirm the departure.
     assert _series(mind_mod, [0.6, 0.62]) == []
-    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] is False
+    assert mind_mod._last_known_findmyhub["adrian"]["at_home"] == presence.AWAY
