@@ -904,3 +904,31 @@ class TestCapabilityHealth:
         entry = health.read_health(components=("px-blog",))["components"]["px-blog"]
         assert entry["status"] == "degraded"
         assert "generation" in entry["capabilities"]
+
+
+# ---------------------------------------------------------------------------
+# Unit-file correctness (#247/#390: the install is the moment this bites)
+# ---------------------------------------------------------------------------
+
+def test_start_limit_directives_live_in_the_unit_section():
+    """`StartLimitIntervalSec` is a [Unit] key, not a [Service] key.
+
+    Four units carried it under [Service], so systemd 252 logged
+    "Unknown key ... in section [Service], ignoring" and the restart-limit that
+    was intended to bound a crash loop was never in effect. Harmless while every
+    unit starts; silently wrong exactly when it matters (#247's unit-file
+    reconciliation is the change that installs these).
+    """
+    unit_dir = Path(__file__).resolve().parent.parent / "systemd"
+    offenders = []
+    for unit in sorted(unit_dir.glob("*.service")):
+        section = None
+        for line in unit.read_text().splitlines():
+            if line.startswith("["):
+                section = line.strip()
+            elif line.startswith("StartLimit") and section != "[Unit]":
+                offenders.append(f"{unit.name}: {line} under {section}")
+    assert not offenders, (
+        "StartLimit* directives must be in [Unit] — systemd ignores them "
+        f"anywhere else: {offenders}"
+    )

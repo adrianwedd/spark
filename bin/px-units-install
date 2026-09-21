@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Reconcile the repo's systemd unit files onto the host (#390, #247, #281).
+#
+# The gate (`bin/px-deploy-check`) reports which installed unit files differ from
+# the repo. It cannot install them: /etc/systemd/system needs root and the gate
+# runs as pi. This is the other half — the exact commands the gate prints,
+# scripted so the install is reviewable and repeatable rather than retyped.
+#
+# Scope is deliberately narrow (#281): `install` of the *unit files* this repo
+# tracks, one `daemon-reload`, and nothing else. It never restarts a unit, never
+# edits sudoers, and never touches a path outside the two directories below. A
+# restart is a separate, per-unit decision the operator makes with the gate's
+# output in hand.
+#
+# Usage:
+#   bin/px-units-install --dry-run    # show exactly what would change
+#   sudo bin/px-units-install         # apply
+#
+# Exit codes: 0 ok, 1 usage/refusal, 2 a unit differs and --dry-run was requested.
+set -euo pipefail
+
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+SRC_DIR="$PROJECT_ROOT/systemd"
+DEST_DIR="/etc/systemd/system"
+UNIT_GLOB="*.service"
+DRY_RUN=0
+
+usage() {
+    sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n) DRY_RUN=1 ;;
+        --help|-h)    usage 0 ;;
+        *) echo "px-units-install: unknown argument: $arg" >&2; usage 1 ;;
+    esac
+done
+
+if [[ ! -d "$SRC_DIR" ]]; then
+    echo "px-units-install: no unit directory at $SRC_DIR" >&2
+    exit 1
+fi
+
+# Unit *drop-in* directories (systemd/<unit>.service.d/) are installed by their
+# own documented path in docs/operations/io-attribution.md; this script is the
+# top-level unit files only, which is exactly what the gate reports.
+shopt -s nullglob
+units=("$SRC_DIR"/$UNIT_GLOB)
+if [[ ${#units[@]} -eq 0 ]]; then
+    echo "px-units-install: no $UNIT_GLOB files in $SRC_DIR" >&2
+    exit 1
+fi
+
+changed=()
+for src in "${units[@]}"; do
+    name="$(basename "$src")"
+    dest="$DEST_DIR/$name"
+    if [[ ! -f "$dest" ]]; then
+        changed+=("not installed  $name")
+    elif ! cmp -s "$src" "$dest"; then
+        changed+=("differs        $name")
+    fi
+done
+
+echo "px-units-install: source $SRC_DIR -> $DEST_DIR"
+if [[ ${#changed[@]} -eq 0 ]]; then
+    echo "  nothing to do — all ${#units[@]} unit file(s) already match the repo"
+    exit 0
+fi
+printf '  %s\n' "${changed[@]}"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "  (dry run — no change written)"
+    exit 2
+fi
+
+if [[ "$(id -u)" != "0" ]]; then
+    echo "px-units-install: needs root to write $DEST_DIR" >&2
+    echo "  re-run with: sudo $0" >&2
+    exit 1
+fi
+
+# Validate before installing. A unit systemd cannot parse is worse than a stale
+# one: the stale unit is running, a broken one is not. `systemd-analyze verify`
+# resolves the unit's own syntax without activating anything.
+for src in "${units[@]}"; do
+    if ! systemd-analyze verify "$src" 2>/dev/null; then
+        echo "px-units-install: refusing — systemd-analyze verify failed for $src" >&2
+        exit 1
+    fi
+done
+
+install -m 0644 "${units[@]}" "$DEST_DIR/"
+systemctl daemon-reload
+echo "px-units-install: installed ${#units[@]} unit file(s) and reloaded systemd"
+echo "  note: an installed unit file takes effect on that unit's next start/restart."
+echo "  Run 'bin/px-deploy-check' to see which long-lived units are still executing"
+echo "  pre-deploy code, and restart those deliberately."
