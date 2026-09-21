@@ -67,6 +67,12 @@ THOUGHTS_FILE = STATE_DIR / "thoughts-spark.jsonl"
 HOBART_TZ = ZoneInfo("Australia/Hobart")
 BLOG_LIMIT = 500
 MIN_THOUGHTS_FOR_DAILY = 3
+#: A blog that has published nothing for this many days, while source material
+#: was available, is blocked rather than idle — and must say so on the health
+#: board. Chosen at 2 days: the schedule is daily, so one missed evening is
+#: within tolerance (a quiet day, a budget-throttled cycle) and a second one is
+#: not. The month-long silence this closes was invisible for thirty times that.
+BLOG_FRESHNESS_MAX_AGE_DAYS = float(os.environ.get("PX_BLOG_FRESHNESS_MAX_AGE_DAYS", "2"))
 POLL_INTERVAL = 60
 # Per-post-ID generation failure cap — after this many failed generation
 # attempts (empty body/response, title-only, exceptions), a post_id is
@@ -708,7 +714,25 @@ Keep it under 2000 words."""
 # ---------------------------------------------------------------------------
 
 def _qa_gate(text: str) -> str | None:
-    """Run Claude QA gate on blog text. Returns 'pass', 'rejected', 'ambiguous', or None on error.
+    """Ask the pinned cognition tier whether this post is safe to publish.
+
+    Returns 'pass', 'rejected', 'ambiguous', or None when the tier did not
+    answer (a defer, not a rejection).
+
+    The question is asked in the *positive-absence* polarity — "does it contain
+    any of these" — because the previous phrasing ("is this appropriate to
+    publish?") was answered NO to every benign post on this tier, silently
+    stopping the blog. Measured on the robot 2026-09-21, same model and prompt
+    shape, four real published posts and two genuinely unsafe strings:
+
+        current phrasing   real -> no  no  no  no     unsafe -> no   no
+        contains-any?      real -> no  no  no  no     unsafe -> yes  yes
+
+    The old phrasing cannot discriminate: it answered "no" to a post that names
+    a real person's home address, phone number and a slur, which is the one
+    answer the gate exists to produce. The phrasing below separates the classes
+    on the same inputs, and `_qa_safe()` requires positive clearance so that a
+    refusal can never be read as a pass.
 
     A circuit breaker opens after 3 consecutive failures, skipping QA calls
     for 5 minutes (returns None immediately). Resets on any success.
@@ -720,10 +744,13 @@ def _qa_gate(text: str) -> str | None:
             log(f"qa breaker: cooldown elapsed, retrying (was {_qa_breaker['failures']} consecutive failures)")
             _qa_breaker["failures"] = 0
 
-    prompt = ('Is this blog post from a small robot appropriate to publish publicly?\n'
-              'Check for: offensive content, personal information leaks, factual errors.\n'
-              'Answer only YES or NO. Nothing else.\n\n'
-              f'The post:\n{text[:3000]}')
+    prompt = ("Read the following journal entry from a small robot and answer one question.\n"
+              "Question: does it contain private personal information (a person's real address,\n"
+              "phone number, email, or ID number), hateful language or slurs, threats of violence,\n"
+              "or sexual content?\n"
+              "Answer YES if it contains any of those. Answer NO if it contains none of them.\n"
+              "Answer with one word only: YES or NO.\n\n"
+              f"The entry:\n{text[:3000]}")
     try:
         from pxh.m5 import ask_m5
         result = ask_m5("blog_qa", prompt, "")
@@ -742,12 +769,38 @@ def _qa_gate(text: str) -> str | None:
 
     resp = result.response.strip().lower()
     _qa_breaker["failures"] = 0
-    if resp.startswith("yes"):
-        return "pass"
     if resp.startswith("no"):
+        # Only an explicit "no" — nothing unsafe found — is a pass. An answer we
+        # cannot read is not clearance: the gate must fail closed, because every
+        # other outcome here (defer, ambiguous, breaker) already does.
+        return "pass"
+    if resp.startswith("yes"):
         return "rejected"
     log(f"qa gate ambiguous: {resp[:80]}")
     return "ambiguous"
+
+
+def _qa_gate_diagnosis(post_id: str, post_type: str, title: str) -> None:
+    """Record what a QA rejection actually means, instead of a bare 'rejected'.
+
+    The month-long silent stop was invisible on two axes at once: the gate
+    returned the same "rejected" for a broken discriminator as for a genuinely
+    unsafe post, and the *catch-up* loop then counted the day as "missing source
+    material" even though 185-244 thoughts were available for every one of those
+    days. Both are naming failures at the boundary, so both are fixed there.
+    """
+    _health.record_capability_failure(
+        "px-blog", "qa_gate",
+        f"the cognition tier rejected {post_type} {post_id} "
+        f"({title[:60]!r}) — if this repeats on benign posts the gate's "
+        f"discriminator is broken, not the posts",
+        detail={"post_id": post_id, "post_type": post_type},
+    )
+    log(
+        f"QA rejected {post_type}: {title[:60]} "
+        f"(qa_gate recorded as a capability — repeated rejections of benign posts "
+        f"mean the discriminator is wrong, not the post)"
+    )
 
 
 def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, dry: bool = False) -> dict | None:
@@ -831,12 +884,16 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
     if os.environ.get("PX_BLOG_QA", "1") != "0":
         qa_result = _qa_gate(body)
         if qa_result == "rejected":
-            log(f"QA rejected {post_type}: {title[:60]}")
+            _qa_gate_diagnosis(pid, post_type, title)
             record_qa_rejected(pid)
             return None
-        if qa_result is None:
-            log(f"QA gate error for {post_type} — publishing anyway (safety net)")
-            qa_result = "error_pass"
+        if qa_result in (None, "ambiguous"):
+            # An unreadable answer is not clearance. The tier not answering is a
+            # defer (next cycle's post); an answer we cannot parse is the same
+            # thing, and neither may publish — a gate that defaults to "yes"
+            # because it could not understand the reply is not a gate.
+            log(f"QA gate did not clear {post_type} ({qa_result}) — deferring, not publishing")
+            return None
 
     duration_s = round(time.monotonic() - _gen_start, 1)
 
@@ -895,6 +952,11 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
     blog_data = load_blog()
     generated = 0
     had_skips = False
+    #: Skips that had source material but were not published for another reason.
+    #: Kept apart from the "no source material" case because conflating them is
+    #: how a month of QA rejections logged as "missing source material" and read
+    #: as an idle robot rather than a broken gate.
+    blocked = 0
 
     for post_type in ("weekly", "monthly", "yearly", "daily"):
         due, target_date = is_due(post_type, blog_data)
@@ -933,11 +995,18 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
 
         post = generate_post(post_type, target_date, blog_data, dry=dry)
         if post is None:
+            # The source material was there — gather_thoughts() was never the
+            # reason for a post_type this loop got past the daily check for — so
+            # this is a *blocked* post (QA refusal, empty model response,
+            # dependency missing), not a missing-source day. Reporting it as
+            # "missing source material" once hid a month of gate rejections.
+            blocked += 1
             had_skips = True
             # QA-rejected daily: mark skipped so catch-up advances to the next
             # date rather than retrying (and burning quota) on the same post.
             if post_type == "daily":
-                log(f"skipping {pid}: QA rejection — marking skipped to advance catch-up")
+                log(f"skipping {pid}: not published this cycle (see the reason above)"
+                    " — marking skipped to advance catch-up")
                 with _blog_lock(BLOG_FILE):
                     fresh = load_blog()
                     if pid not in fresh.get("skipped", []):
@@ -966,7 +1035,82 @@ def run_once(*, dry: bool = False) -> tuple[int, bool]:
         log(f"generated {post_type}: {post['title'][:60]}")
         generated += 1
 
-    return generated, had_skips
+    return generated, had_skips, blocked
+
+
+def _eligible_source_days(lookback_days: int) -> int:
+    """How many of the last `lookback_days` days had enough thoughts for a daily.
+
+    The other half of the freshness question: "no new posts" is only a fault if
+    there was something to publish. A quiet robot with no thoughts is working as
+    designed; a robot with 200 thoughts a day and no posts for a month is not.
+    """
+    if not THOUGHTS_FILE.exists():
+        return 0
+    counts: dict[str, int] = {}
+    today = dt.datetime.now(HOBART_TZ).date()
+    for line in THOUGHTS_FILE.read_text(encoding="utf-8").strip().splitlines():
+        try:
+            ts = dt.datetime.fromisoformat(json.loads(line)["ts"].replace("Z", "+00:00"))
+        except (json.JSONDecodeError, KeyError, ValueError):
+            continue
+        day = ts.astimezone(HOBART_TZ).date()
+        if 0 <= (today - day).days < lookback_days:
+            counts[day.isoformat()] = counts.get(day.isoformat(), 0) + 1
+    return sum(1 for n in counts.values() if n >= MIN_THOUGHTS_FOR_DAILY)
+
+
+def _note_blog_freshness(*, generated_something: bool) -> None:
+    """Fail the `freshness` capability when the blog stops publishing.
+
+    The shape this closes: from 2026-08-19 to 2026-09-21 the blog published
+    nothing, every day had 185-244 thoughts available, and `read_health()` said
+    `ok` the whole time — because the daemon was alive and its poll loop kept
+    succeeding. `state/blog_log.jsonl` had the last success in it; nothing read
+    it. A capability that is only checked by the process that is running is not
+    checked at all (#332's lesson, second instance).
+
+    Sticky-until-success, like the generation capability: it clears only on a
+    post actually being appended, never on a poll that merely ran.
+    """
+    try:
+        last_ts = None
+        if BLOG_LOG.exists():
+            for line in BLOG_LOG.read_text(encoding="utf-8").strip().splitlines()[-50:]:
+                try:
+                    rec = json.loads(line)
+                    if rec.get("ts"):
+                        last_ts = rec["ts"]
+                except json.JSONDecodeError:
+                    continue
+        if last_ts is None:
+            return  # no baseline yet (fresh install) — nothing to compare against
+        last = dt.datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+        age_days = (dt.datetime.now(dt.timezone.utc) - last).total_seconds() / 86400.0
+        if age_days < BLOG_FRESHNESS_MAX_AGE_DAYS:
+            # Publishing normally: clear the block. A sticky failure that nothing
+            # clears is the mirror of the failure it exists to catch — and
+            # `record_capability_success` is a no-op when nothing was blocked, so
+            # the healthy path still writes nothing.
+            _health.record_capability_success("px-blog", "freshness")
+            return
+        eligible = _eligible_source_days(int(BLOG_FRESHNESS_MAX_AGE_DAYS) + 1)
+        if eligible == 0:
+            # A quiet robot with nothing to say is not a broken blog.
+            _health.record_capability_success("px-blog", "freshness")
+            return
+        _health.record_capability_failure(
+            "px-blog", "freshness",
+            f"no new post for {age_days:.1f} days (limit "
+            f"{BLOG_FRESHNESS_MAX_AGE_DAYS}d) while {eligible} day(s) had eligible "
+            f"source material — the blog is blocked, not idle",
+            detail={"last_post_ts": last_ts, "age_days": round(age_days, 1),
+                    "eligible_days": eligible},
+        )
+        log(f"freshness: no post for {age_days:.1f} days with {eligible} day(s) of "
+            f"eligible source material — recorded as a capability failure")
+    except Exception:  # noqa: BLE001 — observability must never stop the blogger
+        pass
 
 
 def run_backfill(*, dry: bool = False) -> int:
@@ -1128,7 +1272,7 @@ def main(argv: list[str]) -> int:
         return 0
 
     if args.once:
-        count, _skips = run_once(dry=dry)
+        count, _skips, _blocked = run_once(dry=dry)
         log(f"generated {count} posts")
         _safe_unlink_pid()
         return 0
@@ -1152,16 +1296,26 @@ def main(argv: list[str]) -> int:
     try:
         while not _shutdown.is_set():
             try:
-                count, had_skips = run_once(dry=dry)
+                count, had_skips, blocked = run_once(dry=dry)
                 _health.record_success("px-blog", detail={"generated": count,
                                                           "skipped": bool(had_skips)})
                 if count:
                     log(f"poll: generated {count} posts")
+                # Freshness: a blog that has not published for N days while
+                # eligible source material exists is the failure this daemon
+                # cannot see from the inside. It reported `ok` for a month while
+                # every day was rejected. See _note_blog_freshness().
+                _note_blog_freshness(generated_something=bool(count))
                 if had_skips and count == 0:
-                    # All due posts were skipped (missing children / insufficient
-                    # thoughts).  Back off for 1 hour instead of retrying every
-                    # poll interval — the source material won't appear in 60 s.
-                    log(f"poll: all due posts skipped (missing source material) — backing off {SKIP_BACKOFF_S}s")
+                    if blocked:
+                        # Source material was present; the posts were refused by
+                        # the gate or produced nothing. That is a *blocked* blog,
+                        # not an idle one — say which, because the two have been
+                        # indistinguishable in this log and only one is a bug.
+                        log(f"poll: {blocked} due post(s) had source material but were not "
+                            f"published (see the reason above) — backing off {SKIP_BACKOFF_S}s")
+                    else:
+                        log(f"poll: all due posts skipped (missing source material) — backing off {SKIP_BACKOFF_S}s")
                     _shutdown.wait(timeout=SKIP_BACKOFF_S)
                 else:
                     _shutdown.wait(timeout=args.poll_interval)

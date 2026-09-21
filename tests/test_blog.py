@@ -602,7 +602,7 @@ class TestQaGateBreaker:
         blog_subprocess = ns["subprocess"]
         breaker["failures"] = 2
 
-        with _brain_says("YES"):
+        with _brain_says("NO"):
             result = ns["_qa_gate"]("a good blog post")
         assert result == "pass"
         assert breaker["failures"] == 0
@@ -615,7 +615,7 @@ class TestQaGateBreaker:
         breaker["failures"] = 3
         breaker["open_until"] = 0  # already elapsed
 
-        with _brain_says("YES") as mock_run:
+        with _brain_says("NO") as mock_run:
             result = ns["_qa_gate"]("thought after cooldown")
         assert mock_run.call_count == 1
         assert result == "pass"
@@ -737,7 +737,8 @@ class TestGenerationFailureCap:
         # subprocess is mocked here, so no live `claude` call is made.
         with patch.dict(os.environ, {"PX_BLOG_QA": "1"}):
             with patch("pxh.model_session.run_model_session", return_value=_mock_claude_result()):
-                with _brain_says("NO"):
+                with _brain_says("YES"):
+                    # YES = "it contains unsafe content" → rejected.
                     post = ns["generate_post"]("daily", today, {"posts": []})
 
         assert post is None
