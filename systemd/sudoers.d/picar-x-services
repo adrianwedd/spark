@@ -21,6 +21,29 @@ pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-wake-listen, /usr/bin/system
 pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-api-server, /usr/bin/systemctl stop px-api-server, /usr/bin/systemctl restart px-api-server, /bin/systemctl start px-api-server, /bin/systemctl stop px-api-server, /bin/systemctl restart px-api-server
 pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-frigate-stream, /usr/bin/systemctl stop px-frigate-stream, /usr/bin/systemctl restart px-frigate-stream, /bin/systemctl start px-frigate-stream, /bin/systemctl stop px-frigate-stream, /bin/systemctl restart px-frigate-stream
 
+# The remaining long-lived units, so the deploy gate's whole fleet is actionable
+# by the agent that reads it (#247/#390). Without these, `px-deploy-check` can
+# name a stale unit that nothing but a human can restart — which is the shape
+# the gate was built to end. Same exact-command form as the five above: one
+# named unit per operation, no wildcard, no unit argument, so no grant here can
+# be turned into "restart anything". px-blog is included because it is the
+# daemon whose restart deploys a blog fix; px-post, px-evolve and px-tts-glados
+# because they are in the same fleet and drift the same way; px-battery-poll
+# because it is the unit #247's carried staleness names.
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-blog, /usr/bin/systemctl stop px-blog, /usr/bin/systemctl restart px-blog, /bin/systemctl start px-blog, /bin/systemctl stop px-blog, /bin/systemctl restart px-blog
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-post, /usr/bin/systemctl stop px-post, /usr/bin/systemctl restart px-post, /bin/systemctl start px-post, /bin/systemctl stop px-post, /bin/systemctl restart px-post
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-evolve, /usr/bin/systemctl stop px-evolve, /usr/bin/systemctl restart px-evolve, /bin/systemctl start px-evolve, /bin/systemctl stop px-evolve, /bin/systemctl restart px-evolve
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-tts-glados, /usr/bin/systemctl stop px-tts-glados, /usr/bin/systemctl restart px-tts-glados, /bin/systemctl start px-tts-glados, /bin/systemctl stop px-tts-glados, /bin/systemctl restart px-tts-glados
+pi ALL=(root) NOPASSWD: /usr/bin/systemctl start px-battery-poll, /usr/bin/systemctl stop px-battery-poll, /usr/bin/systemctl restart px-battery-poll, /bin/systemctl start px-battery-poll, /bin/systemctl stop px-battery-poll, /bin/systemctl restart px-battery-poll
+
+# Unit-file install (#247/#390). Not a wildcard and not a generic shell: the
+# launcher takes no argument at all, installs the *unit files this repo tracks*
+# from a path it resolves itself, and does one daemon-reload. It validates every
+# unit with `systemd-analyze verify` before writing anything, and never restarts
+# a unit or touches sudoers. `bin/px-units-install` refuses to do anything else,
+# which is why a grant this narrow is enough.
+pi ALL=(root) NOPASSWD: /usr/local/sbin/px-units-install
+
 # Root-owned launchers: the arguments each accepts are validated inside the
 # launcher itself (px-signal-alive: fixed signal names; px-gpio-run: fixed
 # target allowlist + charset-checked lease id; px-research-run: exactly one
