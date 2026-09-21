@@ -51,10 +51,17 @@ from pxh import intention as intention_mod
 from pxh import memory as spark_memory
 from pxh import provenance as prov
 from pxh.presence import (
+    AT_HOME,
+    AWAY,
+    COORDINATE,
     ENTER_RADIUS_KM,
     EXIT_RADIUS_KM,
     PENDING_REASON,
+    SEMANTIC,
+    UNKNOWN,
+    arrival_edge,
     latch_at_home,
+    normalise_state,
 )
 from pxh.state import (
     atomic_write,
@@ -152,11 +159,16 @@ FINDMYHUB_FIX_STALE_S  = int(os.environ.get("PX_FINDMYHUB_FIX_STALE_S", "3600"))
 # Approximate home coordinates for distance calculation
 HOME_LAT               = float(os.environ.get("PX_HOME_LAT", "-43.13567"))
 HOME_LON               = float(os.environ.get("PX_HOME_LON", "147.11840"))
-# Semantic address → named place. Substring-matched (lowercased). at_home=True for at-dads.
+# Semantic address → named place. Substring-matched (lowercased). `at-dads` is
+# home; every other named place is a known *absence*; anything unmatched is no
+# claim at all (#305: "Office Mini" matching nothing was being published as
+# `at_home: False`, i.e. as positive evidence of absence).
+HOME_PLACE = "at-dads"
 _SEMANTIC_PLACES: dict[str, str] = {
     "thorp street": "at-mums",
-    "the shack":    "at-dads",
+    "the shack":    HOME_PLACE,
 }
+KNOWN_PLACES = tuple(_SEMANTIC_PLACES.values())
 
 HA_HOST                = spark_config.HA_BASE_URL  # single source of truth (PX_HA_HOST); see spark_config
 HA_TOKEN               = os.environ.get("PX_HA_TOKEN", "")
@@ -884,7 +896,18 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _enrich_tracker(raw: dict, name: str) -> dict | None:
-    """Add at_home, age_s (and place/distance_km) to a raw tracker entry. Returns None on error."""
+    """Add the kind of evidence, age_s (and place/distance_km). None on error.
+
+    This function does not decide `at_home` in either branch. The coordinate
+    branch never could (a bare threshold is what flapped, #305), and the semantic
+    branch must not either: an address is a *representation* of a location, not a
+    claim that can be compared with a coordinate fix about the same tracker. Its
+    own `at_home` was published straight into `awareness["findmyhub"]`, so a
+    tracker that alternated between the two representations showed one consumer
+    a coordinate and the next a semantic boolean — and the arrival detector read
+    that as movement (#305, measured 2026-09-21). The latch owns the decision;
+    every reader sees the latched value.
+    """
     try:
         if "error" in raw:
             return None
@@ -896,12 +919,12 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
                 "unknown",
             )
             return {
-                "semantic": True,
-                "address":  addr,
-                "place":    place,
-                "ts":       raw["ts"],
-                "age_s":    round(age_s),
-                "at_home":  place == "at-dads",
+                "semantic":    True,
+                "address":     addr,
+                "place":       place,
+                "kind":        SEMANTIC,
+                "ts":          raw["ts"],
+                "age_s":       round(age_s),
             }
         lat, lon = raw["lat"], raw["lon"]
         distance_km = _haversine_km(HOME_LAT, HOME_LON, lat, lon)
@@ -915,6 +938,7 @@ def _enrich_tracker(raw: dict, name: str) -> dict | None:
             "lat":         round(lat, 5),
             "lon":         round(lon, 5),
             "accuracy_m":  round(raw.get("accuracy_m", 0)),
+            "kind":        COORDINATE,
             "ts":          raw["ts"],
             "age_s":       round(age_s),
             "distance_km": round(distance_km, 2),
@@ -1016,14 +1040,26 @@ def _read_findmyhub() -> dict:
 
 
 def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
-    """Update the in-memory _last_known_findmyhub cache with the current fresh
-    read and return any away→home transitions detected against the cached
-    previous state (issue #156).
+    """Report away→home edges against the state the latch has already decided.
 
-    Cache starts empty, so the first time we see a tracker no arrival fires
-    even if at_home=true — preserves the daemon-restart guard. The cache is
-    only mutated when ``findmyhub`` is non-empty, so stale-file windows do
-    not erase the prior "away" baseline."""
+    The cache is only mutated when ``findmyhub`` is non-empty, so stale-file
+    windows do not erase the prior "away" baseline.
+
+    Two things this must not do, both of them measured in production (#305):
+
+    * treat ``UNKNOWN`` as ``AWAY``. A tracker whose first sighting was an
+      unusable or stale fix has no decided state, and promoting that absence to
+      "away" is what turned one bad fix after a restart into a greeting;
+    * compare a coordinate claim against a semantic one. One tracker
+      legitimately publishes two representations — a coordinate fix and a
+      semantic address — and `_latch_findmyhub_states` publishes ``UNKNOWN`` for
+      whichever it cannot compare. Reading the *alternation* as movement fired 17
+      false arrivals on 2026-09-21 for a tracker that never left home.
+
+    Both are why the decision is a named state carrying the kind of evidence that
+    produced it, and why the edge rule itself lives in ``pxh.presence`` next to
+    the radii it is derived from.
+    """
     global _last_known_findmyhub, _latch_suppressed, _latch_far_streak, _latch_stale
     transitions: list[str] = []
     if not findmyhub:
@@ -1032,17 +1068,18 @@ def _detect_findmyhub_arrivals(findmyhub: dict) -> list[str]:
         if not isinstance(curr_data, dict):
             continue
         prev_data = _last_known_findmyhub.get(tracker_name)
-        # `is True` / `is False`, not truthiness: "unknown" and "away" must not
-        # read alike. A tracker whose first sighting was a single far fix has no
-        # latched state, and treating that as away is what turned one bad fix
-        # after a restart into a greeting (2026-09-17). An arrival is a
-        # *transition from known away*, which is also what the restart guard was
-        # always meant to mean.
-        if (
-            curr_data.get("at_home") is True
-            and isinstance(prev_data, dict)
-            and prev_data.get("at_home") is False
-        ):
+        prev_state = prev_data.get("at_home") if isinstance(prev_data, dict) else None
+        curr_state = curr_data.get("at_home")
+        # The kind a state was decided from, falling back to the entry's own
+        # shape: a caller handing us a bare `{"at_home": ...}` dict (#156's
+        # contract) is making a coordinate claim, which `_evidence_kind` reads
+        # from the shape rather than requiring a field it never had.
+        prev_kind = (
+            (prev_data.get("at_home_kind") or _evidence_kind(prev_data))
+            if isinstance(prev_data, dict) else None
+        )
+        curr_kind = curr_data.get("at_home_kind") or _evidence_kind(curr_data)
+        if arrival_edge(prev_state, prev_kind, curr_state, curr_kind):
             transitions.append(f"person_arrived_home:{tracker_name}")
         _last_known_findmyhub[tracker_name] = curr_data
     return transitions
@@ -1074,16 +1111,62 @@ def _latch_detail(curr: dict, reason: str) -> str:
     return f"{reason}: {numbers}"
 
 
+def _evidence_kind(entry: dict) -> str | None:
+    """How one enriched tracker entry represents a location.
+
+    Derived from the entry's own shape, not from a field the caller must
+    remember to set: `_findmyhub_transitions` has always been documented as
+    taking already-enriched dicts, and other producers (fixtures, tests, the
+    semantic branch of `_enrich_tracker`) build them directly. An explicit
+    ``kind`` wins when present; otherwise the shape is the evidence — a distance
+    is a coordinate claim, an address is a semantic one, and anything else
+    (a tracker that errored, a bare error string) is neither.
+    """
+    kind = entry.get("kind")
+    if kind in (COORDINATE, SEMANTIC):
+        return kind
+    if entry.get("semantic") or ("address" in entry and "distance_km" not in entry):
+        return SEMANTIC
+    if "distance_km" in entry:
+        return COORDINATE
+    if "at_home" in entry:
+        # A bare boolean claim with no representation at all: the shape #156
+        # defined before either branch carried a kind, and still the contract
+        # `_detect_findmyhub_arrivals` documents. Read it as a coordinate claim —
+        # that is the only producer that ever emitted it — rather than refusing
+        # it, so a direct caller is not silently downgraded to UNKNOWN.
+        return COORDINATE
+    return None
+
+
+def _semantic_place(entry: dict) -> str:
+    """The named place behind a semantic entry, resolving the address if needed.
+
+    Same tolerance as `_evidence_kind`: a caller may hand the latch a raw
+    `{"semantic": true, "address": ...}` dict, and an address whose place has not
+    been resolved yet is not "unplaceable" — it just has not been looked up.
+    """
+    place = entry.get("place")
+    if place:
+        return place
+    addr = str(entry.get("address", "")).lower()
+    return next((p for key, p in _SEMANTIC_PLACES.items() if key in addr), "unknown")
+
+
 def _latch_findmyhub_states(findmyhub: dict) -> None:
-    """Latch every coordinate tracker's `at_home` against its previous state.
+    """Decide one tracker's state per fresh read, and publish *that*.
 
     In place on purpose. The latched value is what both the arrival detector and
     `awareness["findmyhub"]` must read; #305 is precisely two readers deciding
     separately — a greeting that flapped six times per arrival and a prompt label
     that disagreed with the state SPARK was acting on.
 
-    Semantic-address trackers carry their own `at_home` (an address does not
-    jitter) and pass straight through.
+    Every representation goes through the latch now, including the semantic
+    address branch. A representation change is not a movement event: when the
+    evidence this read cannot be compared with the evidence the previous state was
+    decided from — a semantic address against a coordinate fix, say — the state is
+    held as ``UNKNOWN`` (no claim either way) rather than being published as a
+    fresh boolean for the arrival detector to mistake for an edge.
 
     Logged per *new sample*, not per read: the awareness loop ticks every 60 s
     while findmyhub.json is rewritten every ~5 min, so per-read logging would be
@@ -1094,12 +1177,14 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
     transitions.
     """
     for name, curr in findmyhub.items():
-        if not isinstance(curr, dict) or curr.get("semantic"):
-            continue
-        if "distance_km" not in curr:
+        if not isinstance(curr, dict):
             continue
         prev = _last_known_findmyhub.get(name)
-        prev_home = prev.get("at_home") if isinstance(prev, dict) else None
+        # The state is normalised on the way *out* as well: a test or fixture that
+        # hands us the pre-#305 boolean dialect leaves the decided state in the
+        # new one, so no consumer has to know both.
+        prev_state = normalise_state(prev.get("at_home")) if isinstance(prev, dict) else None
+        prev_kind = prev.get("at_home_kind") if isinstance(prev, dict) else None
         sample_is_new = not isinstance(prev, dict) or prev.get("ts") != curr.get("ts")
 
         if not sample_is_new:
@@ -1114,17 +1199,21 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
             # The latched state is copied onto the fresh dict first: the cache
             # ends up holding *this* dict, so returning early without it would
             # drop `at_home` for every consumer until the next cron push.
-            if prev_home is not None:
-                curr["at_home"] = prev_home
+            if prev_state is not None:
+                curr["at_home"] = prev_state
+                curr["at_home_kind"] = prev_kind
             continue
+
         age_s = curr.get("age_s")
+        curr_kind = _evidence_kind(curr)
         if isinstance(age_s, (int, float)) and age_s > FINDMYHUB_FIX_STALE_S:
             # History, not evidence about now. The latched state is copied onto
             # this dict (it is about to become the cache) so no consumer sees the
             # tracker lose its state, and the arrival detector -- which reads that
             # cache -- cannot manufacture an edge out of a stale fix.
-            if prev_home is not None:
-                curr["at_home"] = prev_home
+            if prev_state is not None:
+                curr["at_home"] = prev_state
+                curr["at_home_kind"] = prev_kind
             _latch_stale[name] = _latch_stale.get(name, 0) + 1
             # Every 12th stale fix, not every 100th: the latch advances once per
             # *new* sample (~5 min cron), so 100 was ~8 h of silence on the one
@@ -1133,13 +1222,58 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
                 log(
                     f"findmyhub: {name} fix is stale ({age_s / 3600.0:.1f} h old, "
                     f"limit {FINDMYHUB_FIX_STALE_S / 3600.0:.0f} h) — holding "
-                    f"at_home={prev_home} ({_latch_stale[name]} stale fixes)"
+                    f"at_home={prev_state} ({_latch_stale[name]} stale fixes)"
                 )
+            if prev_state is None:
+                # Nothing remembered yet, and this fix is not evidence: publish
+                # the third state by name rather than omitting the key, so no
+                # consumer reads the silence as "away" (#305).
+                curr["at_home"] = UNKNOWN
             continue
+
+        if curr_kind != COORDINATE:
+            # A representation with no distance: a semantic address, or an entry
+            # that carries neither. Three cases, and none of them is an arrival:
+            #
+            #   * the previous state was decided from a *coordinate* fix. An
+            #     address cannot contradict a measurement, and a representation
+            #     change is not movement — so the remembered state is held
+            #     unchanged, name and kind together. This is the case that fired
+            #     17 arrivals on 2026-09-21;
+            #   * the previous state was semantic (or there is none): an address
+            #     that names a known place decides *within its own kind*, because
+            #     two addresses are comparable;
+            #   * an address matching no known place is *no claim*, never a
+            #     departure — "Office Mini" used to be published as
+            #     `at_home: False`, i.e. as positive evidence of absence.
+            _latch_stale[name] = 0
+            can_decide = curr_kind == SEMANTIC and prev_kind in (None, SEMANTIC)
+            place = _semantic_place(curr) if can_decide else None
+            if can_decide and place == HOME_PLACE:
+                decided, kind = AT_HOME, SEMANTIC
+            elif can_decide and place in KNOWN_PLACES:
+                decided, kind = AWAY, SEMANTIC
+            elif prev_state is not None:
+                decided, kind = prev_state, prev_kind
+            else:
+                decided, kind = UNKNOWN, None
+            curr["at_home"] = decided
+            if kind is None:
+                curr.pop("at_home_kind", None)
+            else:
+                curr["at_home_kind"] = kind
+            continue
+
         _latch_stale[name] = 0
         streak = _latch_far_streak.get(name, 0)
+        # `latch_at_home` decides about a *coordinate*, so it takes the three
+        # coordinate cases only: home, away, and no decided state. UNKNOWN maps to
+        # "no decided state", which is what it means.
+        prev_decided = (
+            None if prev_state in (None, UNKNOWN) else prev_state == AT_HOME
+        )
         state, reason = latch_at_home(
-            curr["distance_km"], curr.get("accuracy_m"), prev_home, streak
+            curr["distance_km"], curr.get("accuracy_m"), prev_decided, streak
         )
         if reason == PENDING_REASON:
             _latch_far_streak[name] = streak + 1
@@ -1148,27 +1282,40 @@ def _latch_findmyhub_states(findmyhub: dict) -> None:
             # evidence either way, so it neither extends nor breaks it.
             _latch_far_streak[name] = 0
         if state is None:
-            state = prev_home
-        if state is not None:
-            curr["at_home"] = state
+            # Nothing new: hold the state the tracker already had, under this
+            # read's kind (we are in the coordinate branch, so both sides are the
+            # same kind of evidence).
+            new_state = prev_state
+        else:
+            new_state = AT_HOME if state else AWAY
+        if new_state is not None:
+            curr["at_home"] = new_state
+            curr["at_home_kind"] = curr_kind
+        else:
+            # No decided state yet: publish the third state *by name*, so nothing
+            # downstream can read the absence as "away".
+            curr["at_home"] = UNKNOWN
+            curr.pop("at_home_kind", None)
 
         # "Would the old bare threshold have flipped here?" — the honest measure
-        # of what the latch absorbed, as opposed to every in-band fix.
-        would_have_flipped = state is not None and (
-            (curr["distance_km"] <= ENTER_RADIUS_KM) != bool(state)
+        # of what the latch absorbed, as opposed to every in-band fix. Judged
+        # against the state as it stands after this read (`new_state`), which is
+        # what the old threshold would have been contradicting.
+        would_have_flipped = new_state is not None and (
+            (curr["distance_km"] <= ENTER_RADIUS_KM) != (new_state == AT_HOME)
         )
         suppressed = _latch_suppressed.get(name, 0)
-        # `prev_home is None` counts as a change on purpose: the *first* latch of
+        # `prev_state is None` counts as a change on purpose: the *first* latch of
         # a fresh process was the one unlogged decision here, and on 2026-09-17
         # that hid exactly the fix that caused a spurious greeting.
-        changed = state is not None and (
-            prev_home is None or bool(state) != bool(prev_home)
+        changed = new_state is not None and (
+            prev_state is None or new_state != prev_state
         )
 
         if changed or suppressed == 0 and would_have_flipped:
             absorbed = f"; {suppressed} suppressed flips while latched" if suppressed else ""
             log(
-                f"findmyhub: {name} at_home {prev_home}→{state} "
+                f"findmyhub: {name} at_home {prev_state}→{new_state} "
                 f"({_latch_detail(curr, reason)}{absorbed})"
             )
         if would_have_flipped:
