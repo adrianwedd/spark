@@ -1,6 +1,8 @@
 [Unit]
 Description=SPARK cognitive loop daemon
 After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -14,8 +16,6 @@ Environment=PATH=/home/pi/picar-x-hacking/.venv/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/pi/picar-x-hacking/bin/px-mind
 Restart=always
 RestartSec=10
-StartLimitBurst=5
-StartLimitIntervalSec=300
 KillMode=control-group
 KillSignal=SIGTERM
 TimeoutStopSec=5
