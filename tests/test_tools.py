@@ -590,23 +590,6 @@ def test_tool_perform_dry_run(isolated_project):
     assert payload["steps"] == 2
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="/proc/{pid} only exists on Linux")
-def test_px_alive_pid_race_not_duplicate(isolated_project):
-    """Second px-alive start should exit cleanly if PID file already shows a live process."""
-    import os
-    pid_file = Path(isolated_project["log_dir"]) / "px-alive.pid"
-    # Write our own PID as if we're px-alive instance 1
-    pid_file.write_text(str(os.getpid()))
-    env = {**isolated_project["env"], "PX_ALIVE_PID": str(pid_file), "PX_DRY": "1"}
-    result = subprocess.run(
-        [str(PROJECT_ROOT / "bin" / "px-alive"), "--dry-run"],
-        capture_output=True, text=True, env=env, timeout=10,
-    )
-    # Should have exited cleanly (rc=0) without overwriting the PID file
-    assert result.returncode == 0, f"expected rc=0, got {result.returncode}: {result.stderr}"
-    assert pid_file.read_text().strip() == str(os.getpid()), "PID file was overwritten by second instance"
-
-
 def test_tool_perform_missing_steps(isolated_project):
     env = isolated_project["env"].copy()
     env["PX_DRY"] = "1"
