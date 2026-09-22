@@ -1,6 +1,7 @@
 """Tests for px-alive idle-alive daemon (dry-run only — no GPIO)."""
 import ast
 import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -81,6 +82,41 @@ def test_px_alive_dry_run_no_pid_leftover(isolated_project):
 
     run_alive([], env)
     assert not pid_file.exists(), "PID file not cleaned up after dry-run"
+
+
+def test_px_alive_reclaims_pid_reused_by_unrelated_process(isolated_project):
+    """An orphaned PID file must not block startup after a reboot."""
+    env = isolated_project["env"].copy()
+    log_dir = isolated_project["log_dir"]
+    pid_file = log_dir / "px-alive.pid"
+    pid_file.write_text(str(os.getpid()))  # this test runner is not px-alive
+    env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
+    env["PX_ALIVE_PID"] = str(pid_file)
+
+    result = run_alive([], env)
+
+    assert result.returncode == 0, result.stderr
+    assert "dry gaze" in (log_dir / "px-alive.log").read_text()
+    assert not pid_file.exists()
+
+
+def test_px_alive_lock_rejects_second_instance(isolated_project):
+    """A held lock protects the daemon even when the PID file is stale."""
+    env = isolated_project["env"].copy()
+    log_dir = isolated_project["log_dir"]
+    pid_file = log_dir / "px-alive.pid"
+    lock_file = log_dir / "px-alive.pid.lock"
+    env["PX_LOG_FILE"] = str(log_dir / "px-alive.log")
+    env["PX_ALIVE_PID"] = str(pid_file)
+    pid_file.write_text("999999")
+
+    with lock_file.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = run_alive([], env)
+
+    assert result.returncode == 0, result.stderr
+    assert "another px-alive holds the PID lock" in result.stdout
+    assert pid_file.read_text() == "999999"
 
 
 def test_px_alive_no_prox_flag(isolated_project):

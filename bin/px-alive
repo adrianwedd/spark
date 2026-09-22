@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import math
 import os
@@ -56,6 +57,7 @@ from pathlib import Path
 LOG_DIR  = Path(os.environ.get("LOG_DIR",  Path.cwd() / "logs"))
 LOG_FILE = Path(os.environ.get("PX_LOG_FILE", LOG_DIR / "px-alive.log"))
 PID_FILE = Path(os.environ.get("PX_ALIVE_PID", LOG_DIR / "px-alive.pid"))
+PID_LOCK_FILE = PID_FILE.with_name(PID_FILE.name + ".lock")
 
 GAZE_MIN_S        = 20
 GAZE_MAX_S        = 50
@@ -1180,16 +1182,17 @@ def main(argv) -> int:
     GAZE_MAX_S  = args.gaze_max
     PROX_THRESH = args.prox_cm if not args.no_prox else 0.0
 
-    # Write PID — guarded: if another live px-alive already owns the file, exit
-    # cleanly so we don't clobber its PID (race condition on rapid restarts).
+    # A PID names a reusable slot, so its presence cannot prove another
+    # px-alive is running. Keep a separate advisory lock for the whole process
+    # lifetime; the kernel releases it even after an unclean shutdown. Leave
+    # the lock file in place so a new process never locks a different inode.
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _existing_pid = None
+    pid_lock = PID_LOCK_FILE.open("a+")
     try:
-        _existing_pid = int(PID_FILE.read_text().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        pass  # expected on first run or corrupt PID file
-    if _existing_pid and _existing_pid != os.getpid() and os.path.isdir(f"/proc/{_existing_pid}"):
-        log(f"another px-alive (pid={_existing_pid}) already running — exiting")
+        fcntl.flock(pid_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pid_lock.close()
+        log("another px-alive holds the PID lock — exiting")
         return 0
     PID_FILE.write_text(str(os.getpid()))
 
