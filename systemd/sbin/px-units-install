@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# px-units-install — install this repo's systemd unit files as root, with a
+# fixed, root-chosen repo path and environment (issues #390, #440).
+#
+# The sudoers grant is `NOPASSWD: /usr/local/sbin/px-units-install` with no
+# argument list, and a sudoers command with no arguments permits *any*
+# arguments — so this launcher refuses every one itself. `bin/px-units-install`
+# cannot be installed here directly: it derives the repo from its own location,
+# which from /usr/local/sbin is /usr/local.
+#
+# Environment is rebuilt from nothing (`env -i`): the installer honours
+# PROJECT_ROOT and a PX_UNITS_DEST_DIR test seam, and neither may come from the
+# caller.
+#
+# Installed root:root 0755 at /usr/local/sbin/px-units-install (source of truth:
+# systemd/sbin/px-units-install in the repo — reinstall after editing).
+# Sudoers: /etc/sudoers.d/picar-x-services (source: systemd/sudoers.d/).
+set -euo pipefail
+
+REPO=/home/pi/picar-x-hacking
+
+if [[ $# -ne 0 ]]; then
+    echo "px-units-install: takes no arguments (dry run: $REPO/bin/px-units-install --dry-run)" >&2
+    exit 2
+fi
+
+exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PROJECT_ROOT="$REPO" \
+    /bin/bash "$REPO/bin/px-units-install"
