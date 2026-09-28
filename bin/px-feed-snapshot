@@ -1,30 +1,352 @@
 #!/usr/bin/env bash
-# px-feed-snapshot — Copy state/feed.json to site/data/ and push if changed.
-# Designed for cron: */30 * * * * /home/pi/picar-x-hacking/bin/px-feed-snapshot
+# px-feed-snapshot — publish state/feed.json as site/data/feed.json and deliver it.
+#
+# Cron: */30 * * * * /home/pi/picar-x-hacking/bin/px-feed-snapshot
+#
+# WHY THIS FILE IS THIS CAREFUL (#190)
+# -----------------------------------
+# This job runs *inside the live shared checkout* on the robot, every 30 minutes,
+# beside humans and other agents editing the same working tree. Three properties
+# follow from that, and each is enforced below rather than assumed:
+#
+#   1. It commits exactly one path. `git commit -m … -- site/data/feed.json`
+#      (the pathspec form), staged from a working-tree copy this script wrote
+#      itself, then VERIFIED after the fact: the new commit's path list and the
+#      blob it recorded for the destination must match the source bytes. The
+#      pathspec form is what stops another writer's *already staged* work being
+#      swept into a `data: update feed snapshot` commit; the verification is
+#      what catches a commit hook staging a file between the last guard and the
+#      commit — a hook is the one insertion point no pre-check can see.
+#   2. It refuses rather than repairs. Unrelated staged, dirty or untracked
+#      files make the run exit non-zero *before* anything is written. There is
+#      no rebase, no stash, no reset, no clean and no force-push anywhere in
+#      this file: a shared checkout is not this job's to tidy.
+#   3. It never pushes work it did not make. The push names the exact commit
+#      sha, and every commit between origin/master and HEAD must be this job's
+#      own (its subject, and only this one path) or delivery is refused. A
+#      delivery that cannot happen is reported through pxh.health and exits
+#      non-zero — it used to be `git push … || true`, i.e. invisible.
+#
+# An undelivered snapshot commit is *retried* on the next run even when the feed
+# bytes match: the byte comparison decides whether there is anything new to
+# commit, never whether there is anything to deliver.
+#
+# Exit codes: 0 delivered (or nothing to do), 1 refused / nothing changed
+# locally, 2 a local snapshot commit exists but was not delivered.
 set -euo pipefail
+
 source "$(dirname "$0")/px-env"
 
+PROJECT_ROOT="${PROJECT_ROOT:?PROJECT_ROOT is set by bin/px-env}"
+COMPONENT="px-feed-snapshot"
 SRC="$PROJECT_ROOT/state/feed.json"
-DST="$PROJECT_ROOT/site/data/feed.json"
+DST_REL="site/data/feed.json"
+DST="$PROJECT_ROOT/$DST_REL"
+BRANCH="master"
+TRACKING_REF="refs/remotes/origin/$BRANCH"
+COMMIT_SUBJECT="data: update feed snapshot"
+LOG_FILE="${LOG_DIR:-$PROJECT_ROOT/logs}/$COMPONENT.log"
+# Fixed name, not random: a run killed between the copy and the commit must not
+# wedge the next run behind the untracked-file guard, and only this job writes
+# here. It is removed before use and after the copy.
+COPY_TMP_REL="site/data/.feed.json.tmp"
+COPY_TMP="$PROJECT_ROOT/$COPY_TMP_REL"
 
-# Nothing to snapshot if feed doesn't exist yet
-[ -f "$SRC" ] || exit 0
+EXIT_OK=0
+EXIT_REFUSED=1
+EXIT_UNDELIVERED=2
 
-cp "$SRC" "$DST"
+# The interpreter for the two small helpers (JSON validation, health reporting).
+# Overridable so a test can pin the one that can import pxh.
+PY="${PX_SNAPSHOT_PYTHON:-python3}"
 
-cd "$PROJECT_ROOT"
+log() {
+    local line
+    line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $COMPONENT: $*"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+    printf '%s\n' "$line" >&2
+}
 
-# Exit if nothing changed
-git diff --quiet site/data/feed.json 2>/dev/null && exit 0
+# Record on the health board so a wedged snapshot job is visible to
+# read_health()/the operator board instead of only in cron mail. Never raises
+# and never blocks the caller: health reporting must not be able to break the
+# thing it reports on (same posture as every other px-* component).
+record_health() {
+    local action="$1" message="${2:-}"
+    "$PY" - "$action" "$message" "$COMPONENT" <<'PY' >/dev/null 2>&1 || true
+import sys
 
-git add site/data/feed.json
-git commit -m "data: update feed snapshot"
+action, message, component = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    from pxh import health
+except Exception:                 # pxh not importable here — say nothing
+    sys.exit(0)
+try:
+    if action == "success":
+        health.record_success(component, detail={"note": message} if message else None)
+    else:
+        health.record_failure(component, message)
+except Exception:
+    pass
+PY
+}
 
-# Pull with rebase; abort on conflict to avoid committing merge markers
-if ! git pull --rebase --quiet 2>/dev/null; then
-  git rebase --abort 2>/dev/null || true
-  echo "px-feed-snapshot: rebase conflict, skipping push" >&2
-  exit 1
+fatal() {  # <reason> [exit code]
+    local reason="$1" code="${2:-$EXIT_REFUSED}"
+    log "$reason"
+    record_health failure "$reason"
+    exit "$code"
+}
+
+git_q() { git -C "$PROJECT_ROOT" "$@"; }
+
+# Compare Git's NUL-delimited names as bytes. Converting NULs to newlines can
+# hide a foreign path whose name contains a newline followed by the allowed
+# path, so keep the delimiter until after the comparison.
+others_than() {  # <allowed path> <git args...>
+    local allowed="$1"
+    shift
+    "$@" 2>/dev/null | "$PY" -c '
+import os, sys
+allowed = os.fsencode(sys.argv[1])
+raw = sys.stdin.buffer.read()
+if raw and not raw.endswith(b"\0"):
+    sys.exit(2)
+paths = raw.split(b"\0")[:-1] if raw else []
+bad = [repr(os.fsdecode(p)) for p in paths if p != allowed]
+print(", ".join(bad))
+' "$allowed"
+}
+
+# A commit this job is willing to publish: its own subject, and only the feed.
+commit_is_ours() {  # <sha>
+    local sha="$1" subject
+    subject="$(git_q log -1 --format=%s "$sha" 2>/dev/null || true)"
+    if [ "$subject" != "$COMMIT_SUBJECT" ]; then
+        return 1
+    fi
+    git_q diff-tree --no-commit-id --name-only -r -z "$sha" 2>/dev/null |
+        "$PY" -c '
+import os, sys
+expected = os.fsencode(sys.argv[1])
+raw = sys.stdin.buffer.read()
+if not raw.endswith(b"\0"):
+    sys.exit(1)
+sys.exit(0 if raw.split(b"\0")[:-1] == [expected] else 1)
+' "$DST_REL"
+}
+
+# The source feed must be the envelope px-post writes before it may replace the
+# published copy: an unreadable or truncated file must not become the site feed.
+validate_source() {
+    "$PY" - "$SRC" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception as exc:
+    print(f"not readable as JSON: {exc}")
+    sys.exit(1)
+if not isinstance(data, dict) or not isinstance(data.get("posts"), list):
+    print("not a feed envelope: expected an object with a 'posts' list")
+    sys.exit(1)
+for index, post in enumerate(data["posts"]):
+    if not isinstance(post, dict) or not isinstance(post.get("thought"), str) or not post["thought"].strip():
+        print(f"posts[{index}] has no non-empty 'thought' string")
+        sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
+# Preconditions. All read-only: every refusal below leaves the checkout exactly
+# as it was found, including another writer's index.
+# ---------------------------------------------------------------------------
+
+if [ ! -f "$SRC" ]; then
+    # A missing source does not make an already-created local snapshot commit
+    # delivered. Keep that failure visible in both the exit status and health.
+    if git_q rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+       git_q rev-parse --quiet --verify "$TRACKING_REF" >/dev/null 2>&1; then
+        if ! pending_count="$(git_q rev-list --count "$TRACKING_REF..HEAD" 2>/dev/null)"; then
+            fatal "source feed is absent and local delivery state cannot be inspected" "$EXIT_UNDELIVERED"
+        fi
+        if [ "$pending_count" -gt 0 ]; then
+            fatal "source feed is absent while $pending_count local commit(s) remain undelivered" "$EXIT_UNDELIVERED"
+        fi
+    fi
+    log "no source feed at $SRC — nothing to snapshot"
+    # Absence cannot prove an earlier undelivered commit reached origin. Keep
+    # any existing failure visible until a later run can verify delivery.
+    exit "$EXIT_OK"
 fi
 
-git push --quiet 2>/dev/null || true
+if ! git_q rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    fatal "$PROJECT_ROOT is not a git working tree; refusing"
+fi
+
+# The whole delivery story below assumes the branch that the site deploys from.
+if [ "$(git_q symbolic-ref --quiet --short HEAD 2>/dev/null || true)" != "$BRANCH" ]; then
+    fatal "checkout is not on $BRANCH (HEAD is $(git_q rev-parse --short HEAD 2>/dev/null || echo unknown)); refusing to publish"
+fi
+
+if ! source_error="$(validate_source 2>&1)"; then
+    fatal "refusing: state/feed.json is not a valid feed envelope ($source_error)"
+fi
+
+if ! staged_other="$(others_than "$DST_REL" git_q diff --cached --name-only -z)"; then
+    fatal "could not inspect the staged path list; refusing"
+fi
+if [ -n "$staged_other" ]; then
+    fatal "refusing: unrelated staged changes in the shared checkout: $staged_other"
+fi
+if ! git_q diff --cached --quiet HEAD -- "$DST_REL"; then
+    # A killed run or failed commit can leave our feed staged. Resume only
+    # when both index and worktree are byte-identical to the current source;
+    # any other staged value belongs to a writer we cannot identify.
+    if cmp -s "$SRC" "$DST" &&
+       git_q show ":$DST_REL" 2>/dev/null | cmp -s - "$SRC"; then
+        log "$DST_REL already has a matching staged feed; resuming"
+    else
+        fatal "refusing: $DST_REL has a pre-existing staged edit that differs from state/feed.json"
+    fi
+fi
+
+if ! dirty_other="$(others_than "$DST_REL" git_q diff --name-only -z)"; then
+    fatal "could not inspect the working-tree path list; refusing"
+fi
+if [ -n "$dirty_other" ]; then
+    fatal "refusing: unrelated uncommitted changes in the shared checkout: $dirty_other"
+fi
+
+# An untracked file is unexpected too — but this job's own copy temp is not,
+# or one killed run would wedge every run after it.
+if ! untracked="$(others_than "$COPY_TMP_REL" git_q ls-files --others --exclude-standard -z)"; then
+    fatal "could not inspect the untracked path list; refusing"
+fi
+if [ -n "$untracked" ]; then
+    fatal "refusing: untracked files present in the shared checkout: $untracked"
+fi
+
+# The destination is allowed to be dirty (a previous run's copy that never got
+# committed). It is not allowed to be *someone else's* edit: only bytes that
+# came from the current source are ours to overwrite.
+if [ -f "$DST" ] && git_q rev-parse --quiet --verify "HEAD:$DST_REL" >/dev/null 2>&1; then
+    if ! git_q diff --quiet HEAD -- "$DST_REL" 2>/dev/null; then
+        if cmp -s "$SRC" "$DST"; then
+            log "$DST_REL already holds this feed (uncommitted copy); continuing"
+        else
+            fatal "refusing: $DST_REL has local edits that do not match state/feed.json; not overwriting another writer's change"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Local snapshot: copy, then commit — one path, verified.
+# ---------------------------------------------------------------------------
+
+cleanup_copy_tmp() { rm -f -- "$COPY_TMP" 2>/dev/null || true; }
+trap cleanup_copy_tmp EXIT
+
+if ! cmp -s "$SRC" "$DST"; then
+    cleanup_copy_tmp
+    cp -- "$SRC" "$COPY_TMP"
+    # The first guard ran before the copy. Catch an operator edit made while
+    # the copy was prepared, immediately before replacing the destination.
+    if ! git_q diff --quiet HEAD -- "$DST_REL"; then
+        fatal "refusing: $DST_REL changed during snapshot preparation; not overwriting another writer's edit"
+    fi
+    if ! git_q diff --cached --quiet HEAD -- "$DST_REL"; then
+        fatal "refusing: $DST_REL was staged during snapshot preparation; not replacing another writer's index entry"
+    fi
+    mv -f -- "$COPY_TMP" "$DST"
+    log "copied state/feed.json -> $DST_REL"
+fi
+
+local_commit=""
+if ! git_q diff --quiet HEAD -- "$DST_REL" 2>/dev/null; then
+    # Re-check the index at the last moment before staging: another writer
+    # staging a file while this run was validating is the race this guards.
+    if ! staged_now="$(others_than "$DST_REL" git_q diff --cached --name-only -z)"; then
+        fatal "could not recheck the staged path list; refusing" "$EXIT_UNDELIVERED"
+    fi
+    if [ -n "$staged_now" ]; then
+        fatal "refusing: the index gained unrelated staged changes during this run: $staged_now"
+    fi
+    git_q add -- "$DST_REL"
+    if ! git_q diff --quiet -- "$DST_REL" 2>/dev/null; then
+        fatal "could not stage $DST_REL to match the working tree; refusing" "$EXIT_UNDELIVERED"
+    fi
+    if ! staged_now="$(others_than "$DST_REL" git_q diff --cached --name-only -z)"; then
+        fatal "could not recheck the staged path list; refusing" "$EXIT_UNDELIVERED"
+    fi
+    if [ -n "$staged_now" ]; then
+        fatal "refusing: the index gained unrelated staged changes during this run: $staged_now" "$EXIT_UNDELIVERED"
+    fi
+
+    if ! commit_out="$(git_q commit -m "$COMMIT_SUBJECT" -- "$DST_REL" 2>&1)"; then
+        fatal "commit of $DST_REL failed: $commit_out" "$EXIT_UNDELIVERED"
+    fi
+    local_commit="$(git_q rev-parse HEAD)"
+
+    # Verification, because a commit hook can stage anything it likes between
+    # the guard above and the commit that runs it.
+    if ! commit_is_ours HEAD; then
+        fatal "the snapshot commit recorded unexpected paths or subject; nothing was pushed — inspect $(git_q rev-parse --short HEAD)" "$EXIT_UNDELIVERED"
+    fi
+    if ! git_q cat-file blob "HEAD:$DST_REL" 2>/dev/null | cmp -s - "$SRC"; then
+        fatal "the snapshot commit does not carry the source feed bytes; nothing was pushed — inspect $(git_q rev-parse --short HEAD)" "$EXIT_UNDELIVERED"
+    fi
+    log "committed $DST_REL as ${local_commit:0:9}"
+fi
+
+# ---------------------------------------------------------------------------
+# Delivery. Never a rebase, never a force, and never a commit we did not make.
+# ---------------------------------------------------------------------------
+
+if ! fetch_out="$(git_q fetch --quiet origin "$BRANCH" 2>&1)"; then
+    fatal "git fetch origin $BRANCH failed: ${fetch_out:-no output}; cannot verify remote state" "$EXIT_UNDELIVERED"
+fi
+
+if ! git_q rev-parse --quiet --verify "$TRACKING_REF" >/dev/null 2>&1; then
+    fatal "no $TRACKING_REF to compare against (has this clone ever fetched?); refusing to push blind" "$EXIT_UNDELIVERED"
+fi
+
+ahead="$(git_q rev-list --reverse "$TRACKING_REF..HEAD" 2>/dev/null || true)"
+to_push=""
+if [ -n "$ahead" ]; then
+    while IFS= read -r sha; do
+        if [ -z "$sha" ]; then
+            continue
+        fi
+        if ! commit_is_ours "$sha"; then
+            fatal "refusing to push: $(git_q log -1 --format='%h %s' "$sha") is not this job's commit" "$EXIT_UNDELIVERED"
+        fi
+        to_push="$sha"
+    done <<<"$ahead"
+fi
+
+if [ -z "$to_push" ]; then
+    if [ "$(git_q rev-parse HEAD)" != "$(git_q rev-parse "$TRACKING_REF")" ]; then
+        fatal "local $BRANCH is behind or divergent from $TRACKING_REF; refusing to call the snapshot delivered" "$EXIT_UNDELIVERED"
+    fi
+    if [ -n "$local_commit" ]; then
+        log "committed ${local_commit:0:9} but it is already on $TRACKING_REF?"
+    fi
+    log "nothing to deliver (${DST_REL} is up to date with $TRACKING_REF)"
+    record_health success "up to date"
+    exit "$EXIT_OK"
+fi
+
+# The refspec names the exact sha rather than HEAD: a commit another writer
+# makes while this run is pushing is theirs to deliver, not this job's.
+if ! push_out="$(git_q push origin "$to_push:refs/heads/$BRANCH" 2>&1)"; then
+    fatal "push to origin/$BRANCH failed: $push_out" "$EXIT_UNDELIVERED"
+fi
+
+log "pushed ${to_push:0:9} to origin/$BRANCH"
+record_health success "delivered ${to_push:0:9}"
+exit "$EXIT_OK"
