@@ -152,6 +152,42 @@ def _mock_claude_result(title="Test Blog Title", body="This is the blog body.\n\
 # ===========================================================================
 
 
+def test_daily_prompt_uses_prior_posts_to_avoid_recycling_a_fault(blog_mod):
+    ns, state_dir, _ = blog_mod
+    target = dt.datetime(2026, 9, 27, 22, tzinfo=HOBART_TZ)
+    _write_thoughts(state_dir, target, count=3)
+    prior = _make_daily_post(target - dt.timedelta(days=1), "The Numb Hand Again")
+    prior["body"] = "A quiet day in the house. " * 12 + "The tracker is unavailable."
+    future = _make_daily_post(target + dt.timedelta(days=1), "Future post")
+    blog_data = {"posts": [prior, future]}
+    captured = {}
+
+    def generate(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        return _mock_claude_result()
+
+    with patch("pxh.model_session.run_model_session", side_effect=generate):
+        assert ns["generate_post"]("daily", target, blog_data)
+
+    prompt = captured["prompt"]
+    assert "The Numb Hand Again" in prompt
+    assert "The tracker is unavailable." in prompt
+    assert "Future post" not in prompt
+    assert "An unavailable\nsensor means you do not know" in prompt
+    assert "do not make it the centre again" in prompt
+
+
+def test_weekly_prompt_treats_repeated_fault_as_one_condition(blog_mod):
+    ns, _, _ = blog_mod
+    target = dt.datetime(2026, 9, 27, 22, 30, tzinfo=HOBART_TZ)
+    prompt = ns["build_prompt"]("weekly", [
+        _make_daily_post(target - dt.timedelta(days=1), "Tracker fault"),
+        _make_daily_post(target - dt.timedelta(days=2), "Tracker fault again"),
+    ], target)
+    assert "one continuing condition" in prompt
+    assert "missing sensor data" in prompt
+
+
 class TestBlogSchedule:
 
     def test_daily_idempotent(self, blog_mod):

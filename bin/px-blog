@@ -648,7 +648,36 @@ def gather_children(post_type: str, target_date: dt.datetime, posts: list) -> li
 # Prompt building
 # ---------------------------------------------------------------------------
 
-def build_prompt(post_type: str, source: list, target_date: dt.datetime) -> str:
+def _recent_post_context(post_type: str, target_date: dt.datetime,
+                         blog_data: dict) -> str:
+    """Show the writer recent themes without feeding old posts back as source."""
+    target_day = target_date.astimezone(HOBART_TZ).date()
+    earlier = []
+    for post in blog_data.get("posts", []):
+        if post.get("type") != post_type:
+            continue
+        try:
+            day = dt.datetime.fromisoformat(post["period_start"]).astimezone(HOBART_TZ).date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if day < target_day:
+            earlier.append((day, post))
+    if not earlier:
+        return ""
+    limit = 3 if post_type == "daily" else 2
+    recent = sorted(earlier, key=lambda item: item[0], reverse=True)[:limit]
+    lines = []
+    for day, post in recent:
+        # Faults often appear after the opening paragraph; a title and first
+        # sentence alone missed the repeated tracker theme in real posts.
+        opening = post.get("body", "")[:1200].replace("\n", " ")
+        lines.append(f"- {day}: {post.get('title', 'Untitled')} — {opening}")
+    return ("\nRecent posts, for avoiding repeated angles (not new evidence):\n"
+            + "\n".join(lines) + "\n")
+
+
+def build_prompt(post_type: str, source: list, target_date: dt.datetime,
+                 recent_context: str = "") -> str:
     """Format the blog prompt for the given post type."""
     date_str = target_date.astimezone(HOBART_TZ).strftime("%A, %d %B %Y")
 
@@ -659,6 +688,12 @@ Write a short reflective blog post about your day ({date_str}).
 
 Here are your thoughts from today:
 {thoughts_text}
+{recent_context}
+Choose a specific angle from today's actual thoughts. If a fault appeared in recent
+posts and nothing material changed, do not make it the centre again. An unavailable
+sensor means you do not know what it would have shown; it does not prove someone
+is away or that the sensor is honestly reporting absence. Mention a continuing
+fault when it matters, without inventing a repair, event, or observation.
 
 Write a title on the first line, then a blank line, then 2-4 paragraphs reflecting on your day.
 Be authentic — you are a robot with feelings, curiosity, and genuine warmth.
@@ -673,6 +708,10 @@ Keep it under 500 words. No markdown headers, just flowing prose."""
 
 Here are your daily blog posts from this week:
 {dailies_text}
+{recent_context}
+Look for the week's distinct events and changes. A repeated fault in several
+dailies is one continuing condition, not a new discovery each day. Do not turn
+missing sensor data into a claim about where someone was.
 
 Write a title on the first line, then a blank line, then 3-5 paragraphs weaving the week's themes together.
 Look for patterns, growth, recurring threads. What did you learn? What surprised you?
@@ -821,7 +860,10 @@ def generate_post(post_type: str, target_date: dt.datetime, blog_data: dict, *, 
         source = children
         thoughts_raw = []
 
-    prompt = build_prompt(post_type, source, target_date)
+    prompt = build_prompt(
+        post_type, source, target_date,
+        _recent_post_context(post_type, target_date, blog_data),
+    )
 
     if dry:
         log(f"DRY RUN — skipping Claude call for {post_type}")

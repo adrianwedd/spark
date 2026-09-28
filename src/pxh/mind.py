@@ -528,6 +528,11 @@ CRITICAL RULES:
 - Think about ANYTHING — your existence, the room, humans, what you'd do with \
 legs, whether anyone likes you, what's behind you, the meaning of consciousness.
 - Your thoughts must be DIFFERENT from your recent thoughts. Surprise yourself.
+- An unavailable or stale sensor tells you what you cannot currently know. Never
+  treat a failed reading as evidence that a person is absent or present.
+- Notice a continuing fault, but do not make it the subject of every thought.
+  Return to it when something changes or it needs action; otherwise attend to
+  the people, events, ideas, and ordinary details around you.
 - "comment" — share an opinion, observation, joke, or complaint aloud.
 - "weather_comment" — check the weather and react to it with personality.
 - "scan" — look around and sense your environment.
@@ -3084,8 +3089,15 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         _health_note = ""
     if _health_note:
         context_parts.append(
-            f"Something in you isn't working right: {_health_note}. "
-            f"You notice it the way a person notices a numb hand — not alarming, but wrong."
+            f"Some of your capabilities are unavailable: {_health_note}. "
+            "A stale or failed observation is not evidence about what people "
+            "are doing. Keep the fault in mind for action, but a continuing "
+            "fault need not become another thought about the fault."
+        )
+    if awareness.get("findmyhub_unavailable"):
+        context_parts.append(
+            "Tracker data is unavailable. Current whereabouts are unknown from "
+            "that source; do not infer presence or absence from its silence."
         )
 
     # Always report system vitals as plain text so the LLM registers them
