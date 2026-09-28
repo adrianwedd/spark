@@ -447,6 +447,18 @@ def test_reflection_context_reports_unhealthy_daemons(monkeypatch):
                         lambda *a, **k: "px-post: failing after 3 failures (HEALTH-MARKER)")
     mind.reflection({"persona": "", "health": {"overall": "failing"}}, dry=False)
     assert "HEALTH-MARKER" in captured["prompt"]
+    assert "not evidence about what people are doing" in captured["prompt"]
+    assert "numb hand" not in captured["prompt"]
+
+
+def test_reflection_marks_unavailable_tracker_as_unknown(monkeypatch):
+    captured = {}
+    _reflection_harness(monkeypatch, captured)
+    monkeypatch.setattr(mind.health_mod, "summarize", lambda *a, **k: "")
+    mind.reflection({"persona": "", "findmyhub_unavailable": "stale fix",
+                     "ha_presence": None}, dry=False)
+    assert "Current whereabouts are unknown from that source" in captured["prompt"]
+    assert "stale fix" not in captured["prompt"]
 
 
 def test_reflection_context_silent_when_everything_is_well(monkeypatch):
