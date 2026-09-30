@@ -1,11 +1,19 @@
 # systemd units
 
 Service units for the twelve SPARK daemons (see CLAUDE.md "Systemd Services").
-Install to `/etc/systemd/system/` on the Pi, then `daemon-reload` + `enable --now`.
+Units are copied, not symlinked, so the checked-in file and the installed one
+can drift. `bin/px-deploy-check` reports that drift (#389/#390); one command
+clears it — every `*.service`, `*.timer` and `<unit>.d/*.conf` drop-in, each
+`systemd-analyze verify`'d first, then one `daemon-reload`:
 
-Units are plain `cp`'d, not symlinked — the checked-in file and the deployed
-file can drift, and nothing detects that automatically. When editing a unit,
-redeploy it.
+```bash
+bin/px-units-install --dry-run          # what would change
+sudo /usr/local/sbin/px-units-install   # apply (NOPASSWD once the launcher is installed)
+```
+
+It never restarts or enables anything: a new setting lands at each unit's next
+restart, and a never-installed unit (e.g. `px-io-attrib`) still needs
+`enable --now`. The launcher's source is `sbin/px-units-install`.
 
 ## Resource containment (#217/#218/#219)
 
