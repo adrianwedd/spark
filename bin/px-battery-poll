@@ -37,6 +37,17 @@ except ImportError:                                   # pxh not on PYTHONPATH
 OUT          = STATE_DIR / "battery.json"
 TMP          = STATE_DIR / "battery.tmp"
 
+# Diagnostic only: constructor and enqueue perform no filesystem IO. Missing
+# support must not change any battery decision or stop the poller.
+try:
+    from pxh.battery_evidence import BatteryEvidence
+    evidence = BatteryEvidence(STATE_DIR / "battery-history.jsonl")
+except Exception:
+    class _NoEvidence:
+        def record(self, *args):
+            pass
+    evidence = _NoEvidence()
+
 
 def _write_battery(data: dict) -> None:
     """Write battery.json atomically with fsync for SD card durability."""
@@ -151,11 +162,13 @@ warmup_remaining: int = 2  # skip first N readings for ADC to settle after resta
 
 while True:
     try:
-        volts = round(get_battery_voltage(), 2)
+        raw_volts = get_battery_voltage()
+        volts = round(raw_volts, 2)
         # ADC glitch guard: 0V (or near-zero) is physically impossible for a
         # 2S LiPo — it means the I2C read returned garbage.  Skip this tick
         # entirely so we don't write a bogus 0% that triggers emergency shutdown.
         if volts < VOLTAGE_FLOOR:
+            evidence.record(raw_volts, volts, "rejected_adc", was_charging)
             print(f"[battery-poll] ADC glitch: {volts}V < {VOLTAGE_FLOOR}V floor — skipping", file=sys.stderr)
             # One glitch is noise; three in a row is a dead ADC. The streak in
             # health.json is what tells them apart.
@@ -168,6 +181,7 @@ while True:
 
         # Warmup: skip first readings (ADC noise on cold start causes false transitions)
         if warmup_remaining > 0:
+            evidence.record(raw_volts, volts, "warmup", False)
             warmup_remaining -= 1
             # Still write state (with charging=False) so file stays fresh
             data = {"ts": ts, "volts": volts, "pct": pct, "charging": False}
@@ -177,6 +191,7 @@ while True:
 
         # Detect charging state from the windowed trend
         charging = detector.update(volts)
+        evidence.record(raw_volts, volts, "accepted", charging)
         if charging and not was_charging:
             on_plug_in(pct)
         elif was_charging and not charging:
