@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import datetime as dt
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,8 @@ def public_client(isolated_project, monkeypatch):
 
     from pxh import api
     api._load_token()
+    with api._public_rate_lock:
+        api._public_rate_store.clear()
 
     from fastapi.testclient import TestClient
     with TestClient(api.app, raise_server_exceptions=False) as client:
@@ -151,7 +154,7 @@ class TestPublicVitals:
 
     def test_reads_battery_pct_from_file(self, public_client, state_dir):
         battery_file = state_dir / "battery.json"
-        battery_file.write_text(json.dumps({"pct": 72, "volts": 8.1, "charging": False}))
+        battery_file.write_text(json.dumps({"pct": 72, "volts": 8.1, "charging": False, "ts": dt.datetime.now(dt.timezone.utc).isoformat()}))
         resp = public_client.get("/api/v1/public/vitals")
         assert resp.json()["battery_pct"] == 72
 
@@ -587,3 +590,25 @@ class TestPublicRateLimit:
         # body), but it must NOT be 429 from the public middleware.
         r = public_client.post("/api/v1/public/chat", json={})
         assert r.status_code != 429
+
+
+@pytest.mark.parametrize("payload", [
+    {"ts": "2026-10-03T03:54:29Z", "pct": 100, "volts": 8.2},
+    {"ts": "bad", "pct": 100, "volts": 8.2},
+    {"pct": 100, "volts": 8.2},
+])
+def test_unavailable_battery_stays_unknown_in_api_and_history(public_client, state_dir, payload):
+    from pxh import api
+    (state_dir / "battery.json").write_text(json.dumps(payload))
+    assert public_client.get("/api/v1/public/vitals").json()["battery_pct"] is None
+    assert api._collect_history_sample(state_dir, "spark")["battery_pct"] is None
+    assert "battery_pct" not in api._FORWARD_FILL_FIELDS
+
+
+@pytest.mark.parametrize("distance", [None, -1, 0, "bad"])
+def test_invalid_sonar_returns_unavailable(public_client, state_dir, distance):
+    (state_dir / "sonar_live.json").write_text(json.dumps({"ts": time.time(), "distance_cm": distance}))
+    response = public_client.get("/api/v1/public/sonar")
+    assert response.status_code == 200
+    assert response.json()["source"] == "unavailable"
+    assert response.json()["sonar_cm"] is None
