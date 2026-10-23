@@ -691,8 +691,13 @@ async def health():
     sonar_file = resolve_sonar_live_read_path(state_dir)
     try:
         sonar = json.loads(sonar_file.read_text(encoding="utf-8"))
-        sonar_age_s = max(0.0, _time.time() - float(sonar["ts"]))
-        if sonar_age_s <= SONAR_STALE_S:
+        sonar_age_s = _time.time() - float(sonar["ts"])
+        if sonar_age_s < 0:
+            raise ValueError("future sonar timestamp")
+        if sonar_age_s <= SONAR_STALE_S and read_sonar(sonar_file, max_age=SONAR_STALE_S) is None:
+            checks["sonar"] = {"status": "unavailable", "age_s": round(sonar_age_s)}
+            overall = "degraded"
+        elif sonar_age_s <= SONAR_STALE_S:
             sonar_status = "ok"
             checks["sonar"] = {
                 "status": sonar_status,
