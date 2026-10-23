@@ -2511,7 +2511,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "minutes_since_interaction": round(mins_interaction, 1),
         "minutes_since_speech": round(mins_speech, 1),
         "period_duration_min": round(period_duration_min, 1),
-        "battery_pct": curr_batt if battery else prev_batt,
+        "battery_pct": curr_batt if battery else None,
         "battery_volts": battery["volts"] if battery else None,
         "battery_charging": battery.get("charging", False) if battery else False,
         "listening": session.get("listening", False),
