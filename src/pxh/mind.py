@@ -702,16 +702,9 @@ def read_sonar(dry: bool) -> float | None:
     state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
     from .runtime_paths import resolve_sonar_live_read_path
     sonar_live = resolve_sonar_live_read_path(state_dir)
-    try:
-        data = json.loads(sonar_live.read_text())
-        age = time.time() - float(data.get("ts", 0))
-        if age < 35:  # 35s: covers 10s RestartSec + ~6s Picarx acquisition + margin
-            val = data.get("distance_cm")
-            return float(val) if val is not None else None
-        log(f"sonar_live.json stale ({age:.0f}s) — skipping (px-alive will recover)")
-    except Exception as exc:
-        log(f"sonar_live.json read failed ({exc}) — skipping")
-    return None
+    from .telemetry import read_sonar
+    data = read_sonar(sonar_live, max_age=35)
+    return data["distance_cm"] if data else None
 
 
 def _fetch_frigate_presence(dry: bool = False) -> dict | None:
@@ -1725,16 +1718,9 @@ def _format_introspection(intro: dict) -> str:
 
 def read_battery() -> dict | None:
     """Read battery state from px-battery-poll's shared file. Returns None if stale/missing."""
-    try:
-        data = json.loads(BATTERY_FILE.read_text())
-        ts = dt.datetime.fromisoformat(data["ts"].replace("Z", "+00:00"))
-        age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
-        if age_s > 90:  # 3 missed polls (30s each) = stale
-            return None
-        return {"pct": int(data["pct"]), "volts": float(data["volts"]),
-                "charging": bool(data.get("charging", False))}
-    except Exception:
-        return None
+    from .telemetry import read_battery as validated_battery
+    data = validated_battery(BATTERY_FILE)
+    return {key: data[key] for key in ("pct", "volts", "charging")} if data else None
 
 
 def _can_explore(session: dict, awareness: dict) -> bool:
@@ -2511,7 +2497,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "minutes_since_interaction": round(mins_interaction, 1),
         "minutes_since_speech": round(mins_speech, 1),
         "period_duration_min": round(period_duration_min, 1),
-        "battery_pct": curr_batt if battery else prev_batt,
+        "battery_pct": curr_batt if battery else None,
         "battery_volts": battery["volts"] if battery else None,
         "battery_charging": battery.get("charging", False) if battery else False,
         "listening": session.get("listening", False),

@@ -34,6 +34,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import people
 from .runtime_paths import resolve_heartbeat_read_path, resolve_sonar_live_read_path
+from .telemetry import read_battery, read_sonar
 from .state import atomic_write, clear_quiet_mode, load_session, load_session_readonly, set_quiet_mode, update_session, tail_lines
 from .time import utc_timestamp
 from .voice_loop import (
@@ -444,20 +445,10 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
     except (FileNotFoundError, OSError, ValueError):
         sample["cpu_temp_c"] = None
 
-    # Battery
-    try:
-        bdata = json.loads((state_dir / "battery.json").read_text())
-        sample["battery_pct"] = bdata.get("pct")
-    except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
-        sample["battery_pct"] = None
-
-    # Sonar — age gate: null if > 60s
-    try:
-        sdata = json.loads(resolve_sonar_live_read_path(state_dir).read_text())
-        age = _time.time() - float(sdata["ts"])
-        sample["sonar_cm"] = sdata["distance_cm"] if age <= 60 else None
-    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
-        sample["sonar_cm"] = None
+    battery = read_battery(state_dir / "battery.json")
+    sample["battery_pct"] = battery["pct"] if battery else None
+    sonar = read_sonar(resolve_sonar_live_read_path(state_dir))
+    sample["sonar_cm"] = sonar["distance_cm"] if sonar else None
 
     # Token usage (cumulative since last restart)
     try:
@@ -518,7 +509,7 @@ def _collect_history_sample(state_dir: "Path", persona: str = "") -> "Dict[str, 
     return sample
 
 
-_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "battery_pct", "wifi_dbm", "rain_24h_mm", "mood")
+_FORWARD_FILL_FIELDS = ("weather_temp_c", "wind_kmh", "humidity_pct", "wifi_dbm", "rain_24h_mm", "mood")
 
 
 def _history_worker(stop_event: threading.Event) -> None:
@@ -527,7 +518,7 @@ def _history_worker(stop_event: threading.Event) -> None:
         try:
             # Always sample SPARK — public history must not reflect gremlin/vixen state.
             sample = _collect_history_sample(_public_state_dir(), "spark")
-            # Forward-fill fields that change slowly (weather, battery) so sparklines
+            # Forward-fill fields that change slowly (weather) so sparklines
             # don't go blank between BOM/battery poll cycles.
             with _history_lock:
                 if _history_buf:
@@ -700,8 +691,13 @@ async def health():
     sonar_file = resolve_sonar_live_read_path(state_dir)
     try:
         sonar = json.loads(sonar_file.read_text(encoding="utf-8"))
-        sonar_age_s = max(0.0, _time.time() - float(sonar["ts"]))
-        if sonar_age_s <= SONAR_STALE_S:
+        sonar_age_s = _time.time() - float(sonar["ts"])
+        if sonar_age_s < 0:
+            raise ValueError("future sonar timestamp")
+        if sonar_age_s <= SONAR_STALE_S and read_sonar(sonar_file, max_age=SONAR_STALE_S) is None:
+            checks["sonar"] = {"status": "unavailable", "age_s": round(sonar_age_s)}
+            overall = "degraded"
+        elif sonar_age_s <= SONAR_STALE_S:
             sonar_status = "ok"
             checks["sonar"] = {
                 "status": sonar_status,
@@ -888,14 +884,9 @@ async def public_vitals() -> Dict[str, Any]:
     except (FileNotFoundError, OSError, ValueError):
         pass
 
-    battery_pct = None
-    battery_charging = False
-    try:
-        data = json.loads((_public_state_dir() / "battery.json").read_text())
-        battery_pct = data.get("pct")
-        battery_charging = bool(data.get("charging", False))
-    except (FileNotFoundError, json.JSONDecodeError, OSError, AttributeError, TypeError):
-        pass
+    battery = read_battery(_public_state_dir() / "battery.json")
+    battery_pct = battery["pct"] if battery else None
+    battery_charging = battery["charging"] if battery else False
 
     tokens_in = tokens_out = None
     try:
@@ -924,22 +915,11 @@ async def public_vitals() -> Dict[str, Any]:
 @app.get("/api/v1/public/sonar")
 async def public_sonar() -> Dict[str, Any]:
     """Latest sonar reading from sonar_live.json. No auth required."""
-    import time as _time
-
-    sonar_path = resolve_sonar_live_read_path(_public_state_dir())
-    try:
-        data = json.loads(sonar_path.read_text())
-        ts_float = float(data["ts"])
-        age = round(_time.time() - ts_float)
-        if age > 60:
-            return {"sonar_cm": None, "age_seconds": None, "source": "unavailable"}
-        return {
-            "sonar_cm": data["distance_cm"],
-            "age_seconds": age,
-            "source": "sonar_live",
-        }
-    except (FileNotFoundError, json.JSONDecodeError, OSError, KeyError, ValueError):
+    data = read_sonar(resolve_sonar_live_read_path(_public_state_dir()))
+    if data is None:
         return {"sonar_cm": None, "age_seconds": None, "source": "unavailable"}
+    return {"sonar_cm": data["distance_cm"], "age_seconds": data["age_seconds"],
+            "source": "sonar_live"}
 
 
 @app.get("/api/v1/public/awareness")
@@ -3024,7 +3004,6 @@ async function pollFace(){
     if(tl){const m=tl.match(/thought: (.+?)  mood=/);if(m)document.getElementById('f-thought').textContent=m[1];}
     const sl=[...(logs.lines||[])].reverse().find(l=>l.includes('sonar='));
     if(sl){
-      const ms=sl.match(/sonar=(\\d+)cm/);if(ms)document.getElementById('st-sonar').textContent=ms[1]+'cm';
       const mp=sl.match(/period=(\\w+)/);if(mp)document.getElementById('st-period').textContent=mp[1];
     }
   }catch(e){}
@@ -3035,7 +3014,12 @@ async function pollFace(){
       const el=document.getElementById('st-battery');
       el.textContent=(ch?'\u26A1':'')+bp+'%';
       el.style.color=bp<=15?'var(--danger)':bp<=30?'var(--orange)':'inherit';
+    }else{
+      document.getElementById('st-battery').textContent='unavailable';
+      document.getElementById('st-battery').style.color='inherit';
     }
+    const sonar=await fetch('/api/v1/public/sonar').then(r=>r.json());
+    document.getElementById('st-sonar').textContent=sonar.sonar_cm==null?'unavailable':sonar.sonar_cm+'cm';
   }catch(e){}
   try{
     if(_pinOk){

@@ -150,6 +150,16 @@ class TestHealth:
         assert checks["alive_loop"]["mode"] == "running"
         assert checks["sonar"]["status"] == "ok"
 
+    def test_fresh_null_sonar_is_unavailable(self, api_client, isolated_project):
+        state_dir = isolated_project["state_dir"]
+        self._write_fresh_core_state(state_dir)
+        self._write_heartbeat(state_dir)
+        (state_dir / "sonar_live.json").write_text(json.dumps({
+            "ts": time.time(), "distance_cm": None,
+        }))
+        response = api_client.get("/api/v1/health")
+        assert response.json()["checks"]["sonar"]["status"] == "unavailable"
+
     def test_health_treats_stale_sonar_as_expected_while_charging(
             self, api_client, isolated_project):
         state_dir = isolated_project["state_dir"]
