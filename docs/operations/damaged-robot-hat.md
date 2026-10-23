@@ -7,6 +7,9 @@ battery charge from the Pi being powered, or from an old battery state file.
 Use the existing saved session controls to set `confirm_motion_allowed=false`
 and `roaming_allowed=false`. Preserve their prior values before changing them.
 Create `state/robot-hat-disabled` with the reason for the hardware hold.
+The existing shared `px-env` launcher checks this marker before HAT-dependent
+tool and direct helper calls, returning `unavailable` before GPIO acquisition.
+Speech, camera, cognition and the emergency-stop path remain available.
 
 The two tracked `90-hardware-disabled.conf` drop-ins use systemd's
 `ConditionPathExists` to keep `px-alive` and `px-battery-poll` from starting,
