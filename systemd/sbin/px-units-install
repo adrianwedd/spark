@@ -1,0 +1,51 @@
+#!/usr/bin/python3 -I
+"""Apply administrator-staged units without trusting the pi checkout (#442).
+
+Both executable implementation and systemd inputs must be under root custody.
+Bootstrap/staging is an administrator action, never part of this sudo grant.
+"""
+import os
+from pathlib import Path
+import stat
+import sys
+
+IMPLEMENTATION = Path('/usr/local/libexec/spark/px-units-install')
+STAGED_ROOT = Path('/usr/local/share/spark/units')
+SYSTEMD_SOURCE = STAGED_ROOT / 'systemd'
+
+
+def trusted_path(path, *, directory=False):
+    """Check lexical components; never resolve away a replaceable symlink."""
+    if not path.is_absolute():
+        raise ValueError(f'not an absolute trusted path: {path}')
+    for index, component in enumerate((path, *path.parents)):
+        info = component.lstat()
+        expected_type = stat.S_ISDIR if directory or index > 0 else stat.S_ISREG
+        if (not expected_type(info.st_mode) or info.st_uid != 0
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise ValueError(f'untrusted owner, mode or file type: {component}')
+
+
+def main(argv):
+    if argv:
+        print("px-units-install: takes no arguments; use the checkout's --dry-run for comparison", file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print('px-units-install: requires the installed root launcher', file=sys.stderr)
+        return 1
+    try:
+        trusted_path(Path(__file__))
+        trusted_path(IMPLEMENTATION)
+        trusted_path(SYSTEMD_SOURCE, directory=True)
+        for entry in SYSTEMD_SOURCE.rglob('*'):
+            trusted_path(entry, directory=stat.S_ISDIR(entry.lstat().st_mode))
+        os.execve('/bin/bash', ['/bin/bash', '--noprofile', '--norc', str(IMPLEMENTATION)],
+                  {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin',
+                   'PROJECT_ROOT': str(STAGED_ROOT)})
+    except (OSError, ValueError) as exc:
+        print(f'px-units-install: refusing trusted snapshot: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
