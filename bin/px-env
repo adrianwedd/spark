@@ -7,6 +7,18 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PROJECT_ROOT
 export LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/logs}"
 
+# The damaged-HAT hold also covers direct tool calls, not only the two daemons.
+# Keep this before any hardware helper can yield/acquire GPIO. Speech, camera,
+# cognition and the emergency stop remain available.
+if [[ -e "$PROJECT_ROOT/state/robot-hat-disabled" ]]; then
+    case "$(basename "$0")" in
+        tool-look|tool-emote|tool-sonar|tool-drive|tool-circle|tool-figure8|tool-wander|tool-perform|tool-scan|tool-status|px-look|px-emote|px-sonar|px-drive|px-circle|px-figure8|px-wander|px-perform|px-scan|px-status|px-dance|px-race|px-line-follow|run-line-follow)
+            printf '%s\n' '{"status":"unavailable","reason":"robot_hat_disabled"}'
+            exit 0
+            ;;
+    esac
+fi
+
 normalize_path_list() {
     local path_list=":$1:"
     local addition=":$2:"
