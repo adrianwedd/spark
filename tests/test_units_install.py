@@ -85,6 +85,27 @@ def test_a_warning_about_an_installed_unit_does_not_block(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_real_systemd_ignored_key_refuses_before_copy(tmp_path):
+    """Exercise actual Linux diagnostics, not just our analyzer test double."""
+    import shutil
+    if not shutil.which("systemd-analyze"):
+        pytest.skip("systemd-analyze is unavailable on this host; Linux CI covers it")
+    source = tmp_path / "source"
+    units = source / "systemd"
+    units.mkdir(parents=True)
+    (units / "spark-installer-fixture.service").write_text(
+        "[Unit]\nDescription=Offline installer fixture\n[Service]\n"
+        "DefinitelyNotARealSystemdKey=yes\nExecStart=/usr/bin/true\n")
+    dest = tmp_path / "destination"
+    dest.mkdir()
+    env = dict(os.environ, PROJECT_ROOT=str(source), PX_UNITS_DEST_DIR=str(dest))
+    proc = subprocess.run(["bash", str(INSTALLER)], env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "refusing" in proc.stderr
+    assert not list(dest.iterdir())
+
+
 def test_launcher_refuses_every_argument():
     # A sudoers command with no argument list permits any arguments.
     for args in (["--dry-run"], ["x"], ["", ""]):
