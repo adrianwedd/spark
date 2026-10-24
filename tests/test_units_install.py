@@ -8,6 +8,12 @@ property that matters is parity: after it runs, the gate must report nothing.
 
 import os
 import re
+import importlib.machinery
+import importlib.util
+import stat
+import sys
+
+import pytest
 import subprocess
 from pathlib import Path
 
@@ -79,20 +85,99 @@ def test_a_warning_about_an_installed_unit_does_not_block(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
 
+def test_real_systemd_ignored_key_refuses_before_copy(tmp_path):
+    """Exercise actual Linux diagnostics, not just our analyzer test double."""
+    import shutil
+    if not shutil.which("systemd-analyze"):
+        pytest.skip("systemd-analyze is unavailable on this host; Linux CI covers it")
+    source = tmp_path / "source"
+    units = source / "systemd"
+    units.mkdir(parents=True)
+    (units / "spark-installer-fixture.service").write_text(
+        "[Unit]\nDescription=Offline installer fixture\n[Service]\n"
+        "DefinitelyNotARealSystemdKey=yes\nExecStart=/usr/bin/true\n")
+    dest = tmp_path / "destination"
+    dest.mkdir()
+    env = dict(os.environ, PROJECT_ROOT=str(source), PX_UNITS_DEST_DIR=str(dest))
+    proc = subprocess.run(["bash", str(INSTALLER)], env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "refusing" in proc.stderr
+    assert not list(dest.iterdir())
+
+
 def test_launcher_refuses_every_argument():
     # A sudoers command with no argument list permits any arguments.
     for args in (["--dry-run"], ["x"], ["", ""]):
-        proc = subprocess.run(["bash", str(LAUNCHER), *args],
+        proc = subprocess.run([sys.executable, "-I", str(LAUNCHER), *args],
                               capture_output=True, text=True, timeout=30)
         assert proc.returncode == 2
         assert "takes no arguments" in proc.stderr
 
 
-def test_launcher_pins_repo_and_scrubs_environment():
-    text = LAUNCHER.read_text(encoding="utf-8")
+def load_launcher():
+    loader = importlib.machinery.SourceFileLoader("units_root_launcher", str(LAUNCHER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_launcher_pins_trusted_inputs_and_scrubs_environment(monkeypatch):
+    launcher = load_launcher()
+    checked = []
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(launcher, "trusted_path", lambda path, **kw: checked.append(path))
+    monkeypatch.setattr(Path, "rglob", lambda *args: iter(()))
+    monkeypatch.setenv("PROJECT_ROOT", "/pi-writable/checkout")
+    monkeypatch.setenv("BASH_ENV", "/pi-writable/evil.sh")
+    monkeypatch.setenv("PX_UNITS_DEST_DIR", "/etc/sudoers.d")
+    called = []
+    def capture(program, argv, env):
+        called.append((program, argv, env))
+        raise RuntimeError("captured exec, no process launched")
+    monkeypatch.setattr(launcher.os, "execve", capture)
+    with pytest.raises(RuntimeError, match="captured exec"):
+        launcher.main([])
+    assert launcher.IMPLEMENTATION in checked
+    assert launcher.SYSTEMD_SOURCE in checked
+    assert called == [("/bin/bash", ["/bin/bash", "--noprofile", "--norc", "/usr/local/libexec/spark/px-units-install"],
+                       {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "PROJECT_ROOT": "/usr/local/share/spark/units"})]
+    assert LAUNCHER.read_text().splitlines()[0] == "#!/usr/bin/python3 -I"
     assert os.access(LAUNCHER, os.X_OK)
-    assert "REPO=/home/pi/picar-x-hacking" in text
-    assert re.search(r"exec /usr/bin/env -i ", text)
+
+
+@pytest.mark.parametrize("mode,uid,bad_component", [
+    (stat.S_IFLNK | 0o777, 0, "/trusted/units"),
+    (stat.S_IFREG | 0o644, 1000, "/trusted/units"),
+    (stat.S_IFREG | 0o664, 0, "/trusted/units"),
+    (stat.S_IFDIR | 0o777, 0, "/trusted"),
+    (stat.S_IFDIR | 0o755, 1000, "/trusted"),
+    (stat.S_IFIFO | 0o600, 0, "/trusted/units"),
+])
+def test_trusted_inputs_refuse_writable_or_foreign_components(monkeypatch, mode, uid, bad_component):
+    from types import SimpleNamespace
+    launcher = load_launcher()
+    def metadata(path):
+        if str(path) == bad_component:
+            return SimpleNamespace(st_mode=mode, st_uid=uid)
+        return SimpleNamespace(st_mode=(stat.S_IFREG | 0o644) if str(path)=="/trusted/units" else (stat.S_IFDIR | 0o755), st_uid=0)
+    monkeypatch.setattr(Path, "lstat", metadata)
+    with pytest.raises(ValueError, match="untrusted"):
+        launcher.trusted_path(Path("/trusted/units"))
+
+
+def test_real_root_owned_file_is_accepted_without_executing_it():
+    launcher = load_launcher()
+    launcher.trusted_path(Path("/usr/bin/true"))
+
+
+def test_refused_snapshot_never_executes(monkeypatch):
+    launcher = load_launcher()
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(launcher, "trusted_path", lambda *a, **k: (_ for _ in ()).throw(ValueError("unsafe snapshot")))
+    monkeypatch.setattr(launcher.os, "execve", lambda *a: pytest.fail("executed a refused snapshot"))
+    assert launcher.main([]) == 1
 
 
 def test_every_sbin_grant_has_a_tracked_launcher_source():

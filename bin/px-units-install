@@ -15,7 +15,7 @@
 #
 # Usage:
 #   bin/px-units-install --dry-run    # show exactly what would change
-#   sudo bin/px-units-install         # apply
+#   sudo /usr/local/sbin/px-units-install  # apply admin-staged snapshot
 #
 # Exit codes: 0 ok, 1 usage/refusal, 2 a unit differs and --dry-run was requested.
 set -euo pipefail
@@ -73,7 +73,7 @@ done
 
 echo "px-units-install: source $SRC_DIR -> $DEST_DIR"
 if [[ ${#changed[@]} -eq 0 ]]; then
-    echo "  nothing to do — all ${#files[@]} unit file(s) already match the repo"
+    echo "  nothing to do — all ${#files[@]} unit file(s) already match the source"
     exit 0
 fi
 printf '  %s\n' "${changed[@]}"
@@ -108,12 +108,17 @@ for src in "${units[@]}"; do
 done
 
 for rel in "${files[@]}"; do
-    install -D -m 0644 "$SRC_DIR/$rel" "$DEST_DIR/$rel"
+    install -d -m 0755 "$DEST_DIR/$(dirname "$rel")"
+    install -m 0644 "$SRC_DIR/$rel" "$DEST_DIR/$rel"
 done
 if [[ -z "${PX_UNITS_DEST_DIR:-}" ]]; then
     systemctl daemon-reload
 fi
-echo "px-units-install: installed ${#files[@]} unit file(s) and reloaded systemd"
+if [[ -z "${PX_UNITS_DEST_DIR:-}" ]]; then
+    echo "px-units-install: installed ${#files[@]} unit file(s) and reloaded systemd"
+else
+    echo "px-units-install: installed ${#files[@]} unit file(s) in test destination; no daemon-reload"
+fi
 echo "  note: an installed unit file takes effect on that unit's next start/restart,"
 echo "  and a unit that was never installed is not enabled by this script."
 echo "  Run 'bin/px-deploy-check' to see which long-lived units are still executing"

@@ -308,20 +308,32 @@ def extract_person_facts(*, role: str, text: str, subject: str = DEFAULT_SUBJECT
     return out
 
 
-def load_people(persona: str = "spark") -> list[dict]:
+def load_people(persona: str = "spark", *, strict=False) -> list[dict]:
     f = people_file(persona)
-    if not f.exists():
-        return []
     out: list[dict] = []
     try:
-        for line in f.read_text(encoding="utf-8").strip().splitlines():
+        for number, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(f"invalid person-store JSON at line {number}") from exc
                 continue
+            if strict and (not isinstance(rec, dict) or not isinstance(rec.get("text"), str)
+                           or not rec["text"].strip()):
+                raise ValueError(f"invalid person-store record at line {number}")
+            if strict and (rec.get("source") == "menu_command" or "menu_item" in rec
+                           or str(rec.get("topic", "")).startswith("dopamine:")):
+                validate_menu_record(rec)
             if isinstance(rec, dict) and rec.get("text"):
                 out.append(rec)
+    except FileNotFoundError:
+        return []
     except (OSError, UnicodeDecodeError):
+        if strict:
+            raise
         return []
     return out
 
@@ -340,7 +352,7 @@ def is_expired(record: dict, now: dt.datetime | None = None) -> bool:
 
 
 def read_people(persona: str = "spark", subject: str | None = None,
-                now: dt.datetime | None = None) -> list[dict]:
+                now: dt.datetime | None = None, *, strict=False) -> list[dict]:
     """Live facts: expiry filtered at read time, supersession annotated.
 
     Expired commitments are excluded, never deleted — the record stays on disk
@@ -348,7 +360,7 @@ def read_people(persona: str = "spark", subject: str | None = None,
     being surfaced as current. Superseded records are returned carrying
     `superseded_by` so a caller can show the correction; retrieval drops them.
     """
-    records = provenance.apply_supersessions(load_people(persona))
+    records = provenance.apply_supersessions(load_people(persona, strict=strict))
     want = str(subject).lower().strip() if subject else None
     return [r for r in records
             if not is_expired(r, now)
@@ -361,32 +373,118 @@ def append_person_facts(records: list[dict], persona: str = "spark",
     same (subject, fact_kind, topic). Correction without deletion."""
     if not records:
         return []
-    live = read_people(persona, now=now)
-    latest: dict[tuple, dict] = {}
-    for rec in live:
-        if not provenance.is_superseded(rec):
-            latest[(rec.get("subject"), rec.get("fact_kind"), rec.get("topic"))] = rec
-    for rec in records:
-        prior = latest.get((rec.get("subject"), rec.get("fact_kind"), rec.get("topic")))
-        if prior:
-            provenance.mark_supersedes(rec, prior)
     f = people_file(persona)
     f.parent.mkdir(parents=True, exist_ok=True)
     with FileLock(str(f) + ".lock", timeout=LOCK_TIMEOUT_S):
+        latest = {(r.get("subject"), r.get("fact_kind"), r.get("topic")): r
+                  for r in read_people(persona, now=now, strict=True) if not provenance.is_superseded(r)}
+        for rec in records:
+            key = (rec.get("subject"), rec.get("fact_kind"), rec.get("topic"))
+            prior = latest.get(key)
+            if prior:
+                provenance.mark_supersedes(rec, prior)
+            latest[key] = rec
         with f.open("a", encoding="utf-8") as fh:
             for rec in records:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        # Same rule as memories and thoughts: trim rarely, never per append
-        # (#247). `state.trim_jsonl_if_needed` carries the measurement.
         trim_jsonl_if_needed(f, PEOPLE_LIMIT, what="people")
     return records
+
+
+MENU_ENERGIES = {"high", "medium", "low"}
+MENU_CONTEXTS = {"free", "focus", "wind-down"}
+
+
+def menu_topic(item, energy, context):
+    identity = hashlib.sha256(item.casefold().rstrip('.!?').encode()).hexdigest()[:24]
+    return f"dopamine:{energy}:{context}:{identity}"
+
+
+def validate_menu_record(record):
+    """A damaged removal must not disappear from a mutation/read snapshot."""
+    item = record.get("menu_item")
+    prov = record.get("provenance")
+    if (record.get("source") != "menu_command" or record.get("fact_kind") != "preference"
+            or not isinstance(item, str) or not 1 <= len(item) <= MAX_FACT_CHARS
+            or not isinstance(record.get("id"), str) or not record["id"]
+            or not isinstance(record.get("subject"), str) or not record["subject"]
+            or not isinstance(record.get("energy"), str) or record["energy"] not in MENU_ENERGIES
+            or not isinstance(record.get("context"), str) or record["context"] not in MENU_CONTEXTS
+            or not isinstance(record.get("polarity"), str) or record["polarity"] not in {"like", "dislike"}
+            or not isinstance(prov, dict) or prov.get("kind") != "report"
+            or not isinstance(prov.get("supersedes"), list)
+            or any(not isinstance(x, str) for x in prov["supersedes"])):
+        raise ValueError("invalid structured menu history")
+    if record.get("topic") != menu_topic(item, record["energy"], record["context"]):
+        raise ValueError("invalid structured menu topic")
+_MENU_REQUEST = re.compile(
+    r"^(?:please\s+)?(?P<verb>add|put|remove|take)\s+(?P<item>.+?)\s+"
+    r"(?P<prep>to|on|from|off)\s+my\s+"
+    r"(?:(?P<energy>high|medium|low)(?:[- ]energy)?\s+)?"
+    r"(?:(?P<context>free|focus|wind-down)\s+)?dopamine menu[.!]?$", re.I)
+
+
+def extract_menu_fact(*, role, text, menu, subject=DEFAULT_SUBJECT, ts=None, msg_id=None):
+    """Bind a structured menu change to an explicit human command, not a guess.
+
+    Defaults are medium/free. Optional energy/context words precede 'dopamine
+    menu'. A mismatching tool proposal cannot manufacture a person preference.
+    """
+    if str(role).lower() not in SPEAKER_ROLES or not isinstance(menu, dict):
+        return []
+    if not isinstance(text, str) or len(text) > 512:
+        return []
+    match = _MENU_REQUEST.fullmatch(str(text or "").strip())
+    if not match:
+        return []
+    verb, prep = match.group("verb").lower(), match.group("prep").lower()
+    action = "add" if verb in {"add", "put"} and prep in {"to", "on"} else (
+        "remove" if verb in {"remove", "take"} and prep in {"from", "off"} else None)
+    item = _norm(match.group("item"))
+    energy = (match.group("energy") or "medium").lower()
+    context = (match.group("context") or "free").lower()
+    if (not action or not item or len(item) > MAX_FACT_CHARS or any(ord(c) < 32 for c in item)
+            or menu.get("action") != action or _norm(menu.get("item")).casefold() != item.casefold()
+            or menu.get("energy", "medium") != energy or menu.get("context", "free") != context):
+        return []
+    record = {"ts": ts or utc_timestamp(), "subject": str(subject).lower(),
+              "fact_kind": "preference", "topic": menu_topic(item, energy, context),
+              "polarity": "like" if action == "add" else "dislike",
+              "menu_item": item, "energy": energy, "context": context,
+              "text": str(text).strip(), "tags": sorted(memory._tokenize(item)),
+              "importance": IMPORTANCE, "source": "menu_command", "expires_ts": None}
+    ref = msg_id or "turn:" + hashlib.sha256(str(text).encode()).hexdigest()[:12]
+    provenance.stamp(record, "report", "menu_command", evidence=[ref, str(text).strip()])
+    return [record]
+
+
+def dopamine_selection(energy, context, persona="spark", subject=DEFAULT_SUBJECT):
+    """One validated snapshot for both current entries and exclusions."""
+    if normalize_persona(persona) not in WRITER_PERSONAS:
+        return [], []
+    current = []
+    for r in read_people("spark", subject=subject, strict=True):
+        if r.get("source") != "menu_command":
+            continue
+        if r.get("energy") == energy and r.get("context") == context and not provenance.is_superseded(r):
+            current.append(r)
+    return tuple(list(dict.fromkeys(r["menu_item"] for r in current if r["polarity"] == polarity))
+                 for polarity in ("like", "dislike"))
+
+
+def dopamine_items(energy, context, persona="spark", subject=DEFAULT_SUBJECT, *, removed=False):
+    return dopamine_selection(energy, context, persona, subject)[1 if removed else 0]
 
 
 def record_person_facts(*, role: str, text: str, persona: str = "spark",
                         subject: str = DEFAULT_SUBJECT, ts: str | None = None,
                         msg_id: str | None = None,
-                        channel: str = "conversation") -> int:
+                        channel: str = "conversation",
+                        menu: dict | None = None) -> int:
     """The one-line call-site hook. Never raises; returns how many facts landed.
+
+    An explicit menu proposal is checked against the actual human command;
+    ordinary conversation extraction keeps its existing rejection rules.
 
     GREMLIN and VIXEN are refused here rather than at the filename: a
     per-persona file would have given the performance characters their own
@@ -395,8 +493,10 @@ def record_person_facts(*, role: str, text: str, persona: str = "spark",
     try:
         if normalize_persona(persona) not in WRITER_PERSONAS:
             return 0
-        facts = extract_person_facts(role=role, text=text, subject=subject,
-                                     ts=ts, msg_id=msg_id, channel=channel)
+        facts = (extract_menu_fact(role=role, text=text, menu=menu, subject=subject,
+                                   ts=ts, msg_id=msg_id) if menu is not None else
+                 extract_person_facts(role=role, text=text, subject=subject,
+                                      ts=ts, msg_id=msg_id, channel=channel))
         append_person_facts(facts, persona="spark")
         return len(facts)
     except Exception as exc:  # broad: a memory writer must not kill its caller
@@ -491,6 +591,9 @@ def render_person_fact(record: dict, now: dt.datetime | None = None) -> str:
     subject = str(record.get("subject") or DEFAULT_SUBJECT).capitalize()
     text = str(record.get("text") or "").strip()
     age = _age_phrase(str(record.get("ts") or ""), when)
+    if record.get("source") == "menu_command":
+        operation = "addition" if record.get("polarity") == "like" else "removal"
+        return f"{subject} requested menu {operation}: {record.get('menu_item')!r}."
     if record.get("source") == SEED_SOURCE:
         actor = str(record.get("source_actor") or "someone").capitalize()
         return f"{actor} told you that {subject} {text}."
