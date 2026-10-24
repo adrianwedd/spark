@@ -164,3 +164,11 @@ access. Live operations are refused; a dry preview uses only generic defaults
 and does not repair the session. A valid explicit default persona remains SPARK,
 matching the normal session template. The existing subject=obi convention is
 preserved; this feature does not identify a physical speaker.
+
+A missing persona field is unavailable context; explicit null/empty remains the
+normal default. Menu selection reads one strict snapshot for positive entries
+and exclusions. Malformed nonblank rows, damaged menu metadata or unreadable
+history refuse suggestions and mutations instead of reviving a removed item.
+No automatic repair/deletion occurs; preserve the ledger before operator repair.
+General legacy retrieval keeps its existing lenient behaviour; mutations validate
+the history they will supersede.

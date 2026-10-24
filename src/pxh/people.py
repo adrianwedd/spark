@@ -312,11 +312,21 @@ def load_people(persona: str = "spark", *, strict=False) -> list[dict]:
     f = people_file(persona)
     out: list[dict] = []
     try:
-        for line in f.read_text(encoding="utf-8").strip().splitlines():
+        for number, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                if strict:
+                    raise ValueError(f"invalid person-store JSON at line {number}") from exc
                 continue
+            if strict and (not isinstance(rec, dict) or not isinstance(rec.get("text"), str)
+                           or not rec["text"].strip()):
+                raise ValueError(f"invalid person-store record at line {number}")
+            if strict and (rec.get("source") == "menu_command" or "menu_item" in rec
+                           or str(rec.get("topic", "")).startswith("dopamine:")):
+                validate_menu_record(rec)
             if isinstance(rec, dict) and rec.get("text"):
                 out.append(rec)
     except FileNotFoundError:
@@ -383,6 +393,30 @@ def append_person_facts(records: list[dict], persona: str = "spark",
 
 MENU_ENERGIES = {"high", "medium", "low"}
 MENU_CONTEXTS = {"free", "focus", "wind-down"}
+
+
+def menu_topic(item, energy, context):
+    identity = hashlib.sha256(item.casefold().rstrip('.!?').encode()).hexdigest()[:24]
+    return f"dopamine:{energy}:{context}:{identity}"
+
+
+def validate_menu_record(record):
+    """A damaged removal must not disappear from a mutation/read snapshot."""
+    item = record.get("menu_item")
+    prov = record.get("provenance")
+    if (record.get("source") != "menu_command" or record.get("fact_kind") != "preference"
+            or not isinstance(item, str) or not 1 <= len(item) <= MAX_FACT_CHARS
+            or not isinstance(record.get("id"), str) or not record["id"]
+            or not isinstance(record.get("subject"), str) or not record["subject"]
+            or not isinstance(record.get("energy"), str) or record["energy"] not in MENU_ENERGIES
+            or not isinstance(record.get("context"), str) or record["context"] not in MENU_CONTEXTS
+            or not isinstance(record.get("polarity"), str) or record["polarity"] not in {"like", "dislike"}
+            or not isinstance(prov, dict) or prov.get("kind") != "report"
+            or not isinstance(prov.get("supersedes"), list)
+            or any(not isinstance(x, str) for x in prov["supersedes"])):
+        raise ValueError("invalid structured menu history")
+    if record.get("topic") != menu_topic(item, record["energy"], record["context"]):
+        raise ValueError("invalid structured menu topic")
 _MENU_REQUEST = re.compile(
     r"^(?:please\s+)?(?P<verb>add|put|remove|take)\s+(?P<item>.+?)\s+"
     r"(?P<prep>to|on|from|off)\s+my\s+"
@@ -413,9 +447,8 @@ def extract_menu_fact(*, role, text, menu, subject=DEFAULT_SUBJECT, ts=None, msg
             or menu.get("action") != action or _norm(menu.get("item")).casefold() != item.casefold()
             or menu.get("energy", "medium") != energy or menu.get("context", "free") != context):
         return []
-    topic_id = hashlib.sha256(item.casefold().rstrip('.!?').encode()).hexdigest()[:24]
     record = {"ts": ts or utc_timestamp(), "subject": str(subject).lower(),
-              "fact_kind": "preference", "topic": f"dopamine:{energy}:{context}:{topic_id}",
+              "fact_kind": "preference", "topic": menu_topic(item, energy, context),
               "polarity": "like" if action == "add" else "dislike",
               "menu_item": item, "energy": energy, "context": context,
               "text": str(text).strip(), "tags": sorted(memory._tokenize(item)),
@@ -425,15 +458,22 @@ def extract_menu_fact(*, role, text, menu, subject=DEFAULT_SUBJECT, ts=None, msg
     return [record]
 
 
-def dopamine_items(energy, context, persona="spark", subject=DEFAULT_SUBJECT, *, removed=False):
-    """SPARK's current explicit entries or exclusions; never another persona."""
+def dopamine_selection(energy, context, persona="spark", subject=DEFAULT_SUBJECT):
+    """One validated snapshot for both current entries and exclusions."""
     if normalize_persona(persona) not in WRITER_PERSONAS:
-        return []
-    return list(dict.fromkeys(r["menu_item"] for r in read_people("spark", subject=subject)
-        if r.get("source") == "menu_command" and r.get("menu_item")
-        and r.get("energy") == energy and r.get("context") == context
-        and r.get("polarity") == ("dislike" if removed else "like")
-        and not provenance.is_superseded(r)))
+        return [], []
+    current = []
+    for r in read_people("spark", subject=subject, strict=True):
+        if r.get("source") != "menu_command":
+            continue
+        if r.get("energy") == energy and r.get("context") == context and not provenance.is_superseded(r):
+            current.append(r)
+    return tuple(list(dict.fromkeys(r["menu_item"] for r in current if r["polarity"] == polarity))
+                 for polarity in ("like", "dislike"))
+
+
+def dopamine_items(energy, context, persona="spark", subject=DEFAULT_SUBJECT, *, removed=False):
+    return dopamine_selection(energy, context, persona, subject)[1 if removed else 0]
 
 
 def record_person_facts(*, role: str, text: str, persona: str = "spark",

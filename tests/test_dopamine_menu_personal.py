@@ -150,7 +150,7 @@ def test_removed_builtin_is_not_offered_and_restore_is_explicit(menu_env,monkeyp
 def test_tool_never_reads_private_store_for_other_personas(menu_env,monkeypatch,capsys,persona):
     menu_env[2].write_text(json.dumps({'persona':persona}))
     scope=load_tool()
-    monkeypatch.setattr(people,'dopamine_items',lambda *a,**k:pytest.fail('private store was read'))
+    monkeypatch.setattr(people,'dopamine_selection',lambda *a,**k:pytest.fail('private store was read'))
     scope['speak']=scope['emote']=lambda *a:pytest.fail('child invoked')
     assert scope['main']()==1
     assert json.loads(capsys.readouterr().out)['status']=='error'
@@ -182,16 +182,17 @@ def test_validator_keeps_current_audio_classification_and_rejects_untrusted_sour
         voice_loop.validate_action({'tool':tool,'params':{'action':'add','item':'bad'+chr(0)}})
 
 
-@pytest.mark.parametrize('broken',['missing','invalid','nonobject','recovered'])
+@pytest.mark.parametrize('broken',['missing','invalid','nonobject','recovered','missing-persona'])
 def test_unavailable_persona_never_grants_private_access(menu_env,monkeypatch,capsys,broken):
     from pxh.state import RECOVERED_KEY
     if broken=='missing':menu_env[2].unlink()
     elif broken=='invalid':menu_env[2].write_text('broken JSON')
     elif broken=='nonobject':menu_env[2].write_text('[]')
+    elif broken=='missing-persona':menu_env[2].write_text('{}')
     else:menu_env[2].write_text(json.dumps({'persona':'spark',RECOVERED_KEY:True}))
     before=menu_env[2].read_bytes() if menu_env[2].exists() else None
     scope=load_tool()
-    monkeypatch.setattr(people,'dopamine_items',lambda *a,**k:pytest.fail('private store read with unknown scope'))
+    monkeypatch.setattr(people,'dopamine_selection',lambda *a,**k:pytest.fail('private store read with unknown scope'))
     scope['speak']=scope['emote']=lambda *a:pytest.fail('unknown scope invoked a child')
     assert scope['main']()==1
     capsys.readouterr()
@@ -262,3 +263,45 @@ def test_child_helpers_receive_no_raw_human_request(menu_env,monkeypatch):
     monkeypatch.setattr(scope['subprocess'],'run',lambda *a,**k:calls.append(k['env']))
     scope['speak']('Added that to your menu.',False);scope['emote']('curious',False)
     assert len(calls)==2 and all('PX_DOPAMINE_REQUEST' not in env for env in calls)
+
+
+@pytest.mark.parametrize('damage',['json','nonobject','missing-text','menu-shape','invalid-energy'])
+def test_corrupt_latest_removal_cannot_be_silently_ignored(menu_env,monkeypatch,capsys,damage):
+    assert people.record_person_facts(**request(item='Reading'))==1
+    assert people.record_person_facts(**request(item='Reading',action='remove'))==1
+    ledger=people.people_file();lines=ledger.read_text().splitlines()
+    if damage=='json':lines[-1]='{"broken"'
+    elif damage=='nonobject':lines[-1]='[]'
+    elif damage=='missing-text':lines[-1]='{"source":"menu_command"}'
+    else:
+        record=json.loads(lines[-1])
+        if damage=='invalid-energy':record['energy']=[]
+        else:record.pop('menu_item')
+        lines[-1]=json.dumps(record)
+    ledger.write_text('\n'.join(lines)+'\n');before=ledger.read_bytes()
+    scope=load_tool();scope['speak']=scope['emote']=lambda *a:pytest.fail('corrupt history produced child output')
+    assert scope['main']()==1
+    assert json.loads(capsys.readouterr().out)['status']=='error'
+    assert ledger.read_bytes()==before
+    assert people.record_person_facts(**request(item='Reading'))==0
+    assert ledger.read_bytes()==before
+
+
+def test_unreadable_suggest_snapshot_refuses_without_children(menu_env,monkeypatch,capsys):
+    people.record_person_facts(**request(action='remove'))
+    ledger=people.people_file();original=Path.read_text
+    def failure(path,*a,**k):
+        if path==ledger:raise PermissionError('synthetic snapshot read failure')
+        return original(path,*a,**k)
+    monkeypatch.setattr(Path,'read_text',failure)
+    scope=load_tool();scope['speak']=scope['emote']=lambda *a:pytest.fail('unreadable history produced child output')
+    assert scope['main']()==1
+    assert json.loads(capsys.readouterr().out)['status']=='error'
+
+
+def test_explicit_null_persona_remains_the_normal_default(menu_env,monkeypatch,capsys):
+    menu_env[2].write_text('{"persona":null}')
+    people.record_person_facts(**request())
+    scope=load_tool();monkeypatch.setenv('PX_DRY','1')
+    assert scope['main']()==0
+    assert 'magnetic tiles' in json.loads(capsys.readouterr().out)['picks']

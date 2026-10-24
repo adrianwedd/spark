@@ -54,7 +54,7 @@ def menu_persona():
         data = json.loads(session_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict) or data.get(RECOVERED_KEY):
+    if not isinstance(data, dict) or "persona" not in data or data.get(RECOVERED_KEY):
         return None
     raw = data.get("persona")
     if raw is None:
@@ -178,10 +178,13 @@ def main() -> int:
                           "energy": energy, "context": context, "dry": dry, "applied": applied}))
         return 0
 
-    personal = people.dopamine_items(energy, context, persona=persona) if persona is not None else []
-    removed = {x.casefold().rstrip('.!?') for x in
-               (people.dopamine_items(energy, context, persona=persona, removed=True)
-                if persona is not None else [])}
+    try:
+        personal, exclusions = (people.dopamine_selection(energy, context, persona=persona)
+                                if persona is not None else ([], []))
+    except (OSError, ValueError):
+        print(json.dumps({"status": "error", "error": "personal menu unavailable; preserve history before repair"}))
+        return 1
+    removed = {x.casefold().rstrip('.!?') for x in exclusions}
     personal = [x for x in personal if x.casefold().rstrip('.!?') not in removed]
     options = [x for x in dict.fromkeys(personal + MENU[energy][context])
                if x.casefold().rstrip('.!?') not in removed]
