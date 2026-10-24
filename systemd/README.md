@@ -55,20 +55,27 @@ install -d -o root -g root -m 0755 /usr/local/libexec/spark /usr/local/share/spa
 install -o root -g root -m 0755 "$spark_unit_stage/bin/px-units-install" /usr/local/libexec/spark/px-units-install
 cp -R "$spark_unit_stage/systemd" /usr/local/share/spark/units/
 install -o root -g root -m 0755 "$spark_unit_stage/systemd/sbin/px-units-install" /usr/local/sbin/px-units-install
+exit  # leave the administrator shell before using any checkout scripts
 ```
 
 All ancestor directories must also be root-owned and not group/world writable;
-the launcher refuses otherwise. Snapshot files may be root-only (0600/0700) or
+the launcher refuses otherwise. Before installing or using a sudoers grant, inspect
+the entire installed path with `namei -l`: a launcher cannot protect its own code
+if its installation directory permits replacement. Snapshot files may be root-only (0600/0700) or
 readable (0644/0755), never writable by pi/group/others. A later snapshot update
 is the same administrator-controlled operation: retain the old implementation,
 launcher and snapshot under a fresh root-owned backup name before replacement;
 never overwrite custody evidence or restage through the NOPASSWD helper.
 
 Install/validate any separately approved sudoers policy **after** the trusted
-files exist (`systemd/sudoers.d/picar-x-services`, root:root0644, `visudo -c -f`).
+files exist (`systemd/sudoers.d/picar-x-services`, root:root, mode0644, `visudo -c -f`).
 This helper neither installs it nor grants additional privileges. Then:
 
+The comparison and deploy check below run as ordinary `pi`, after leaving the
+root shell. Only the absolute installed launcher is privileged.
+
 ```sh
+cd /home/pi/picar-x-hacking
 bin/px-units-install --dry-run
 sudo /usr/local/sbin/px-units-install
 bin/px-deploy-check --strict
