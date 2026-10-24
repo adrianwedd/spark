@@ -1211,6 +1211,16 @@ def validate_action(action: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             energy = "medium"
         if context not in valid_context:
             context = "free"
+        act = str(params.get("action", "suggest")).lower()
+        if act not in {"suggest", "add", "remove"}:
+            raise VoiceLoopError("dopamine action must be suggest, add or remove")
+        sanitized["PX_DOPAMINE_ACTION"] = act
+        if act != "suggest":
+            item = params.get("item")
+            if (not isinstance(item, str) or not item.strip() or len(item.strip()) > 120
+                    or any(ord(c) < 32 for c in item)):
+                raise VoiceLoopError("dopamine item must contain 1-120 characters")
+            sanitized["PX_DOPAMINE_ITEM"] = item.strip()
         sanitized["PX_DOPAMINE_ENERGY"] = energy
         sanitized["PX_DOPAMINE_CONTEXT"] = context
     elif tool == "tool_sensory_check":
@@ -1322,6 +1332,7 @@ def execute_tool(tool: str, env_overrides: Dict[str, str], dry_mode: bool, timeo
         raise VoiceLoopError(f"tool command missing: {command_path}")
 
     env = os.environ.copy()
+    env.pop("PX_DOPAMINE_REQUEST", None)
     env.setdefault("PROJECT_ROOT", str(PROJECT_ROOT))
     env_overrides = dict(env_overrides)
     env_overrides.pop("PX_DRY", None)  # never allow model to control PX_DRY
@@ -1473,6 +1484,8 @@ def supervisor_loop(args: argparse.Namespace) -> None:
         with heartbeat_lock:
             heartbeat_val[0] = time.monotonic()
         try:
+            if tool == "tool_dopamine_menu" and len(user_text) <= 512 and chr(0) not in user_text:
+                env_overrides["PX_DOPAMINE_REQUEST"] = user_text
             rc_tool, tool_stdout, tool_stderr = execute_tool(tool, env_overrides, args.dry_run)
         except VoiceLoopError as exc:
             print(f"[voice-loop] Execution error: {exc}")

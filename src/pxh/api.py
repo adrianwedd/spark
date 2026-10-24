@@ -2235,6 +2235,8 @@ def _do_chat_turn(text: str, dry: bool) -> Dict[str, Any]:
         return {"status": "error", "error": str(exc), "action": action}
 
     timeout = SYNC_TIMEOUT_SLOW if tool in SLOW_TOOLS else SYNC_TIMEOUT_DEFAULT
+    if tool == "tool_dopamine_menu" and len(text) <= 512 and chr(0) not in text:
+        env_overrides["PX_DOPAMINE_REQUEST"] = text
     t_rc, t_stdout, t_stderr = execute_tool(tool, env_overrides, dry, timeout)
     return {
         "status": "ok" if t_rc == 0 else "error",

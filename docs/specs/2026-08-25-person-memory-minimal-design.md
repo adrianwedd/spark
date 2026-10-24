@@ -120,3 +120,55 @@ to its record.
   SPARK can propose editing.
 - `tests/conftest.py` isolates the store autouse, so test utterances never
   land fabricated facts in the live robot's `state/`.
+
+
+## Explicit personal menu commands (#33, 24 October 2026)
+
+The later #33 decision supersedes its old tag-in-notes proposal. An explicit
+human add/remove command may now be represented as a structured **preference**
+in the same private person store: subject, menu item, energy/context, namespaced
+stable topic and positive/negative polarity. No fourth fact class or parallel
+notes convention is introduced. `record_person_facts(..., menu=...)` validates
+the proposed fields against an anchored, bounded actual human command; ordinary
+conversation matching still rejects commands. The model cannot supply the raw
+request through action parameters. Voice/private-chat callers bind that request,
+and the executor discards an inherited request before applying trusted overrides.
+
+The source/provenance is `menu_command`, kind `report`, with the existing confidence
+ceiling. Rendering says the person requested a menu change; it does not assert an
+observed therapeutic benefit or invent that the person “likes” it. Add/remove
+supersession is decided under the same append lock. Expiry/read filtering and
+retention remain the existing store's rules. Removal appends a negative record;
+no record is deleted by the feature. Re-adding explicitly supersedes that removal.
+
+The menu tool reads only SPARK's scoped current entries/exclusions, merges them
+with unchanged defaults and prefers personal entries. Adult/unknown personas
+are refused before any private read or child action. No bridge to reflection,
+public chat, social, blog or MCP resources is added. Old note-tag experiments,
+if any exist, are left untouched and are not automatically imported.
+
+A direct CLI write needs an explicit matching `PX_DOPAMINE_REQUEST`; generic tool
+calls without that source are refused. Dry tool previews skip all writes and
+voice/emote children, read session snapshots without healing or locks, skip dotenv/log-directory
+startup and disable bytecode writes. This promise concerns the tool; normal
+caller-level conversation logging is separate. Both actions remain under the
+existing audio classification because successful live changes acknowledge via
+the established voice sink; no effect-table override or policy bypass is added.
+
+Offline tests use synthetic private stores and stubbed children. No real personal
+entry, microphone/audio, GPIO or hardware action is used for source validation.
+Adrian/Obi own personal entries and actual-use acceptance after deployment.
+
+An unreadable, corrupt, recovered or invalid session cannot grant personal-menu
+access. Live operations are refused; a dry preview uses only generic defaults
+and does not repair the session. A valid explicit default persona remains SPARK,
+matching the normal session template. The existing subject=obi convention is
+preserved; this feature does not identify a physical speaker.
+
+A missing persona field is unavailable context; explicit null/empty remains the
+normal default. Menu selection reads one strict snapshot for positive entries
+and exclusions. Malformed nonblank rows, damaged menu metadata or unreadable
+history refuse suggestions and mutations instead of reviving a removed item.
+No automatic repair/deletion occurs; preserve the ledger before operator repair.
+General legacy retrieval keeps its existing lenient behaviour; mutations validate
+the history they will supersede.

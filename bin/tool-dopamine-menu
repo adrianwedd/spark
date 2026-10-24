@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Only the caller can supply human evidence; dotenv cannot manufacture it.
+readonly _px_dopamine_request="${PX_DOPAMINE_REQUEST-}"
+unset PX_DOPAMINE_REQUEST
+export PX_ENV_READONLY=1
+# Dry preview must not load credentials or create log/session/store paths.
+if [[ "${PX_DRY:-0}" != "0" ]]; then
+    export PX_ENV_SKIP_DOTENV=1 PX_ENV_READONLY=1 PYTHONDONTWRITEBYTECODE=1
+fi
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/px-env"
+unset PX_ENV_READONLY  # live voice/emote children retain their normal startup
+export PX_DOPAMINE_REQUEST="$_px_dopamine_request"
 
 python - "$@" <<'PY'
 """Tool: SPARK dopamine menu — interest-based activity suggestions.
@@ -13,6 +23,13 @@ engagement — offers, never directs. No pressure to choose.
 Params:
   PX_DOPAMINE_ENERGY — high|medium|low (default: medium)
   PX_DOPAMINE_CONTEXT — free|focus|wind-down (default: free)
+  PX_DOPAMINE_ACTION — suggest|add|remove (default: suggest)
+  PX_DOPAMINE_ITEM — explicit activity, up to 120 characters
+  PX_DOPAMINE_REQUEST — actual human request, supplied by the caller, never the model
+
+Personal data is SPARK-only and remains in the existing person-fact store.
+Dry preview does not create logs, sessions, notes or person facts and calls no
+voice/emote children. Caller-level conversation logging is separate.
 """
 from __future__ import annotations
 import json
@@ -22,12 +39,27 @@ import subprocess
 from pathlib import Path
 
 from pxh.logging import log_event
-from pxh.state import load_session, update_session
+from pxh.state import session_path, RECOVERED_KEY, update_session
+from pxh import people
 from pxh.time import utc_timestamp
 
 PROJECT_ROOT = Path(os.environ["PROJECT_ROOT"])
 TOOL_VOICE   = PROJECT_ROOT / "bin" / "tool-voice"
 TOOL_EMOTE   = PROJECT_ROOT / "bin" / "tool-emote"
+
+
+def menu_persona():
+    """Read without healing/locking; unavailable state cannot grant private access."""
+    try:
+        data = json.loads(session_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or "persona" not in data or data.get(RECOVERED_KEY):
+        return None
+    raw = data.get("persona")
+    if raw is None:
+        return ""  # explicit default persona in the normal session template
+    return raw.lower().strip() if isinstance(raw, str) else None
 
 # Dopamine menu: energy × context → options
 # Sideways language: "Some people like...", "There's always...", no commands
@@ -89,6 +121,7 @@ MENU: dict[str, dict[str, list[str]]] = {
 
 def speak(text: str, dry: bool) -> None:
     env = os.environ.copy()
+    env.pop("PX_DOPAMINE_REQUEST", None)
     env["PX_TEXT"] = text[:2000]
     if dry:
         env["PX_DRY"] = "1"
@@ -97,6 +130,7 @@ def speak(text: str, dry: bool) -> None:
 
 def emote(name: str, dry: bool) -> None:
     env = os.environ.copy()
+    env.pop("PX_DOPAMINE_REQUEST", None)
     env["PX_EMOTE"] = name
     if dry:
         env["PX_DRY"] = "1"
@@ -114,23 +148,66 @@ def main() -> int:
     if context not in MENU[energy]:
         context = "free"
 
-    options = MENU[energy][context]
+    action = os.environ.get("PX_DOPAMINE_ACTION", "suggest").lower()
+    persona = menu_persona()
+    if persona is None and not dry:
+        print(json.dumps({"status": "error", "error": "session unavailable; personal menu access refused"}))
+        return 1
+    if persona not in {None, "", "spark"}:
+        print(json.dumps({"status": "error", "error": "personal menu is SPARK-only"}))
+        return 1
+    if action not in {"suggest", "add", "remove"}:
+        print(json.dumps({"status": "error", "error": "unknown menu action"}))
+        return 1
+    if action in {"add", "remove"}:
+        item = os.environ.get("PX_DOPAMINE_ITEM", "").strip()
+        if not item or len(item) > people.MAX_FACT_CHARS or any(ord(c) < 32 for c in item):
+            print(json.dumps({"status": "error", "error": "item must contain 1-120 characters"}))
+            return 1
+        applied = False
+        if not dry:
+            applied = people.record_person_facts(
+                role="user", text=os.environ.get("PX_DOPAMINE_REQUEST", ""),
+                persona=persona, channel="dopamine-menu", menu={"action": action,
+                    "item": item, "energy": energy, "context": context}) == 1
+            if not applied:
+                print(json.dumps({"status": "error", "error": "menu change was not stored; check the explicit request and private store"}))
+                return 1
+            speak("Added that to your menu." if action == "add" else "Taken that off your menu.", False)
+        print(json.dumps({"status": "ok", "action": action, "item": item,
+                          "energy": energy, "context": context, "dry": dry, "applied": applied}))
+        return 0
+
+    try:
+        personal, exclusions = (people.dopamine_selection(energy, context, persona=persona)
+                                if persona is not None else ([], []))
+    except (OSError, ValueError):
+        print(json.dumps({"status": "error", "error": "personal menu unavailable; preserve history before repair"}))
+        return 1
+    removed = {x.casefold().rstrip('.!?') for x in exclusions}
+    personal = [x for x in personal if x.casefold().rstrip('.!?') not in removed]
+    options = [x for x in dict.fromkeys(personal + MENU[energy][context])
+               if x.casefold().rstrip('.!?') not in removed]
     # Pick two distinct options (sideways: offer choice, not a command)
-    picks = random.sample(options, min(2, len(options)))
+    own = random.sample(personal, min(2, len(personal)))
+    pool = [x for x in options if x not in own]
+    picks = own + random.sample(pool, min(2-len(own), len(pool)))
 
-    emote("curious", dry)
-    speak("Some options.", dry)
-    for pick in picks:
-        speak(pick, dry)
+    if not dry:
+        emote("curious", False)
+        speak("Some options." if picks else "Nothing on that menu right now. You can add something when you like.", False)
+        for pick in picks:
+            speak(pick, False)
 
-    update_session(
-        fields={"last_action": "tool_dopamine_menu"},
-        history_entry={"event": "dopamine_menu", "energy": energy,
-                       "context": context, "ts": utc_timestamp()},
-    )
-    payload = {"status": "ok", "energy": energy, "context": context,
+        update_session(
+            fields={"last_action": "tool_dopamine_menu"},
+            history_entry={"event": "dopamine_menu", "energy": energy,
+                           "context": context, "ts": utc_timestamp()},
+        )
+    payload = {"status": "ok", "action": "suggest", "energy": energy, "context": context,
                "picks": picks, "dry": dry}
-    log_event("dopamine_menu", payload)
+    if not dry:
+        log_event("dopamine_menu", payload)
     print(json.dumps(payload))
     return 0
 
