@@ -1,19 +1,89 @@
 # systemd units
 
-Service units for the twelve SPARK daemons (see CLAUDE.md "Systemd Services").
-Units are copied, not symlinked, so the checked-in file and the installed one
-can drift. `bin/px-deploy-check` reports that drift (#389/#390); one command
-clears it — every `*.service`, `*.timer` and `<unit>.d/*.conf` drop-in, each
-`systemd-analyze verify`'d first, then one `daemon-reload`:
+`bin/px-deploy-check` compares copied unit files with the checkout. The
+unprivileged `bin/px-units-install --dry-run` reports the same set: top-level
+`*.service`, `*.timer`, and every corresponding `<unit>.d/*.conf` drop-in.
 
-```bash
-bin/px-units-install --dry-run          # what would change
-sudo /usr/local/sbin/px-units-install   # apply (NOPASSWD once the launcher is installed)
+Applying a change uses **administrator-staged code and inputs**, not the
+pi-writable checkout. The no-argument `/usr/local/sbin/px-units-install` launcher
+runs isolated system Python, checks root ownership and rejects symlinks,
+group/world-writable components and unexpected file types throughout its
+implementation/input paths. It replaces the environment and executes only
+`/usr/local/libexec/spark/px-units-install`, using the protected source tree
+`/usr/local/share/spark/units/systemd`. It never stages or self-updates itself.
+
+The installer validates all units/drop-ins before copying and performs one
+`daemon-reload`; it never starts, restarts or enables a unit or changes sudoers.
+**Reload can still apply live resource-containment settings** (below). Review
+those changes and any pending restart-limit decision before applying. The
+current robot-HAT hold and its two `90-hardware-disabled.conf` files must remain
+intact; do not start hardware to validate this installer.
+
+## Administrator bootstrap and snapshot updates (#390/#440/#442)
+
+This is an authenticated administrator step, not a workaround for unavailable
+sudo. The grant cannot turn a pi-writable file into a trusted input. First
+prepare the reviewed archive on a trusted development host:
+
+```sh
+git archive --format=tar REVIEWED_COMMIT bin/px-units-install systemd > spark-units.tar
+shasum -a 256 spark-units.tar
 ```
 
-It never restarts or enables anything: a new setting lands at each unit's next
-restart, and a never-installed unit (e.g. `px-io-attrib`) still needs
-`enable --now`. The launcher's source is `sbin/px-units-install`.
+Record the full commit and archive SHA256 in the review receipt. Transfer the
+archive without executing it. Obtain the expected hash independently from that
+trusted receipt, **not from the pi checkout or a hash supplied beside an
+untrusted replacement**. The administrator then authenticates and uses a fresh
+root-only staging directory (replace the two REVIEWED placeholders):
+
+```sh
+sudo -i
+set -eu
+umask 077
+spark_unit_stage=/root/spark-units-staging
+[ ! -e "$spark_unit_stage" ]
+install -d -o root -g root -m 0700 "$spark_unit_stage"
+install -o root -g root -m 0600 /path/to/spark-units.tar "$spark_unit_stage/source.tar"
+printf '%s  %s\n' REVIEWED_ARCHIVE_SHA256 "$spark_unit_stage/source.tar" | sha256sum -c -
+tar --no-same-owner --no-same-permissions -xf "$spark_unit_stage/source.tar" -C "$spark_unit_stage"
+
+# Fresh bootstrap refuses to overwrite an existing trusted installation.
+[ ! -e /usr/local/libexec/spark/px-units-install ]
+[ ! -e /usr/local/sbin/px-units-install ]
+[ ! -e /usr/local/share/spark/units ]
+install -d -o root -g root -m 0755 /usr/local/libexec/spark /usr/local/share/spark/units
+install -o root -g root -m 0755 "$spark_unit_stage/bin/px-units-install" /usr/local/libexec/spark/px-units-install
+cp -R "$spark_unit_stage/systemd" /usr/local/share/spark/units/
+install -o root -g root -m 0755 "$spark_unit_stage/systemd/sbin/px-units-install" /usr/local/sbin/px-units-install
+```
+
+All ancestor directories must also be root-owned and not group/world writable;
+the launcher refuses otherwise. Snapshot files may be root-only (0600/0700) or
+readable (0644/0755), never writable by pi/group/others. A later snapshot update
+is the same administrator-controlled operation: retain the old implementation,
+launcher and snapshot under a fresh root-owned backup name before replacement;
+never overwrite custody evidence or restage through the NOPASSWD helper.
+
+Install/validate any separately approved sudoers policy **after** the trusted
+files exist (`systemd/sudoers.d/picar-x-services`, root:root0644, `visudo -c -f`).
+This helper neither installs it nor grants additional privileges. Then:
+
+```sh
+bin/px-units-install --dry-run
+sudo /usr/local/sbin/px-units-install
+bin/px-deploy-check --strict
+```
+
+A checkout update does not update the trusted snapshot. If the gate still
+reports drift, stage the newly reviewed units rather than letting the helper
+read pi-writable inputs. Keep source revision, trusted snapshot, installed
+files and running processes distinct; restart only the deliberately selected
+units after the gate's process readback and current hardware/safety review.
+
+This repairs the **unit-install helper's** code/input trust boundary. It does
+not complete Spark's OS isolation: existing root units may still execute
+checkout code, as documented separately under #281. No broad privilege-separation
+claim follows from a root-owned launcher.
 
 ## Resource containment (#217/#218/#219)
 
