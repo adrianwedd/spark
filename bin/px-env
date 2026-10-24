@@ -261,7 +261,9 @@ yield_alive() {
     fi
 }
 
-mkdir -p "$LOG_DIR"
+if [[ "${PX_ENV_READONLY:-0}" != "1" ]]; then
+    mkdir -p "$LOG_DIR"
+fi
 
 # Default audio output: HifiBerry DAC via robot_hat ALSA plug device.
 # Override with e.g. PX_VOICE_DEVICE=plughw:1,0 for direct HW access.
