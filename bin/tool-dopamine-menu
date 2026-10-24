@@ -173,7 +173,8 @@ def main() -> int:
             if not applied:
                 print(json.dumps({"status": "error", "error": "menu change was not stored; check the explicit request and private store"}))
                 return 1
-            speak("Added that to your menu." if action == "add" else "Taken that off your menu.", False)
+            confirmation = "Added that to" if action == "add" else "Taken that off"
+            speak(f"{confirmation} your {energy} energy menu.", False)
         print(json.dumps({"status": "ok", "action": action, "item": item,
                           "energy": energy, "context": context, "dry": dry, "applied": applied}))
         return 0
