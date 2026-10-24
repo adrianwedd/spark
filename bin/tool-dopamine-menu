@@ -179,6 +179,10 @@ def main() -> int:
                           "energy": energy, "context": context, "dry": dry, "applied": applied}))
         return 0
 
+    if not dry:
+        print(json.dumps({"status": "error", "error": "menu suggestions temporarily held for a private-speech repair"}))
+        return 1
+
     try:
         personal, exclusions = (people.dopamine_selection(energy, context, persona=persona)
                                 if persona is not None else ([], []))
