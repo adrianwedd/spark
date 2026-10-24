@@ -139,6 +139,9 @@ def emote(name: str, dry: bool) -> None:
 
 def main() -> int:
     dry = os.environ.get("PX_DRY", "0") != "0"
+    if not dry:
+        print(json.dumps({"status": "error", "error": "live personal menu temporarily held for privacy repair"}))
+        return 1
     energy = os.environ.get("PX_DOPAMINE_ENERGY", "medium").lower()
     context = os.environ.get("PX_DOPAMINE_CONTEXT", "free").lower()
 
@@ -178,10 +181,6 @@ def main() -> int:
         print(json.dumps({"status": "ok", "action": action, "item": item,
                           "energy": energy, "context": context, "dry": dry, "applied": applied}))
         return 0
-
-    if not dry:
-        print(json.dumps({"status": "error", "error": "menu suggestions temporarily held for a private-speech repair"}))
-        return 1
 
     try:
         personal, exclusions = (people.dopamine_selection(energy, context, persona=persona)
