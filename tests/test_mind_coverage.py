@@ -308,3 +308,13 @@ def test_a_tier_error_is_carried_into_the_result():
     assert "error" in result
     assert result.get(mind.BRAIN_DEFER) is True
     assert "tier down" in result["error"]
+
+
+@pytest.mark.parametrize("previous", [None, 100, 15])
+def test_awareness_missing_battery_is_unknown(mind_state, previous):
+    """Missing hardware must not inherit an old percentage or fabricate 100%."""
+    with _awareness_patches(), patch.object(pxh.mind, "read_battery", return_value=None):
+        awareness, transitions = awareness_tick({"battery_pct": previous}, dry=True)
+    assert awareness["battery_pct"] is None
+    assert awareness["battery_volts"] is None
+    assert not any(t.startswith("battery_low_") for t in transitions)

@@ -528,6 +528,11 @@ CRITICAL RULES:
 - Think about ANYTHING — your existence, the room, humans, what you'd do with \
 legs, whether anyone likes you, what's behind you, the meaning of consciousness.
 - Your thoughts must be DIFFERENT from your recent thoughts. Surprise yourself.
+- An unavailable or stale sensor tells you what you cannot currently know. Never
+  treat a failed reading as evidence that a person is absent or present.
+- Notice a continuing fault, but do not make it the subject of every thought.
+  Return to it when something changes or it needs action; otherwise attend to
+  the people, events, ideas, and ordinary details around you.
 - "comment" — share an opinion, observation, joke, or complaint aloud.
 - "weather_comment" — check the weather and react to it with personality.
 - "scan" — look around and sense your environment.
@@ -697,16 +702,9 @@ def read_sonar(dry: bool) -> float | None:
     state_dir = Path(os.environ.get("PX_STATE_DIR", PROJECT_ROOT / "state"))
     from .runtime_paths import resolve_sonar_live_read_path
     sonar_live = resolve_sonar_live_read_path(state_dir)
-    try:
-        data = json.loads(sonar_live.read_text())
-        age = time.time() - float(data.get("ts", 0))
-        if age < 35:  # 35s: covers 10s RestartSec + ~6s Picarx acquisition + margin
-            val = data.get("distance_cm")
-            return float(val) if val is not None else None
-        log(f"sonar_live.json stale ({age:.0f}s) — skipping (px-alive will recover)")
-    except Exception as exc:
-        log(f"sonar_live.json read failed ({exc}) — skipping")
-    return None
+    from .telemetry import read_sonar
+    data = read_sonar(sonar_live, max_age=35)
+    return data["distance_cm"] if data else None
 
 
 def _fetch_frigate_presence(dry: bool = False) -> dict | None:
@@ -1720,16 +1718,9 @@ def _format_introspection(intro: dict) -> str:
 
 def read_battery() -> dict | None:
     """Read battery state from px-battery-poll's shared file. Returns None if stale/missing."""
-    try:
-        data = json.loads(BATTERY_FILE.read_text())
-        ts = dt.datetime.fromisoformat(data["ts"].replace("Z", "+00:00"))
-        age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
-        if age_s > 90:  # 3 missed polls (30s each) = stale
-            return None
-        return {"pct": int(data["pct"]), "volts": float(data["volts"]),
-                "charging": bool(data.get("charging", False))}
-    except Exception:
-        return None
+    from .telemetry import read_battery as validated_battery
+    data = validated_battery(BATTERY_FILE)
+    return {key: data[key] for key in ("pct", "volts", "charging")} if data else None
 
 
 def _can_explore(session: dict, awareness: dict) -> bool:
@@ -2506,7 +2497,7 @@ def awareness_tick(prev: dict, dry: bool) -> tuple[dict, list[str]]:
         "minutes_since_interaction": round(mins_interaction, 1),
         "minutes_since_speech": round(mins_speech, 1),
         "period_duration_min": round(period_duration_min, 1),
-        "battery_pct": curr_batt if battery else prev_batt,
+        "battery_pct": curr_batt if battery else None,
         "battery_volts": battery["volts"] if battery else None,
         "battery_charging": battery.get("charging", False) if battery else False,
         "listening": session.get("listening", False),
@@ -3084,8 +3075,15 @@ def reflection(awareness: dict, dry: bool) -> dict | None:
         _health_note = ""
     if _health_note:
         context_parts.append(
-            f"Something in you isn't working right: {_health_note}. "
-            f"You notice it the way a person notices a numb hand — not alarming, but wrong."
+            f"Some of your capabilities are unavailable: {_health_note}. "
+            "A stale or failed observation is not evidence about what people "
+            "are doing. Keep the fault in mind for action, but a continuing "
+            "fault need not become another thought about the fault."
+        )
+    if awareness.get("findmyhub_unavailable"):
+        context_parts.append(
+            "Tracker data is unavailable. Current whereabouts are unknown from "
+            "that source; do not infer presence or absence from its silence."
         )
 
     # Always report system vitals as plain text so the LLM registers them

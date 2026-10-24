@@ -1,5 +1,7 @@
 """Tests for SPARK MCP server tools."""
 import json
+import time
+import datetime as dt
 from unittest.mock import patch
 
 import pytest
@@ -76,19 +78,20 @@ class TestSparkAwareness:
 
 class TestSparkSonar:
     def test_returns_sonar(self, state_dir):
-        sonar = {"cm": 35.2, "source": "px-alive", "ts": "2026-03-20T10:00:00Z"}
+        sonar = {"distance_cm": 35.2, "ts": time.time()}
         (state_dir / "sonar_live.json").write_text(json.dumps(sonar))
         result = json.loads(spark_sonar())
-        assert result["cm"] == 35.2
+        assert result["distance_cm"] == 35.2
 
     def test_missing_sonar(self, state_dir):
         result = json.loads(spark_sonar())
-        assert "error" in result
+        assert result["source"] == "unavailable"
+        assert result["distance_cm"] is None
 
 
 class TestSparkVitals:
     def test_returns_battery_when_available(self, state_dir):
-        battery = {"volts": 8.1, "pct": 95, "charging": False, "ts": "x"}
+        battery = {"volts": 8.1, "pct": 95, "charging": False, "ts": dt.datetime.now(dt.timezone.utc).isoformat()}
         (state_dir / "battery.json").write_text(json.dumps(battery))
         result = json.loads(spark_vitals())
         assert result["battery"]["volts"] == 8.1
@@ -102,5 +105,12 @@ class TestSparkVitals:
     def test_no_battery_still_returns_ram(self, state_dir):
         # No battery.json, but psutil available → should return ram data
         result = json.loads(spark_vitals())
-        assert "battery" not in result
+        assert result["battery"] is None
         assert "ram_mb" in result
+
+
+def test_mcp_rejects_stale_sensor_records(state_dir):
+    (state_dir / "battery.json").write_text(json.dumps({"volts": 8.1, "pct": 100, "ts": "2026-10-03T03:54:29Z"}))
+    (state_dir / "sonar_live.json").write_text(json.dumps({"distance_cm": 40, "ts": time.time() - 120}))
+    assert json.loads(spark_vitals())["battery"] is None
+    assert json.loads(spark_sonar())["source"] == "unavailable"
