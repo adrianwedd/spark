@@ -305,3 +305,15 @@ def test_explicit_null_persona_remains_the_normal_default(menu_env,monkeypatch,c
     scope=load_tool();monkeypatch.setenv('PX_DRY','1')
     assert scope['main']()==0
     assert 'magnetic tiles' in json.loads(capsys.readouterr().out)['picks']
+
+
+@pytest.mark.parametrize('action',['add','remove'])
+def test_live_confirmation_names_the_recorded_energy(menu_env,monkeypatch,capsys,action):
+    scope=load_tool();spoken=[];scope['speak']=lambda text,dry:spoken.append(text)
+    monkeypatch.setenv('PX_DOPAMINE_ACTION',action);monkeypatch.setenv('PX_DOPAMINE_ITEM','magnetic tiles')
+    monkeypatch.setenv('PX_DOPAMINE_ENERGY','high');monkeypatch.setenv('PX_DOPAMINE_CONTEXT','focus')
+    text=('Add magnetic tiles to' if action=='add' else 'Remove magnetic tiles from')+' my high energy focus dopamine menu'
+    monkeypatch.setenv('PX_DOPAMINE_REQUEST',text)
+    assert scope['main']()==0
+    payload=json.loads(capsys.readouterr().out);assert payload['applied'] is True
+    assert spoken==[('Added that to' if action=='add' else 'Taken that off')+' your high energy menu.']
