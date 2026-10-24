@@ -17,8 +17,9 @@ archive is created. An oversized current file from outside this writer is
 removed rather than archived. Bounds assume this poller is the sole writer;
 external edits or multiple pollers are unsupported.
 
-One sample line is appended per successful ADC acquisition, including rejected
-readings and warm-up, at the existing 30-second cadence. Each appended line is
+When the writer is available, one sample is offered per successful ADC acquisition,
+including rejected readings, warm-up and failed percentage conversions, at the
+existing 30-second cadence. Storage/drop limits can lose offered samples. Each appended line is
 capped at 512 bytes, including newline and diagnostic counters. Thus the logical
 append-volume ceiling is `512 * (86400 / 30)` bytes/day; rotations rename files,
 not rewrite their contents. Filesystem metadata/block write amplification is
@@ -44,8 +45,11 @@ battery.json, health, stderr, and alert paths remain as before.
   not when a delayed writer commits it. Clock steps remain possible.
 - `raw_volts`: unrounded ADC result; `volts`: existing two-decimal value used by
   the poller. Neither is a smoothed or inferred pack-voltage trace.
-- `classification`: `rejected_adc`, `warmup`, or `accepted`, describing the
-  poller's existing branch, not the mind's separate percentage glitch filter.
+- `classification`: `rejected_adc`, `warmup`, `accepted`, or `conversion_error`,
+  describing the poller's branch, not the mind's separate percentage glitch filter.
+  NaN/+infinity fail percentage conversion; their diagnostic is retained before
+  the original exception is re-raised into existing error handling. This does not
+  accept those samples into battery state or change any decision policy.
 - `charging`: unchanged detector state for an accepted sample; false in warm-up;
   previous reported state for a rejected ADC sample (no detector update).
 - `queue_dropped` and `storage_errors`: cumulative counters since process start,
@@ -71,6 +75,10 @@ counters reset, and the size cap, not an age guarantee, determines retention.
 ## Later operator verification (not performed here)
 
 Only after independent review and explicitly authorised deployment:
+
+The current robot-HAT hold takes precedence. Do not remove its marker, start the
+poller, acquire GPIO or induce discharge to obtain this evidence. Live ADC acceptance
+waits for an operator-authorised hardware repair/recovery and natural samples.
 
 1. Without changing charging/discharge state or inducing a fault, read the two
    history files from the operator's authorised local session. Check file sizes,

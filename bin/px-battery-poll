@@ -176,7 +176,13 @@ while True:
                                    f"ADC glitch: {volts}V below {VOLTAGE_FLOOR}V floor")
             time.sleep(POLL_S)
             continue
-        pct   = volts_to_pct(volts)
+        try:
+            pct = volts_to_pct(volts)
+        except (ValueError, OverflowError):
+            # Retain the ADC observation before the unchanged conversion-error
+            # path. NaN/+inf cannot be converted to an integer percentage.
+            evidence.record(raw_volts, volts, "conversion_error", was_charging)
+            raise
         ts    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # Warmup: skip first readings (ADC noise on cold start causes false transitions)

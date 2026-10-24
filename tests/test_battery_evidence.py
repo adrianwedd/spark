@@ -155,6 +155,41 @@ def test_nonfinite_raw_values_remain_strict_json(tmp_path):
         writer.close()
 
 
+@pytest.mark.parametrize("value,error", [(float("nan"), ValueError),
+                                         (float("inf"), OverflowError),
+                                         (7.2, None)])
+def test_poller_conversion_boundary_retains_fault_before_original_error(tmp_path, value, error):
+    """Execute only the actual pure converter/diagnostic branch, never GPIO."""
+    source = (Path(__file__).parents[1] / "bin/px-battery-poll").read_text()
+    tree = ast.parse(source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0])
+    converter = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                     and n.name == "volts_to_pct")
+    loop = next(n for n in tree.body if isinstance(n, ast.While))
+    conversion = next(n for n in loop.body[0].body if isinstance(n, ast.Try)
+                      and "pct = volts_to_pct(volts)" in ast.unparse(n))
+    writer = BatteryEvidence(tmp_path / "history.jsonl", clock=lambda: 1000)
+    scope = {"raw_volts": value, "volts": round(value, 2),
+             "was_charging": False, "evidence": writer}
+    code = compile(ast.Module(body=[converter, conversion], type_ignores=[]),
+                   "offline-poller-conversion", "exec")
+    try:
+        if error:
+            with pytest.raises(error):
+                exec(code, scope)
+            writer.flush()
+            row = _records(writer.path)[0]
+            assert row["classification"] == "conversion_error"
+            assert row["raw_volts"] == str(value)
+            assert row["charging"] is False
+        else:
+            exec(code, scope)
+            assert scope["pct"] == 50
+            writer.flush()
+            assert not writer.path.exists(), "ordinary sample is recorded by its later branch"
+    finally:
+        writer.close()
+
+
 def test_poller_integration_without_executing_poller():
     source = (Path(__file__).parents[1] / "bin/px-battery-poll").read_text()
     tree = ast.parse(source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0])
