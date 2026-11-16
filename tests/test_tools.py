@@ -1435,6 +1435,71 @@ def test_tool_announce_live_path_posts_relay_and_ha(isolated_project, monkeypatc
     assert not (isolated_project["state_dir"] / "gpio_lease.json").exists()
 
 
+def test_tool_voice_routes_spark_conversation_to_nest(isolated_project):
+    _StubHandler.captured = []
+    srv = _start_stub()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    env = isolated_project["env"].copy()
+    env.update({
+        "PX_DRY": "0",
+        "PX_TEXT": "hello there",
+        "PX_PERSONA": "spark",
+        "_PX_VOICE_PERSONA_DONE": "1",
+        "PX_VOICE_ROUTE_NEST": "1",
+        "PX_ANNOUNCE_RELAY_URL": base,
+        "PX_HA_HOST": base,
+        "ANNOUNCE_RELAY_TOKEN": "t",
+        "PX_HA_TOKEN": "t",
+        "PX_NIGHT_SILENCE_START_H": "99",
+        "PX_NIGHT_SILENCE_END_H": "0",
+    })
+    try:
+        payload = parse_json(run_tool(["bin/tool-voice"], env))
+    finally:
+        srv.shutdown()
+
+    assert payload["status"] == "ok"
+    assert payload["route"] == "nest"
+    assert payload["target"] == "media_player.nest_hub_max"
+    assert any(path.endswith("/announce") for _, path, _ in _StubHandler.captured)
+
+
+def test_tool_voice_no_route_override_stays_onboard(isolated_project):
+    env = isolated_project["env"].copy()
+    env.update({
+        "PX_DRY": "0",
+        "PX_TEXT": "hello there",
+        "PX_PERSONA": "spark",
+        "_PX_VOICE_PERSONA_DONE": "1",
+        "PX_VOICE_ROUTE_NEST": "1",
+        "PX_VOICE_NO_ROUTE": "1",
+        "PX_VOICE_PLAYER": "true",
+    })
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["status"] == "ok"
+    assert payload["route"] == "onboard"
+
+
+def test_tool_voice_nest_failure_falls_back_onboard(isolated_project):
+    env = isolated_project["env"].copy()
+    env.update({
+        "PX_DRY": "0",
+        "PX_TEXT": "hello there",
+        "PX_PERSONA": "spark",
+        "_PX_VOICE_PERSONA_DONE": "1",
+        "PX_VOICE_ROUTE_NEST": "1",
+        "PX_VOICE_PLAYER": "true",
+        "PX_ANNOUNCE_RELAY_URL": "http://127.0.0.1:1",
+        "PX_HA_HOST": "http://127.0.0.1:1",
+        "PX_NIGHT_SILENCE_START_H": "99",
+        "PX_NIGHT_SILENCE_END_H": "0",
+    })
+    payload = parse_json(run_tool(["bin/tool-voice"], env))
+    assert payload["status"] == "ok"
+    assert payload["route"] == "onboard"
+    assert payload["route_fallback_reason"]
+
+
 def test_tool_announce_ignores_gpio_leases(isolated_project):
     """tool-announce touches no hardware, so it must not consult the GPIO lease
     at all. The old lease check was the second half of the Nest regression: the

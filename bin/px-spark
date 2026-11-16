@@ -49,6 +49,11 @@ export PX_PERSONA=spark
 export PX_VOICE_VARIANT=en+m3
 export PX_VOICE_PITCH=82
 export PX_VOICE_RATE=120
+# Route conversational speech through the existing M5 → Home Assistant →
+# Google Nest pipeline. tool-voice falls back to SPARK's onboard speaker when
+# the relay or Cast path fails; urgent local alerts opt out with
+# PX_VOICE_NO_ROUTE=1.
+export PX_VOICE_ROUTE_NEST=1
 
 # Use Claude Haiku for SPARK's inner thoughts (much better quality than Ollama small models)
 export PX_MIND_BACKEND=claude

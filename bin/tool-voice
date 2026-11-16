@@ -132,11 +132,70 @@ def main() -> int:
             return result.returncode
     
     dry_mode = os.environ.get("PX_DRY", "0") != "0"
+    route_fallback_reason = None
+
+    # A SPARK conversation may choose the household Nest as its speech sink.
+    # Keep this opt-in at the launcher rather than changing every producer:
+    # compound tools (Q&A, chat, routines, stories) already converge here, so
+    # they inherit one route and the existing onboard path remains the fallback.
+    # Urgent/device-local callers set PX_VOICE_NO_ROUTE=1 explicitly.
+    if (
+        not dry_mode
+        and os.environ.get("PX_VOICE_ROUTE_NEST") == "1"
+        and os.environ.get("PX_VOICE_NO_ROUTE") != "1"
+        and persona == "spark"
+    ):
+        announce_env = os.environ.copy()
+        announce_env["PX_ANNOUNCE_TEXT"] = text
+        try:
+            result = subprocess.run(
+                [str(PROJECT_ROOT / "bin" / "tool-announce")],
+                env=announce_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=95,
+            )
+            announce_payload = json.loads(result.stdout.strip().splitlines()[-1])
+            if announce_payload.get("status") == "ok":
+                payload = {
+                    "status": "ok",
+                    "dry": False,
+                    "text": text,
+                    "route": "nest",
+                    "target": (announce_payload.get("targets") or [None])[0],
+                    "duration_s": announce_payload.get("duration_s"),
+                }
+                update_session(
+                    fields={"last_action": "tool_voice"},
+                    history_entry={"event": "voice", "text": text,
+                                   "dry": False, "route": "nest"},
+                )
+                _log_voice(payload)
+                print(json.dumps(payload))
+                return 0
+            if announce_payload.get("status") == "suppressed":
+                payload = {
+                    "status": "suppressed",
+                    "reason": announce_payload.get("reason", "suppressed"),
+                    "text": text,
+                    "route": "nest",
+                }
+                _log_voice(payload)
+                print(json.dumps(payload))
+                return 0
+            route_fallback_reason = announce_payload.get("error", "announce failed")
+        except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as exc:
+            route_fallback_reason = type(exc).__name__
+
     payload = {
         "status": "ok",
         "dry": dry_mode,
         "text": text,
+        "route": "onboard",
     }
+    if route_fallback_reason:
+        payload["route_fallback_reason"] = route_fallback_reason
 
     # Network TTS routing by persona
     # GREMLIN → GLaDOS TTS on Pi (localhost:7861)

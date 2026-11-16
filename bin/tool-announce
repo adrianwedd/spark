@@ -37,7 +37,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from pxh.state import update_session
-from pxh import policy
+from pxh import policy, wake_grant
 from pxh import spark_config as cfg
 
 # Test/ops override hooks (production uses spark_config defaults). The tool runs
@@ -70,7 +70,12 @@ def _is_night_silence() -> bool:
     Delegates to pxh.policy so the Nest path and the onboard speaker
     (bin/tool-voice) cannot end up disagreeing about when night is.
     """
-    return policy.is_night_hour(dt.datetime.now(HOBART_TZ).hour)
+    # A confirmed, still-active "Hey Spark" conversation is the deliberate
+    # exception already recognised by the onboard sink. Without carrying the
+    # same exception here, routing an otherwise-authorised reply to a Nest
+    # would turn it back into silence after dark.
+    return (policy.is_night_hour(dt.datetime.now(HOBART_TZ).hour)
+            and not wake_grant.is_grant_confirmed())
 
 
 def _resolve_targets() -> list[str]:
